@@ -855,7 +855,8 @@ export function formatResult(opName: string, result: unknown): string {
     }
     case 'search':
     case 'query': {
-      const results = result as any[];
+      const { redactSearchResults } = require('./core/search/output-redaction.ts') as typeof import('./core/search/output-redaction.ts');
+      const results = redactSearchResults(result as any[]);
       if (results.length === 0) return 'No results.\n';
       // v0.40.4 — --explain switches to per-stage attribution formatter.
       // Reads CliOptions.explain via the module-level singleton.

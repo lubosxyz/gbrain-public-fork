@@ -24,6 +24,7 @@ import { getContentFlag } from './quarantine.ts';
 import { bumpLastRetrievedAt } from './last-retrieved.ts';
 import { isSearchMode } from './search/mode.ts';
 import { stampEvidence } from './search/evidence.ts';
+import { redactSearchResults } from './search/output-redaction.ts';
 import type { SearchResult } from './types.ts';
 import { CJK_SLUG_CHARS } from './cjk.ts';
 import * as db from './db.ts';
@@ -1456,8 +1457,9 @@ const search: Operation = {
       // hybridSearch, so stamp explicitly). Fail-open inside the helper.
       await stampContentFlags(ctx.engine, results);
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
-      maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false);
-      return results;
+      const safeResults = redactSearchResults(results);
+      maybeCaptureSearch(ctx, queryText, safeResults, Date.now() - startedAt, false);
+      return safeResults;
     }
 
     // Cheap-hybrid (D4/D15): full vector+keyword+RRF+pool+title+alias, but
@@ -1473,8 +1475,9 @@ const search: Operation = {
     });
     const latency_ms = Date.now() - startedAt;
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
-    maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
-    return results;
+    const safeResults = redactSearchResults(results);
+    maybeCaptureSearch(ctx, queryText, safeResults, latency_ms, true, capturedMeta);
+    return safeResults;
   },
   scope: 'read',
   cliHints: { name: 'search', positional: ['query'] },
@@ -1617,7 +1620,7 @@ const query: Operation = {
         embeddingColumn: 'embedding_image',
         ...querySourceScope,
       });
-      return results;
+      return redactSearchResults(results);
     }
 
     if (!queryText) {
@@ -1678,6 +1681,7 @@ const query: Operation = {
       relationalRetrieval: typeof p.relational === 'boolean' ? (p.relational as boolean) : undefined,
     });
     const latency_ms = Date.now() - startedAt;
+    const safeResults = redactSearchResults(results);
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
     // search handler — fire-and-forget, internal callers bypass this path.
@@ -1696,7 +1700,7 @@ const query: Operation = {
         {
           tool_name: 'query',
           query: queryText,
-          results,
+          results: safeResults,
           meta,
           latency_ms,
           remote: ctx.remote ?? false,
@@ -1709,7 +1713,7 @@ const query: Operation = {
       );
     }
 
-    return results;
+    return safeResults;
   },
   scope: 'read',
   cliHints: { name: 'query', positional: ['query'] },
