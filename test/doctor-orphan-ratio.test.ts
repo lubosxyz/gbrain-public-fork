@@ -41,7 +41,7 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-  setCliOptions({ quiet: true, progressJson: false, progressInterval: 1000, explain: false, timeoutMs: null });
+  setCliOptions({ quiet: true, progressJson: false, progressInterval: 1000, explain: false, timeoutMs: null, brain: null });
 }, 60_000);
 
 afterAll(async () => {
@@ -175,6 +175,38 @@ describe('runDoctor — orphan_ratio check (local surface, D5)', () => {
     const check = findCheck(report, 'orphan_ratio');
     expect(check!.status).toBe('fail');
     expect(check!.message).toContain('gbrain extract links --by-mention');
+  });
+
+  test('#2264 — auto_chronicle life/events/ volume is excluded, so it does not trip orphan_ratio', async () => {
+    // Healthy knowledge graph: 100 fully-linked entity pages (no real decay).
+    for (let i = 0; i < 100; i++) {
+      await engine.putPage(`people/person-${i}`, {
+        type: 'person', title: `Person ${i}`, compiled_truth: 'b', timeline: '', frontmatter: {},
+      });
+    }
+    await engine.putPage('writing/index', {
+      type: 'note', title: 'Index', compiled_truth: 'index', timeline: '', frontmatter: {},
+    });
+    const links = [];
+    for (let i = 0; i < 100; i++) {
+      links.push({
+        from_slug: 'writing/index',
+        to_slug: `people/person-${i}`,
+        link_type: 'mentions', link_source: 'markdown', context: '',
+      });
+    }
+    await engine.addLinksBatch(links);
+    // Machine chronicle volume: 500 life/events/ pages, no inbound links by
+    // design. Without the exclusion these swamp the denominator (~83% orphan
+    // → FAIL); excluded, orphan_ratio reflects the healthy knowledge graph.
+    for (let i = 0; i < 500; i++) {
+      await engine.putPage(`life/events/2026-08-${i}-evt`, {
+        type: 'event', title: `Event ${i}`, compiled_truth: 'e', timeline: '', frontmatter: {},
+      });
+    }
+    const report = await runDoctorJson();
+    const check = findCheck(report, 'orphan_ratio');
+    expect(check!.status).toBe('ok');
   });
 
   test('zero entity pages → vacuous status ok', async () => {

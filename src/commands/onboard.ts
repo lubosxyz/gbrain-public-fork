@@ -142,12 +142,16 @@ export async function runOnboard(engine: BrainEngine, args: string[]): Promise<v
 
   // --auto path: runs through the T2 library orchestrator. Hooks emit CLI
   // progress to stderr; the final result lands as JSON on stdout (or human
-  // summary).
+  // summary). extraRemediations (gathered above from runAllOnboardChecks)
+  // is threaded into the runner so the onboard-check remediations
+  // (extract-ner, extract-timeline-from-meetings, etc.) reach the planner
+  // — the same wiring the --check path uses above.
   const result = await runRemediation(
     engine,
     {
       targetScore,
       maxUsd,
+      extraRemediations,
       // --auto --yes opts into the prompt_required tier too; library
       // doesn't distinguish auto_apply vs prompt_required, it just runs
       // every remediation in the plan. The plan-building side (T12 render)
@@ -247,7 +251,7 @@ async function renderPackUpgradeExplain(
       `  Page-to-link:        ${result.per_phase.page_to_link.would_convert} edges across ${result.per_phase.page_to_link.rules} rules\n` +
       `  Page-to-alias:       ${result.per_phase.page_to_alias.would_alias} aliases across ${result.per_phase.page_to_alias.rules} rules\n` +
       `\nRun the migration with:\n` +
-      `  gbrain jobs submit unify-types --allow-protected --params '${JSON.stringify({ target_pack: targetPack })}'\n`,
+      `  gbrain jobs submit unify-types --allow-protected --params '${JSON.stringify({ target_pack: targetPack, apply: true })}'\n`,
     );
     if (result.warnings.length > 0) {
       process.stdout.write(`\nWarnings:\n`);

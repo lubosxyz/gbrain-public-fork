@@ -18,6 +18,7 @@
  */
 
 import { quarantineFilterFragment } from '../quarantine.ts';
+import { unverifiedExtractionFragment } from '../extraction-review.ts';
 
 /**
  * Escape `%`, `_`, and `\` so a string can be used as a LIKE prefix literal.
@@ -63,6 +64,7 @@ export function buildSourceFactorCase(
   slugColumn: string,
   boostMap: Record<string, number>,
   detail: 'low' | 'medium' | 'high' | undefined,
+  unverifiedGuardColumn?: string,
 ): string {
   // Loose-string guard: agents passing `"HIGH"` or `"high "` over MCP/JSON
   // should still hit the temporal-bypass path. TypeScript narrows `detail`
@@ -80,7 +82,26 @@ export function buildSourceFactorCase(
     `WHEN ${slugColumn} LIKE ${buildLikePrefixLiteral(prefix)} THEN ${factor}`
   ).join(' ');
 
-  return `(CASE ${whens} ELSE 1.0 END)`;
+  // Extraction quarantine lane (issue #160): unverified auto-extracted stubs
+  // never receive the namespace-authority factor (people/ / companies/ 1.2x)
+  // — they rank as ordinary content until promoted. Two forms:
+  //   - table-qualified slug column ('p.slug'): reference the sibling
+  //     `frontmatter` column inline via unverifiedExtractionFragment.
+  //   - bare column + `unverifiedGuardColumn`: the vector arm's re-rank CTE
+  //     has no frontmatter column, so its inner hnsw_candidates CTE projects
+  //     the predicate as a boolean (`... AS unverified_stub`) and passes the
+  //     column name here. Without this the 1.2x would apply INSIDE the
+  //     scored/best_per_page pipeline pre-LIMIT — an unverified stub could
+  //     outrank AND evict a legitimate page from the candidate pool, which
+  //     nothing downstream can restore.
+  const alias = slugColumn.includes('.') ? slugColumn.split('.')[0] : null;
+  const unverifiedGuard = unverifiedGuardColumn
+    ? `WHEN ${unverifiedGuardColumn} THEN 1.0 `
+    : alias
+      ? `WHEN ${unverifiedExtractionFragment(alias)} THEN 1.0 `
+      : '';
+
+  return `(CASE ${unverifiedGuard}${whens} ELSE 1.0 END)`;
 }
 
 /**
@@ -204,6 +225,51 @@ export function buildBestPerPagePoolCte(candidateCte: string): string {
         FROM ${candidateCte}
         ORDER BY COALESCE(source_id, 'default'), slug, score DESC, page_id ASC, chunk_id ASC
       )`;
+}
+
+// ============================================================
+// AND→OR keyword-recall fallback (fix/title-retrieval-arm, D2)
+// ============================================================
+
+/**
+ * Build a relaxed OR-of-terms websearch string for the keyword-arm recall
+ * fallback.
+ *
+ * `websearch_to_tsquery('english', query)` joins unquoted terms with `&`
+ * (AND). At chunk grain, one query token that doesn't co-occur in any
+ * single chunk zeroes keyword recall with no fallback. When the strict
+ * AND query returns zero rows, engines retry ONCE with the string this
+ * builder returns — the same tokens joined with websearch's `OR` keyword,
+ * which compiles to `|`.
+ *
+ * Why rebuild via websearch syntax instead of hand-assembling a tsquery:
+ * websearch_to_tsquery never raises on malformed input, applies the same
+ * stemming/stopword pipeline as the document side, and an all-stopword
+ * token list degrades to an empty tsquery (matches nothing) instead of a
+ * SQL error — the empty-tsquery guard comes free.
+ *
+ * Returns null when relaxation is pointless or unsafe:
+ *   - fewer than 2 tokens survive tokenization (OR of one term is the same
+ *     query as AND of one term);
+ *   - the raw query uses websearch OPERATORS (Reviewer F3): a `-term`
+ *     negation would be RESURRECTED as a positive OR term, and a quoted
+ *     phrase would degrade to a bag of words — both invert caller intent,
+ *     so operator queries get no fallback at all.
+ * Tokenization splits on non-alphanumeric runs (Unicode-aware). Literal
+ * OR/AND words are dropped so they can't be re-parsed as operators
+ * mid-list.
+ */
+export function buildOrFallbackWebsearchQuery(query: string): string | null {
+  // F3 operator guard: any double quote, or a dash LEADING a token
+  // (whitespace/start boundary — interior hyphens like "foo-bar" are fine).
+  if (query.includes('"') || /(^|\s)-\S/.test(query)) return null;
+  const tokens = query
+    .normalize('NFKC')
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean)
+    .filter(t => { const u = t.toUpperCase(); return u !== 'OR' && u !== 'AND'; });
+  if (tokens.length < 2) return null;
+  return tokens.join(' OR ');
 }
 
 // ============================================================

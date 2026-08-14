@@ -48,6 +48,16 @@ mock.module('../../src/core/embedding.ts', () => ({
   estimateEmbeddingCostUsd: (tokens: number) => (tokens / 1000) * 0.00013,
   // v0.41.31: embed phase reads the current signature to stamp provenance.
   currentEmbeddingSignature: () => 'text-embedding-3-large:1536',
+  // The cycle sync phase reaches commands/sync.ts, whose static embedding.ts
+  // imports must all resolve against this mock (missing names are a load-time
+  // SyntaxError, not a runtime undefined).
+  currentEmbeddingPricePerMTok: () => 0.13,
+  willEmbedSynchronously: (opts: { v2Enabled: boolean; serialFlag: boolean; noEmbed: boolean }) => {
+    const effectiveNoEmbed = opts.v2Enabled && !opts.serialFlag && !opts.noEmbed ? true : opts.noEmbed;
+    return effectiveNoEmbed ? 'deferred' : 'inline';
+  },
+  shouldBlockSync: (costUsd: number, floorUsd: number, mode: string, posture: 'gated' | 'tokenmax' = 'gated') =>
+    posture === 'tokenmax' ? false : mode === 'inline' && costUsd > floorUsd,
 }));
 
 const { runCycle, ALL_PHASES } = await import('../../src/core/cycle.ts');
@@ -127,6 +137,7 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'propose_takes',              // v0.36.1.0 — hindsight calibration wave
   'grade_takes',                // v0.36.1.0
   'calibration_profile',        // v0.36.1.0
+  'drift',                       // #2653 — drift detection (default OFF, report-only)
   'conversation_facts_backfill', // v0.41.11.0 — opt-in conversation backfill
   'enrich_thin',                 // v0.41.39 (#1700) — brain-internal stub enrichment (default OFF)
   'skillopt',                    // v0.42.0.0 — self-evolving skills (default OFF)

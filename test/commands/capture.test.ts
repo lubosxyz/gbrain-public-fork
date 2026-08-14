@@ -16,12 +16,19 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import matter from 'gray-matter';
 import { runCapture, __testing } from '../../src/commands/capture.ts';
+import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
 let brainDir: string;
 
 beforeAll(async () => {
+  // Keep capture's put_page integration hermetic under CI's fake provider keys.
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: {},
+  });
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -29,6 +36,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+  resetGateway();
 });
 
 beforeEach(async () => {
@@ -136,12 +144,13 @@ describe('capture — buildContent', () => {
     expect(parsed.data.title).toBe('Real first line');
   });
 
-  test('caps title at 80 chars', () => {
+  test('caps title at 80 chars with explicit ellipsis', () => {
     const longLine = 'x'.repeat(200);
     const result = __testing.buildContent(longLine, {});
     const parsed = matter(result);
     expect(typeof parsed.data.title).toBe('string');
     expect((parsed.data.title as string).length).toBeLessThanOrEqual(80);
+    expect((parsed.data.title as string).endsWith('…')).toBe(true);
   });
 
   test('honors --source via captured_via', () => {

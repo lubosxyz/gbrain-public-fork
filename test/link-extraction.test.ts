@@ -7,8 +7,12 @@ import {
   inferLinkType,
   makeResolver,
   parseTimelineEntries,
+  deriveTimelineAnchor,
   isAutoLinkEnabled,
   FRONTMATTER_LINK_MAP,
+  unwrapWikilink,
+  buildBasenameIndex,
+  queryBasenameIndex,
   type SlugResolver,
 } from '../src/core/link-extraction.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -98,10 +102,14 @@ describe('extractEntityRefs', () => {
     expect(extractEntityRefs('[Alice(people/alice)')).toEqual([]);
   });
 
-  test('skips non-entity dirs (notes/, ideas/ stay if added later but are accepted now)', () => {
-    // Current regex targets entity dirs explicitly. Notes/ shouldn't match.
+  test('#2576: non-whitelisted dirs (notes/, ops/) ARE extracted as candidates', () => {
+    // Pre-#2576 the DIR_PATTERN whitelist silently dropped these. Now any
+    // dir-shaped path is a candidate; page-existence checks downstream
+    // (resolveCandidateSources / put_page allSlugs / addLinksBatch JOIN)
+    // decide whether an edge is persisted.
     const refs = extractEntityRefs('See [random](notes/random).');
-    expect(refs).toEqual([]);
+    expect(refs.map(r => r.slug)).toEqual(['notes/random']);
+    expect(refs[0].dir).toBe('notes');
   });
 
   test('extracts meeting refs', () => {
@@ -138,6 +146,17 @@ describe('extractEntityRefs', () => {
     expect(aliceRefs[0].needsResolution).toBeUndefined();
     expect(wikiRefs.length).toBe(1);
     expect(wikiRefs[0].needsResolution).toBe(true);
+  });
+
+  test('recognizes reference-page wikilinks as concrete targets', () => {
+    const refs = extractEntityRefs('See [[reference/mcminnville-market-data]] for source context.');
+    expect(refs.length).toBe(1);
+    expect(refs[0]).toMatchObject({
+      name: 'reference/mcminnville-market-data',
+      slug: 'reference/mcminnville-market-data',
+      dir: 'reference',
+    });
+    expect(refs[0].needsResolution).toBeUndefined();
   });
 
   test('skips qualified-syntax tokens (those belong to 2a)', () => {
@@ -268,6 +287,53 @@ describe('extractPageLinks', () => {
     const sourceLink = candidates.find(c => c.linkType === 'source');
     expect(sourceLink).toBeDefined();
     expect(sourceLink!.targetSlug).toBe('meetings/2026-01-15');
+  });
+
+  // ─── global_basename for frontmatter link fields (issue #972 follow-up) ───
+
+  test('frontmatter [[wikilink]] resolves via global_basename when resolve() misses', async () => {
+    // `sources: [[2025-12-25_mentor-extraction]]` — bare title, no '/', so the
+    // standard resolver misses; the basename index finds the single match.
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) =>
+        name === '2025-12-25_mentor-extraction'
+          ? ['trading/raw/2025-12-25_mentor-extraction']
+          : [],
+    };
+    const { candidates } = await extractPageLinks(
+      'trading/wiki/backtesting', 'Body.',
+      { sources: ['[[2025-12-25_mentor-extraction]]'] },
+      'concept', resolver, { globalBasename: true },
+    );
+    // `sources` is direction:'incoming' → edge is resolved → page.
+    const edge = candidates.find(c => c.linkType === 'discussed_in');
+    expect(edge).toBeDefined();
+    expect(edge!.fromSlug).toBe('trading/raw/2025-12-25_mentor-extraction');
+    expect(edge!.targetSlug).toBe('trading/wiki/backtesting');
+  });
+
+  test('frontmatter basename fallback stays unresolved when ambiguous (>1 match)', async () => {
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async () => ['a/dup', 'b/dup'],
+    };
+    const { candidates, unresolved } = await extractPageLinks(
+      'wiki/x', 'Body.', { sources: ['[[dup]]'] }, 'concept', resolver, { globalBasename: true },
+    );
+    expect(candidates.find(c => c.linkType === 'discussed_in')).toBeUndefined();
+    expect(unresolved.some(u => u.field === 'sources')).toBe(true);
+  });
+
+  test('frontmatter basename fallback is gated OFF when globalBasename is false', async () => {
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async () => ['raw/note'],
+    };
+    const { candidates } = await extractPageLinks(
+      'wiki/x', 'Body.', { sources: ['[[note]]'] }, 'concept', resolver, // globalBasename omitted = false
+    );
+    expect(candidates.find(c => c.linkType === 'discussed_in')).toBeUndefined();
   });
 
   test('extracts bare slug references in text', async () => {
@@ -403,6 +469,85 @@ describe('extractPageLinks', () => {
     expect(candidates).toEqual([]);
   });
 
+  test('path-qualified wikilink outside DIR_PATTERN queries by final segment', async () => {
+    // `[[notes/struktura]]` (dir not in DIR_PATTERN) falls to the generic
+    // pass. The resolver's basename index is keyed by final path segments,
+    // so the lookup must strip the dirname — mirroring the FS path
+    // (resolveSlugAll). Regression: the raw literal was passed through,
+    // which never matched, so these links silently dropped.
+    const seen: string[] = [];
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) => {
+        seen.push(name);
+        return name === 'struktura' ? ['notes/struktura'] : [];
+      },
+    };
+    const { candidates } = await extractPageLinks(
+      'concepts/x', 'See [[notes/struktura]].',
+      {}, 'concept', resolver, { globalBasename: true },
+    );
+    expect(seen).toContain('struktura');
+    expect(seen).not.toContain('notes/struktura');
+    expect(candidates.map(c => c.targetSlug)).toEqual(['notes/struktura']);
+    // #2576: the literal path now yields the direct verb-typed candidate
+    // (parity with whitelisted dirs), not a wikilink_basename demotion.
+    expect(candidates[0].linkType).toBe('mentions');
+    expect(candidates[0].linkSource).toBe('markdown');
+  });
+
+  test('path-qualified wikilink keeps only matches ending with the written path', async () => {
+    // The written path disambiguates: `[[notes/struktura]]` must never
+    // attach to `wiki/struktura` even though both share the basename.
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) =>
+        name === 'struktura' ? ['notes/struktura', 'wiki/struktura'] : [],
+    };
+    const { candidates } = await extractPageLinks(
+      'concepts/x', 'See [[notes/struktura]].',
+      {}, 'concept', resolver, { globalBasename: true },
+    );
+    expect(candidates.map(c => c.targetSlug)).toEqual(['notes/struktura']);
+  });
+
+  test('path-qualified wikilink matches a deeper real slug by path suffix', async () => {
+    // The page lives at vault/notes/struktura; the author wrote the shorter
+    // tail `[[notes/struktura]]`. Suffix matching connects them, while the
+    // basename-only sibling `wiki/struktura` stays excluded.
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) =>
+        name === 'struktura' ? ['vault/notes/struktura', 'wiki/struktura'] : [],
+    };
+    const { candidates } = await extractPageLinks(
+      'concepts/x', 'See [[notes/struktura]].',
+      {}, 'concept', resolver, { globalBasename: true },
+    );
+    // #2576: the literal path is ALSO emitted as a direct candidate (typed,
+    // linkSource 'markdown') — downstream existence checks drop it when no
+    // `notes/struktura` page exists, so only the suffix match persists.
+    expect(candidates.map(c => c.targetSlug)).toEqual(['notes/struktura', 'vault/notes/struktura']);
+    const suffixMatch = candidates.find(c => c.targetSlug === 'vault/notes/struktura')!;
+    expect(suffixMatch.linkType).toBe('wikilink_basename');
+    expect(suffixMatch.linkSource).toBe('wikilink-resolved');
+  });
+
+  test('path-qualified self-link is dropped like the bare form', async () => {
+    // `[[notes/struktura]]` written on notes/struktura itself must not
+    // produce a self-loop (same guard as the bare `[[own-tail]]` case).
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) =>
+        name === 'struktura' ? ['notes/struktura'] : [],
+    };
+    const { candidates } = await extractPageLinks(
+      'notes/struktura', 'See [[notes/struktura]].',
+      {}, 'concept', resolver, { globalBasename: true },
+    );
+    expect(candidates).toEqual([]);
+  });
+
   test('bare wikilink resolution does not interfere with DIR_PATTERN wikilinks', async () => {
     // 2b refs (people/alice) take the verb-inferred type;
     // 2c refs (struktura) take wikilink_basename. Same call.
@@ -422,6 +567,77 @@ describe('extractPageLinks', () => {
     expect(alice!.linkType).not.toBe('wikilink_basename'); // verb-inferred
     expect(strk).toBeDefined();
     expect(strk!.linkType).toBe('wikilink_basename');
+  });
+
+  // ─── issue #1964: dir-qualified wikilinks with raw Obsidian paths ────────
+
+  test('#1964: dir-qualified wikilink resolves via sync-consistent slugification (flag OFF)', async () => {
+    // `[[llm-wiki/entities/AI 3.0]]` is a raw Obsidian path; the page slug
+    // is the sync-slugified `llm-wiki/entities/ai-3.0`. Must resolve WITHOUT
+    // global_basename (it's dir-qualified) and must NOT leak to a same-tail
+    // page in a different directory.
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) =>
+        name === 'ai-3.0' ? ['other/ai-3.0', 'llm-wiki/entities/ai-3.0'] : [],
+    };
+    const { candidates } = await extractPageLinks(
+      'llm-wiki/notes/roadmap',
+      'See [[llm-wiki/entities/AI 3.0]] for the model.',
+      {}, 'concept', resolver,
+      // opts.globalBasename omitted (= false) — path is dir-qualified
+    );
+    // #2576/#3560 also emits raw-literal + bare-path candidates alongside;
+    // downstream existence checks drop them (no such pages). The resolved
+    // wikilink edge is what this test pins.
+    const resolved = candidates.filter(c => c.linkSource === 'wikilink-resolved');
+    expect(resolved.map(c => c.targetSlug)).toEqual(['llm-wiki/entities/ai-3.0']);
+    expect(resolved[0].linkType).toBe('wikilink_basename');
+  });
+
+  test('#1964: path-suffix match resolves wiki-root-relative paths against a real index', async () => {
+    // Author writes `[[llm-wiki/entities/AI 3.0]]` but the brain nests the
+    // wiki under a vault dir. Suffix match rescues it; queried through the
+    // REAL basename index so the tail-key lookup is exercised end to end.
+    const idx = buildBasenameIndex(['vault/llm-wiki/entities/ai-3.0', 'people/ai-3.0']);
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) => queryBasenameIndex(idx, name),
+    };
+    const { candidates } = await extractPageLinks(
+      'vault/llm-wiki/notes/roadmap',
+      'See [[llm-wiki/entities/AI 3.0]].',
+      {}, 'concept', resolver,
+    );
+    // Filter to the resolved wikilink edge — #2576/#3560's raw-literal and
+    // bare-path candidates are emitted alongside and dropped downstream.
+    const resolved = candidates.filter(c => c.linkSource === 'wikilink-resolved');
+    expect(resolved.map(c => c.targetSlug)).toEqual(['vault/llm-wiki/entities/ai-3.0']);
+  });
+
+  test('wikilink interiors are masked from the bare-path pass (no parent-page edge)', async () => {
+    // Codex wave-i finding: `[[llm-wiki/entities/AI 3.0]]` leaves its
+    // lowercase prefix `llm-wiki/entities` as a bare-path match if the
+    // scanner sees wikilink interiors — a spurious 'markdown' edge to the
+    // PARENT page whenever it exists. The mask blanks `[[...]]` spans before
+    // pass 2; the wikilink pass owns those interiors.
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) =>
+        name === 'ai-3.0' ? ['llm-wiki/entities/ai-3.0'] : [],
+    };
+    const { candidates } = await extractPageLinks(
+      'llm-wiki/notes/roadmap',
+      'See [[llm-wiki/entities/AI 3.0]] for the model. Also see ops/runbook.',
+      {}, 'concept', resolver,
+    );
+    // The parent-prefix must NOT appear from the wikilink interior...
+    expect(candidates.map(c => c.targetSlug)).not.toContain('llm-wiki/entities');
+    // ...while a genuine bare path in prose still produces its candidate,
+    expect(candidates.map(c => c.targetSlug)).toContain('ops/runbook');
+    // and the wikilink itself still resolves through its own pass.
+    expect(candidates.filter(c => c.linkSource === 'wikilink-resolved')
+      .map(c => c.targetSlug)).toEqual(['llm-wiki/entities/ai-3.0']);
   });
 
   test('opts.skipFrontmatter suppresses the frontmatter pass', async () => {
@@ -719,6 +935,55 @@ More prose here.
 - **2026-02-20** | Another event`;
     const entries = parseTimelineEntries(content);
     expect(entries.length).toBe(2);
+  });
+});
+
+// ─── deriveTimelineAnchor ──────────────────────────────────────
+
+describe('deriveTimelineAnchor', () => {
+  test('anchors at a frontmatter effective_date with the page title as summary', () => {
+    const a = deriveTimelineAnchor({
+      slug: 'meetings/2026-04-24-handover',
+      title: 'Ops handover',
+      effectiveDate: new Date('2026-04-24T09:00:00Z'),
+      effectiveDateSource: 'event_date',
+    });
+    expect(a).toEqual({ date: '2026-04-24', summary: 'Ops handover', detail: '' });
+  });
+
+  test('accepts a filename-sourced date and an ISO-string effectiveDate', () => {
+    const a = deriveTimelineAnchor({
+      slug: 'daily/2022-04-20-standup',
+      title: '',
+      effectiveDate: '2022-04-20',
+      effectiveDateSource: 'filename',
+    });
+    expect(a).toEqual({ date: '2022-04-20', summary: '2022-04-20-standup', detail: '' });
+  });
+
+  test('returns null for the fallback (updated_at) source — not a real content date', () => {
+    expect(deriveTimelineAnchor({
+      slug: 'notes/x', title: 'X',
+      effectiveDate: new Date('2026-01-01T00:00:00Z'),
+      effectiveDateSource: 'fallback',
+    })).toBeNull();
+  });
+
+  test('returns null when no date or no source', () => {
+    expect(deriveTimelineAnchor({ slug: 'a', effectiveDate: null, effectiveDateSource: 'date' })).toBeNull();
+    expect(deriveTimelineAnchor({ slug: 'a', effectiveDate: new Date('2026-01-01Z'), effectiveDateSource: null })).toBeNull();
+  });
+
+  test('returns null on an unparseable date string', () => {
+    expect(deriveTimelineAnchor({ slug: 'a', title: 'A', effectiveDate: 'not-a-date', effectiveDateSource: 'date' })).toBeNull();
+  });
+
+  test('falls back to the slug basename when title is empty', () => {
+    const a = deriveTimelineAnchor({
+      slug: 'people/jane-example-com', title: '   ',
+      effectiveDate: '2025-12-31', effectiveDateSource: 'published',
+    });
+    expect(a?.summary).toBe('jane-example-com');
   });
 });
 
@@ -1165,6 +1430,43 @@ describe('makeResolver — fallback chain', () => {
     const out = await r.resolveBasenameMatches!('struktura');
     expect(out.sort()).toEqual(['notes/struktura', 'struktura']);
   });
+
+  test('opts.sourceId is forwarded to findByTitleFuzzy (twin of #1436 fix)', async () => {
+    // Captures every (name, dirPrefix, minSimilarity, sourceId) call so we
+    // can assert the resolver threads sourceId through. Without the wire-up,
+    // findByTitleFuzzy would be called with sourceId=undefined and the SQL
+    // could return cross-source slug suggestions that the FK filter
+    // downstream silently drops.
+    const calls: Array<{ name: string; dirPrefix?: string; minSimilarity?: number; sourceId?: string }> = [];
+    const engine = {
+      async getPage() { return null; },
+      async findByTitleFuzzy(name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string) {
+        calls.push({ name, dirPrefix, minSimilarity, sourceId });
+        return null;
+      },
+      async searchKeyword() { return []; },
+    } as unknown as BrainEngine;
+    const r = makeResolver(engine, { mode: 'batch', sourceId: 'src-a' });
+    await r.resolve('Alice Example', 'people');
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every(c => c.sourceId === 'src-a')).toBe(true);
+  });
+
+  test('opts.sourceId omitted → findByTitleFuzzy receives undefined (back-compat)', async () => {
+    const calls: Array<{ sourceId?: string }> = [];
+    const engine = {
+      async getPage() { return null; },
+      async findByTitleFuzzy(_name: string, _dirPrefix?: string, _min?: number, sourceId?: string) {
+        calls.push({ sourceId });
+        return null;
+      },
+      async searchKeyword() { return []; },
+    } as unknown as BrainEngine;
+    const r = makeResolver(engine, { mode: 'batch' });
+    await r.resolve('Alice Example', 'people');
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every(c => c.sourceId === undefined)).toBe(true);
+  });
 });
 
 describe('FRONTMATTER_LINK_MAP integrity', () => {
@@ -1265,3 +1567,201 @@ describe("v0.18.0 migration v22 — links_resolution_type", () => {
   });
 });
 
+
+describe('parseTimelineEntries — Format 3: inline [Source: ..., YYYY-MM-DD] citations', () => {
+  test('extracts an entry from a dated citation', () => {
+    const entries = parseTimelineEntries('Closed the seed round. [Source: board notes, 2025-04-02]');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].date).toBe('2025-04-02');
+    expect(entries[0].summary).toBe('Closed the seed round.');
+    expect(entries[0].detail).toBe('Source: board notes');
+  });
+
+  test('keeps commas inside the citation source', () => {
+    const entries = parseTimelineEntries('Alice joined. [Source: email re: offer, signed, 2025-05-10]');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].detail).toBe('Source: email re: offer, signed');
+  });
+
+  test('does not double-extract a timeline bullet carrying its own citation', () => {
+    const entries = parseTimelineEntries('- **2025-03-18** | Meeting notes [Source: notes, 2025-03-18]');
+    expect(entries).toHaveLength(1); // bullet pass only
+  });
+
+  test('skips invalid calendar dates and bare citations', () => {
+    expect(parseTimelineEntries('Claim. [Source: memo, 2026-13-45]')).toHaveLength(0);
+    expect(parseTimelineEntries('[Source: import batch, 2025-07-01]')).toHaveLength(0);
+  });
+});
+// ─── Frontmatter [[wikilink]] + slug-path resolution ──────────────────────
+// Mainstream Obsidian authors frontmatter links as `related: ["[[Page]]"]`,
+// and PARA-numbered vaults use digit-leading / nested slug paths like
+// `[[90-people/nicolai]]`. Both were silently dropped: brackets were treated
+// as part of the value and the step-1 slug regex (`^[a-z]…`) rejected
+// digit-leading / nested paths, while full-path fuzzy scored below threshold.
+// Fix: unwrapWikilink() before resolution + an exact getPage() for any
+// slug-shaped value (exact-match only → no false positives).
+
+describe('unwrapWikilink', () => {
+  test('wrapped title → bare title', () => {
+    expect(unwrapWikilink('[[Monday Range]]')).toBe('Monday Range');
+  });
+  test('wrapped slug-path (digit-leading folder) → bare slug', () => {
+    expect(unwrapWikilink('[[90-people/nicolai]]')).toBe('90-people/nicolai');
+  });
+  test('wrapped nested slug-path → bare slug', () => {
+    expect(unwrapWikilink('[[01-trading/wiki/strategies/opening-range-breakout]]'))
+      .toBe('01-trading/wiki/strategies/opening-range-breakout');
+  });
+  test('strips |alias', () => {
+    expect(unwrapWikilink('[[90-people/nicolai|Nicolai]]')).toBe('90-people/nicolai');
+  });
+  test('strips #heading', () => {
+    expect(unwrapWikilink('[[Page#Section]]')).toBe('Page');
+  });
+  test('strips ^block', () => {
+    expect(unwrapWikilink('[[Page^abc123]]')).toBe('Page');
+  });
+  test('surrounding whitespace tolerated', () => {
+    expect(unwrapWikilink('  [[Page]]  ')).toBe('Page');
+  });
+  test('bare title passes through unchanged', () => {
+    expect(unwrapWikilink('Monday Range')).toBe('Monday Range');
+  });
+  test('bare slug passes through unchanged', () => {
+    expect(unwrapWikilink('90-people/nicolai')).toBe('90-people/nicolai');
+  });
+  test('partially-wrapped value is NOT unwrapped (anchored)', () => {
+    // Not a wholly-wrapped value → left intact so existing behavior is exact.
+    expect(unwrapWikilink('see [[Page]] for detail')).toBe('see [[Page]] for detail');
+  });
+});
+
+describe('makeResolver — slug-path exact getPage (step 1 broadened)', () => {
+  function fakeEngine(
+    slugs: string[],
+    fuzzyMap: Map<string, { slug: string; similarity: number }> = new Map(),
+  ): BrainEngine {
+    const lookup = new Set(slugs);
+    return {
+      async getPage(slug: string) { return lookup.has(slug) ? { slug } as any : null; },
+      async findByTitleFuzzy(name: string) { return fuzzyMap.get(name) ?? null; },
+      async searchKeyword() { return []; },
+    } as unknown as BrainEngine;
+  }
+
+  test('digit-leading folder slug resolves via exact getPage', async () => {
+    const r = makeResolver(fakeEngine(['90-people/nicolai']));
+    expect(await r.resolve('90-people/nicolai')).toBe('90-people/nicolai');
+  });
+
+  test('nested (>2 segment) slug resolves via exact getPage', async () => {
+    const r = makeResolver(fakeEngine(['01-trading/wiki/strategies/opening-range-breakout']));
+    expect(await r.resolve('01-trading/wiki/strategies/opening-range-breakout'))
+      .toBe('01-trading/wiki/strategies/opening-range-breakout');
+  });
+
+  test('regression: single-segment lowercase slug still resolves', async () => {
+    const r = makeResolver(fakeEngine(['people/pedro']));
+    expect(await r.resolve('people/pedro')).toBe('people/pedro');
+  });
+
+  test('exact-only: slug-shaped value with no matching page falls through (no false positive)', async () => {
+    // `90-people/ghost` is slug-shaped but absent → step-1 getPage misses,
+    // no fuzzy hit → null. Never invents an edge.
+    const r = makeResolver(fakeEngine(['90-people/nicolai']));
+    expect(await r.resolve('90-people/ghost')).toBeNull();
+  });
+
+  test('non-slug value still routes to fuzzy', async () => {
+    const r = makeResolver(fakeEngine(
+      ['01-trading/monday-range'],
+      new Map([['Monday Range', { slug: '01-trading/monday-range', similarity: 1 }]]),
+    ));
+    expect(await r.resolve('Monday Range')).toBe('01-trading/monday-range');
+  });
+});
+
+describe('extractFrontmatterLinks — [[wikilink]] related: values (end-to-end)', () => {
+  function fakeEngine(
+    slugs: string[],
+    fuzzyMap: Map<string, { slug: string; similarity: number }> = new Map(),
+  ): BrainEngine {
+    const lookup = new Set(slugs);
+    return {
+      async getPage(slug: string) { return lookup.has(slug) ? { slug } as any : null; },
+      async findByTitleFuzzy(name: string) { return fuzzyMap.get(name) ?? null; },
+      async searchKeyword() { return []; },
+    } as unknown as BrainEngine;
+  }
+
+  test('wrapped slug-path related: resolves (the core win)', async () => {
+    const resolver = makeResolver(fakeEngine(['90-people/nicolai']));
+    const { candidates, unresolved } = await extractFrontmatterLinks(
+      'wiki/originals/ideas/note', 'note' as never,
+      { related: '[[90-people/nicolai]]' }, resolver,
+    );
+    expect(unresolved).toHaveLength(0);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      fromSlug: 'wiki/originals/ideas/note',
+      targetSlug: '90-people/nicolai',
+      linkType: 'related_to',
+      linkSource: 'frontmatter',
+    });
+  });
+
+  test('wrapped nested slug-path related: resolves', async () => {
+    const resolver = makeResolver(fakeEngine(['01-trading/wiki/strategies/opening-range-breakout']));
+    const { candidates } = await extractFrontmatterLinks(
+      'wiki/note', 'note' as never,
+      { related: ['[[01-trading/wiki/strategies/opening-range-breakout]]'] }, resolver,
+    );
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].targetSlug).toBe('01-trading/wiki/strategies/opening-range-breakout');
+  });
+
+  test('wrapped value with |alias resolves to the target', async () => {
+    const resolver = makeResolver(fakeEngine(['90-people/nicolai']));
+    const { candidates } = await extractFrontmatterLinks(
+      'wiki/note', 'note' as never,
+      { related: '[[90-people/nicolai|Nicolai]]' }, resolver,
+    );
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].targetSlug).toBe('90-people/nicolai');
+  });
+
+  test('regression: bare slug related: still resolves', async () => {
+    const resolver = makeResolver(fakeEngine(['90-people/nicolai']));
+    const { candidates } = await extractFrontmatterLinks(
+      'wiki/note', 'note' as never,
+      { related: '90-people/nicolai' }, resolver,
+    );
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].targetSlug).toBe('90-people/nicolai');
+  });
+
+  test('regression: wrapped title resolves via fuzzy (brackets harmless)', async () => {
+    const resolver = makeResolver(fakeEngine(
+      ['01-trading/monday-range'],
+      new Map([['Monday Range', { slug: '01-trading/monday-range', similarity: 1 }]]),
+    ));
+    const { candidates } = await extractFrontmatterLinks(
+      'wiki/note', 'note' as never,
+      { related: '[[Monday Range]]' }, resolver,
+    );
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].targetSlug).toBe('01-trading/monday-range');
+  });
+
+  test('unknown wrapped slug → unresolved (no crash), original value preserved', async () => {
+    const resolver = makeResolver(fakeEngine(['90-people/nicolai']));
+    const { candidates, unresolved } = await extractFrontmatterLinks(
+      'wiki/note', 'note' as never,
+      { related: '[[99-archive/does-not-exist]]' }, resolver,
+    );
+    expect(candidates).toHaveLength(0);
+    expect(unresolved).toHaveLength(1);
+    expect(unresolved[0]).toEqual({ field: 'related', name: '[[99-archive/does-not-exist]]' });
+  });
+});

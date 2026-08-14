@@ -132,17 +132,20 @@ describe('runNightlyQualityProbe (DI stub harness)', () => {
     });
   });
 
-  test('enabled + recent run within 24h → outcome: rate_limited', async () => {
+  test('enabled + recent run within 24h → outcome: rate_limited, NO audit row', async () => {
     // Pre-seed a recent audit event by running the probe once first.
     await withEnv({ GBRAIN_AUDIT_DIR: auditTmp }, async () => {
       // First run succeeds.
       await runNightlyQualityProbe(makeDeps());
-      // Second run, same hour → rate_limited.
+      // Second run, same hour → rate_limited. A skip is a non-event: the
+      // autopilot loop invokes the probe every cycle (~5-10 min), so
+      // logging each skip would flood the audit file and flip doctor's
+      // any-non-pass-is-bad filter to a permanent WARN.
       const r2 = await runNightlyQualityProbe(makeDeps());
       expect(r2.outcome).toBe('rate_limited');
       const events = await readEvents();
-      expect(events.length).toBe(2);
-      expect(events[1].outcome).toBe('rate_limited');
+      expect(events.length).toBe(1);
+      expect(events[0].outcome).toBe('pass');
     });
   });
 
@@ -293,6 +296,39 @@ describe('computeNightlyQualityProbeHealthCheck — pure doctor branch coverage'
     const check = computeNightlyQualityProbeHealthCheck(true, events);
     expect(check.status).toBe('warn');
     expect(check.message).toMatch(/1 non-PASS run /); // "run " not "runs "
+  });
+
+  test('cross-week ordering: reader sorts chronologically so "Latest" is the newest run', async () => {
+    // Regression: the reader walks the CURRENT week's file first, then the
+    // previous week's. Without sorting, the array tail — which this check
+    // reports as "Latest:" — was the OLDEST in-window event whenever last
+    // week's file had entries (observed live: counts updated as new runs
+    // landed while "Latest" stayed pinned days behind).
+    const { computeQualityProbeAuditFilename, readRecentQualityProbeEvents } =
+      await import('../src/core/audit-quality-probe.ts');
+    const { computeNightlyQualityProbeHealthCheck } = await import('../src/commands/doctor.ts');
+    const now = new Date('2026-07-23T12:00:00Z');
+    const thisWeekFile = computeQualityProbeAuditFilename(now);
+    const prevWeekFile = computeQualityProbeAuditFilename(new Date(now.getTime() - 7 * 86400000));
+    writeFileSync(join(auditTmp, thisWeekFile), [
+      JSON.stringify({ outcome: 'fail', ts: '2026-07-22T08:00:00Z' }),
+      JSON.stringify({ outcome: 'fail', ts: '2026-07-23T08:00:00Z' }),
+    ].join('\n') + '\n');
+    writeFileSync(join(auditTmp, prevWeekFile), [
+      JSON.stringify({ outcome: 'fail', ts: '2026-07-17T08:00:00Z' }),
+      JSON.stringify({ outcome: 'fail', ts: '2026-07-18T08:00:00Z' }),
+    ].join('\n') + '\n');
+    await withEnv({ GBRAIN_AUDIT_DIR: auditTmp }, async () => {
+      const events = readRecentQualityProbeEvents(7, now);
+      expect(events.map(e => e.ts)).toEqual([
+        '2026-07-17T08:00:00Z',
+        '2026-07-18T08:00:00Z',
+        '2026-07-22T08:00:00Z',
+        '2026-07-23T08:00:00Z',
+      ]);
+      const check = computeNightlyQualityProbeHealthCheck(true, events);
+      expect(check.message).toContain('Latest: fail at 2026-07-23T08:00:00Z');
+    });
   });
 
   test('single PASS event uses singular grammar', async () => {

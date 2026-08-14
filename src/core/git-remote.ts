@@ -303,6 +303,83 @@ export function validateRepoState(
   return 'healthy';
 }
 
+/**
+ * True if `path` is itself a git repo OR a subdirectory of one, per
+ * `git rev-parse --show-toplevel`. Mirrors the walk-up discovery
+ * `sync.ts:discoverGitRoot` performs at sync time (#753/#774 — subdir-of-git
+ * sources are valid), so a directory that passes this check is guaranteed
+ * not to hit sync's "Not inside a git repository" error later. Used by
+ * `addSource` (#2707) to validate `--path` at registration time instead of
+ * deferring the failure to the first sync.
+ */
+export function isInsideGitRepo(path: string): boolean {
+  try {
+    execFileSync('git', ['-C', path, 'rev-parse', '--show-toplevel'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000,
+      env: { ...process.env, ...GIT_ENV },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The empty-tree object ID for `path`'s repo, derived (not hardcoded) so
+ * this works for both the default SHA-1 object format and the opt-in
+ * `--object-format=sha256` one (git 2.29+) — each has its own empty-tree
+ * OID. `git hash-object -t tree --stdin < /dev/null` computes the hash of
+ * a zero-entry tree using whatever hash algorithm `path`'s repo is
+ * configured for, without needing to know which one that is. #2707 codex
+ * round 4 (P2): an earlier version hardcoded the well-known SHA-1 constant
+ * (`4b825dc6...`), which silently mismatched — and so let an empty
+ * SHA-256 repo through — on a SHA-256 repo's real (different) empty-tree
+ * OID.
+ */
+function emptyTreeOid(path: string): string {
+  return execFileSync('git', ['-C', path, 'hash-object', '-t', 'tree', '--stdin'], {
+    input: '',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 10_000,
+    env: { ...process.env, ...GIT_ENV },
+  }).toString().trim();
+}
+
+/**
+ * True if `path`'s HEAD tree has at least one tracked entry scoped to
+ * `path` itself. `-C path` + the `HEAD:./` revision syntax resolves the
+ * tree object for `path` specifically (not the whole repo root), so this
+ * is correct for both a repo's toplevel AND a subdirectory-of-a-repo
+ * source — then a single OID comparison against that repo's empty-tree
+ * object (see `emptyTreeOid`) tells us whether that tree is empty. #2707
+ * codex round 3 (P2): unlike listing (`ls-tree`), this is O(1) output — no
+ * `maxBuffer` exposure on a repo with a very large number of entries.
+ *
+ * Subsumes "no commits at all" (`HEAD:./` on an unborn repo fails to
+ * resolve — there's no HEAD) AND "has a HEAD commit but it's empty"
+ * (#2707 codex round 2): `git commit --allow-empty` followed by creating
+ * untracked files resolves `HEAD:./` successfully (to the empty-tree OID)
+ * but that tree has zero entries — a directory that would pass a bare
+ * `rev-parse HEAD` check yet still can't sync (or worse, "succeeds"
+ * importing nothing and then never notices the untracked files change —
+ * the silent-staleness class #2707 exists to prevent). A directory
+ * that's `git init`ed but never committed, or where this specific path
+ * was never `git add`ed, fails this check either way.
+ */
+export function hasTrackedContent(path: string): boolean {
+  try {
+    const out = execFileSync('git', ['-C', path, 'rev-parse', '--verify', 'HEAD:./'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000,
+      env: { ...process.env, ...GIT_ENV },
+    });
+    return out.toString().trim() !== emptyTreeOid(path);
+  } catch {
+    return false;
+  }
+}
+
 // ── Durability helpers (v0.42.44) ───────────────────────────────────────────
 // Used by the brain-repo durability feature (`gbrain sources harden/pull`) and
 // the DB-free pull cron. These are the auth-capable, rebase-aware counterparts
@@ -316,7 +393,7 @@ export function validateRepoState(
  * transport. Default stays `never`. These ops act on an ALREADY-validated origin
  * (set + checked at clone time); `http.followRedirects=false` is the live guard.
  */
-function durableSsrfFlags(): string[] {
+export function durableSsrfFlags(): string[] {
   const fileAllow = process.env.GBRAIN_GIT_ALLOW_FILE_TRANSPORT === '1' ? 'always' : 'never';
   return [
     '-c', 'http.followRedirects=false',

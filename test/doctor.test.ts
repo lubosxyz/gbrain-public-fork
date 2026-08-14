@@ -1,4 +1,12 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { withEnv } from './helpers/with-env.ts';
+import { logRerankFailure } from '../src/core/rerank-audit.ts';
 
 describe('doctor command', () => {
   test('doctor module exports runDoctor', async () => {
@@ -44,6 +52,108 @@ describe('doctor command', () => {
     expect(check.issues![0].action).toContain('trigger');
   });
 
+  test('subagent_capability checks explicit models.subagent before tier/default fallbacks', async () => {
+    const { checkSubagentCapability } = await import('../src/commands/doctor.ts');
+    const config = new Map<string, string | null>([
+      ['models.subagent', 'openai:gpt-5.2'],
+      ['models.tier.subagent', 'anthropic:claude-sonnet-4-6'],
+      ['models.default', 'anthropic:claude-sonnet-4-6'],
+    ]);
+    const check = await checkSubagentCapability({
+      async getConfig(key: string): Promise<string | null> {
+        return config.get(key) ?? null;
+      },
+    } as any);
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('models.subagent is "openai:gpt-5.2"');
+    expect(check.message).toContain('prompt caching');
+  });
+
+  test('subagent_capability reports explicit models.subagent on the ok path', async () => {
+    const { checkSubagentCapability } = await import('../src/commands/doctor.ts');
+    const config = new Map<string, string | null>([
+      ['models.subagent', 'anthropic:claude-opus-4-7'],
+      ['models.tier.subagent', 'anthropic:claude-haiku-4-5'],
+    ]);
+    const check = await checkSubagentCapability({
+      async getConfig(key: string): Promise<string | null> {
+        return config.get(key) ?? null;
+      },
+    } as any);
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('Subagent model resolves via models.subagent to "anthropic:claude-opus-4-7"');
+  });
+
+  test('subagent_capability checks models.default before tier fallback', async () => {
+    const { checkSubagentCapability } = await import('../src/commands/doctor.ts');
+    const config = new Map<string, string | null>([
+      ['models.tier.subagent', 'anthropic:claude-sonnet-4-6'],
+      ['models.default', 'openai:gpt-5.2'],
+    ]);
+    const check = await checkSubagentCapability({
+      async getConfig(key: string): Promise<string | null> {
+        return config.get(key) ?? null;
+      },
+    } as any);
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('models.default is "openai:gpt-5.2"');
+  });
+
+  test('reranker_health warns on repeated unknown rerank failures', async () => {
+    const { checkRerankerHealth } = await import('../src/commands/doctor.ts');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-doctor-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        for (let i = 0; i < 3; i++) {
+          logRerankFailure({
+            model: 'zeroentropyai:zerank-2',
+            reason: 'unknown',
+            query_hash: `unknown${i}`,
+            doc_count: 30,
+            error_summary: 'ZeroEntropy reranker requires ZEROENTROPY_API_KEY.',
+          });
+        }
+        const check = await checkRerankerHealth({
+          async getConfig(key: string): Promise<string | null> {
+            return key === 'search.reranker.enabled' ? 'true' : null;
+          },
+        } as any);
+        expect(check.status).toBe('warn');
+        expect(check.message).toContain('unknown');
+        expect(check.message).toContain('ZEROENTROPY_API_KEY');
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('#3628: reranker_health surfaces budget failures with pricing guidance', async () => {
+    const { checkRerankerHealth } = await import('../src/commands/doctor.ts');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-budget-doctor-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        logRerankFailure({
+          model: 'acmecorp:unpriced-reranker-v9',
+          reason: 'budget',
+          query_hash: 'budget01',
+          doc_count: 30,
+          error_summary: 'no pricing entry for model "acmecorp:unpriced-reranker-v9" (kind=rerank)',
+        });
+        const check = await checkRerankerHealth({
+          async getConfig(key: string): Promise<string | null> {
+            return key === 'search.reranker.enabled' ? 'true' : null;
+          },
+        } as any);
+        expect(check.status).toBe('warn');
+        expect(check.message).toContain('budget/pricing');
+        expect(check.message).toContain('embedding-pricing.ts');
+        expect(check.message).toContain('--max-cost');
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   test('runDoctor accepts null engine for filesystem-only mode', async () => {
     const { runDoctor } = await import('../src/commands/doctor.ts');
     // runDoctor should accept null engine — it runs filesystem checks only.
@@ -52,6 +162,25 @@ describe('doctor command', () => {
     // Function.length counts required params only (JS ignores ?-marked).
     expect(runDoctor.length).toBeGreaterThanOrEqual(2);
     expect(runDoctor.length).toBeLessThanOrEqual(3);
+  });
+
+  test('doctor --json suppresses implicit progress unless --progress-json is explicit', async () => {
+    const { _resetCliOptionsForTest, setCliOptions, DEFAULT_CLI_OPTIONS } = await import('../src/core/cli-options.ts');
+    const { doctorProgressOptions } = await import('../src/commands/doctor.ts');
+
+    try {
+      _resetCliOptionsForTest();
+      expect(doctorProgressOptions(true).mode).toBe('quiet');
+      expect(doctorProgressOptions(false).mode).toBe('auto');
+
+      setCliOptions({ ...DEFAULT_CLI_OPTIONS, progressJson: true });
+      expect(doctorProgressOptions(true).mode).toBe('json');
+
+      setCliOptions({ ...DEFAULT_CLI_OPTIONS, quiet: true, progressJson: true });
+      expect(doctorProgressOptions(true).mode).toBe('quiet');
+    } finally {
+      _resetCliOptionsForTest();
+    }
   });
 
   // Bug 7 — --fast should differentiate "no config anywhere" from "user
@@ -99,6 +228,95 @@ describe('doctor command', () => {
     expect(source).toMatch(/table:\s*'raw_data'.*col:\s*'data'/);
     expect(source).toMatch(/table:\s*'ingest_log'.*col:\s*'pages_updated'/);
     expect(source).toMatch(/table:\s*'files'.*col:\s*'metadata'/);
+  });
+
+  test('pgvector and jsonb_integrity checks use the active PGLite engine', async () => {
+    const { PGLiteEngine } = await import('../src/core/pglite-engine.ts');
+    const { pgvectorCheck, jsonbIntegrityCheck } = await import('../src/commands/doctor.ts');
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+    try {
+      const pgvector = await pgvectorCheck(engine);
+      expect(pgvector.name).toBe('pgvector');
+      expect(pgvector.status).toBe('ok');
+
+      const jsonb = await jsonbIntegrityCheck(engine);
+      expect(jsonb.name).toBe('jsonb_integrity');
+      expect(jsonb.status).toBe('ok');
+    } finally {
+      await engine.disconnect();
+    }
+  });
+
+  test('jsonb_integrity: flags double-encoded subagent payloads, ignores legitimate string scalars, skips absent tables', async () => {
+    const { PGLiteEngine } = await import('../src/core/pglite-engine.ts');
+    const { jsonbIntegrityCheck } = await import('../src/commands/doctor.ts');
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+    try {
+      // Seed a minion job to satisfy the FK, then two subagent rows:
+      // one DOUBLE-ENCODED (string scalar whose content is a JSON array —
+      // the pre-#2375 damage class) and one LEGITIMATE string scalar
+      // (persistToolExec binds pre-serialized string payloads as-is).
+      await engine.executeRaw(
+        `INSERT INTO minion_jobs (id, name, data, status) VALUES (990001, 'doctor-jsonb-test', '{}'::jsonb, 'completed')`,
+      );
+      await engine.executeRaw(
+        `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+         VALUES (990001, 0, 'assistant', to_jsonb('[{"type":"text"}]'::text))`,
+      );
+      await engine.executeRaw(
+        `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+         VALUES (990001, 1, 'assistant', to_jsonb('plain text payload, not JSON'::text))`,
+      );
+      // Container-LOOKING but invalid JSON — matches the shape probe but
+      // pg_input_is_valid must exclude it (repairing it would throw).
+      await engine.executeRaw(
+        `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+         VALUES (990001, 2, 'assistant', to_jsonb('[INFO] fetch complete'::text))`,
+      );
+
+      const damaged = await jsonbIntegrityCheck(engine);
+      expect(damaged.status).toBe('warn');
+      // Exactly the double-encoded row counts — the legit string scalar doesn't.
+      expect(damaged.message).toContain('subagent_messages.content_blocks=1');
+
+      // Cleanup, then prove the ok path again.
+      await engine.executeRaw(`DELETE FROM subagent_messages WHERE job_id = 990001`);
+      await engine.executeRaw(`DELETE FROM minion_jobs WHERE id = 990001`);
+      expect((await jsonbIntegrityCheck(engine)).status).toBe('ok');
+
+      // Absent-table skip lane: rename a target table; the check must skip
+      // it without throwing (pre-v0.15 brains lack subagent_* entirely).
+      await engine.executeRaw(`ALTER TABLE subagent_tool_executions RENAME TO subagent_tool_executions_bak`);
+      try {
+        expect((await jsonbIntegrityCheck(engine)).status).toBe('ok');
+      } finally {
+        await engine.executeRaw(`ALTER TABLE subagent_tool_executions_bak RENAME TO subagent_tool_executions`);
+      }
+    } finally {
+      await engine.disconnect();
+    }
+  });
+
+  test('skill conformance derives a valid host manifest when manifest.json is absent', async () => {
+    const { skillConformanceCheck } = await import('../src/commands/doctor.ts');
+    const skillsDir = join(tmpdir(), `gbrain-doctor-skills-${crypto.randomUUID()}`);
+    mkdirSync(join(skillsDir, 'host-only'), { recursive: true });
+    writeFileSync(
+      join(skillsDir, 'host-only', 'SKILL.md'),
+      '---\nname: host-only\ndescription: host-owned skill\n---\n\n# Host-only\n',
+    );
+    try {
+      const check = skillConformanceCheck(skillsDir);
+      expect(check).toMatchObject({ name: 'skill_conformance', status: 'ok' });
+      expect(check.message).toContain('1/1 skills pass');
+      expect(check.message).toContain('derived from SKILL.md files');
+    } finally {
+      rmSync(skillsDir, { recursive: true, force: true });
+    }
   });
 
   // v0.31.2 — facts_extraction_health check added in PR1 commit 12.
@@ -199,8 +417,13 @@ describe('doctor command', () => {
     expect(block).toMatch(/evtenabled\s*!==\s*'O'[\s\S]*?evtenabled\s*!==\s*'A'/);
     // PGLite skip path is required (no event triggers there).
     expect(block).toMatch(/engine\.kind\s*===\s*'pglite'/);
-    // Recovery command names the migration version explicitly.
-    expect(block).toContain('--force-retry 35');
+    // Recovery hint points at the doc that carries the recreate SQL.
+    // (`gbrain apply-migrations --force-retry 35` was the old hint; it can't
+    // work — --force-retry targets the vX.Y.Z orchestrator registry, and the
+    // v35 trigger lives in the numeric MIGRATIONS array which the flag can't
+    // reach. Pin against regression.)
+    expect(block).toContain('docs/guides/rls-and-you.md');
+    expect(block).not.toContain('--force-retry 35');
   });
 
   // v0.31.7 IRON-RULE regression test for #376 + #536.
@@ -901,7 +1124,7 @@ describe('v0.41.32.0 — commit-relative staleness', () => {
     expect(result.details).toEqual({ unchanged_count: 1, synced_recently_count: 0, stale_count: 0 });
   });
 
-  test('T2: REMOTE (no localOnly) reads column, quiet repo → ok, NO git subprocess', async () => {
+  test('T2: REMOTE (no localOnly) reads column, quiet + recently synced → ok, NO git subprocess', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
       await import('../src/core/git-head.ts');
@@ -911,7 +1134,9 @@ describe('v0.41.32.0 — commit-relative staleness', () => {
 
     const result = await checkSyncFreshness(makeStubEngine([
       { id: 'remote', name: '', local_path: '/tmp/remote',
-        last_sync_at: agoMs(100 * 60 * 60 * 1000),
+        // Synced 1h ago: caught up AND being checked. Must stay ok — this is the
+        // quiet-source contract the content comparison exists to protect.
+        last_sync_at: agoMs(1 * 60 * 60 * 1000),
         last_commit: 'x', chunker_version: currentChunkerVersion,
         // Content committed BEFORE the last sync → caught up.
         newest_content_at: agoMs(200 * 60 * 60 * 1000) },
@@ -921,6 +1146,30 @@ describe('v0.41.32.0 — commit-relative staleness', () => {
     expect(cleanCalls).toBe(0);
     expect(result.status).toBe('ok');
     expect(result.details).toEqual({ unchanged_count: 0, synced_recently_count: 1, stale_count: 0 });
+  });
+
+  test('T2-ceiling: REMOTE, caught up but unsynced past the ceiling → NOT ok', async () => {
+    // The 71-day bug at the doctor layer. This shape (caught up, synced 100h ago)
+    // previously reported ok forever, so a dead daemon was invisible. The ceiling
+    // ramps it to ~28h, which crosses the 24h warn line but NOT the 72h fail line —
+    // proving the escalation is ordered rather than a single jump to fail.
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
+      await import('../src/core/git-head.ts');
+    let headCalls = 0;
+    _setGitHeadProbeForTests(() => { headCalls++; return 'x'; });
+    _setGitCleanProbeForTests(() => true);
+
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'abandoned', name: '', local_path: '/tmp/abandoned',
+        last_sync_at: agoMs(100 * 60 * 60 * 1000),
+        last_commit: 'x', chunker_version: currentChunkerVersion,
+        newest_content_at: agoMs(200 * 60 * 60 * 1000) },
+    ]));
+
+    expect(headCalls).toBe(0);           // still no subprocess on the remote path
+    expect(result.status).toBe('warn');  // 28h: past warn, short of fail
+    expect(result.details).toEqual({ unchanged_count: 0, synced_recently_count: 0, stale_count: 1 });
   });
 
   test('T2b: REMOTE + NULL column → wall-clock fallback → stale (no git subprocess)', async () => {
@@ -1425,6 +1674,35 @@ describe('BUG 4 — in-progress sync via live lock, not stale freshness', () => 
     expect(result.status).toBe('fail');
   });
 
+  test('a lock held PAST the staleness ceiling is wedged, not in-progress → fail', async () => {
+    // `withRefreshingLock` bumps the heartbeat on its own timer regardless of
+    // whether the import is making forward progress, so a holder blocked inside
+    // a query refreshes forever. An uncapped in-progress verdict would mask that
+    // source from every staleness check indefinitely — the same invisible-failure
+    // class as the freshness bug, reached through the lock table instead.
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    await addSource('wiki', staleDate());
+    // Live, actively-refreshing lock (TTL 30 min in the future) — but acquired
+    // 100h ago, well past the 72h default ceiling.
+    await engine.executeRaw(
+      `INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at)
+       VALUES ($1, 4242, 'testhost', now() - interval '100 hours', now() + interval '30 minutes', now())`,
+      [syncLockId('wiki')],
+    );
+    const result = await checkSyncFreshness(engine);
+    expect(result.status).toBe('fail');
+    expect(result.message).toContain('held the sync lock');
+    expect(result.message).toContain('break-lock');
+  });
+
+  test('a freshly-acquired live lock is still in-progress → ok (cap does not over-fire)', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    await addSource('wiki', staleDate());
+    await holdLock('wiki', 30); // acquired_at = now(), well under the ceiling
+    const result = await checkSyncFreshness(engine);
+    expect(result.status).toBe('ok');
+  });
+
   test('blocked source with banked checkpoint rows but NO live lock → still fail', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     await addSource('wiki', staleDate());
@@ -1439,5 +1717,176 @@ describe('BUG 4 — in-progress sync via live lock, not stale freshness', () => 
     );
     const result = await checkSyncFreshness(engine);
     expect(result.status).toBe('fail');
+  });
+});
+
+// ============================================================================
+// sync_freshness — clone-unavailable content-lag fallback (stateless deploys)
+// ============================================================================
+// A container restart (Docker on EB / K8s / Fly) wipes federated clones;
+// each one is only re-materialized when that source's next sync job runs.
+// Until then the LOCAL git short-circuit cannot probe HEAD at all. That is
+// not evidence of pending work, so instead of falling through to raw
+// wall-clock age (which no-op syncs never advance → false stale/FAIL for
+// every quiet source after a restart), the check borrows the REMOTE path's
+// newest_content_at lag (v0.41.32.0). Contracts:
+//   F1: clone unavailable + content at/before last sync → healthy (lag 0).
+//   F2: clone unavailable + content NEWER than last sync → still stale
+//       (wall-clock) — real missed work is never masked.
+//   F3: clone unavailable + NULL newest_content_at → wall-clock fallback
+//       (pre-migration parity with git short-circuit case 5).
+//   F4: chunker mismatch disables the fallback (D7 — a pending re-chunk is
+//       never masked).
+//   F5: a READABLE clone that failed the short-circuit (HEAD moved) keeps
+//       wall-clock even when newest_content_at is old — the fallback is
+//       scoped to 'unavailable' only.
+// ============================================================================
+describe('sync_freshness — clone-unavailable content-lag fallback', () => {
+  function makeStubEngine(rows: any[]): any {
+    return { executeRaw: async () => rows };
+  }
+  function agoMs(ms: number): Date { return new Date(Date.now() - ms); }
+  const HOURS = 60 * 60 * 1000;
+  let currentChunkerVersion: string;
+
+  beforeEach(async () => {
+    const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
+      await import('../src/core/git-head.ts');
+    const { CHUNKER_VERSION } = await import('../src/core/chunkers/code.ts');
+    currentChunkerVersion = String(CHUNKER_VERSION);
+    _setGitHeadProbeForTests(null);
+    _setGitCleanProbeForTests(null);
+  });
+
+  afterAll(async () => {
+    const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
+      await import('../src/core/git-head.ts');
+    _setGitHeadProbeForTests(null);
+    _setGitCleanProbeForTests(null);
+  });
+
+  test('F1: quiet source, clone gone, content predates last sync → ok', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
+      await import('../src/core/git-head.ts');
+    _setGitHeadProbeForTests(() => null);  // clone not re-materialized yet
+    _setGitCleanProbeForTests(() => true);
+
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'quiet-docs', name: '', local_path: '/tmp/quiet-docs',
+        last_sync_at: agoMs(40 * HOURS),
+        last_commit: 'abc', chunker_version: currentChunkerVersion,
+        newest_content_at: agoMs(72 * HOURS) },  // content older than last sync
+    ]), { localOnly: true });
+
+    expect(result.status).toBe('ok');
+    expect(result.details).toEqual({
+      unchanged_count: 0, synced_recently_count: 1, stale_count: 0,
+    });
+  });
+
+  test('F2: clone gone but content NEWER than last sync → warn (real work not masked)', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
+      await import('../src/core/git-head.ts');
+    _setGitHeadProbeForTests(() => null);
+    _setGitCleanProbeForTests(() => true);
+
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'missed-work', name: '', local_path: '/tmp/missed-work',
+        last_sync_at: agoMs(40 * HOURS),
+        last_commit: 'abc', chunker_version: currentChunkerVersion,
+        newest_content_at: agoMs(1 * HOURS) },  // content NEWER than last sync
+    ]), { localOnly: true });
+
+    expect(result.status).toBe('warn');
+    expect(result.message).toMatch(/40h ago/);
+    expect(result.details?.stale_count).toBe(1);
+  });
+
+  test('F3: clone gone + NULL newest_content_at → wall-clock fallback (warn)', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
+      await import('../src/core/git-head.ts');
+    _setGitHeadProbeForTests(() => null);
+    _setGitCleanProbeForTests(() => true);
+
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'pre-migration', name: '', local_path: '/tmp/pre-migration',
+        last_sync_at: agoMs(40 * HOURS),
+        last_commit: 'abc', chunker_version: currentChunkerVersion,
+        newest_content_at: null },
+    ]), { localOnly: true });
+
+    expect(result.status).toBe('warn');
+    expect(result.details?.stale_count).toBe(1);
+  });
+
+  test('F4: clone gone + chunker MISMATCH → fallback disabled, wall-clock warn', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
+      await import('../src/core/git-head.ts');
+    _setGitHeadProbeForTests(() => null);
+    _setGitCleanProbeForTests(() => true);
+
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'needs-rechunk', name: '', local_path: '/tmp/needs-rechunk',
+        last_sync_at: agoMs(40 * HOURS),
+        last_commit: 'abc',
+        chunker_version: '0',  // STALE — re-chunk pending
+        newest_content_at: agoMs(72 * HOURS) },
+    ]), { localOnly: true });
+
+    expect(result.status).toBe('warn');
+    expect(result.details?.stale_count).toBe(1);
+  });
+
+  test('F5: readable clone, HEAD moved → wall-clock even with old content', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
+      await import('../src/core/git-head.ts');
+    _setGitHeadProbeForTests(() => 'NEW-HEAD');  // clone readable, real work
+    _setGitCleanProbeForTests(() => true);
+
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'has-commits', name: '', local_path: '/tmp/has-commits',
+        last_sync_at: agoMs(40 * HOURS),
+        last_commit: 'OLD-HEAD', chunker_version: currentChunkerVersion,
+        newest_content_at: agoMs(72 * HOURS) },
+    ]), { localOnly: true });
+
+    expect(result.status).toBe('warn');
+    expect(result.message).toMatch(/40h ago/);
+    expect(result.details?.stale_count).toBe(1);
+  });
+
+  test('F6: three-bucket invariant holds across rescued + unchanged + stale', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
+      await import('../src/core/git-head.ts');
+    _setGitHeadProbeForTests((path) => path === '/tmp/frozen' ? 'frozen-sha' : null);
+    _setGitCleanProbeForTests(() => true);
+
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'frozen', name: '', local_path: '/tmp/frozen',        // unchanged bucket
+        last_sync_at: agoMs(40 * HOURS),
+        last_commit: 'frozen-sha', chunker_version: currentChunkerVersion,
+        newest_content_at: agoMs(80 * HOURS) },
+      { id: 'rescued', name: '', local_path: '/tmp/rescued',      // clone gone, quiet → healthy
+        last_sync_at: agoMs(40 * HOURS),
+        last_commit: 'abc', chunker_version: currentChunkerVersion,
+        newest_content_at: agoMs(80 * HOURS) },
+      { id: 'stale', name: '', local_path: '/tmp/stale',          // clone gone, content newer → stale
+        last_sync_at: agoMs(5 * 24 * HOURS),
+        last_commit: 'def', chunker_version: currentChunkerVersion,
+        newest_content_at: agoMs(1 * HOURS) },
+    ]), { localOnly: true });
+
+    expect(result.status).toBe('fail');
+    expect(result.message).toContain(`'stale'`);
+    expect(result.message).not.toContain(`'rescued'`);
+    expect(result.details).toEqual({
+      unchanged_count: 1, synced_recently_count: 1, stale_count: 1,
+    });
   });
 });

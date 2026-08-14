@@ -112,7 +112,9 @@ async function callSubmitAgent(ctx: any, params: Record<string, unknown>): Promi
 describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with binding enforcement)', () => {
   describe('op surface', () => {
     it('declares scope=agent + mutating=true', () => {
-      expect(submit_agent.scope).toBe('agent' as any);
+      // Minions-visibility wave: 'agent' is a first-class member of the
+      // Operation scope union now (amendment 16) — no `as any` escape hatch.
+      expect(submit_agent.scope).toBe('agent');
       expect(submit_agent.mutating).toBe(true);
     });
     it('declares required prompt param', () => {
@@ -196,6 +198,37 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
       const result = await callSubmitAgent(ctx, { prompt: 'go' });
       expect(result.dry_run).toBe(true);
+    });
+
+    // An EXPLICIT [] used to pass both subset loops vacuously and reach the
+    // worker, which reads empty allowed_tools as "the whole registry" — so a
+    // client bound to ['search'] got put_page. `??` doesn't substitute for an
+    // empty array, only for null/undefined.
+    it('collapses an explicit empty allowed_tools to the binding, not the full registry', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const result = await callSubmitAgent(ctx, { prompt: 'go', allowed_tools: [] });
+      expect(result.dry_run).toBe(true);
+      expect(result.resolved_tools).toEqual(['search']);
+    });
+
+    // Empty prefixes reached the subagent as "use the legacy
+    // wiki/agents/<job-id>/ namespace" — outside every bound prefix.
+    it('collapses an explicit empty allowed_slug_prefixes to the binding', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['emp-alice/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const result = await callSubmitAgent(ctx, { prompt: 'go', allowed_slug_prefixes: [] });
+      // Normalized into the glob the delegated matcher understands, so the
+      // subagent can write descendants rather than one exact slug.
+      expect(result.resolved_slug_prefixes).toEqual(['emp-alice/*']);
     });
   });
 
@@ -334,6 +367,15 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(result.id).toBeGreaterThan(0);
       expect(result.name).toBe('subagent');
       expect(result.client_id).toBe('cursor');
+      // Minions-visibility wave (amendments 24/25): every successful submit
+      // carries a queue-state probe. Either a real snapshot (depth counts the
+      // job just enqueued) or the fail-open {probe_failed: true} marker —
+      // never absent, never an error.
+      expect(result.queue_state).toBeDefined();
+      if (!result.queue_state.probe_failed) {
+        expect(result.queue_state.depth).toBeGreaterThanOrEqual(1);
+        expect(typeof result.queue_state.worker_alive).toBe('boolean');
+      }
 
       // Job persisted with correct shape.
       const rows = await engine.executeRaw<Record<string, unknown>>(

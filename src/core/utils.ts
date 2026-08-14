@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'crypto';
 import type { Page, PageInput, PageType, Chunk, SearchResult, StalePageRow } from './types.ts';
-import type { Take, TakeKind } from './engine.ts';
+import type { Take, TakeKind, TakeHit } from './engine.ts';
 
 /**
  * SHA-256 hash a token/secret for storage. Never store plaintext tokens.
@@ -112,6 +112,12 @@ export function rowToPage(row: Record<string, unknown>): Page {
   const ingestedAt = readOptionalDate(row.ingested_at);
   // v0.42.x — migration v79 `last_retrieved_at` (see types.ts Page JSDoc).
   const lastRetrievedAt = readOptionalDate(row.last_retrieved_at);
+  // #3507: the CR tier the page was last embedded under (three-state, same
+  // pattern as the provenance columns above). Re-embed paths (`embed --stale`
+  // and friends) read this to reproduce the page's stored wrapping convention.
+  const contextualRetrievalMode = row.contextual_retrieval_mode === undefined
+    ? undefined
+    : (row.contextual_retrieval_mode as Page['contextual_retrieval_mode']);
   return {
     id: row.id as number,
     slug: row.slug as string,
@@ -138,6 +144,7 @@ export function rowToPage(row: Record<string, unknown>): Page {
     ...(ingestedVia !== undefined && { ingested_via: ingestedVia }),
     ...(ingestedAt !== undefined && { ingested_at: ingestedAt }),
     ...(lastRetrievedAt !== undefined && { last_retrieved_at: lastRetrievedAt }),
+    ...(contextualRetrievalMode !== undefined && { contextual_retrieval_mode: contextualRetrievalMode }),
     // v0.31.12: propagate source_id so downstream callers (embed, reconcile-links)
     // can thread it through getChunks / upsertChunks without defaulting to 'default'.
     // v0.32.8: Page.source_id is required. Every SELECT feeding rowToPage now
@@ -332,6 +339,7 @@ export function rowToChunk(row: Record<string, unknown>, includeEmbedding = fals
     parent_symbol_path: (row.parent_symbol_path as string[] | null | undefined) ?? null,
     doc_comment: (row.doc_comment as string | null | undefined) ?? null,
     symbol_name_qualified: (row.symbol_name_qualified as string | null | undefined) ?? null,
+    modality: (row.modality as 'text' | 'image' | undefined) ?? undefined,
   };
 }
 
@@ -383,6 +391,19 @@ export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
       result.effective_date_source = raw;
     }
   }
+  if (typeof row.message_id === 'string' && row.message_id.trim().length > 0) {
+    result.message_id = row.message_id;
+  }
+  if (typeof row.thread_id === 'string' && row.thread_id.length > 0) {
+    result.thread_id = row.thread_id;
+  }
+  if (
+    result.message_id &&
+    typeof row.source_subject === 'string' &&
+    row.source_subject.length > 0
+  ) {
+    result.source_subject = row.source_subject;
+  }
   return result;
 }
 
@@ -428,5 +449,26 @@ export function takeRowToTake(row: Record<string, unknown>): Take {
     resolved_by: row.resolved_by == null ? null : String(row.resolved_by),
     created_at: isoOrNull(row.created_at) ?? '',
     updated_at: isoOrNull(row.updated_at) ?? '',
+  };
+}
+
+/**
+ * Convert a takes search-hit SQL row to the `TakeHit` shape. The Postgres
+ * driver returns int8 columns (`take_id`/`page_id` are BIGSERIAL-backed) as
+ * native BigInt, which crashes JSON.stringify at the MCP/CLI serialization
+ * boundary (#2450-class). Number() is the same 2^53 envelope takeRowToTake
+ * already accepts for these ids.
+ */
+export function takeHitRowToHit(row: Record<string, unknown>): TakeHit {
+  return {
+    take_id: Number(row.take_id),
+    page_id: Number(row.page_id),
+    page_slug: String(row.page_slug ?? ''),
+    row_num: Number(row.row_num),
+    claim: String(row.claim),
+    kind: row.kind as TakeKind,
+    holder: String(row.holder),
+    weight: Number(row.weight),
+    score: Number(row.score),
   };
 }

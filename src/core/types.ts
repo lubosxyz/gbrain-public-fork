@@ -308,6 +308,15 @@ export interface PageFilters {
   /** ISO date string (YYYY-MM-DD or full ISO timestamp). Filter to pages updated_at > value. */
   updated_after?: string;
   /**
+   * v0.45.7 — keyset cursor for deterministic pagination through pages sharing
+   * one `updated_at`. `WHERE p.updated_at > ts OR (p.updated_at = ts AND
+   * p.slug > slug)`. Supersedes `updated_after` when set; pair with
+   * `sort: 'updated_asc'` (total order). Used by the `delta` verb's session
+   * cursor so a >limit same-timestamp cluster pages cleanly instead of
+   * livelocking. `slug` empty ⇒ start of the `ts` bucket.
+   */
+  updatedAfterKeyset?: { updatedAt: string; slug: string };
+  /**
    * Prefix-match filter on slug. Implemented as `WHERE slug LIKE prefix || '%'`
    * in both engines so it uses the (source_id, slug) UNIQUE constraint's btree
    * index for efficient range scans on large brains. Used by storage-tiering
@@ -363,7 +372,12 @@ export interface GetPageOpts {
 /** v0.29: literal ORDER BY fragments for the PageFilters.sort enum. Whitelisted. */
 export const PAGE_SORT_SQL: Record<NonNullable<PageFilters['sort']>, string> = {
   updated_desc: 'p.updated_at DESC',
-  updated_asc:  'p.updated_at ASC',
+  // v0.45.7: slug tiebreaker makes updated_asc a TOTAL order, so keyset
+  // pagination (updatedAfterKeyset) can page deterministically through a
+  // cluster of pages sharing one updated_at (bulk syncs stamp identical
+  // now() across a transaction). Without the tiebreaker, rows at the same
+  // timestamp order arbitrarily and a >limit tie cluster is unpageable.
+  updated_asc:  'p.updated_at ASC, p.slug ASC',
   created_desc: 'p.created_at DESC',
   slug:         'p.slug ASC',
 };
@@ -605,6 +619,13 @@ export interface Chunk {
   parent_symbol_path?: string[] | null;
   doc_comment?: string | null;
   symbol_name_qualified?: string | null;
+  /**
+   * v0.27.1 multimodal. Read side of ChunkInput.modality — must round-trip
+   * through getChunks → embed-stale merge → upsertChunks or image rows get
+   * reset to 'text' (EXCLUDED.modality on the upsert) and vanish from the
+   * image search arm.
+   */
+  modality?: 'text' | 'image';
 }
 
 /**
@@ -624,6 +645,29 @@ export interface StaleChunkRow {
   source_id: string;
   /** v0.33.3: page_id for cursor pagination in listStaleChunks. */
   page_id: number;
+}
+
+/**
+ * A page with non-empty `compiled_truth` and/or `timeline` (both are
+ * chunked independently by the healer) but ZERO `content_chunks` rows,
+ * returned by `listChunklessPagesWithContent`. `embed --stale` scans
+ * `content_chunks` (embedding IS NULL) — a page written directly via
+ * `putPage` that never went through the chunking step (e.g. an
+ * enrichment-generated entity stub) has no chunk row to go stale, so it is
+ * invisible to that scan forever. This is the safety-net detection: find
+ * such pages so `embed --stale` can chunk them and fold the resulting
+ * NULL-embedding chunks into the same run.
+ *
+ * Quarantined and `embed_skip` pages are excluded by the underlying query
+ * (`src/core/quarantine.ts` / `src/core/embed-skip.ts`) — both are
+ * INTENTIONALLY chunkless by design (content-quality gate), not drift.
+ */
+export interface ChunklessPageRow {
+  id: number;
+  slug: string;
+  source_id: string;
+  compiled_truth: string;
+  timeline: string;
 }
 
 /**
@@ -717,6 +761,17 @@ export interface SearchResult {
    */
   content_flag?: { reason: string; detail: string };
   /**
+   * Extraction quarantine lane (issue #160): true when the result's page is
+   * an unverified auto-extracted entity stub (frontmatter
+   * `provenance: 'auto-extracted'` + `status: 'unverified'`). Such pages are
+   * excluded from the compiled-truth authority boost and the namespace
+   * source-boost — they rank as ordinary content — and this marker tells the
+   * agent the page has NOT been reviewed by the owner. Stamped pre-fusion by
+   * `stampUnverifiedExtractions` (hybrid.ts). Absent for reviewed/ordinary
+   * pages.
+   */
+  unverified?: boolean;
+  /**
    * v0.36 (cross-modal wave): the chunk's modality discriminator from
    * content_chunks.modality. 'text' for the existing text-embedding rows,
    * 'image' for rows populated by importImageFile. Surfaced so callers /
@@ -740,6 +795,12 @@ export interface SearchResult {
    */
   effective_date?: string | null;
   effective_date_source?: string | null;
+  /** RFC 5322 Message-ID projected from allowlisted email frontmatter. */
+  message_id?: string;
+  /** Gmail thread id projected from allowlisted email frontmatter. */
+  thread_id?: string;
+  /** Exact email subject, projected only when the page has a Message-ID. */
+  source_subject?: string;
   /**
    * v0.40.4 graph signals — populated by applyGraphSignals when the
    * graph_signals mode-bundle knob is on. Surfaced in JSON envelope
@@ -999,6 +1060,19 @@ export interface SearchOpts {
    */
   sourceIds?: string[];
   /**
+   * fix/title-retrieval-arm (D2, Reviewer F1): opt-in AND→OR keyword-recall
+   * fallback. When true, `searchKeyword` retries ONCE with OR-of-terms after
+   * the strict websearch AND query returns zero rows (strict results always
+   * win when non-empty). Default false/undefined = strict-AND only — the
+   * pre-fix contract. hybridSearch opts in for its keyword arm; precision
+   * consumers (enrichment countMentions, link-extraction resolution, eval
+   * paths) MUST NOT set this: OR-matches would inflate mention counts and
+   * relax link-candidate resolution ("John Smith" matching every John and
+   * every Smith). `searchTitles` has its own page-grain fallback and
+   * ignores this flag.
+   */
+  orFallback?: boolean;
+  /**
    * v0.27.1 / v0.36 (D11): target column for vector search. Two shapes:
    *
    * 1. String name (legacy + user-facing). Engine and hybridSearch convert
@@ -1190,7 +1264,11 @@ export interface CodeEdgeResult {
 // Links
 export interface Link {
   from_slug: string;
+  /** Exact source identity of the from-page joined by from_page_id. */
+  from_source_id: string;
   to_slug: string;
+  /** Exact source identity of the to-page joined by to_page_id. */
+  to_source_id: string;
   link_type: string;
   context: string;
   /**
@@ -1208,6 +1286,8 @@ export interface Link {
    * multiple pages reference the same (from, to, type) tuple.
    */
   origin_slug?: string | null;
+  /** Exact source identity of origin_slug; null when absent or grant-redacted. */
+  origin_source_id?: string | null;
   /**
    * The frontmatter field name that created this edge (e.g. 'key_people',
    * 'investors'). Used for debug output and the `unresolved` response list.
@@ -1426,10 +1506,20 @@ export interface BrainStats {
 
 export interface BrainHealth {
   page_count: number;
+  /**
+   * Pages inside the linkable scope (src/core/orphan-policy.ts) — the
+   * pages expected to participate in the curated link graph. Excludes
+   * archive (raw/), generated, and daily-log pages; the same scope the
+   * orphans audit uses. Denominator for the no-orphans and
+   * timeline-coverage score components.
+   */
+  linkable_page_count: number;
   embed_coverage: number;
   stale_pages: number;
   /**
-   * Islanded pages — zero inbound AND zero outbound links. A hub page
+   * Islanded pages — zero inbound AND zero outbound links, counted over
+   * LINKABLE pages only (the same scope as the `gbrain orphans` audit, so
+   * doctor cannot report two contradictory orphan numbers). A hub page
    * that has references out but no back-references is NOT an orphan under
    * this definition (it's working as intended as an index). The metric
    * aims at "pages I forgot to connect to anything", not the stricter
@@ -1581,6 +1671,67 @@ export interface EvalCaptureFailure {
 }
 
 /**
+ * WP2/T3 — CLOSED degradation vocabulary for `HybridSearchMeta.degraded`
+ * (D6). Every stage a search can degrade through has an enumerated name;
+ * consumers (MCP `_meta.retrieval`, telemetry, `--explain`) match on these
+ * codes. Additive-forever: new stages append, existing names never change.
+ *
+ *   embed_unavailable  — no embedding ran (no provider, or provider errored)
+ *   embed_timeout      — every query embed hit the wall-clock deadline
+ *   expansion_failed   — the LLM multi-query expander threw; original only
+ *   expansion_partial  — some (not all) variant embeds survived; results
+ *                        salvaged from the surviving lists (ENG-15)
+ *   rescore_skipped    — original-query embed failed, so the cosine
+ *                        re-score stage was skipped (variant-list salvage)
+ *   vector_arm_failed  — an engine.searchVector arm threw; surviving arms
+ *                        (or keyword) carried the result
+ *   budget_dropped_all — the first result alone exceeded the token budget
+ *                        and NOTHING was returned (GBRAIN_SEARCH_SALVAGE=off
+ *                        strict path — the result set is empty)
+ *   budget_truncated   — the minKeep failsafe kept ONE result truncated to
+ *                        fit the budget (results non-empty but cut; distinct
+ *                        stage so consumers can tell "empty" from "clipped")
+ *   keyword_zero       — the keyword arm returned zero rows on a path where
+ *                        it was the primary recall arm (vector unavailable)
+ *   cache_prestamp     — served from a cache row written before the
+ *                        degradation stamp existed; cleanliness unprovable
+ */
+export const DEGRADED_STAGES = [
+  'embed_unavailable',
+  'embed_timeout',
+  'expansion_failed',
+  'expansion_partial',
+  'rescore_skipped',
+  'vector_arm_failed',
+  'budget_dropped_all',
+  'budget_truncated',
+  'keyword_zero',
+  'cache_prestamp',
+] as const;
+export type DegradedStage = (typeof DEGRADED_STAGES)[number];
+
+/**
+ * WP2/T3 — enumerated reason codes for degraded stages (D6). NEVER raw
+ * exception text: raw errors go to stderr/telemetry only, so a provider's
+ * error string (which can embed URLs, keys, internal hostnames) never
+ * rides the wire to a remote MCP consumer.
+ */
+export const DEGRADED_REASONS = [
+  'no_provider',
+  'provider_error',
+  'timeout',
+  'variant_embed_failed',
+  'original_embed_failed',
+  'first_result_truncated',
+] as const;
+export type DegradedReason = (typeof DEGRADED_REASONS)[number];
+
+export interface DegradedStageEntry {
+  stage: DegradedStage;
+  reason?: DegradedReason;
+}
+
+/**
  * Side-channel metadata that hybridSearch reports about what actually ran.
  * Surfaced via the optional `onMeta` callback in HybridSearchOpts so
  * existing SearchResult[] consumers (Cathedral II, gbrain-evals, etc.)
@@ -1622,7 +1773,27 @@ export interface HybridSearchMeta {
     used: number;
     kept: number;
     dropped: number;
+    /**
+     * WP2/T3 (ENG-2/FOV-2) — set when the minKeep failsafe kept ONE result
+     * whose chunk_text was truncated (on a copy) to fit the budget, where
+     * the strict packer would have returned [].
+     */
+    truncated?: boolean;
   };
+  /**
+   * WP2/T3 (D6) — degradation stamp. Empty array = clean run (every stage
+   * ran as configured); entries name what fell over, with enumerated reason
+   * codes only. Always present on hybridSearch-emitted meta so cache rows
+   * carry the stamp; absent only on meta shapes written before this field
+   * existed (surfaced as `cache_prestamp` at hit time).
+   */
+  degraded?: DegradedStageEntry[];
+  /**
+   * WP2/T3 — pre-budget hit count: how many results retrieval produced for
+   * this page BEFORE token-budget enforcement. Lets a consumer distinguish
+   * "0 retrieved" (clean miss) from "N retrieved, budget dropped them".
+   */
+  retrieved_count?: number;
   /**
    * v0.32.x (search-lite): cache hit/miss tracking. Omitted when the
    * semantic query cache wasn't consulted (cache disabled, vector search

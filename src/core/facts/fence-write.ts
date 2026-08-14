@@ -34,9 +34,10 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { dirname } from 'node:path';
 
 import type { BrainEngine, NewFact, FactVisibility } from '../engine.ts';
+import { resolvePageFilePath } from '../markdown.ts';
 import { withPageLock } from '../page-lock.ts';
 import { gbrainPath } from '../config.ts';
 import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
@@ -64,6 +65,12 @@ export interface FenceInputFact {
   /** Defaults to 1.0 when undefined (matches engine.insertFact behavior). */
   confidence?: number;
   validFrom?: Date;
+  /**
+   * MEMORY_VERBS v1 (c5): remember's ttl → valid_until. Date-only in the
+   * fence cell; the DB column derives from it on the stamp step.
+   * Undefined/null = never expires (pre-v1 behavior unchanged).
+   */
+  validUntil?: Date | null;
   embedding: Float32Array | null;
   sessionId: string | null;
 }
@@ -166,7 +173,12 @@ export async function writeFactsToFence(
     return { inserted: 0, ids: [] };
   }
 
-  const filePath = join(target.localPath, `${target.slug}.md`);
+  // Local patch 2026-06-11: route through resolvePageFilePath so non-default
+  // sources fence into `<local_path>/.sources/<id>/<slug>.md` — the same path
+  // the put_page write-through and dream-cycle reverse-render compute. The
+  // bare join wrote main-source fences to the repo ROOT (the default source's
+  // tree), polluting ~/brain with stray root-level fence files.
+  const filePath = resolvePageFilePath(target.localPath, target.slug, target.sourceId);
   const tmpPath = `${filePath}.tmp`;
 
   return withPageLock(
@@ -213,17 +225,61 @@ export async function writeFactsToFence(
 
       // 2. Upsert each fact onto the fence in input order. row_num
       //    monotonically increases (max-existing + 1 per call, append-only).
+      //
+      //    Seed the counter from the DB as well as the fence file. Uniqueness
+      //    is enforced by idx_facts_fence_key on
+      //    (source_id, source_markdown_slug, row_num) in Postgres, but
+      //    upsertFactRow derives the next value from the fence in the markdown
+      //    alone — and falls back to 1 when the file has no fence at all. Any
+      //    write path that rewrites a page without preserving its facts fence
+      //    (put_page write-through, sync, dream-cycle reverse-render) therefore
+      //    resets the counter below what the DB already holds, and the next
+      //    absorb re-issues a row_num that is already taken. That surfaces as
+      //    "duplicate key value violates unique constraint idx_facts_fence_key"
+      //    and the whole batch of facts is dropped.
+      //
+      //    Symptom in the wild: a page whose fence had been rewritten away had
+      //    24 facts in the DB and none in the file, so every subsequent absorb
+      //    on it failed permanently. Taking the max of both sources keeps the
+      //    file as the readable mirror while the DB stays authoritative about
+      //    which row_nums have been issued.
+      //
+      //    Degrades to the previous file-only behaviour if the lookup fails
+      //    (pre-v51 brain without the fence columns, or a transient DB error):
+      //    a fence write must not become impossible just because the counter
+      //    hint is unavailable.
+      let dbMaxRowNum = 0;
+      try {
+        const rows = await engine.executeRaw<{ max_row_num: number | null }>(
+          `SELECT MAX(row_num) AS max_row_num FROM facts
+            WHERE source_id = $1 AND source_markdown_slug = $2`,
+          [target.sourceId, target.slug],
+        );
+        dbMaxRowNum = Number(rows[0]?.max_row_num ?? 0);
+      } catch {
+        dbMaxRowNum = 0;
+      }
+      const { facts: existingFenceFacts } = parseFactsFence(body);
+      const fileMaxRowNum = existingFenceFacts.length > 0
+        ? Math.max(...existingFenceFacts.map(f => f.rowNum))
+        : 0;
+      let nextRowNum = Math.max(fileMaxRowNum, dbMaxRowNum) + 1;
+
       const assignedRowNums: number[] = [];
       for (const f of facts) {
         const validFromStr = (f.validFrom ?? new Date()).toISOString().slice(0, 10);
         const { body: updated, rowNum } = upsertFactRow(body, {
+          rowNum:      nextRowNum++,
           claim:       f.fact,
           kind:        (f.kind ?? 'fact') as 'fact' | 'event' | 'preference' | 'commitment' | 'belief',
           confidence:  f.confidence ?? 1.0,
           visibility:  f.visibility,
           notability:  f.notability ?? 'medium',
           validFrom:   validFromStr,
-          validUntil:  undefined,
+          // MEMORY_VERBS v1 (c5): remember's ttl threads through to the fence
+          // cell — was hard-coded undefined, which silently dropped expiry on
+          // this path. extractFactsFromFenceText derives the DB column from it.
+          validUntil:  f.validUntil ? f.validUntil.toISOString().slice(0, 10) : undefined,
           source:      f.source,
           context:     f.context ?? undefined,
         });

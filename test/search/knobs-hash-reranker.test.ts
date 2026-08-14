@@ -27,6 +27,7 @@ import {
   MODE_BUNDLES,
   type ResolvedSearchKnobs,
 } from '../../src/core/search/mode.ts';
+import { resolveHardExcludes } from '../../src/core/search/source-boost.ts';
 
 /** Build a baseline resolved knob set with all reranker fields filled. */
 function baseKnobs(): ResolvedSearchKnobs {
@@ -43,7 +44,7 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 11 (…; 8→9 archive-demote #1777; 9→10 relational recall; 10→11 asymmetric input_type #1400)', () => {
+  test('version is 17 (…; 12→13 embedding-provider migration #3390; 14→15 FTS language; 15→16 detail fold #3515; 16→17 degradation stamp)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -61,7 +62,20 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // #1400: 10→11 asymmetric input_type fix — embedQuery() now produces
     // query-side vectors for asymmetric providers, so rows keyed on
     // pre-fix document-side query vectors must not be served.
-    expect(KNOBS_HASH_VERSION).toBe(11);
+    // #2825: 11→12 to fold the resolved hard-exclude prefix list (hx=) —
+    // cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across processes.
+    // #3430: 13→14 — the compiled_truth boost no longer applies at
+    // detail=medium. Results are cached after fusion, so rows ranked under
+    // the old boost semantics must not be served under the new ones.
+    // FTS language: 14→15 to fold the resolved GBRAIN_FTS_LANGUAGE config
+    // name (fts=). It retokenizes both the trigger-built search_vector and
+    // the query-side tsquery, so rows written under the previous language
+    // must not survive a `reindex-search-vector` language switch.
+    // #3515: 15→16 to fold the effective detail level (det=) — a detail=low
+    // write must not be served to a detail=medium lookup.
+    // WP2/T3: 16→17 degradation-stamp epoch — cache rows now carry
+    // degraded[]/retrieved_count; pre-stamp rows must not claim clean.
+    expect(KNOBS_HASH_VERSION).toBe(17);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {
@@ -206,5 +220,38 @@ describe('append-only convention (CDX2-F13)', () => {
     const bare = knobsHash(k);
     const explicit = knobsHash(k, { embeddingColumn: 'embedding', embeddingModel: 'default' });
     expect(bare).toBe(explicit);
+  });
+});
+
+describe('v=12 hard-exclude participation (#2825)', () => {
+  test('different exclude lists → different hashes', () => {
+    const k = baseKnobs();
+    const noEnv = knobsHash(k, { hardExcludes: resolveHardExcludes(undefined, undefined, undefined) });
+    const withEnv = knobsHash(k, { hardExcludes: resolveHardExcludes(undefined, undefined, 'private/') });
+    expect(noEnv).not.toBe(withEnv);
+  });
+
+  test('include (opt-back-in) changes the hash too', () => {
+    const k = baseKnobs();
+    const a = knobsHash(k, { hardExcludes: resolveHardExcludes(undefined, undefined, undefined) });
+    const b = knobsHash(k, { hardExcludes: resolveHardExcludes(undefined, ['test/'], undefined) });
+    expect(a).not.toBe(b);
+  });
+
+  test('same prefixes in different input order → SAME hash (normalization)', () => {
+    const k = baseKnobs();
+    const a = knobsHash(k, { hardExcludes: ['a/', 'b/', 'test/'] });
+    const b = knobsHash(k, { hardExcludes: ['test/', 'b/', 'a/'] });
+    expect(a).toBe(b);
+  });
+
+  test('undefined hardExcludes is stable (legacy-caller fallback)', () => {
+    const k = baseKnobs();
+    expect(knobsHash(k)).toBe(knobsHash(k));
+    // ...and distinct from an explicit resolved default list — a legacy
+    // caller can never collide with a policy-carrying cache row.
+    expect(knobsHash(k)).not.toBe(
+      knobsHash(k, { hardExcludes: resolveHardExcludes(undefined, undefined, undefined) }),
+    );
   });
 });

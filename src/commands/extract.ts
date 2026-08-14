@@ -35,7 +35,7 @@ import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from '../core/en
 import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
 import {
-  extractPageLinks, parseTimelineEntries, inferLinkType, makeResolver,
+  extractPageLinks, parseTimelineEntries, deriveTimelineAnchor, inferLinkType, makeResolver,
   extractFrontmatterLinks, isGlobalBasenameEnabled, LINK_EXTRACTOR_VERSION_TS,
   WIKILINK_BASENAME_LINK_TYPE,
   buildBasenameIndex, queryBasenameIndex, stripCodeBlocks,
@@ -43,7 +43,7 @@ import {
 } from '../core/link-extraction.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
-import { pathToSlug, pruneDir, isSyncable } from '../core/sync.ts';
+import { pathToSlug, slugifyPath, pruneDir, isSyncable } from '../core/sync.ts';
 // v0.41.18.0: withRetry + isRetryableConnError + WithRetryOpts moved to
 // src/core/retry.ts as the canonical primitive. Engine methods
 // (addLinksBatch/addTimelineEntriesBatch/upsertChunks) now self-retry via
@@ -81,8 +81,10 @@ const BATCH_SIZE = 100;
 const STALE_BATCH_SIZE = Math.max(1, Number(process.env.GBRAIN_EXTRACT_STALE_BATCH) || 25);
 // v0.42.7: wall-clock budget for one `extract --stale` invocation (default
 // 30 min). `--catch-up` removes the cap (loops until 0 stale). Mirrors
-// embedAllStale's time-budget shape.
-const STALE_TIME_BUDGET_MS = Math.max(1000, Number(process.env.GBRAIN_EXTRACT_TIME_BUDGET_MS) || 30 * 60 * 1000);
+// embedAllStale's time-budget shape. Exported so the #2849 deferred-sweep
+// submitters (sync's size-gate defer branch + the jobs continuation chain)
+// derive their job timeout_ms from the SAME budget instead of hardcoding.
+export const STALE_TIME_BUDGET_MS = Math.max(1000, Number(process.env.GBRAIN_EXTRACT_TIME_BUDGET_MS) || 30 * 60 * 1000);
 
 /**
  * v0.42.7 (#1696): best-effort extraction stamp for the source-correct write
@@ -188,7 +190,7 @@ export function walkMarkdownFiles(dir: string): { path: string; relPath: string 
   // Pre-fix, this walker had only an ad-hoc dot-prefix exclusion and didn't
   // call isSyncable at all — so it descended into `node_modules/`, emitted
   // markdown files from there, AND ignored the canonical exclusion list
-  // (`.raw/`, `ops/`, README.md, etc.). Now: pruneDir skips entire vendor
+  // (`.raw/`, README.md, etc.). Now: pruneDir skips entire vendor
   // subtrees before recursion (saving IO), and isSyncable filters the emit
   // set against the canonical markdown-strategy rules.
   const files: { path: string; relPath: string }[] = [];
@@ -269,14 +271,24 @@ export function extractMarkdownLinks(content: string): { name: string; relTarget
 export function resolveSlug(fileDir: string, relTarget: string, allSlugs: Set<string>): string | null {
   const targetNoExt = relTarget.endsWith('.md') ? relTarget.slice(0, -3) : relTarget;
 
-  const s1 = join(fileDir, targetNoExt);
-  if (allSlugs.has(s1)) return s1;
+  // Issue #1964: wikilinks carry raw Obsidian paths (`[[llm-wiki/entities/AI 3.0]]`)
+  // but allSlugs holds sync-slugified slugs (`llm-wiki/entities/ai-3.0`). Try the
+  // raw candidate first (back-compat), then the sync-consistent slugified form.
+  const hit = (candidate: string): string | null => {
+    if (allSlugs.has(candidate)) return candidate;
+    const slugified = slugifyPath(candidate);
+    if (slugified !== candidate && allSlugs.has(slugified)) return slugified;
+    return null;
+  };
+
+  const s1 = hit(join(fileDir, targetNoExt));
+  if (s1) return s1;
 
   const parts = fileDir.split('/').filter(Boolean);
   for (let strip = 1; strip <= parts.length; strip++) {
     const ancestor = parts.slice(0, parts.length - strip).join('/');
-    const candidate = ancestor ? join(ancestor, targetNoExt) : targetNoExt;
-    if (allSlugs.has(candidate)) return candidate;
+    const candidate = hit(ancestor ? join(ancestor, targetNoExt) : targetNoExt);
+    if (candidate) return candidate;
   }
 
   return null;
@@ -349,7 +361,13 @@ function inferTypeByDir(fromDir: string, toDir: string, frontmatter?: Record<str
   const to = toDir.split('/')[0];
   if (from === 'people' && to === 'companies') {
     if (Array.isArray(frontmatter?.founded)) return 'founded';
-    return 'works_at';
+    // #3466: bare people/ -> companies/ adjacency is not evidence of
+    // employment, so it gets the neutral 'mentions' verb instead of
+    // 'works_at'. Real works_at edges still come from the two paths that
+    // read actual evidence: the company:/companies: frontmatter fields
+    // (FRONTMATTER_LINK_MAP) and employment phrasing in prose
+    // (inferLinkType in link-extraction.ts).
+    return 'mentions';
   }
   if (from === 'people' && to === 'deals') return 'involved_in';
   if (from === 'deals' && to === 'companies') return 'deal_for';
@@ -433,7 +451,10 @@ export async function extractLinksFromFile(
       async resolve(name: string, dirHint?: string | string[]): Promise<string | null> {
         if (!name) return null;
         const trimmed = name.trim();
-        if (/^[a-z][a-z0-9-]*\/[a-z0-9][a-z0-9-]*$/.test(trimmed) && allSlugs.has(trimmed)) {
+        // Same broadened slug-shape as makeResolver step 1: accepts
+        // digit-leading folders (`90-people/nicolai`) and nested paths.
+        // Exact Set membership guards it — no false positives.
+        if (/\//.test(trimmed) && /^[a-z0-9][a-z0-9/_-]*$/.test(trimmed) && allSlugs.has(trimmed)) {
           return trimmed;
         }
         const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
@@ -469,15 +490,53 @@ export async function extractLinksFromFile(
 
 // --- Timeline extraction ---
 
+/**
+ * Index of the first dash (—, –, -) that can serve as the Source — Summary
+ * delimiter: it must have whitespace on both sides and sit outside every
+ * markdown-link span. Hyphens inside link targets
+ * (`../people/alice-example.md`) and dashes inside link labels
+ * (`[Deals — Q1 Review](...)`) are content, not delimiters — splitting on
+ * them shatters one entry into two fragments whose halves re-insert on
+ * every sync (the (page_id, date, summary, source) uniqueness sees each
+ * fragment shape as a new row). Returns -1 when the line has no delimiter.
+ */
+function findDelimiterOutsideLinks(text: string): number {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '[' || c === '(') depth++;
+    else if (c === ']' || c === ')') { if (depth > 0) depth--; }
+    else if (
+      depth === 0 &&
+      (c === '—' || c === '–' || c === '-') &&
+      i > 0 && /\s/.test(text[i - 1]) &&
+      i + 1 < text.length && /\s/.test(text[i + 1])
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 /** Extract timeline entries from markdown content */
 export function extractTimelineFromContent(content: string, slug: string): ExtractedTimelineEntry[] {
   const entries: ExtractedTimelineEntry[] = [];
 
   // Format 1: Bullet — - **YYYY-MM-DD** | Source — Summary
-  const bulletPattern = /^-\s+\*\*(\d{4}-\d{2}-\d{2})\*\*\s*\|\s*(.+?)\s*[—–-]\s*(.+)$/gm;
+  // The delimiter search is link-aware (see findDelimiterOutsideLinks); a
+  // bullet with no delimiter (e.g. an auto-generated backlink line
+  // `- **date** | Referenced in [X](y.md)`) is kept whole as the summary
+  // rather than dropped or fragmented.
+  const bulletPattern = /^-\s+\*\*(\d{4}-\d{2}-\d{2})\*\*\s*\|\s*(.+)$/gm;
   let match;
   while ((match = bulletPattern.exec(content)) !== null) {
-    entries.push({ slug, date: match[1], source: match[2].trim(), summary: match[3].trim() });
+    const rest = match[2].trim();
+    const at = findDelimiterOutsideLinks(rest);
+    if (at >= 0) {
+      entries.push({ slug, date: match[1], source: rest.slice(0, at).trim(), summary: rest.slice(at + 1).trim() });
+    } else {
+      entries.push({ slug, date: match[1], source: 'markdown', summary: rest });
+    }
   }
 
   // Format 2: Header — ### YYYY-MM-DD — Title
@@ -492,6 +551,38 @@ export function extractTimelineFromContent(content: string, slug: string): Extra
     );
     const detail = content.slice(afterIdx, endIdx).trim();
     entries.push({ slug, date: match[1], source: 'markdown', summary: match[2].trim(), detail: detail || undefined });
+  }
+
+  // Format 3: Inline citation — [Source: <source>, YYYY-MM-DD]
+  //
+  // This is the citation convention gbrain's own quality rules require on
+  // every brain write (skills/conventions/quality.md), so dated evidence is
+  // pervasive in curated pages — but until now the extractor could not see
+  // it, and a page whose dates all live in citations scored zero timeline
+  // coverage. The entry's summary is the sentence the citation annotates
+  // (the surrounding line with citation markers stripped).
+  //
+  // Lines already captured by Format 1 are skipped: a timeline bullet often
+  // carries its own [Source: ...] citation, and re-extracting it would file
+  // a duplicate entry under a different (source, summary) shape that the
+  // DB-level uniqueness cannot collapse.
+  const citationPattern = /\[Source:\s*([^\]]+?),\s*(\d{4}-\d{2}-\d{2})\s*\]/g;
+  const bulletLinePattern = /^-\s+\*\*\d{4}-\d{2}-\d{2}\*\*\s*\|/;
+  for (const line of content.split(/\r?\n/)) {
+    if (bulletLinePattern.test(line)) continue;
+    const lineMatches = [...line.matchAll(citationPattern)];
+    if (lineMatches.length === 0) continue;
+    // Strip every citation marker from the line to leave the annotated text.
+    const summary = line
+      .replace(/\[Source:[^\]]*\]/g, '')
+      .replace(/^[-*>#\s]+/, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 300);
+    if (!summary) continue; // a bare citation with no surrounding text is not an event
+    for (const m of lineMatches) {
+      entries.push({ slug, date: m[2], source: m[1].trim().slice(0, 200), summary });
+    }
   }
 
   return entries;
@@ -536,6 +627,31 @@ export interface ExtractOpts {
    * paths: extractForSlugs, extractLinksFromDir, extractTimelineFromDir.
    */
   signal?: AbortSignal;
+  /**
+   * Brain source id to stamp on extracted fs-walk rows (#1747 / #1503).
+   *
+   * The fs-walk extractors build LinkBatchInput / TimelineBatchInput rows
+   * with no source_id, so addLinksBatch / addTimelineEntriesBatch map
+   * missing → literal 'default'. On a brain whose content lives in a
+   * non-'default' source (e.g. 'wiki'), the batch INSERT's
+   * `JOIN pages ON (slug, source_id='default')` drops EVERY row → 0
+   * inserted, no error (the "created 0 from N pages" silent no-op).
+   * Threading the resolved source id here stamps from/to/origin_source_id
+   * so the JOIN matches. When undefined, rows fall back to 'default' as
+   * before (single-'default'-source brains unaffected).
+   */
+  sourceId?: string;
+  /**
+   * v0.42 — also extract frontmatter links on the incremental (slugs) path.
+   * `extractForSlugs` extracts BODY links only by default; set this true to also
+   * parse each changed page's frontmatter so `sources:`/`related:` edges stay fresh
+   * when YAML is edited externally and synced in. Applied PER changed page, so the
+   * incremental walk stays bounded (no switch to a full DB scan). Only honored on
+   * the incremental path (`slugs` defined); the full-walk path already covers
+   * frontmatter via its own dispatch. Gated upstream by the config key
+   * `autopilot.incremental_extract_include_frontmatter` (default off).
+   */
+  includeFrontmatter?: boolean;
 }
 
 /**
@@ -574,7 +690,7 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
       // Nothing changed — skip entirely.
       return result;
     }
-    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode, workers, opts.signal);
+    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode, workers, opts.signal, opts.sourceId, opts.includeFrontmatter);
     result.links_created = r.links_created;
     result.timeline_entries_created = r.timeline_created;
     result.pages_processed = r.pages;
@@ -583,12 +699,12 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
 
   // Full walk path: CLI `gbrain extract` or first-run.
   if (opts.mode === 'links' || opts.mode === 'all') {
-    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode, workers, opts.signal);
+    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode, workers, opts.signal, opts.sourceId);
     result.links_created = r.created;
     result.pages_processed = r.pages;
   }
   if (opts.mode === 'timeline' || opts.mode === 'all') {
-    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode, workers, opts.signal);
+    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode, workers, opts.signal, opts.sourceId);
     result.timeline_entries_created = r.created;
     result.pages_processed = Math.max(result.pages_processed, r.pages);
   }
@@ -596,7 +712,43 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
   return result;
 }
 
+const EXTRACT_HELP = `Usage: gbrain extract <subcommand> [flags]
+
+Extraction:
+  gbrain extract links    [--source fs|db] [--source-id <id>] [--dir <brain-dir>]
+                          [--type T] [--since DATE] [--include-frontmatter]
+                          [--workers N|--concurrency N] [--dry-run] [--json]
+  gbrain extract timeline [--source fs|db] [--source-id <id>] [--dir <brain-dir>]
+                          [--type T] [--since DATE] [--include-frontmatter]
+                          [--infer-dates] [--workers N|--concurrency N]
+                          [--dry-run] [--json]
+  gbrain extract all      [--source fs|db] [--source-id <id>] [--dir <brain-dir>]
+                          [--type T] [--since DATE] [--include-frontmatter]
+                          [--infer-dates] [--workers N|--concurrency N]
+                          [--dry-run] [--json]
+  gbrain extract <links|timeline> --by-mention --source db
+  gbrain extract <links|timeline|all> --ner --source db
+  gbrain extract <timeline|all> --from-meetings --source db
+
+Incremental sweep:
+  gbrain extract --stale [--source-id <id>] [--include-frontmatter]
+                         [--catch-up] [--dry-run] [--json]
+      Re-extract links + timeline only for stale pages. DB-source; safe to
+      cron. --catch-up loops past the 30-minute budget until none remain.
+
+Inspection:
+  gbrain extract --explain <kind> [--json]
+  gbrain extract benchmark --pack <name> --kind <type> [--json]
+
+Status:
+  gbrain extract status [--source-id ID] [--kind X] [--verbose] [--json]`;
+
 export async function runExtract(engine: BrainEngine, args: string[]) {
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(EXTRACT_HELP);
+    return;
+  }
+
   const subcommand = args[0];
 
   // v0.42 Wave C+D dispatch — new operator surfaces. These intercept
@@ -689,6 +841,12 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   // v0.41.18.0 (A11, T8): --from-meetings extracts timeline entries from
   // meeting pages onto each discussed entity. Timeline subcommand only.
   const fromMeetings = args.includes('--from-meetings');
+  // --infer-dates: for pages whose body has NO parseable timeline line, anchor
+  // one entry at the page's computed effective_date (frontmatter / filename date,
+  // never the updated_at fallback). Default OFF for back-compat — comms/calendar
+  // brains opt in to populate timeline from slug/frontmatter dates. DB-source only
+  // (needs the full Page.effective_date, which getPage projects).
+  const inferDates = args.includes('--infer-dates');
   // v0.41.17.0 (T7, D9): --workers N parsed via the shared validator.
   // Honored on the fs-walk inner loops only; DB-source paths stay
   // serial in v0.41.17.0 (see ExtractOpts.workers doc).
@@ -718,32 +876,7 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   }
 
   if (!subcommand || !['links', 'timeline', 'all'].includes(subcommand)) {
-    console.error(`Usage: gbrain extract <subcommand> [flags]
-
-Extraction (existing):
-  gbrain extract links    [--source fs|db] [--source-id <id>] [--dir <brain-dir>] [--dry-run] [--json] [--type T] [--since DATE] [--workers N]
-  gbrain extract timeline [--source fs|db] [--source-id <id>] [--dir <brain-dir>] [--dry-run] [--json] [--type T] [--since DATE] [--workers N]
-  gbrain extract all      [--source fs|db] [--source-id <id>] [--dir <brain-dir>] [--dry-run] [--json] [--type T] [--since DATE] [--workers N]
-  gbrain extract <links|timeline> --by-mention --source db
-  gbrain extract <links|timeline|all> --ner --source db
-  gbrain extract <timeline|all> --from-meetings
-
-Incremental sweep (v0.42.7):
-  gbrain extract --stale [--source-id <id>] [--catch-up] [--dry-run] [--json]
-      Re-extract links + timeline ONLY for pages whose extraction is stale
-      (never extracted, edited since, or extractor bumped). DB-source; safe to
-      cron. --catch-up loops past the 30-min wall-clock budget until 0 remain.
-
-Inspection (v0.42):
-  gbrain extract --explain <kind> [--json]
-      Print resolution chain for one pack-declared extractable kind.
-  gbrain extract benchmark --pack <name> --kind <type> [--json]
-      Run a pack's fixture corpus through the extractor (v0.42 reports
-      fixture shape; LLM dispatch comes in v0.43+).
-
-Status (v0.42):
-  gbrain extract status [--source-id ID] [--kind X] [--verbose] [--json]
-      Per-kind 7-day rollup: cost, halt rate, eval pass/fail counts.`);
+    console.error(EXTRACT_HELP);
     process.exit(1);
   }
 
@@ -903,17 +1036,27 @@ Status (v0.42):
           result.pages_processed = r.pages;
         }
         if (subcommand === 'timeline' || subcommand === 'all') {
-          const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, { sourceIdFilter });
+          const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, { sourceIdFilter, inferDates });
           result.timeline_entries_created = r.created;
           result.pages_processed = Math.max(result.pages_processed, r.pages);
         }
       }
     } else {
+      // #1747: resolve the brain source id and thread it into the fs-walk
+      // extractors so batch rows carry from/to_source_id. Without this they
+      // default to 'default' and addLinksBatch's JOIN drops every row on a
+      // non-'default' brain → silent "created 0 from N pages". Resolution
+      // honors --source-id, then GBRAIN_SOURCE / .gbrain-source /
+      // registered-path / sole-non-default, mirroring the source-aware
+      // inline hooks (extractLinksForSlugs) that #1204 confirmed correct.
+      const { resolveSourceId } = await import('../core/source-resolver.ts');
+      const resolvedSourceId = await resolveSourceId(engine, sourceIdFilter, brainDir);
       result = await runExtractCore(engine, {
         mode: subcommand as 'links' | 'timeline' | 'all',
         dir: brainDir,
         dryRun,
         jsonMode,
+        sourceId: resolvedSourceId,
         workers,
       });
     }
@@ -953,6 +1096,13 @@ async function extractForSlugs(
   // shared counter increments atomic.
   workers: number = 1,
   signal?: AbortSignal,
+  // #1747/#1503: stamp resolved brain source id on batch rows (see ExtractOpts.sourceId).
+  sourceId?: string,
+  // v0.42: when true, also extract frontmatter links per changed page so
+  // externally-edited YAML (`sources:`/`related:`) stays fresh on the cycle.
+  // Default false preserves the body-only incremental behavior. Gated upstream
+  // by `autopilot.incremental_extract_include_frontmatter`.
+  includeFrontmatter: boolean = false,
 ): Promise<{ links_created: number; timeline_created: number; pages: number }> {
   // Build the full slug set for link resolution (fast: just readdir, no file reads)
   const allFiles = walkMarkdownFiles(brainDir);
@@ -967,6 +1117,10 @@ async function extractForSlugs(
   let linksCreated = 0;
   let timelineCreated = 0;
   let pagesProcessed = 0;
+  // #2636: successfully processed pages get their extraction watermark
+  // stamped after the final flush (mode 'all' only — a partial-mode run
+  // hasn't done the full extraction the watermark asserts).
+  const processedRefs: Array<{ slug: string; source_id: string }> = [];
 
   // Issue #972: read the basename flag once per extract run.
   const globalBasename = await isGlobalBasenameEnabled(engine);
@@ -1027,13 +1181,15 @@ async function extractForSlugs(
         const content = readFileSync(fullPath, 'utf-8');
 
         if (doLinks) {
-          const links = await extractLinksFromFile(content, relPath, allSlugs, { globalBasename });
+          const links = await extractLinksFromFile(content, relPath, allSlugs, { globalBasename, includeFrontmatter });
           for (const link of links) {
             if (dryRun) {
               if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
               linksCreated++;
             } else {
-              linkBatch.push(link);
+              linkBatch.push(sourceId
+                ? { ...link, from_source_id: sourceId, to_source_id: sourceId, origin_source_id: sourceId }
+                : link);
               if (linkBatch.length >= BATCH_SIZE) await flushLinks();
             }
           }
@@ -1046,13 +1202,14 @@ async function extractForSlugs(
               if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
               timelineCreated++;
             } else {
-              timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+              timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail, ...(sourceId ? { source_id: sourceId } : {}) });
               if (timelineBatch.length >= BATCH_SIZE) await flushTimeline();
             }
           }
         }
 
         pagesProcessed++;
+        if (!dryRun) processedRefs.push({ slug, source_id: sourceId ?? 'default' });
       } catch { /* skip unreadable */ }
       progress.tick(1);
     },
@@ -1060,6 +1217,13 @@ async function extractForSlugs(
 
   await flushLinks();
   await flushTimeline();
+  // #2636: the Dream cycle disables sync's inline extraction and routes
+  // changed slugs through this incremental path — without a stamp here,
+  // those pages never get links_extracted_at and stay permanently visible
+  // to `extract --stale` / doctor. Stamp only after BOTH batches flushed.
+  if (!dryRun && mode === 'all') {
+    await stampExtracted(engine, processedRefs);
+  }
   progress.finish();
 
   if (!jsonMode) {
@@ -1075,6 +1239,9 @@ async function extractLinksFromDir(
   // v0.41.15.0 (T7): in-process worker count. Default 1.
   workers: number = 1,
   signal?: AbortSignal,
+  // #1747/#1503: stamp resolved brain source id on batch rows so the
+  // addLinksBatch JOIN matches non-'default' source pages.
+  sourceId?: string,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
   const allSlugs = new Set(files.map(f => pathToSlug(f.relPath)));
@@ -1131,7 +1298,9 @@ async function extractLinksFromDir(
             if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
             created++;
           } else {
-            batch.push(link);
+            batch.push(sourceId
+              ? { ...link, from_source_id: sourceId, to_source_id: sourceId, origin_source_id: sourceId }
+              : link);
             if (batch.length >= BATCH_SIZE) await flush();
           }
         }
@@ -1154,6 +1323,9 @@ async function extractTimelineFromDir(
   // v0.41.15.0 (T7): in-process worker count. Default 1.
   workers: number = 1,
   signal?: AbortSignal,
+  // #1747/#1503: stamp resolved brain source id so addTimelineEntriesBatch
+  // matches non-'default' source pages.
+  sourceId?: string,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
 
@@ -1200,7 +1372,7 @@ async function extractTimelineFromDir(
             if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
             created++;
           } else {
-            batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+            batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail, ...(sourceId ? { source_id: sourceId } : {}) });
             if (batch.length >= BATCH_SIZE) await flush();
           }
         }
@@ -1347,6 +1519,8 @@ async function extractLinksFromDB(
     slugToSources.set(ref.slug, list);
   }
   let processed = 0, created = 0;
+  // #2576: skipped-candidate counter — see extractStaleFromDB's twin.
+  let skippedMissingTarget = 0;
   // v0.42.7 (#1696): pages whose links we extracted this run — stamped after
   // the loop so a manual `gbrain extract links|all --source db` clears the
   // links_extraction_lag doctor signal. Non-dry-run only.
@@ -1403,7 +1577,7 @@ async function extractLinksFromDB(
       // endpoint-validation + from/to source-id picking (null = skip: missing
       // endpoint OR target only in a non-origin/non-default source).
       const resolved = resolveCandidateSources(c, slug, source_id, allSlugs, slugToSources);
-      if (!resolved) continue;
+      if (!resolved) { skippedMissingTarget++; continue; }
       const { fromSlug, fromSourceId, toSourceId } = resolved;
 
       if (dryRunSeen) {
@@ -1460,6 +1634,9 @@ async function extractLinksFromDB(
   if (!jsonMode) {
     const label = dryRun ? '(dry run) would create' : 'created';
     console.log(`Links: ${label} ${created} from ${processed} pages (db source)`);
+    if (skippedMissingTarget > 0) {
+      console.log(`Skipped ${skippedMissingTarget} candidate(s) whose target page doesn't exist (references to non-pages are never persisted).`);
+    }
     if (includeFrontmatter && unresolved.length > 0) {
       // Top-20 preview of unresolvable frontmatter names so the user can
       // see where the graph has holes (codex tension 6.4).
@@ -1484,7 +1661,7 @@ async function extractTimelineFromDB(
   jsonMode: boolean,
   typeFilter: PageType | undefined,
   since: string | undefined,
-  opts?: { sourceIdFilter?: string },
+  opts?: { sourceIdFilter?: string; inferDates?: boolean },
 ): Promise<{ created: number; pages: number }> {
   // v0.32.8: listAllPageRefs enumerates (slug, source_id) pairs so we can
   // thread sourceId to getPage and addTimelineEntriesBatch. Pre-fix used
@@ -1493,6 +1670,7 @@ async function extractTimelineFromDB(
   // v0.37.7.0 #1204: when sourceIdFilter is set, scope the walk to one
   // source so federated brain users can extract per-source.
   const sourceIdFilter = opts?.sourceIdFilter;
+  const inferDates = opts?.inferDates ?? false;
   const allRefs = sourceIdFilter
     ? (await engine.listAllPageRefs()).filter(r => r.source_id === sourceIdFilter)
     : await engine.listAllPageRefs();
@@ -1532,7 +1710,19 @@ async function extractTimelineFromDB(
     }
 
     const fullContent = page.compiled_truth + '\n' + page.timeline;
-    const entries = parseTimelineEntries(fullContent);
+    let entries = parseTimelineEntries(fullContent);
+    // --infer-dates: pages with no in-body timeline line but a trustworthy
+    // content date (frontmatter / filename) get one anchor entry at that date.
+    // Applied ONLY on the zero-entry path so it never shadows a real timeline.
+    if (entries.length === 0 && inferDates) {
+      const anchor = deriveTimelineAnchor({
+        slug,
+        title: page.title,
+        effectiveDate: page.effective_date,
+        effectiveDateSource: page.effective_date_source,
+      });
+      if (anchor) entries = [anchor];
+    }
 
     for (const entry of entries) {
       if (dryRunSeen) {
@@ -1583,7 +1773,7 @@ async function extractTimelineFromDB(
  * make re-extraction idempotent). EVERY processed page is stamped, including
  * zero-link pages — they WERE processed.
  */
-async function extractStaleFromDB(
+export async function extractStaleFromDB(
   engine: BrainEngine,
   opts: {
     dryRun: boolean;
@@ -1592,7 +1782,7 @@ async function extractStaleFromDB(
     sourceIdFilter?: string;
     catchUp: boolean;
   },
-): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number }> {
+): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number; skippedMissingTarget?: number }> {
   const { dryRun, jsonMode, includeFrontmatter, sourceIdFilter, catchUp } = opts;
   const versionTs = LINK_EXTRACTOR_VERSION_TS;
 
@@ -1616,9 +1806,17 @@ async function extractStaleFromDB(
   // Batch mode = pg_trgm + exact only, NO per-name search fallback. The
   // resolution map sees ALL sources so qualified cross-source wikilinks resolve
   // even when --source-id scopes the stale SCAN.
-  const resolver = makeResolver(engine, { mode: 'batch' });
-  const nullResolver = { resolve: async () => null as string | null };
-  const activeResolver = includeFrontmatter ? resolver : nullResolver;
+  //
+  // #2576 bug 1: ALWAYS the real resolver — extractPageLinks's opts gate which
+  // pass runs (`skipFrontmatter` for the frontmatter pass, `globalBasename` for
+  // the issue-#972 bare-wikilink pass). The former `includeFrontmatter ?
+  // resolver : nullResolver` ternary predates #972; the synthetic resolver has
+  // no `resolveBasenameMatches`, so the --stale sweep silently skipped basename
+  // resolution even with `link_resolution.global_basename` enabled, stamping
+  // pages as extracted with their bare wikilinks dropped. Mirrors
+  // extractLinksFromDB (including the codex-[P1] `sourceId` scoping).
+  const resolver = makeResolver(engine, { mode: 'batch', sourceId: sourceIdFilter });
+  const globalBasename = await isGlobalBasenameEnabled(engine);
   const allRefs = await engine.listAllPageRefs();
   const allSlugs = new Set<string>();
   const slugToSources = new Map<string, string[]>();
@@ -1636,6 +1834,10 @@ async function extractStaleFromDB(
   let afterPageId = 0;
   let linksCreated = 0, timelineCreated = 0, pagesProcessed = 0;
   let budgetHit = false;
+  // #2576: candidates whose endpoint pages don't exist are skipped, not
+  // persisted. Counted so a dropped reference is observable in the summary
+  // instead of vanishing silently (the failure mode that hid bug 2).
+  let skippedMissingTarget = 0;
 
   for (;;) {
     const rows = await engine.listStalePagesForExtraction({
@@ -1650,11 +1852,12 @@ async function extractStaleFromDB(
     for (const page of rows) {
       const fullContent = page.compiled_truth + '\n' + page.timeline;
       const extracted = await extractPageLinks(
-        page.slug, fullContent, page.frontmatter, page.type, activeResolver,
+        page.slug, fullContent, page.frontmatter, page.type, resolver,
+        { skipFrontmatter: !includeFrontmatter, globalBasename },
       );
       for (const c of extracted.candidates) {
         const r = resolveCandidateSources(c, page.slug, page.source_id, allSlugs, slugToSources);
-        if (!r) continue;
+        if (!r) { skippedMissingTarget++; continue; }
         linkRows.push({
           from_slug: r.fromSlug, to_slug: c.targetSlug, link_type: c.linkType,
           context: c.context, link_source: c.linkSource, origin_slug: c.originSlug,
@@ -1675,7 +1878,18 @@ async function extractStaleFromDB(
       // `page.updated_at.toISOString()` — the JS Date is ms-truncated, so the
       // µs-precision DB updated_at stayed strictly greater and the page never
       // cleared on Postgres. Stamping the exact value makes them equal.
-      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: page.updated_at_iso });
+      //
+      // BUT the stamp must also clear the version-staleness clause
+      // (`links_extracted_at < versionTs`). A page whose updated_at predates
+      // versionTs would otherwise be stamped below the threshold and read as
+      // stale forever — a permanent re-extract loop that never clears the lag.
+      // GREATEST(updated_at, versionTs) preserves the race semantics (a real
+      // future edit advances updated_at > versionTs >= stamp → re-extracts)
+      // while lifting old pages to the threshold so they clear.
+      const stampIso = page.updated_at.getTime() >= Date.parse(versionTs)
+        ? page.updated_at_iso
+        : versionTs;
+      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: stampIso });
     }
 
     // Flush NON-swallowing (CDX-4): a throw here propagates out of the sweep so
@@ -1704,6 +1918,9 @@ async function extractStaleFromDB(
 
   if (!jsonMode) {
     console.log(`Extract --stale: ${linksCreated} link(s) + ${timelineCreated} timeline entr(ies) from ${pagesProcessed} page(s).`);
+    if (skippedMissingTarget > 0) {
+      console.log(`Skipped ${skippedMissingTarget} candidate(s) whose target page doesn't exist (references to non-pages are never persisted).`);
+    }
     if (budgetHit && staleRemaining > 0) {
       console.log(`Time budget reached — ${staleRemaining} page(s) still stale. Re-run 'gbrain extract --stale' (or pass --catch-up) to continue.`);
     }
@@ -1711,9 +1928,10 @@ async function extractStaleFromDB(
     process.stdout.write(JSON.stringify({
       action: 'extract_stale_done', links_created: linksCreated, timeline_created: timelineCreated,
       pages_processed: pagesProcessed, stale_remaining: staleRemaining, budget_hit: budgetHit,
+      skipped_missing_target: skippedMissingTarget,
     }) + '\n');
   }
-  return { linksCreated, timelineCreated, pagesProcessed, staleRemaining };
+  return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget };
 }
 
 /**

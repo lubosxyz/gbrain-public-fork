@@ -1,15 +1,24 @@
 # Install
 
-Three install paths. Pick one. Mix later if needed.
+**Recommended door: the agent bootstrap.** Open your agent (Codex, Claude Code,
+or any harness) in the folder that will become its home and paste the block
+from the [README's install section](../README.md) — the agent fetches
+`BOOTSTRAP_FOR_AGENTS.md` from the `latest-stable` tag, installs the CLI,
+initializes a local PGLite brain, wires MCP, and isn't done until
+`gbrain bootstrap verify` exits 0. Full contract, security posture, and
+uninstall: [docs/guides/bootstrap.md](guides/bootstrap.md).
 
-## 1. Run with an agent platform (recommended)
+The paths below are the manual equivalents and deep-dive detail. Pick one.
+Mix later if needed.
+
+## 1. Run with an agent platform
 
 Already running [OpenClaw](https://github.com/garrytan/openclaw) or [Hermes](https://github.com/garrytan/hermes)?
 
 ```bash
-bun install -g github:garrytan/gbrain
+bun install -g github:garrytan/gbrain#latest-stable
 gbrain init --pglite                  # 2 seconds; no server
-gbrain skillpack scaffold --all       # 43 skills scaffolded into your agent workspace
+gbrain skillpack scaffold --all       # scaffolds every bundled skill (skills/manifest.json) into your agent workspace
 gbrain doctor                         # green checks all the way down
 ```
 
@@ -24,7 +33,7 @@ To upgrade later: `gbrain upgrade` runs schema migrations + post-upgrade prompts
 No agent platform, just shell + MCP-aware editor.
 
 ```bash
-bun install -g github:garrytan/gbrain
+bun install -g github:garrytan/gbrain#latest-stable
 gbrain init --pglite
 ```
 
@@ -39,10 +48,11 @@ gbrain migrate --to pglite       # Postgres → PGLite (rare)
 
 For shared / large / multi-machine deployments (a team or company brain with multiple users hitting one server over HTTP MCP with OAuth scoping per user), follow the dedicated walkthrough: **[Tutorial: set up GBrain as your company brain](tutorials/company-brain.md)**.
 
-API keys live in `~/.gbrain/config.json` (file plane) or env vars (`OPENAI_API_KEY`, `ZEROENTROPY_API_KEY`, `VOYAGE_API_KEY`, `ANTHROPIC_API_KEY`). Set via CLI:
+API keys live in `~/.gbrain/config.json` (file plane) or env vars (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `ZEROENTROPY_API_KEY`, `VOYAGE_API_KEY`, `ANTHROPIC_API_KEY`). Set via CLI:
 
 ```bash
 gbrain config set zeroentropy_api_key sk-...
+gbrain config set openrouter_api_key sk-or-...
 gbrain config set anthropic_api_key sk-ant-...
 ```
 
@@ -57,16 +67,17 @@ gbrain autopilot --install        # background daemon for nightly enrichment
 **Wire this same local brain into your coding agent** — zero server, zero token:
 
 ```bash
-claude mcp add gbrain -- gbrain serve    # Claude Code
-codex  mcp add gbrain -- gbrain serve    # Codex
+claude mcp add gbrain -- gbrain serve --surface verbs    # Claude Code
+codex  mcp add gbrain -- gbrain serve --surface verbs    # Codex
 ```
 
-The agent spawns `gbrain serve` as a stdio subprocess against your local brain. Full walkthrough (both this local path and connecting to a remote brain), plus the brain-first protocol to paste into `CLAUDE.md` / `AGENTS.md`: **[Give your coding agent a memory](tutorials/connect-coding-agent.md)**.
+The agent spawns `gbrain serve` as a stdio subprocess against your local brain. `--surface verbs` gives the agent the seven-verb memory protocol (`recall`, `remember`, `entity`, `synthesize`, `forget`, `context_pack`, `delta` — [MEMORY_VERBS v1](protocol/MEMORY_VERBS_v1.md)) instead of the full tool catalog; `--surface starter` adds the daily-driver set on top of the verbs (~26 ops total); drop the flag (default `full`) for every operation. Full walkthrough (both this local path and connecting to a remote brain), plus the brain-first protocol to paste into `CLAUDE.md` / `AGENTS.md`: **[Give your coding agent a memory](tutorials/connect-coding-agent.md)**.
 
 ## 3. MCP server (any MCP client)
 
 ```bash
 gbrain serve                      # stdio MCP (Claude Desktop / Code / Cursor)
+gbrain serve --surface verbs      # stdio MCP, just the 7 memory verbs (quickstart)
 gbrain serve --http               # HTTP MCP with OAuth 2.1 + admin dashboard
 ```
 
@@ -105,9 +116,31 @@ Useful for: team mounts, brain-as-a-service deployments, dev machines without di
 ## Verifying the install
 
 ```bash
+gbrain bootstrap verify           # the whole install contract; exits non-zero on failure
 gbrain doctor --json              # full health check
 gbrain models                     # which AI models are configured for what
 gbrain models doctor              # 1-token probe per configured model
 ```
 
-If anything's yellow, `gbrain doctor` names the fix command in the message. Most issues are missing API keys or stale schema (`gbrain upgrade --force-schema`).
+If anything's yellow, `gbrain doctor` names the fix command in the message. Most issues are missing API keys or stale schema (`gbrain upgrade --force-schema`). For the manual check-by-check runbook, see [docs/GBRAIN_VERIFY.md](GBRAIN_VERIFY.md).
+
+## Troubleshooting
+
+### PGLite crashes at startup (`RuntimeError: Aborted()`)
+
+This crash (typically first seen after a macOS upgrade) is **not** a
+macOS/WASM incompatibility — an unclean shutdown tore the data dir's
+write-ahead log, and every subsequent open fails WAL replay. The short
+version of the recovery ladder:
+
+1. **Auto-repair (default):** run any gbrain command — gbrain detects the
+   abort, resets the WAL in place (data preserved, backup kept), and
+   continues. Then run `gbrain doctor`.
+2. **Manual repair:** `gbrain pglite-repair --dry-run`, then
+   `gbrain pglite-repair --yes`.
+3. **Rebuild:** `gbrain reinit-pglite`.
+4. **Switch engines:** Supabase or native Homebrew Postgres + pgvector.
+
+The full ladder — safety bounds, kill-switches, when WAL repair can't help,
+and the Homebrew Postgres recipe — lives in
+[docs/ENGINES.md](ENGINES.md#troubleshooting-startup-abort-runtimeerror-aborted).

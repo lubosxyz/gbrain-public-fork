@@ -14,7 +14,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'bun:test'
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { computeWedgedQueueCheck } from '../src/commands/doctor.ts';
+import { computeQueueHealthCheck, computeWedgedQueueCheck } from '../src/commands/doctor.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 let base: PGLiteEngine;
@@ -44,14 +44,42 @@ async function seed(
   queue: string,
   name: string,
   status: string,
-  extra: { lockUntilSql?: string; updatedAtSql?: string } = {},
+  extra: { lockUntilSql?: string; updatedAtSql?: string; createdAtSql?: string } = {},
 ): Promise<void> {
   await base.executeRaw(
-    `INSERT INTO minion_jobs (name, queue, status, lock_until, updated_at)
-     VALUES ($1, $2, $3, ${extra.lockUntilSql ?? 'NULL'}, ${extra.updatedAtSql ?? 'now()'})`,
+    `INSERT INTO minion_jobs (name, queue, status, lock_until, updated_at, created_at)
+     VALUES ($1, $2, $3, ${extra.lockUntilSql ?? 'NULL'}, ${extra.updatedAtSql ?? 'now()'}, ${extra.createdAtSql ?? 'now()'})`,
     [name, queue, status],
   );
 }
+
+describe('issue #2557 — queue_health catches deferred embed with no worker', () => {
+  it('warns when old embed-backfill jobs have no live worker for their queue', async () => {
+    await seed('default', 'embed-backfill', 'waiting', {
+      createdAtSql: "now() - interval '3 hours'",
+    });
+    const check = await computeQueueHealthCheck(pgLike, {
+      readWorkers: () => [],
+      oldWaitingHours: 1,
+    });
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('embed-backfill');
+    expect(check.message).toContain('no live worker');
+    expect(check.message).toContain('gbrain jobs work --queue default');
+  });
+
+  it('does not warn for old embed-backfill jobs when a worker is live on that queue', async () => {
+    await seed('default', 'embed-backfill', 'waiting', {
+      createdAtSql: "now() - interval '3 hours'",
+    });
+    const check = await computeQueueHealthCheck(pgLike, {
+      readWorkers: () => [{ queue: 'default' }],
+      oldWaitingHours: 1,
+    });
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('no old embed-backfill jobs without a worker');
+  });
+});
 
 describe('issue #1801 fix #3 — computeWedgedQueueCheck', () => {
   it('flags a wedged queue (waiting, 0 active_healthy, stale completion) as fail', async () => {
@@ -101,6 +129,44 @@ describe('issue #1801 fix #3 — computeWedgedQueueCheck', () => {
     const check = await computeWedgedQueueCheck(base as unknown as BrainEngine);
     expect(check.status).toBe('ok');
     expect(check.message).toContain('PGLite');
+  });
+});
+
+describe('Minions-visibility wave — computeQueueHealthCheck structured details', () => {
+  it('ok path carries {depth, oldest_age_seconds, worker_alive} (messages unchanged)', async () => {
+    const check = await computeQueueHealthCheck(pgLike, { readWorkers: () => [] });
+    expect(check.status).toBe('ok');
+    // Message text is pinned elsewhere by prose consumers — unchanged.
+    expect(check.message).toContain('No stalled-forever jobs');
+    // Empty queue: zero depth, null oldest age, vacuously worker_alive.
+    expect(check.details).toEqual({ depth: 0, oldest_age_seconds: null, worker_alive: true });
+  });
+
+  it('warn path reports total waiting depth + oldest age + worker_alive=false when a waiting queue has no worker', async () => {
+    await seed('default', 'embed-backfill', 'waiting', {
+      createdAtSql: "now() - interval '3 hours'",
+    });
+    await seed('default', 'embed', 'waiting', {
+      createdAtSql: "now() - interval '10 minutes'",
+    });
+    const check = await computeQueueHealthCheck(pgLike, {
+      readWorkers: () => [],
+      oldWaitingHours: 1,
+    });
+    expect(check.status).toBe('warn');
+    const d = check.details as { depth: number; oldest_age_seconds: number; worker_alive: boolean };
+    expect(d.depth).toBe(2);
+    expect(d.oldest_age_seconds).toBeGreaterThanOrEqual(3 * 3600 - 60);
+    expect(d.worker_alive).toBe(false);
+  });
+
+  it('worker_alive=true when every waiting queue has a live registered worker', async () => {
+    await seed('default', 'embed', 'waiting');
+    const check = await computeQueueHealthCheck(pgLike, {
+      readWorkers: () => [{ queue: 'default' }],
+    });
+    const d = check.details as { worker_alive: boolean };
+    expect(d.worker_alive).toBe(true);
   });
 });
 

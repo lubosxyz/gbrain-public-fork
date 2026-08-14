@@ -58,10 +58,19 @@ export const GET_RECENT_TRANSCRIPTS_DESCRIPTION =
 export const LIST_PAGES_DESCRIPTION =
   "List pages with optional filters. " +
   "For 'what's recent / what did I touch this week' questions, use list_pages " +
-  "with sort=updated_desc instead of semantic search.";
+  "with sort=updated_desc instead of semantic search. " +
+  "Default 50 rows; remote callers are capped at 100 (local CLI callers' explicit " +
+  "limits are honored). A result with exactly `limit` rows may be truncated. " +
+  "For exhaustive listing, page with sort=updated_asc + " +
+  "updated_after=<last row's updated_at> until a page returns fewer rows than the limit.";
 
 export const QUERY_DESCRIPTION =
   "Hybrid search with vector + keyword + multi-query expansion. " +
+  "Prefer `query` for concept / synonym / landscape questions ('all the X that " +
+  "do Y', 'the landscape of Z') — expansion recovers synonym- and " +
+  "outcome-phrased matches a single embedding misses. Still top-K: for " +
+  "exhaustive enumeration use list_pages; for exact known tokens `search` is " +
+  "cheaper (no expansion LLM call). " +
   "For personal/emotional questions ('what's going on with me', 'anything notable', " +
   "'how am I feeling'), prefer get_recent_salience, find_anomalies, or " +
   "get_recent_transcripts. Semantic search returns polished pages and misses " +
@@ -69,12 +78,19 @@ export const QUERY_DESCRIPTION =
   "mean impressive — they often mean difficult or emotionally charged.";
 
 export const SEARCH_DESCRIPTION =
-  "Keyword search using full-text search. For personal/emotional questions, " +
+  "Cheap hybrid search (vector + keyword + RRF) with no LLM expansion. " +
+  "Best for exact known tokens, names, and structured-field lookups. A populated " +
+  "result set is NOT proof of coverage — for concept / synonym / landscape " +
+  "questions use `query` (adds multi-query expansion); for exhaustive " +
+  "enumeration use list_pages pagination. " +
+  "For personal/emotional questions, " +
   "prefer get_recent_salience or find_anomalies — they surface activity bursts " +
   "without needing a search term. " +
   "For code-symbol questions (callers, callees, definitions, blast radius), use " +
   "code_callers / code_callees / code_def / code_refs instead — those return " +
-  "structural graph data, not text chunks.";
+  "structural graph data, not text chunks. " +
+  "For agent memory reads (saved facts + budget-packed retrieval), prefer the " +
+  "`recall` verb.";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // v0.32.6 — contradiction probe MCP surface (M3)

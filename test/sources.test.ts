@@ -6,7 +6,10 @@
  * shape, validation, and flag parsing.
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { mkdtempSync, mkdirSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { runSources } from '../src/commands/sources.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
@@ -158,6 +161,47 @@ describe('sources add', () => {
   });
 });
 
+// ── add — #2707 git-repo validation (CLI wiring) ───────────────
+//
+// Uses a REAL on-disk temp dir (unlike the fake-path tests above) so the
+// core addSource git check actually runs; the stub engine still fakes the
+// DB round-trip. Confirms --force parses through to opsAddSource.
+
+describe('sources add — #2707 --force flag wiring', () => {
+  let plainDir: string;
+
+  beforeEach(() => {
+    plainDir = mkdtempSync(join(tmpdir(), 'gbrain-sources-cli-2707-'));
+  });
+  afterEach(() => {
+    rmSync(plainDir, { recursive: true, force: true });
+  });
+
+  test('rejects a real non-git --path directory by default', async () => {
+    const { engine } = makeStub();
+    await expect(runSources(engine, ['add', 'cli-plain', '--path', plainDir]))
+      .rejects.toThrow(/not a git repository/);
+  });
+
+  test('--force registers the same directory anyway', async () => {
+    const { engine, calls } = makeStub({
+      'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at': [{
+        id: 'cli-forced',
+        name: 'cli-forced',
+        local_path: plainDir,
+        last_commit: null,
+        last_sync_at: null,
+        config: '{}',
+        created_at: new Date(),
+      }],
+    });
+    await runSources(engine, ['add', 'cli-forced', '--path', plainDir, '--force']);
+    const insert = calls.find(c => c.sql.includes('INSERT INTO sources'));
+    expect(insert).toBeDefined();
+    expect(insert!.params[2]).toBe(plainDir);
+  });
+});
+
 // ── list ────────────────────────────────────────────────────
 
 describe('sources list', () => {
@@ -171,6 +215,51 @@ describe('sources list', () => {
     await runSources(engine, ['list']);
     const select = calls.find(c => c.sql.includes('ORDER BY (id = \'default\') DESC'));
     expect(select).toBeDefined();
+  });
+
+  test('counts only visible pages', async () => {
+    const { engine, calls } = makeStub({
+      'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at': [
+        { id: 'default', name: 'default', local_path: null, last_commit: null, last_sync_at: null, config: '{"federated":true}', created_at: new Date() },
+      ],
+      'COUNT(*)::int AS n FROM pages': [{ n: 1 }],
+    });
+
+    await runSources(engine, ['list']);
+
+    const count = calls.find(c => c.sql.includes('COUNT(*)::int AS n FROM pages'));
+    expect(count?.sql).toContain('deleted_at IS NULL');
+  });
+
+  test('distinguishes explicit false / absent key / explicit true in the human-readable label', async () => {
+    const { engine } = makeStub({
+      'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at': [
+        { id: 'wiki', name: 'wiki', local_path: '/tmp/wiki', last_commit: null, last_sync_at: null, config: '{"federated":true}', created_at: new Date() },
+        { id: 'yc-media', name: 'yc-media', local_path: '/tmp/yc', last_commit: null, last_sync_at: null, config: '{"federated":false}', created_at: new Date() },
+        { id: 'gstack', name: 'gstack', local_path: '/tmp/gstack', last_commit: null, last_sync_at: null, config: '{}', created_at: new Date() },
+      ],
+      'COUNT(*)::int AS n FROM pages': [{ n: 0 }],
+    });
+    const lines: string[] = [];
+    const logSpy = spyOn(console, 'log').mockImplementation((...a: unknown[]) => { lines.push(a.map(String).join(' ')); });
+    try {
+      await runSources(engine, ['list']);
+    } finally {
+      logSpy.mockRestore();
+    }
+    const wikiLine = lines.find(l => l.includes('wiki'))!;
+    const ycLine = lines.find(l => l.includes('yc-media'))!;
+    const gstackLine = lines.find(l => l.includes('gstack'))!;
+    // Explicit `federated: true` — unchanged.
+    expect(wikiLine).toContain('federated');
+    // Explicit `federated: false` (`sources unfederate`) — fully isolated.
+    expect(ycLine).toContain('isolated');
+    // Absent key (bare `sources add`, config={}) is NOT the same as explicit
+    // false: it doesn't appear in others' federated reads, but its own
+    // unqualified reads still widen outward (#1434/#2561/#2928). The label
+    // must say something other than "isolated", which overstates it.
+    expect(gstackLine).not.toContain('isolated');
+    expect(gstackLine).toContain('unset');
   });
 });
 

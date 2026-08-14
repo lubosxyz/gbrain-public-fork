@@ -139,6 +139,156 @@ describe('client registration', () => {
       sql`INSERT INTO oauth_clients (client_id, client_name, scope) VALUES (${clientId}, ${'dup'}, ${'read'})`,
     ).rejects.toThrow();
   });
+
+  test('registerClientManual persists submit_agent bindings when supplied', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'bound-agent', ['client_credentials'], 'read agent', [], 'default', undefined, undefined, {
+        boundTools: ['search', 'get_page'],
+        boundSourceId: 'dept-x',
+        boundBrainId: 'brain-a',
+        boundSlugPrefixes: ['wiki/agents/bound-agent/'],
+        boundMaxConcurrent: 2,
+        budgetUsdPerDay: '7.50',
+      },
+    );
+
+    const rows = await sql`
+      SELECT bound_tools, bound_source_id, bound_brain_id, bound_slug_prefixes,
+             bound_max_concurrent, budget_usd_per_day::text AS budget
+        FROM oauth_clients WHERE client_id = ${clientId}
+    `;
+    expect(rows[0].bound_tools).toEqual(['search', 'get_page']);
+    expect(rows[0].bound_source_id).toBe('dept-x');
+    expect(rows[0].bound_brain_id).toBe('brain-a');
+    expect(rows[0].bound_slug_prefixes).toEqual(['wiki/agents/bound-agent/']);
+    expect(Number(rows[0].bound_max_concurrent)).toBe(2);
+    expect(rows[0].budget).toBe('7.50');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rescopeClient (#1914) — admin-gated rescope of a DCR-defaulted client
+// ---------------------------------------------------------------------------
+
+describe('rescopeClient', () => {
+  beforeAll(async () => {
+    // oauth_clients.source_id has FK → sources(id); create the targets.
+    for (const id of ['wiki', 'essays', 'alpha', 'gamma']) {
+      await sql`INSERT INTO sources (id, name) VALUES (${id}, ${id}) ON CONFLICT (id) DO NOTHING`;
+    }
+  });
+
+  test('DCR client stuck on default gets rescoped; existing tokens pick it up', async () => {
+    // Simulate the DCR path: self-registered client lands with
+    // source_id='default', federated_read=['default']. client_credentials
+    // over DCR needs the explicit --enable-dcr-insecure opt-in, so build a
+    // provider with that flag just for this registration.
+    const dcrProvider = new GBrainOAuthProvider({ sql, tokenTtl: 60, allowClientCredentialsDcr: true });
+    const dcr = await dcrProvider.clientsStore.registerClient!({
+      client_name: 'dcr-stuck-client',
+      redirect_uris: [],
+      grant_types: ['client_credentials'],
+      scope: 'read',
+      token_endpoint_auth_method: 'client_secret_post',
+    } as any);
+    const clientId = dcr.client_id;
+    const [before] = await sql`SELECT source_id, federated_read FROM oauth_clients WHERE client_id = ${clientId}`;
+    expect(before.source_id).toBe('default');
+    expect(before.federated_read).toEqual(['default']);
+
+    // Issue a token BEFORE the rescope — it must see the new scope after.
+    const tokens = await provider.exchangeClientCredentials(clientId, dcr.client_secret!, 'read');
+
+    const result = await provider.rescopeClient(clientId, {
+      sourceId: 'wiki',
+      federatedRead: ['wiki', 'essays'],
+    });
+    expect(result.sourceId).toBe('wiki');
+    expect(result.federatedRead).toEqual(['wiki', 'essays']);
+
+    const authInfo = await provider.verifyAccessToken(tokens.access_token) as unknown as CoreAuthInfo;
+    expect(authInfo.sourceId).toBe('wiki');
+    expect(authInfo.allowedSources).toEqual(['wiki', 'essays']);
+  });
+
+  test('partial rescope leaves the other axis untouched', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'partial-rescope', ['client_credentials'], 'read', [], 'alpha', ['alpha', 'beta'],
+    );
+    const result = await provider.rescopeClient(clientId, { federatedRead: ['beta'] });
+    expect(result.sourceId).toBe('alpha'); // untouched
+    expect(result.federatedRead).toEqual(['beta']);
+
+    const result2 = await provider.rescopeClient(clientId, { sourceId: 'gamma' });
+    expect(result2.sourceId).toBe('gamma');
+    expect(result2.federatedRead).toEqual(['beta']); // untouched
+  });
+
+  test('rejects invalid source ids, empty federated list, no-op calls, unknown client', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'rescope-validation', ['client_credentials'], 'read',
+    );
+    await expect(provider.rescopeClient(clientId, { sourceId: '../etc' })).rejects.toThrow('Invalid source_id');
+    await expect(provider.rescopeClient(clientId, { federatedRead: ['ok', 'Not Valid!'] })).rejects.toThrow('Invalid source_id');
+    await expect(provider.rescopeClient(clientId, { federatedRead: [] })).rejects.toThrow('cannot be empty');
+    await expect(provider.rescopeClient(clientId, {})).rejects.toThrow('requires --source, --federated-read, --bound-slug-prefixes, and/or --surface');
+    // v0.42.70.0: an explicit empty prefix list is ambiguous (deny-all) — rejected.
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: [] })).rejects.toThrow('cannot be an empty list');
+    // An empty/whitespace ENTRY matches every slug under startsWith — it would
+    // look like a binding while fencing nothing. Rejected at every write surface.
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: [''] })).rejects.toThrow('non-empty');
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: ['ok/', '  '] })).rejects.toThrow('non-empty');
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: [' ok/'] })).rejects.toThrow('whitespace');
+    // A boundary-less entry reads as a character prefix, so it would silently
+    // cover sibling namespaces (emp-alice -> emp-alice-2/...).
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: ['emp-alice'] })).rejects.toThrow('must end with');
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: ['emp-alice/', 'chan-eng'] })).rejects.toThrow('must end with');
+    await expect(provider.registerClientManual(
+      'empty-prefix-reject', ['client_credentials'], 'read write', [], 'default', undefined, undefined,
+      { boundSlugPrefixes: [''] },
+    )).rejects.toThrow('non-empty');
+    await expect(provider.rescopeClient('gbrain_cl_nonexistent', { sourceId: 'wiki' })).rejects.toThrow('No OAuth client found');
+    // FK: write source must exist in sources(id).
+    await expect(provider.rescopeClient(clientId, { sourceId: 'no-such-source' })).rejects.toThrow('does not exist');
+
+    // Validation failures must not have mutated the row.
+    const [row] = await sql`SELECT source_id FROM oauth_clients WHERE client_id = ${clientId}`;
+    expect(row.source_id).toBe('default');
+  });
+
+  // v0.42.70.0: bound_slug_prefixes rescope — roster churn (channel
+  // joins/leaves) updates the write fence in place; 'none' (null) clears it.
+  test('bound_slug_prefixes: replace, leave-untouched, and clear; live tokens pick it up', async () => {
+    const { clientId, clientSecret } = await provider.registerClientManual(
+      'rescope-fence', ['client_credentials'], 'read write', [], 'default', undefined, undefined, {
+        boundSlugPrefixes: ['emp-carol/'],
+      },
+    );
+    const tokens = await provider.exchangeClientCredentials(clientId, clientSecret!, 'read write');
+
+    // Replace the binding (carol joins chan-eng).
+    const replaced = await provider.rescopeClient(clientId, { boundSlugPrefixes: ['emp-carol/', 'chan-eng/'] });
+    expect(replaced.boundSlugPrefixes).toEqual(['emp-carol/', 'chan-eng/']);
+    expect(replaced.sourceId).toBe('default'); // untouched
+
+    // The already-issued token sees the new binding on next verification.
+    const live = await provider.verifyAccessToken(tokens.access_token) as unknown as CoreAuthInfo;
+    expect(live.boundSlugPrefixes).toEqual(['emp-carol/', 'chan-eng/']);
+
+    // Rescoping another axis leaves the binding untouched — and doesn't even
+    // name the column, so brains predating it can still rescope --source.
+    // `undefined` here means "not read this call", distinct from null = unset.
+    const other = await provider.rescopeClient(clientId, { federatedRead: ['alpha'] });
+    expect(other.boundSlugPrefixes).toBeUndefined();
+    const stillBound = await provider.verifyAccessToken(tokens.access_token) as unknown as CoreAuthInfo;
+    expect(stillBound.boundSlugPrefixes).toEqual(['emp-carol/', 'chan-eng/']);
+
+    // null clears it — client returns to unbound full-source write authority.
+    const cleared = await provider.rescopeClient(clientId, { boundSlugPrefixes: null });
+    expect(cleared.boundSlugPrefixes).toBeNull();
+    const unfenced = await provider.verifyAccessToken(tokens.access_token) as unknown as CoreAuthInfo;
+    expect(unfenced.boundSlugPrefixes).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -208,6 +358,27 @@ describe('verifyAccessToken', () => {
     expect(authInfo.clientId).toBe(clientId);
     expect(authInfo.scopes).toContain('read');
     expect(authInfo.token).toBe(tokens.access_token);
+  });
+
+  // v0.42.70.0: bound_slug_prefixes threads through token verification on
+  // the same JOIN as source_id/federated_read, so enforceClientSlugFence
+  // can fence direct writes without a per-op DB lookup.
+  test('bound_slug_prefixes threads into AuthInfo; absent binding stays undefined', async () => {
+    const bound = await provider.registerClientManual(
+      'fence-thread-test', ['client_credentials'], 'read write', [], 'default', undefined, undefined, {
+        boundSlugPrefixes: ['chan-eng/', 'wiki/agents/fence-thread-test/'],
+      },
+    );
+    const boundTokens = await provider.exchangeClientCredentials(bound.clientId, bound.clientSecret!, 'read write');
+    const boundInfo = await provider.verifyAccessToken(boundTokens.access_token) as unknown as CoreAuthInfo;
+    expect(boundInfo.boundSlugPrefixes).toEqual(['chan-eng/', 'wiki/agents/fence-thread-test/']);
+
+    const unbound = await provider.registerClientManual(
+      'fence-unbound-test', ['client_credentials'], 'read write',
+    );
+    const unboundTokens = await provider.exchangeClientCredentials(unbound.clientId, unbound.clientSecret!, 'read write');
+    const unboundInfo = await provider.verifyAccessToken(unboundTokens.access_token) as unknown as CoreAuthInfo;
+    expect(unboundInfo.boundSlugPrefixes).toBeUndefined();
   });
 
   test('expired token is rejected', async () => {
@@ -337,6 +508,84 @@ describe('verifyAccessToken', () => {
     expect(authInfo.clientId).toBe('legacy-federated-agent');
     expect(authInfo.sourceId).toBe('default');
     expect(authInfo.allowedSources).toEqual(['default', 'src-a', 'src-b']);
+  });
+
+  // -------------------------------------------------------------------------
+  // #2529 — legacy access_tokens fallback threads permissions.takes_holders
+  // into AuthInfo.takesHoldersAllowList. Each test adds the v29 permissions
+  // column idempotently and inserts `permissions` EXPLICITLY: the column's
+  // NOT NULL DEFAULT is '{"takes_holders":["world"]}', so relying on the
+  // default would silently turn an "absent key" case into a ['world'] case.
+  // -------------------------------------------------------------------------
+
+  async function insertLegacyTokenWithPermissions(
+    name: string,
+    permissions: Record<string, unknown> | undefined,
+  ): Promise<string> {
+    await sql`
+      ALTER TABLE access_tokens
+        ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{"takes_holders":["world"]}'::jsonb
+    `;
+    const token = generateToken('gbrain_');
+    const hash = hashToken(token);
+    if (permissions === undefined) {
+      await sql`
+        INSERT INTO access_tokens (id, name, token_hash)
+        VALUES (${crypto.randomUUID()}, ${name}, ${hash})
+      `;
+    } else {
+      await sql`
+        INSERT INTO access_tokens (id, name, token_hash, permissions)
+        VALUES (${crypto.randomUUID()}, ${name}, ${hash}, ${JSON.stringify(permissions)}::jsonb)
+      `;
+    }
+    return token;
+  }
+
+  test('legacy token with takes_holders grant → takesHoldersAllowList threaded (#2529)', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-grant-agent', { takes_holders: ['world', 'brain'] });
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toEqual(['world', 'brain']);
+  });
+
+  test('legacy token with no takes_holders key → undefined (consumer defaults to world)', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-absent-agent', {});
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toBeUndefined();
+  });
+
+  test('legacy token with non-array takes_holders → undefined (fail-closed at consumer)', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-garbage-agent', { takes_holders: 'world' });
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toBeUndefined();
+  });
+
+  test('legacy token with empty-array takes_holders → [] preserved as explicit deny-all', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-denyall-agent', { takes_holders: [] });
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toBeDefined();
+    expect(authInfo.takesHoldersAllowList).toEqual([]);
+  });
+
+  test('legacy token with mixed-type takes_holders → non-string entries filtered', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-mixed-agent', { takes_holders: ['world', 42, null] });
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toEqual(['world']);
+  });
+
+  test('OAuth-client token → takesHoldersAllowList undefined (no per-client storage; fail-closed)', async () => {
+    const { clientId, clientSecret } = await provider.registerClientManual(
+      'takes-oauth-client', ['client_credentials'], 'read',
+    );
+    const tokens = await provider.exchangeClientCredentials(clientId, clientSecret!, 'read');
+    const authInfo = await provider.verifyAccessToken(tokens.access_token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toBeUndefined();
+  });
+
+  test('legacy token relying on the v29 column default → ["world"] (fix invisible to unrestricted tokens)', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-default-agent', undefined);
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toEqual(['world']);
   });
 });
 
@@ -645,13 +894,27 @@ describe('operation scope annotations', () => {
     }
   });
 
-  test('mutating operations are write/admin/sources_admin/users_admin/agent scoped', () => {
+  test('mutating operations are write/admin/sources_admin/users_admin/agent scoped unless remote-gated', () => {
     const { operations } = require('../src/core/operations.ts');
+    // #2598, same allowlist as test/operations-trust-boundary.test.ts: think
+    // is read-scoped for OAuth/MCP because its handler forces save/take off
+    // for remote callers before persistence (pinned by
+    // test/takes-mcp-allowlist.serial.test.ts); local CLI can still persist.
+    // WP4/D9: request_tools is read-scoped + mutating — its only write (the
+    // {surface} persist branch) self-enforces the D2 ceiling, the operator
+    // lock, and a per-client rate limit; the read scope keeps discovery
+    // available to every token class (agent scope via the FOV-4 carve-out).
+    const remoteReadOnlyMutatingOps = new Set(['think', 'request_tools']);
     for (const op of operations) {
       if (op.mutating) {
+        if (remoteReadOnlyMutatingOps.has(op.name)) {
+          expect(op.scope, `${op.name} remote-gated mutating op should be read-scoped`).toBe('read');
+          continue;
+        }
         // v0.28: sources_admin permits sources_add / sources_remove (mutating
         // sources, not pages); read scope is the only thing too narrow for
-        // any mutating op. v0.38: 'agent' is a mutating-axis scope for
+        // a mutating op unless its remote path forces persistence off before
+        // the handler writes. v0.38: 'agent' is a mutating-axis scope for
         // submit_agent (creates jobs, spends money, but contained by bindings).
         expect(
           ['write', 'admin', 'sources_admin', 'users_admin', 'agent'],

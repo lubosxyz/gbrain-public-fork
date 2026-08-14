@@ -30,11 +30,15 @@ import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../
 import { withEnv } from './helpers/with-env.ts';
 
 // ─────────────────────────────────────────────────────────────────────
-// Lane A.7 — Chunk-row INSERT model default tracks defaults.ts constant
-// (not stale OpenAI literal). Pre-fix `chunk.model || 'text-embedding-3-large'`
-// in both engines; post-fix `chunk.model || DEFAULT_EMBEDDING_MODEL`.
+// Lane A.7 — Chunk-row INSERT model default tracks the gateway-resolved
+// model (not a stale OpenAI literal, not the compile-time constant).
+// Pre-fix `chunk.model || 'text-embedding-3-large'` in both engines;
+// v0.37 fix `chunk.model || DEFAULT_EMBEDDING_MODEL`; #2846 tightened it
+// to the gateway's runtime model so provenance matches the vector's
+// actual producer (falls back to DEFAULT_EMBEDDING_MODEL only when the
+// gateway is unconfigured).
 // ─────────────────────────────────────────────────────────────────────
-describe('Lane A.7 — chunk-row INSERT default tracks ai/defaults.ts constant', () => {
+describe('Lane A.7 — chunk-row INSERT default tracks the gateway-resolved model', () => {
   let engine: PGLiteEngine;
 
   beforeAll(async () => {
@@ -47,8 +51,11 @@ describe('Lane A.7 — chunk-row INSERT default tracks ai/defaults.ts constant',
     await engine.disconnect();
   });
 
-  test('upsertChunks without explicit model: row stores DEFAULT_EMBEDDING_MODEL', async () => {
-    const { DEFAULT_EMBEDDING_MODEL } = await import('../src/core/ai/defaults.ts');
+  test('upsertChunks without explicit model: row stores the gateway-resolved model', async () => {
+    // The test preload (test/helpers/legacy-embedding-preload.ts) pins the
+    // gateway to 'openai:text-embedding-3-large', so that's what the write
+    // site must stamp — NOT the compile-time DEFAULT_EMBEDDING_MODEL (#2846).
+    const { getEmbeddingModel } = await import('../src/core/ai/gateway.ts');
     await engine.putPage('test/a7', { type: 'note', title: 'A.7', compiled_truth: 'hello' });
     await engine.upsertChunks('test/a7', [
       { chunk_index: 0, chunk_text: 'hello', chunk_source: 'compiled_truth' },
@@ -57,9 +64,9 @@ describe('Lane A.7 — chunk-row INSERT default tracks ai/defaults.ts constant',
     const rows = await engine.executeRaw<{ model: string }>(
       `SELECT model FROM content_chunks WHERE chunk_index = 0 LIMIT 1`,
     );
-    expect(rows[0]?.model).toBe(DEFAULT_EMBEDDING_MODEL);
+    expect(rows[0]?.model).toBe(getEmbeddingModel());
     // CDX2-4 regression: would have been 'text-embedding-3-large'
-    // (a literal pre-fix; production write site that was never tested).
+    // (a bare literal pre-fix; provider-prefixed form is required).
     expect(rows[0]?.model).not.toBe('text-embedding-3-large');
   });
 });
@@ -417,20 +424,151 @@ describe('reinit-pglite — backup + reinit', () => {
     expect(exits).toContain(1);
   });
 
-  test('refuses when missing required --embedding-model / --embedding-dimensions', async () => {
+  // ── Flag defaulting from the config FILE (eng-review 6A + codex 14.10) ──
+  // Omitted --embedding-model / --embedding-dimensions default from
+  // loadConfigFileOnly() (NOT loadConfig(): a transient outage-shell
+  // GBRAIN_EMBEDDING_* export must not silently change the rebuild target).
+  // Precedence: explicit flag > config-file value > missing_model/missing_dims.
+
+  /**
+   * Run runReinitPglite with process.exit stubbed (same throw-on-exit
+   * pattern as the tests above) and console.log/console.error captured,
+   * so the plan output + defaulting notes are assertable.
+   */
+  async function captureRun(args: string[]): Promise<{ exits: number[]; logs: string[]; errs: string[] }> {
     const { runReinitPglite } = await import('../src/commands/reinit-pglite.ts');
     const origExit = process.exit;
+    const origLog = console.log;
+    const origErr = console.error;
     const exits: number[] = [];
+    const logs: string[] = [];
+    const errs: string[] = [];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (process as any).exit = ((code?: number) => { exits.push(code ?? 0); throw new Error('exit:' + (code ?? 0)); });
+    console.log = (...a: unknown[]) => { logs.push(a.map(String).join(' ')); };
+    console.error = (...a: unknown[]) => { errs.push(a.map(String).join(' ')); };
     try {
-      await runReinitPglite(['--json']);
+      await runReinitPglite(args);
     } catch (e) {
       expect((e as Error).message).toMatch(/^exit:/);
     } finally {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (process as any).exit = origExit;
+      console.log = origLog;
+      console.error = origErr;
     }
+    return { exits, logs, errs };
+  }
+
+  test('no flags: defaults BOTH from the config file', async () => {
+    // Sentinel: pre-create the .bak so the run halts at bak_exists AFTER
+    // parseArgs + the plan print — proving the defaulting resolved from
+    // the file without invoking the real (destructive) init+sync path.
+    writeFileSync(join(tmpHome, '.gbrain', 'brain.pglite.bak'), 'sentinel');
+
+    const { exits, logs, errs } = await captureRun(['--yes']);
+
+    // Halted at the sentinel — parseArgs did NOT fail missing_model/missing_dims.
     expect(exits).toContain(1);
+    const err = errs.join('\n');
+    expect(err).toContain('Backup already exists');
+    // The plan shows the config-file values.
+    const out = logs.join('\n');
+    expect(out).toContain('New embedding model: openai:text-embedding-3-large');
+    expect(out).toMatch(/New dimensions:\s+1536/);
+    // One stderr note per defaulted flag.
+    expect(err).toContain('--embedding-model defaulted from config: openai:text-embedding-3-large');
+    expect(err).toContain('--embedding-dimensions defaulted from config: 1536');
+  });
+
+  test('no flags + config missing the values: still fails missing_model / missing_dims', async () => {
+    const cfgPath = join(tmpHome, '.gbrain', 'config.json');
+
+    // Neither value in the file → missing_model (checked first).
+    writeFileSync(cfgPath, JSON.stringify({
+      engine: 'pglite',
+      database_path: join(tmpHome, '.gbrain', 'brain.pglite'),
+    }));
+    const noModel = await captureRun(['--json']);
+    expect(noModel.exits).toContain(1);
+    const noModelPayload = JSON.parse(noModel.logs[noModel.logs.length - 1]);
+    expect(noModelPayload.status).toBe('error');
+    expect(noModelPayload.reason).toBe('missing_model');
+
+    // Model present but no dimensions → missing_dims.
+    writeFileSync(cfgPath, JSON.stringify({
+      engine: 'pglite',
+      database_path: join(tmpHome, '.gbrain', 'brain.pglite'),
+      embedding_model: 'openai:text-embedding-3-large',
+    }));
+    const noDims = await captureRun(['--json']);
+    expect(noDims.exits).toContain(1);
+    const noDimsPayload = JSON.parse(noDims.logs[noDims.logs.length - 1]);
+    expect(noDimsPayload.reason).toBe('missing_dims');
+  });
+
+  test('flag present but valueless still fails missing_model (no silent config fallback)', async () => {
+    // A malformed explicit flag is a typo, not an omission — it must not
+    // silently rebuild against whatever the config file happens to hold.
+    const { exits, logs } = await captureRun(['--json', '--embedding-model']);
+    expect(exits).toContain(1);
+    const payload = JSON.parse(logs[logs.length - 1]);
+    expect(payload.reason).toBe('missing_model');
+  });
+
+  test('explicit flags win over config-file values', async () => {
+    writeFileSync(join(tmpHome, '.gbrain', 'brain.pglite.bak'), 'sentinel');
+
+    const { exits, logs, errs } = await captureRun([
+      '--embedding-model', 'zeroentropyai:zembed-1',
+      '--embedding-dimensions', '1280',
+      '--yes',
+    ]);
+
+    expect(exits).toContain(1); // bak_exists sentinel
+    const out = logs.join('\n');
+    expect(out).toContain('New embedding model: zeroentropyai:zembed-1');
+    expect(out).toMatch(/New dimensions:\s+1280/);
+    expect(out).not.toContain('openai:text-embedding-3-large');
+    // No defaulting note when both values came from flags.
+    expect(errs.join('\n')).not.toContain('defaulted from config');
+  });
+
+  test('env poisoning: GBRAIN_EMBEDDING_* env is ignored — config FILE values win', async () => {
+    writeFileSync(join(tmpHome, '.gbrain', 'brain.pglite.bak'), 'sentinel');
+
+    await withEnv({
+      GBRAIN_EMBEDDING_MODEL: 'voyage:poisoned-model',
+      GBRAIN_EMBEDDING_DIMENSIONS: '9999',
+    }, async () => {
+      const { exits, logs, errs } = await captureRun(['--yes']);
+
+      expect(exits).toContain(1); // bak_exists sentinel
+      const out = logs.join('\n');
+      expect(out).toContain('New embedding model: openai:text-embedding-3-large');
+      expect(out).toMatch(/New dimensions:\s+1536/);
+      expect(out).not.toContain('voyage:poisoned-model');
+      // Scoped to the plan line — the tmpdir's random suffix in the path
+      // lines could otherwise collide with a bare '9999' substring check.
+      expect(out).not.toMatch(/New dimensions:\s+9999/);
+      const err = errs.join('\n');
+      expect(err).toContain('--embedding-model defaulted from config: openai:text-embedding-3-large');
+      expect(err).toContain('--embedding-dimensions defaulted from config: 1536');
+    });
+  });
+
+  test('invalid_dims validation applies to the config-sourced value too', async () => {
+    const cfgPath = join(tmpHome, '.gbrain', 'config.json');
+    writeFileSync(cfgPath, JSON.stringify({
+      engine: 'pglite',
+      database_path: join(tmpHome, '.gbrain', 'brain.pglite'),
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: -5,
+    }));
+
+    const { exits, logs } = await captureRun(['--json']);
+    expect(exits).toContain(1);
+    const payload = JSON.parse(logs[logs.length - 1]);
+    expect(payload.reason).toBe('invalid_dims');
   });
 });

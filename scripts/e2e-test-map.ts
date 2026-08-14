@@ -34,6 +34,12 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/openclaw-context-engine-plugin.test.ts",
     "test/e2e/openclaw-plugin-load-real.test.ts",
   ],
+  // claw-test harness (command + core: runners, scenarios, seeding, friction
+  // merge) feeds the scripted + shim-live E2E. The hermes door
+  // (install-real-hermes.serial.test.ts) is deliberately NOT mapped — it is
+  // opt-in-gated (GBRAIN_REAL_HERMES_E2E) and self-skips in run-all anyway.
+  "src/commands/claw-test.ts": ["test/e2e/claw-test.test.ts"],
+  "src/core/claw-test/**": ["test/e2e/claw-test.test.ts"],
   // dream.ts is a thin alias over runCycle in cycle.ts.
   "src/core/cycle.ts": ["test/e2e/cycle.test.ts", "test/e2e/dream.test.ts"],
   // Multi-source sync writes share the per-source bookmark anchor.
@@ -42,8 +48,19 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   // phase, extract, integrity, embed, or migrate-engine change.
   "src/core/cycle/extract-takes.ts": ["test/e2e/multi-source-bug-class.test.ts"],
   "src/core/cycle/patterns.ts": ["test/e2e/multi-source-bug-class.test.ts"],
-  "src/core/cycle/synthesize.ts": ["test/e2e/multi-source-bug-class.test.ts"],
-  "src/commands/embed.ts": ["test/e2e/multi-source-bug-class.test.ts"],
+  "src/core/cycle/synthesize.ts": [
+    "test/e2e/multi-source-bug-class.test.ts",
+    "test/e2e/synthesize-bigint-job-id-postgres.test.ts",
+  ],
+  "src/commands/embed.ts": [
+    "test/e2e/multi-source-bug-class.test.ts",
+    // #3391: the NULL-signature stale predicates differ per engine.
+    "test/e2e/migrate-embeddings-postgres.test.ts",
+  ],
+  // #3390: runSchemaTransition's DDL path + the stale predicates behave
+  // differently on real pgvector than on PGLite.
+  "src/core/embedding-migration.ts": ["test/e2e/migrate-embeddings-postgres.test.ts"],
+  "src/core/retrieval-upgrade-planner.ts": ["test/e2e/migrate-embeddings-postgres.test.ts"],
   "src/commands/extract.ts": ["test/e2e/multi-source-bug-class.test.ts"],
   "src/commands/migrate-engine.ts": ["test/e2e/multi-source-bug-class.test.ts"],
   // Any minions queue/worker/handler change exercises all minion E2E.
@@ -61,6 +78,8 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/jsonb-roundtrip.test.ts",
     "test/e2e/engine-parity.test.ts",
     "test/e2e/schema-drift.test.ts",
+    // #3391: includeNullSignature stale predicates (engine parity).
+    "test/e2e/migrate-embeddings-postgres.test.ts",
   ],
   // PGLite bootstrap path + parity guard.
   "src/core/pglite-engine.ts": [

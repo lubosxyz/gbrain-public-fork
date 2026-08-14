@@ -11,31 +11,57 @@
  *   1. Reads the markdown body (DB-side fetch via engine.getPage).
  *   2. Parses the `## Facts` fence with parseFactsFence.
  *   3. Maps ParsedFact → FenceExtractedFact via extractFactsFromFenceText.
- *   4. Wipes the page's DB index via deleteFactsForPage.
- *   5. Re-inserts via engine.insertFacts batch.
+ *   4. De-dupes rows by canonical (claim, source) content key.
+ *   5. Reconciles the page-scoped DB index: no-op when already in sync,
+ *      insert only missing keys when possible, or wipe/reinsert when stale
+ *      DB rows need cleanup (#1781 — the unconditional wipe-and-reinsert
+ *      made every cycle non-idempotent, re-appending duplicate rows).
  *
- * After the phase, the DB index for every affected page byte-matches
- * the fence (modulo embeddings + runtime-derived fields). Pages with
- * no fence go through delete-then-empty-insert — DB rows for that
- * page coordinate are wiped; legacy NULL-source_markdown_slug rows
- * survive because deleteFactsForPage targets source_markdown_slug =
- * slug only.
+ * After the phase, the DB index for every cleanly parsed affected page
+ * matches the fence's canonical (claim, source) row set (modulo embeddings
+ * + runtime-derived fields). Warning-bearing parses are non-authoritative
+ * and preserve that page's existing index. Pages with no fence wipe DB rows
+ * for that page coordinate only; legacy NULL-source_markdown_slug rows
+ * survive because deleteFactsForPage targets source_markdown_slug = slug only.
  *
- * Empty-fence guard (Codex R2-#7): the phase refuses to do its
- * destructive reconciliation pass when legacy rows (row_num IS NULL,
- * entity_slug IS NOT NULL) still exist in the brain — they're the
- * v0.31 hot-memory facts pending the v0_32_2 backfill. Status returns
- * `warn` with a hint to run `gbrain apply-migrations --yes`. Without
- * the guard, an interrupted upgrade where v0_32_2 hasn't run could
- * leave the cycle silently misreporting "0 facts on people/alice"
- * while legacy rows linger in the DB.
+ * Empty-fence guard (Codex R2-#7; #2484; #2646): the phase refuses to do
+ * its destructive reconciliation pass when genuinely-backfillable legacy
+ * rows still exist — in THIS run's source only (`source_id = sourceId`;
+ * a pending row in source A must not jam extraction for source B — the
+ * source-isolation invariant) — `row_num IS NULL` (never fenced) AND
+ * `entity_slug` resolves to a live page in this source (so the v0_32_2
+ * migration's Phase B could fence them) AND the row is not soft-expired
+ * (`expired_at IS NULL`). Status returns `warn` with a hint to re-run
+ * the v0.32.2 fence backfill (`apply-migrations --force-retry 0.32.2`
+ * then `--yes` — a bare `--yes` is a no-op once the ledger says
+ * complete). Without the guard, an interrupted upgrade where v0_32_2
+ * hasn't run could leave the cycle silently misreporting "0 facts on
+ * people/alice" while legacy rows linger.
+ *
+ * The live-page requirement (#2484) is load-bearing: the inline facts
+ * writer keeps producing `row_num IS NULL, entity_slug IS NOT NULL`
+ * rows AFTER the migration completes, whenever a resolved slug has no
+ * fenceable page (slugify-floor / stub-guard-blocked unprefixed slugs).
+ * Those are structurally unfenceable — no page to fence onto, and the
+ * ledger-complete migration won't re-run — so they must NOT gate, or
+ * the phase jams forever (~16/day observed). Requiring a backing page
+ * keeps genuine pre-v0.32.2 rows (whose entity page exists) gating
+ * while excluding the inline-writer's permanent-unfenceable rows.
+ *
+ * Soft-expired rows don't count either (#2646): they're what
+ * `forget_fact` produces, so excluding them lets operators drain the
+ * backlog through the sanctioned removal path instead of raw SQL.
  */
 
 import type { BrainEngine } from '../engine.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { parseFactsFence } from '../facts-fence.ts';
-import { extractFactsFromFenceText } from '../facts/extract-from-fence.ts';
+import {
+  extractFactsFromFenceText,
+  FENCE_SOURCE_DEFAULT,
+  type FenceExtractedFact,
+} from '../facts/extract-from-fence.ts';
 import {
   runPhantomRedirectPass,
   emptyPhantomPassResult,
@@ -43,6 +69,70 @@ import {
 } from './phantom-redirect.ts';
 import { embed, isAvailable } from '../ai/gateway.ts';
 import { isAborted } from '../abort-check.ts';
+
+interface ExistingPageFact {
+  fact: string;
+  source: string | null;
+  row_num: number | string | null;
+}
+
+function factContentKey(fact: string, source: string | null | undefined): string {
+  return `${fact}\u0000${source ?? FENCE_SOURCE_DEFAULT}`;
+}
+
+function dedupeFactsByContentKey(facts: FenceExtractedFact[]): FenceExtractedFact[] {
+  const seen = new Set<string>();
+  const deduped: FenceExtractedFact[] = [];
+  for (const fact of facts) {
+    const key = factContentKey(fact.fact, fact.source);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(fact);
+  }
+  return deduped;
+}
+
+/**
+ * Fence-owned DB rows for one page coordinate. Excludes `cli:`-origin
+ * conversation facts (#1928) — they are not fence-owned, so they must
+ * neither count as "stale" (which would force a wipe every cycle) nor
+ * be compared against the fence's row set. Mirrors the
+ * excludeSourcePrefixes filter deleteFactsForPage applies on the wipe.
+ *
+ * Also excludes soft-expired legacy rows (#2646: `row_num IS NULL AND
+ * expired_at IS NOT NULL`) — rows that `forget_fact` expired via its
+ * legacy DB-only path. They are not fence-owned (fence rows always
+ * carry a row_num), so they must neither count as "stale" (forcing a
+ * wipe every cycle) nor mask a fence row from insertion. Mirrors the
+ * preserveExpiredLegacy filter deleteFactsForPage applies on the wipe.
+ *
+ * Deliberate consequence: if the fence still carries the same
+ * (claim, source) as an expired legacy row, the reconcile inserts it
+ * as a fresh ACTIVE fence-owned row. That is the fence-is-canonical
+ * contract working as documented — legacy DB-only forgets "DO NOT
+ * survive rebuild" (see forget.ts header); suppressing the insert
+ * would instead create silent fence↔DB divergence, the exact failure
+ * mode the empty-fence guard exists to prevent. To durably forget
+ * such a claim, forget the fence-owned row (forget_fact now takes the
+ * fence path, which strikes the row through in markdown). The expired
+ * legacy row survives alongside as the record of the earlier forget.
+ */
+async function listExistingFactsForPage(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+): Promise<ExistingPageFact[]> {
+  return engine.executeRaw<ExistingPageFact>(
+    `SELECT fact, source, row_num
+       FROM facts
+      WHERE source_id = $1
+        AND source_markdown_slug = $2
+        AND COALESCE(source, '') NOT LIKE 'cli:%'
+        AND NOT (row_num IS NULL AND expired_at IS NOT NULL)
+      ORDER BY row_num ASC, id ASC`,
+    [sourceId, slug],
+  );
+}
 
 export interface ExtractFactsOpts {
   /** Subset of slugs to reconcile. undefined = walk every page in the brain. */
@@ -112,22 +202,71 @@ export async function runExtractFacts(
     phantomsMorePending: false,
   };
 
-  // ── Empty-fence guard (Codex R2-#7) ────────────────────────────
-  // Pre-check: if any legacy fact rows exist (row_num NULL but
-  // entity_slug NOT NULL), refuse to run the destructive
-  // reconciliation pass. The v0_32_2 orchestrator must complete
-  // first.
+  // ── Empty-fence guard (Codex R2-#7; #2484; #2646) ──────────────
+  // Pre-check: if any genuinely-backfillable legacy fact rows exist,
+  // refuse to run the destructive reconciliation pass — the v0_32_2
+  // orchestrator must fence them first.
+  //
+  // A row is a real backfill candidate only when `row_num IS NULL`
+  // (never fenced) AND its `entity_slug` resolves to a LIVE page in
+  // this source (the migration's Phase B only fences rows whose
+  // entity_slug maps to a writable page) AND it is not soft-expired.
+  // #2484: the original predicate was just `row_num IS NULL AND
+  // entity_slug IS NOT NULL`, which ALSO matched
+  // structurally-unfenceable hot-memory rows the inline writer keeps
+  // producing post-migration: the legacy DB-only fallback
+  // (backstop.ts) writes `entity_slug` (a resolved slug, e.g. a
+  // slugify-floor or stub-guard-blocked unprefixed slug like
+  // `people-jane-doe`) with `row_num` NULL whenever the slug has no
+  // fenceable page. Those rows can never satisfy the migration's exit
+  // condition (no page to fence onto, and `apply-migrations` is a
+  // ledger-complete no-op for them), so they jammed the phase forever
+  // — ~16/day, mislabeled "v0.31 pending backfill." We now require a
+  // live backing page, which both genuine pre-v0.32.2 rows (their
+  // entity page exists) satisfy and inline-writer unfenceable rows do
+  // not. #2646: soft-expired rows (`expired_at IS NOT NULL`) are also
+  // excluded — `forget_fact`, the officially sanctioned removal path,
+  // soft-expires legacy rows rather than deleting them, so counting
+  // expired rows would leave the guard permanently stuck with no
+  // supported way to drain the backlog.
+  //
+  // Source isolation (#3526): the count is scoped to THIS run's
+  // sourceId. The pre-fix query counted brain-wide, so a single pending
+  // legacy row in any mounted source jammed extract_facts for every
+  // source — a cross-source leak of one source's migration state into
+  // another's cycle (CLAUDE.md source-isolation invariant).
   const legacy = await engine.executeRaw<{ n: string }>(
-    `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL AND entity_slug IS NOT NULL`,
+    `SELECT COUNT(*) AS n
+       FROM facts f
+      WHERE f.source_id = $1
+        AND f.row_num IS NULL
+        AND f.entity_slug IS NOT NULL
+        AND f.expired_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM pages p
+           WHERE p.source_id = f.source_id
+             AND p.slug = f.entity_slug
+             AND p.deleted_at IS NULL
+        )`,
+    [sourceId],
   );
   const legacyCount = parseInt(legacy[0]?.n ?? '0', 10);
   result.legacyRowsPending = legacyCount;
   if (legacyCount > 0) {
     result.guardTriggered = true;
+    // Drain advice must actually work: a bare `apply-migrations --yes`
+    // is a no-op once the v0.32.2 ledger entry says complete (the
+    // runner classifies it as already-applied), so the sanctioned
+    // re-run path is the explicit retry marker first. Phase B is
+    // idempotent — it only touches `row_num IS NULL` rows and de-dupes
+    // against the existing fence — so the re-run is safe. Individual
+    // rows can instead be drained through `forget_fact` (soft-expired
+    // rows stop counting).
     result.warnings.push(
-      `extract_facts: ${legacyCount} legacy v0.31 fact rows pending fence backfill. ` +
-      `Run \`gbrain apply-migrations --yes\` to complete v0_32_2 before this phase ` +
-      `can safely reconcile fence → DB.`,
+      `extract_facts: ${legacyCount} legacy v0.31 fact rows in source "${sourceId}" ` +
+      `(entity page present, not yet fenced) pending fence backfill. Re-run the v0.32.2 ` +
+      `fence backfill: \`gbrain apply-migrations --force-retry 0.32.2\` then ` +
+      `\`gbrain apply-migrations --yes\`. Or drain individual rows via \`forget_fact\`.`,
     );
     return result;
   }
@@ -216,24 +355,14 @@ export async function runExtractFacts(
       result.warnings.push(
         ...parsed.warnings.map(w => `${slug}: ${w}`),
       );
+      // The parser deliberately skips malformed rows and returns any rows it
+      // could still recover. That partial result is not authoritative: using
+      // it for reconciliation would interpret skipped rows as deletions.
+      // Preserve this page's existing index and continue with other pages.
+      continue;
     }
 
     if (parsed.facts.length > 0) result.pagesWithFacts += 1;
-
-    if (opts.dryRun) continue;
-
-    // Wipe-and-reinsert per page. The delete targets source_markdown_slug =
-    // slug only, so NULL-source_markdown_slug legacy rows survive (the
-    // partial-UNIQUE-index keyspace). #1928: `cli:`-origin facts (conversation
-    // facts from extract-conversation-facts) are NOT fence-owned — the page
-    // carries no `## Facts` fence to recreate them — so they MUST survive this
-    // reconcile. Exclude them from the wipe.
-    const deleted = await engine.deleteFactsForPage(slug, sourceId, {
-      excludeSourcePrefixes: ['cli:'],
-    });
-    result.factsDeleted += deleted.deleted;
-
-    if (parsed.facts.length === 0) continue;
 
     // v0.35.4 (D-ENG-1) — thread page.effective_date as the fallback
     // valid_from. Without this, fence rows without explicit `validFrom:`
@@ -241,7 +370,68 @@ export async function runExtractFacts(
     // trajectory query against the page returns import dates instead of
     // claim dates.
     const pageEffectiveDate = page.effective_date ? new Date(page.effective_date) : null;
-    const extracted = extractFactsFromFenceText(parsed.facts, slug, sourceId, { pageEffectiveDate });
+    const extracted = dedupeFactsByContentKey(
+      extractFactsFromFenceText(parsed.facts, slug, sourceId, { pageEffectiveDate }),
+    );
+
+    if (opts.dryRun) continue;
+
+    // #1781 — reconcile instead of unconditional wipe-and-reinsert. Compare
+    // the fence's canonical (claim, source) row set against the page's
+    // fence-owned DB rows: no-op when already in sync, insert only missing
+    // keys when possible, wipe/reinsert only when stale rows need cleanup.
+    const existing = await listExistingFactsForPage(engine, slug, sourceId);
+    const existingKeys = new Set(existing.map(f => factContentKey(f.fact, f.source)));
+    const desiredByKey = new Map(extracted.map(f => [factContentKey(f.fact, f.source), f]));
+
+    if (extracted.length === 0) {
+      if (existing.length > 0) {
+        // The delete targets source_markdown_slug = slug only, so
+        // NULL-source_markdown_slug legacy rows survive (the
+        // partial-UNIQUE-index keyspace). #1928: `cli:`-origin facts
+        // (conversation facts from extract-conversation-facts) are NOT
+        // fence-owned — the page carries no `## Facts` fence to recreate
+        // them — so they MUST survive this reconcile. #2646: soft-expired
+        // legacy rows (forget_fact's record of the forget) likewise
+        // survive via preserveExpiredLegacy.
+        const deleted = await engine.deleteFactsForPage(slug, sourceId, {
+          excludeSourcePrefixes: ['cli:'],
+          preserveExpiredLegacy: true,
+        });
+        result.factsDeleted += deleted.deleted;
+      }
+      continue;
+    }
+
+    const hasStaleExisting = existing.some(f => !desiredByKey.has(factContentKey(f.fact, f.source)));
+    const hasDuplicateExisting = existing.length !== existingKeys.size;
+    const hasRowNumDrift = existing.some(f => {
+      const desired = desiredByKey.get(factContentKey(f.fact, f.source));
+      return desired !== undefined && Number(f.row_num) !== desired.row_num;
+    });
+
+    if (
+      existing.length === extracted.length &&
+      !hasStaleExisting &&
+      !hasDuplicateExisting &&
+      !hasRowNumDrift
+    ) {
+      continue;
+    }
+
+    let toInsert = extracted.filter(f => !existingKeys.has(factContentKey(f.fact, f.source)));
+    if (hasStaleExisting || hasDuplicateExisting || hasRowNumDrift) {
+      // Fall back to the legacy page-level reconcile when old DB rows must
+      // be removed. Same delete scoping as above: legacy
+      // NULL-source_markdown_slug rows, `cli:`-origin conversation
+      // facts (#1928), and soft-expired legacy rows (#2646) survive.
+      const deleted = await engine.deleteFactsForPage(slug, sourceId, {
+        excludeSourcePrefixes: ['cli:'],
+        preserveExpiredLegacy: true,
+      });
+      result.factsDeleted += deleted.deleted;
+      toInsert = extracted;
+    }
 
     // v0.35.4 (D-CDX-3) — batch-embed before insert. Without this,
     // cycle-inserted facts land with `embedding = NULL`, which breaks
@@ -250,17 +440,17 @@ export async function runExtractFacts(
     // unavailable (no API key configured), facts still insert with
     // NULL embeddings — drift_score gracefully returns null and
     // clustering falls back to recency.
-    if (isAvailable('embedding') && extracted.length > 0) {
+    if (isAvailable('embedding') && toInsert.length > 0) {
       try {
-        const texts = extracted.map(e => e.fact);
+        const texts = toInsert.map(e => e.fact);
         // #1972: forward the abort signal so a cancelled cycle's in-flight
         // batch embed (a network call) is itself abortable, not just the loop.
         const embeddings = await embed(texts, { abortSignal: opts.signal });
         // Defensive: embed should return one vector per input; if the
         // gateway returns a partial array (provider partial-batch retry
         // returning fewer than requested), only fill what we have.
-        for (let i = 0; i < extracted.length && i < embeddings.length; i++) {
-          extracted[i].embedding = embeddings[i];
+        for (let i = 0; i < toInsert.length && i < embeddings.length; i++) {
+          toInsert[i].embedding = embeddings[i];
         }
       } catch (err) {
         // Embedding failure is non-fatal — facts still get inserted, just
@@ -271,7 +461,9 @@ export async function runExtractFacts(
       }
     }
 
-    const inserted = await engine.insertFacts(extracted, { source_id: sourceId }); // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
+    if (toInsert.length === 0) continue;
+
+    const inserted = await engine.insertFacts(toInsert, { source_id: sourceId }); // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
     result.factsInserted += inserted.inserted;
   }
 

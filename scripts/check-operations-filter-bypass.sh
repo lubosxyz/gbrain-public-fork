@@ -49,6 +49,8 @@ ALLOWED=(
   "src/commands/enrich.ts"                       # local CLI tool; calls put_page handler with remote=false, not network-exposed
   "src/commands/book-mirror.ts"                 # local CLI tool; not network-exposed
   "src/commands/tools-json.ts"                  # gbrain --tools-json introspection; full op list IS the purpose
+  "src/mcp/publish-gates.ts"                    # reads op.publishGateKey/name only to compute gate-DISABLED sets; never lists/exposes ops
+  "src/mcp/tool-catalog.ts"                     # docs/TOOL_CATALOG.md renderer; filters !op.localOnly at the boundary; never a transport surface
   "src/commands/serve-http.ts"                  # MUST APPLY .filter(op => !op.localOnly) — verified by grep below
 )
 
@@ -70,7 +72,7 @@ PATTERN='import[[:space:]]+(\*[[:space:]]+as[[:space:]]+[a-zA-Z_$][a-zA-Z0-9_$]*
 FOUND_FILES=""
 while IFS= read -r f; do
   [ -n "$f" ] && FOUND_FILES="$FOUND_FILES$f"$'\n'
-done < <(grep -rlE --include='*.ts' "$PATTERN" src/ 2>/dev/null | sort -u || true)
+done < <(grep -rlE --include='*.ts' "$PATTERN" src 2>/dev/null | sort -u || true)
 
 FAIL=0
 

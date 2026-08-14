@@ -3,6 +3,7 @@
  *
  * Subcommands:
  *   takes <slug>                          — list takes for a page
+ *   takes list                            — list all active takes (#2079)
  *   takes search "<query>" [--who h]       — keyword search across all takes
  *   takes add <slug> ...flags              — append a take (markdown + DB)
  *   takes update <slug> --row N ...flags   — update mutable fields
@@ -28,6 +29,8 @@ import {
   type ParsedTake,
 } from '../core/takes-fence.ts';
 import { withPageLock } from '../core/page-lock.ts';
+import { resolveSourceId } from '../core/source-resolver.ts';
+import { resolveOwnerHolder } from '../core/owner-holder.ts';
 
 // --- Helpers ---
 
@@ -83,16 +86,35 @@ function ensureFloat(raw: string | undefined, fallback: number): number {
   return n;
 }
 
-async function getPageId(engine: BrainEngine, slug: string): Promise<number> {
-  const rows = await engine.executeRaw<{ id: number }>(
-    `SELECT id FROM pages WHERE slug = $1 LIMIT 1`,
-    [slug],
-  );
+async function getPageId(engine: BrainEngine, slug: string, sourceId?: string): Promise<number> {
+  const rows = sourceId
+    ? await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM pages WHERE slug = $1 AND source_id = $2 LIMIT 1`,
+        [slug, sourceId],
+      )
+    : await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM pages WHERE slug = $1 LIMIT 1`,
+        [slug],
+      );
   if (!rows[0]) {
-    console.error(`Page not found in brain: ${slug}. Run \`gbrain sync\` first.`);
+    console.error(`Page not found in brain: ${slug}${sourceId ? ` (source=${sourceId})` : ''}. Run \`gbrain sync\` first.`);
     process.exit(1);
   }
   return rows[0].id;
+}
+
+// Fail-closed (#2698 residual, TODOS.md): `resolveSourceId` only ever
+// throws when a source WAS explicitly in play — an invalid or
+// unregistered `GBRAIN_SOURCE`, a `.gbrain-source` dotfile pointing at a
+// source that doesn't exist, or a genuine DB error — never for "nothing
+// configured" (that path resolves cleanly to the seeded `'default'`
+// source, tier 6 of resolveSourceId). Swallowing those errors here used
+// to fall back to the unscoped slug-only page lookup, silently
+// reintroducing the pre-#2698 cross-source write bug whenever resolution
+// merely errored instead of resolving cleanly. Let it propagate so the
+// write is blocked instead of silently unscoped.
+async function resolveTakesSourceId(engine: BrainEngine): Promise<string> {
+  return resolveSourceId(engine, null);
 }
 
 function readBodyOrEmpty(path: string): string {
@@ -108,11 +130,10 @@ function writeBody(path: string, body: string): void {
 // --- Subcommands ---
 
 async function cmdList(engine: BrainEngine, args: string[]): Promise<void> {
-  const slug = args[0];
-  if (!slug) {
-    console.error('Usage: gbrain takes <slug> [--json]');
-    process.exit(1);
-  }
+  // #2079: slug is optional. `gbrain takes list` (no slug) lists ALL active
+  // takes — CLI parity with the takes_list operation. A leading flag is not
+  // a slug.
+  const slug = args[0] && !args[0].startsWith('-') ? args[0] : undefined;
   const json = flagPresent(args, '--json');
   const holder = flagValue(args, '--who');
   const kind = flagValue(args, '--kind') as string | undefined;
@@ -132,17 +153,19 @@ async function cmdList(engine: BrainEngine, args: string[]): Promise<void> {
     return;
   }
 
+  const scope = slug ?? 'this brain';
   if (takes.length === 0) {
-    console.log(`No takes on ${slug}.`);
+    console.log(`No takes on ${scope}.`);
     return;
   }
-  console.log(`# Takes on ${slug}\n`);
+  console.log(`# Takes on ${scope}\n`);
   for (const t of takes) {
     const tag = t.active ? '' : ' [superseded]';
     const w = Number(t.weight).toFixed(2);
     const since = t.since_date ?? '';
     const src = t.source ? ` — ${t.source}` : '';
-    console.log(`#${t.row_num} [${t.kind} • ${t.holder} • w=${w}${since ? ` • ${since}` : ''}]${tag}\n  ${t.claim}${src}\n`);
+    const where = slug ? '' : `${t.page_slug} `;
+    console.log(`${where}#${t.row_num} [${t.kind} • ${t.holder} • w=${w}${since ? ` • ${since}` : ''}]${tag}\n  ${t.claim}${src}\n`);
   }
 }
 
@@ -169,7 +192,7 @@ async function cmdSearch(engine: BrainEngine, args: string[]): Promise<void> {
   }
 }
 
-async function cmdAdd(engine: BrainEngine, args: string[]): Promise<void> {
+async function cmdAdd(engine: BrainEngine, args: string[], sourceId?: string): Promise<void> {
   const slug = args[0];
   if (!slug) {
     console.error('Usage: gbrain takes add <slug> --claim "..." --kind <k> --who <h> [--weight 0.5] [--source "..."] [--since YYYY-MM]');
@@ -187,6 +210,13 @@ async function cmdAdd(engine: BrainEngine, args: string[]): Promise<void> {
   const brainDir = await resolveBrainDir(engine, dirArg ?? null);
 
   await withPageLock(slug, async () => {
+    // Resolve the page BEFORE touching the markdown. getPageId exits 1 when the
+    // page isn't in the brain; doing this after writeBody left a .md file
+    // carrying a take with no DB row — invisible to scorecard/calibration but
+    // present on disk, so a later `takes add` would number the next row past a
+    // take the DB never saw. update/supersede/resolve already resolve first.
+    const pageId = await getPageId(engine, slug, sourceId);
+
     const path = pageFilePath(brainDir, slug);
     const body = readBodyOrEmpty(path);
     const { body: nextBody, rowNum } = upsertTakeRow(body, {
@@ -194,8 +224,6 @@ async function cmdAdd(engine: BrainEngine, args: string[]): Promise<void> {
     });
     writeBody(path, nextBody);
 
-    // Mirror to DB. Page may not be in DB yet if not synced — caller must run sync first.
-    const pageId = await getPageId(engine, slug);
     await engine.addTakesBatch([{
       page_id: pageId, row_num: rowNum, claim, kind, holder, weight,
       since_date: since, source, active: true, superseded_by: null,
@@ -204,7 +232,7 @@ async function cmdAdd(engine: BrainEngine, args: string[]): Promise<void> {
   });
 }
 
-async function cmdUpdate(engine: BrainEngine, args: string[]): Promise<void> {
+async function cmdUpdate(engine: BrainEngine, args: string[], sourceId?: string): Promise<void> {
   const slug = args[0];
   const rowNumStr = flagValue(args, '--row');
   if (!slug || !rowNumStr) {
@@ -223,7 +251,7 @@ async function cmdUpdate(engine: BrainEngine, args: string[]): Promise<void> {
   const brainDir = await resolveBrainDir(engine, dirArg ?? null);
 
   await withPageLock(slug, async () => {
-    const pageId = await getPageId(engine, slug);
+    const pageId = await getPageId(engine, slug, sourceId);
     await engine.updateTake(pageId, rowNum, fields);
 
     // Sync the markdown table: read fence, find row, apply field updates, re-render.
@@ -254,7 +282,7 @@ async function cmdUpdate(engine: BrainEngine, args: string[]): Promise<void> {
   });
 }
 
-async function cmdSupersede(engine: BrainEngine, args: string[]): Promise<void> {
+async function cmdSupersede(engine: BrainEngine, args: string[], sourceId?: string): Promise<void> {
   const slug = args[0];
   const rowNumStr = flagValue(args, '--row');
   if (!slug || !rowNumStr) {
@@ -268,10 +296,10 @@ async function cmdSupersede(engine: BrainEngine, args: string[]): Promise<void> 
   const brainDir = await resolveBrainDir(engine, dirArg ?? null);
 
   await withPageLock(slug, async () => {
-    const pageId = await getPageId(engine, slug);
+    const pageId = await getPageId(engine, slug, sourceId);
 
     // Read existing row to inherit kind/holder unless overridden
-    const existing = await engine.listTakes({ page_id: pageId, active: false, limit: 500 });
+    const existing = await engine.listTakes({ page_id: pageId, active: true, limit: 500 });
     const target = existing.find(t => t.row_num === rowNum);
     if (!target) {
       console.error(`Row #${rowNum} not found on ${slug}.`);
@@ -302,7 +330,7 @@ async function cmdSupersede(engine: BrainEngine, args: string[]): Promise<void> 
   });
 }
 
-async function cmdResolve(engine: BrainEngine, args: string[]): Promise<void> {
+async function cmdResolve(engine: BrainEngine, args: string[], sourceId?: string): Promise<void> {
   const slug = args[0];
   const rowNumStr = flagValue(args, '--row');
   const qualityStr = flagValue(args, '--quality');
@@ -344,10 +372,10 @@ async function cmdResolve(engine: BrainEngine, args: string[]): Promise<void> {
   // --evidence is the v0.30.0 alias for --source on the resolve subcommand
   // (semantic clarity: "what evidence resolved this bet?").
   const source = flagValue(args, '--evidence') ?? flagValue(args, '--source');
-  const resolvedBy = flagValue(args, '--by') ?? 'garry';
+  const resolvedBy = flagValue(args, '--by') ?? resolveOwnerHolder({ configValue: await engine.getConfig('emotional_weight.user_holder') });
   const dirArg = flagValue(args, '--dir');
 
-  const pageId = await getPageId(engine, slug);
+  const pageId = await getPageId(engine, slug, sourceId);
   await engine.resolveTake(pageId, rowNum, {
     quality,
     outcome,
@@ -534,6 +562,8 @@ export async function runTakes(engine: BrainEngine, args: string[]): Promise<voi
 Subcommands:
   takes <slug> [--json] [--who h] [--kind k] [--sort weight|since_date|created_at] [--expired]
                                           List takes for a page
+  takes list [--json] [--who h] [--kind k] [--sort ...] [--expired]
+                                          List all active takes across the brain (#2079)
   takes search "<query>" [--limit N] [--json]
                                           Keyword search across all takes
   takes add <slug> --claim "..." --kind <fact|take|bet|hunch> --who <holder>
@@ -563,11 +593,14 @@ Common flags:
   const rest = args.slice(1);
 
   switch (sub) {
+    // #2079: `takes list` used to be parsed as page slug "list" and printed
+    // "No takes on list." — reading exactly like an empty takes table.
+    case 'list':        return cmdList(engine, rest);
     case 'search':      return cmdSearch(engine, rest);
-    case 'add':         return cmdAdd(engine, rest);
-    case 'update':      return cmdUpdate(engine, rest);
-    case 'supersede':   return cmdSupersede(engine, rest);
-    case 'resolve':     return cmdResolve(engine, rest);
+    case 'add':         return cmdAdd(engine, rest, await resolveTakesSourceId(engine));
+    case 'update':      return cmdUpdate(engine, rest, await resolveTakesSourceId(engine));
+    case 'supersede':   return cmdSupersede(engine, rest, await resolveTakesSourceId(engine));
+    case 'resolve':     return cmdResolve(engine, rest, await resolveTakesSourceId(engine));
     case 'scorecard':   return cmdScorecard(engine, rest);
     case 'calibration': return cmdCalibration(engine, rest);
     case 'revisit':     return cmdRevisit(engine, rest);
@@ -591,11 +624,13 @@ async function cmdExtract(engine: BrainEngine, rest: string[]): Promise<void> {
   const sub = rest[0];
   if (sub !== '--from-pages') {
     process.stderr.write(
-      'Usage: gbrain takes extract --from-pages [--yes] [--dry-run] [--source-id <id>] [--max-pages N] [--holder <name>]\n',
+      'Usage: gbrain takes extract --from-pages [--yes] [--dry-run] [--json] [--source-id <id>] [--max-pages N (clamped to 1000)] [--include-covered] [--holder <name>]\n' +
+      'Runs progress: pages that already hold takes are skipped, so repeat runs sweep a large corpus in slices. --include-covered rescans everything (refresh).\n',
     );
     process.exit(1);
   }
   const dryRun = rest.includes('--dry-run');
+  const json = rest.includes('--json');
   const skipConfirm = rest.includes('--yes');
   const sourceIdx = rest.indexOf('--source-id');
   const sourceIdFilter = sourceIdx >= 0 ? rest[sourceIdx + 1] : undefined;
@@ -604,6 +639,7 @@ async function cmdExtract(engine: BrainEngine, rest: string[]): Promise<void> {
   const maxPages = maxPagesRaw ? Math.max(1, Math.min(1000, parseInt(maxPagesRaw, 10) || 50)) : 50;
   const holderIdx = rest.indexOf('--holder');
   const holder = holderIdx >= 0 ? rest[holderIdx + 1] : 'system';
+  const includeCovered = rest.includes('--include-covered');
 
   // A12 consent gate.
   const bootstrapEnabledCfg = await engine.getConfig('takes.bootstrap_enabled');
@@ -628,11 +664,20 @@ async function cmdExtract(engine: BrainEngine, rest: string[]): Promise<void> {
     dryRun,
     sourceIdFilter,
     maxPages,
+    includeCovered,
     holder,
   });
   if (result.llm_unavailable) {
-    process.stderr.write(`[takes extract] chat gateway unavailable (no API key configured).\n`);
+    if (json) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } else {
+      process.stderr.write(`[takes extract] chat gateway unavailable (no API key configured).\n`);
+    }
     process.exit(2);
+  }
+  if (json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
   }
   process.stdout.write(
     `takes extract --from-pages: ${result.claims_extracted} claim(s) from ${result.pages_scanned} page(s)` +

@@ -29,16 +29,18 @@ import {
 import { loadConfig, loadConfigWithEngine } from './config.ts';
 import {
   buildContextualPrefix,
-  modeRequiresHaiku,
+  modeRequiresSynopsis,
   modeRequiresWrapper,
   sanitizeTitle,
   wrapChunkForEmbedding,
 } from './embedding-context.ts';
 import { loadSearchModeConfig, resolveSearchMode } from './search/mode.ts';
 import { normalizeAliasList } from './search/alias-normalize.ts';
-import { isUndefinedTableError, warnOncePerProcess } from './utils.ts';
+import { isUndefinedTableError, warnOncePerProcess, validateSlug } from './utils.ts';
 import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
+import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
+import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from './facts-fence.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -104,6 +106,27 @@ function fenceTagToPseudoPath(lang: string | undefined): string | null {
  */
 const MAX_FENCES_PER_PAGE = Number.parseInt(process.env.GBRAIN_MAX_FENCES_PER_PAGE || '100', 10);
 
+function extractFactsFenceBlock(body: string): string | null {
+  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
+  if (beginIdx === -1) return null;
+  const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
+  if (endIdx === -1) return null;
+  return body.slice(beginIdx, endIdx + FACTS_FENCE_END.length);
+}
+
+function replaceOrAppendFactsFence(body: string, fenceBlock: string): string {
+  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
+  if (beginIdx !== -1) {
+    const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
+    if (endIdx !== -1) {
+      return body.slice(0, beginIdx) + fenceBlock + body.slice(endIdx + FACTS_FENCE_END.length);
+    }
+  }
+
+  const sep = body.endsWith('\n') ? '\n' : '\n\n';
+  return `${body}${sep}## Facts\n\n${fenceBlock}\n`;
+}
+
 /**
  * Walk the marked lexer output and extract recognizable code fences.
  * Returns one ChunkInput per fence whose language tag maps to a grammar
@@ -115,6 +138,17 @@ async function extractFencedChunks(
   startChunkIndex: number,
 ): Promise<ChunkInput[]> {
   const out: ChunkInput[] = [];
+  // Fast path: most pages (prose, tables, converted docs) contain no code
+  // fence at all, so there is nothing for this function to extract. marked's
+  // lexer still allocates transient memory proportional to page size on every
+  // call — a ~2MB table-heavy page spikes ~110MB of heap just to produce zero
+  // fenced chunks. During bulk import those per-page spikes stack on top of
+  // accumulated chunk/embedding memory and can OOM the worker, and the
+  // try/catch below cannot rescue an OOM (it is process death, not a throw).
+  // Skip the lexer entirely when no fence marker (``` or ~~~) is present.
+  // The `\r` in the line-start class mirrors marked's own `\r\n|\r → \n`
+  // normalization, so CR/CRLF-only documents don't lose a real fence.
+  if (!/(^|[\r\n])[ \t]{0,3}(```|~~~)/.test(markdown)) return out;
   let tokens: ReturnType<typeof marked.lexer>;
   try {
     tokens = marked.lexer(markdown);
@@ -190,7 +224,7 @@ export interface ImportResult {
    * Parsed page content. Present for status='imported' AND status='skipped'
    * (skip happens when content is identical to existing page; auto-link still
    * needs to run for reconciliation in case links table drifted from page text).
-   * Absent only on status='error' (early payload-size rejection).
+   * Absent on early rejection before a page can be parsed.
    */
   parsedPage?: ParsedPage;
   /** Content-quality gate (issue #1699): true when the page landed with a
@@ -204,6 +238,13 @@ export interface ImportResult {
 }
 
 const MAX_FILE_SIZE = 5_000_000; // 5MB
+
+function invalidYamlFrontmatterError(parsed: ReturnType<typeof parseMarkdown>): string | null {
+  const yamlError = parsed.errors?.find((error) => error.code === 'YAML_PARSE');
+  if (!yamlError) return null;
+  const detail = yamlError.message.replace(/^YAML parse failed:\s*/, '').trim();
+  return `Invalid YAML frontmatter: ${detail}. Quote scalar values that contain ": " or fix the frontmatter block.`;
+}
 
 /**
  * Import content from a string. Core pipeline:
@@ -284,6 +325,12 @@ export async function importFromContent(
     remote?: boolean;
   } = {},
 ): Promise<ImportResult> {
+  // Normalize BEFORE any tx write: putPage lowercases via validateSlug but
+  // upsertChunks used to query by the caller's raw slug, so a mixed-case slug
+  // created the page row then failed the chunk upsert with "Page not found",
+  // rolling back the whole import (#430).
+  slug = validateSlug(slug);
+
   // v0.18.0+ multi-source: when caller is syncing under a non-default source,
   // every per-page tx call must carry `sourceId` so writes target the right
   // (source_id, slug) row. Pre-fix, putPage relied on the schema DEFAULT and
@@ -303,7 +350,14 @@ export async function importFromContent(
     };
   }
 
-  const parsed = parseMarkdown(content, slug + '.md', { activePack: opts.activePack });
+  const parsed = parseMarkdown(content, slug + '.md', {
+    validate: true,
+    ...(opts.activePack ? { activePack: opts.activePack } : {}),
+  });
+  const frontmatterError = invalidYamlFrontmatterError(parsed);
+  if (frontmatterError) {
+    return { slug, status: 'error', chunks: 0, error: frontmatterError };
+  }
 
   // v0.42 (#1699 trust boundary): strip gate-owned markers from UNTRUSTED
   // input. parseMarkdown preserves every frontmatter key except type/title/
@@ -526,6 +580,40 @@ export async function importFromContent(
   // is real, unbounded embedding spend). Same bug class as the captured_at /
   // ingested_at fix above; the gate re-derives the markers deterministically
   // on the next import, so dropping them from the hash is safe.
+  // #1035: fetch the existing page BEFORE the hash compute so (a) the type
+  // preservation below participates in the hash (a no-op re-put stays a
+  // hash-match skip) and (b) the hash short-circuit below reuses this row.
+  const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
+
+  // #2044: remote get_page intentionally strips private facts rows. A
+  // documented get_page -> edit -> put_page round-trip can therefore arrive
+  // with an empty/missing Facts fence even though the existing page still has
+  // canonical fence rows. Preserve the old fence in that narrow case so the
+  // system-of-record markdown is not truncated by the privacy boundary.
+  if (opts.remote === true && existing?.compiled_truth) {
+    const incomingFacts = parseFactsFence(parsed.compiled_truth);
+    const existingFacts = parseFactsFence(existing.compiled_truth);
+    const existingFenceBlock = extractFactsFenceBlock(existing.compiled_truth);
+    if (
+      incomingFacts.facts.length === 0 &&
+      incomingFacts.warnings.length === 0 &&
+      existingFacts.warnings.length === 0 &&
+      existingFacts.facts.length > 0 &&
+      existingFenceBlock
+    ) {
+      parsed.compiled_truth = replaceOrAppendFactsFence(parsed.compiled_truth, existingFenceBlock);
+    }
+  }
+
+  // #1035: absence of an explicit frontmatter `type:` on an EXISTING page
+  // means "preserve the stored type", not "re-infer". Pre-fix, a round-trip
+  // put (get_page → edit body → put_page without `type:`) silently regressed
+  // a curated type to the path-inferred default ('concept' for bare slugs).
+  // Explicit frontmatter type stays an override; new pages still infer.
+  if (parsed.typeExplicit !== true && existing) {
+    parsed.type = existing.type;
+  }
+
   const HASH_EPHEMERAL_FRONTMATTER_KEYS = [
     'captured_at',
     'ingested_at',
@@ -558,7 +646,6 @@ export async function importFromContent(
     tags: parsed.tags,
   };
 
-  const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
   if (existing?.content_hash === hash && !opts.forceRechunk) {
     return { slug, status: 'skipped', chunks: 0, parsedPage };
   }
@@ -665,7 +752,7 @@ export async function importFromContent(
   // v0.40.3.0 contextual retrieval wrapper (D20-T1 chunk_text separation):
   // - Resolve effective CR mode via the page/source/global override chain.
   // - For title tier (free): build the title-only prefix and wrap chunks
-  //   inline at embed time. Per-chunk Haiku synopsis tier is NOT supported
+  //   inline at embed time. Per-chunk generated synopsis tier is NOT supported
   //   on the import path — that's an async backfill via the Minion handler
   //   (the cost prompt + 10s grace UX from D3 gates spending; inline import
   //   path takes the cheaper title-only treatment for tokenmax pages here
@@ -698,7 +785,7 @@ export async function importFromContent(
   if (!opts.noEmbed && chunks.length > 0) {
     const safeTitle = sanitizeTitle(parsed.title);
     const prefix =
-      modeRequiresWrapper(effectiveCRMode) && !modeRequiresHaiku(effectiveCRMode)
+      modeRequiresWrapper(effectiveCRMode) && !modeRequiresSynopsis(effectiveCRMode)
         ? buildContextualPrefix(safeTitle, null)
         : null;
     const wrappedTexts = prefix
@@ -721,7 +808,12 @@ export async function importFromContent(
       ? null
       : computeCorpusGeneration({
           crMode: effectiveCRMode,
-          haikuModel: 'anthropic:claude-haiku-4-5-20251001',
+          synopsisModel: DEFAULT_SYNOPSIS_MODEL,
+          // Inline import-file path never uses per_chunk_synopsis (refuses
+          // upstream); pass undefined so the doc-cap field stays out of
+          // the hash here. Per_chunk_synopsis runs through the Minion
+          // backfill handler which threads SYNOPSIS_DOC_MAX_CHARS through
+          // the service layer.
         });
 
   // Transaction wraps all DB writes. Every per-page tx call carries the
@@ -883,6 +975,19 @@ export async function importFromContent(
     }
   }
 
+  // Post-write read-back verification.
+  //
+  // After the transaction commits, the page MUST be resolvable via getPage.
+  // If the read-back returns null (or a stale content_hash), the operation
+  // fails LOUDLY — a non-zero exit + error surfaced to the ingest log — rather
+  // than reporting success. A write is not "done" until it is readable.
+  //
+  // This catches the silent-desync class: the page file exists on disk (or the
+  // git commit landed) but the DB index silently never picked it up. Without
+  // this guard, the operation reports success and the page is invisible to all
+  // reads (get_page, search, query) until someone notices the gap manually.
+  await verifyPageReadable(engine, slug, hash, sourceId, 'importFromContent');
+
   return {
     slug,
     status: 'imported',
@@ -891,6 +996,66 @@ export async function importFromContent(
     ...(pageQuarantined ? { quarantined: true } : {}),
     ...(pageFlagged ? { flagged: true, flag_reason: pageFlagReason } : {}),
   };
+}
+
+/**
+ * Post-write read-back assertion.
+ *
+ * After a page write transaction commits, verify the page is resolvable via
+ * `getPage` and that its `content_hash` matches the hash we just wrote. If the
+ * read-back fails (page not found or stale hash), throw a loud error so the
+ * caller surfaces the failure instead of reporting success.
+ *
+ * This is the write-then-verify guard on the sync/write path: a write is not
+ * "done" until it is readable back.
+ */
+async function verifyPageReadable(
+  engine: BrainEngine,
+  slug: string,
+  expectedHash: string,
+  sourceId: string | undefined,
+  caller: string,
+): Promise<void> {
+  const readBack = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
+  if (!readBack) {
+    // Log to ingest_log before throwing so the failure is durable and
+    // agent-inspectable, not just a transient stderr message.
+    try {
+      await engine.logIngest({
+        source_type: 'write-verify-guard',
+        source_ref: slug,
+        pages_updated: [],
+        summary: `[${caller}] post-write read-back failed: page '${slug}' not found after write (source: ${sourceId ?? 'default'}). Silent desync — DB index did not pick up the write.`,
+        ...(sourceId ? { source_id: sourceId } : {}),
+      });
+    } catch {
+      // Best-effort: don't mask the original failure if logIngest itself fails.
+    }
+    throw new Error(
+      `[${caller}] post-write read-back failed: page '${slug}' not found after write ` +
+      `(source: ${sourceId ?? 'default'}). The page was written but the DB index ` +
+      `did not pick it up. This indicates a silent desync — the operation must fail loudly.`,
+    );
+  }
+  if (readBack.content_hash !== expectedHash) {
+    try {
+      await engine.logIngest({
+        source_type: 'write-verify-guard',
+        source_ref: slug,
+        pages_updated: [],
+        summary: `[${caller}] post-write read-back failed: page '${slug}' has stale content_hash (expected ${expectedHash.slice(0, 12)}, got ${(readBack.content_hash ?? '').slice(0, 12)}; source: ${sourceId ?? 'default'}). Silent desync — DB index has a stale row.`,
+        ...(sourceId ? { source_id: sourceId } : {}),
+      });
+    } catch {
+      // Best-effort.
+    }
+    throw new Error(
+      `[${caller}] post-write read-back failed: page '${slug}' has stale content_hash ` +
+      `(expected ${expectedHash.slice(0, 12)}, got ${(readBack.content_hash ?? '').slice(0, 12)}; ` +
+      `source: ${sourceId ?? 'default'}). The page was written but the DB index ` +
+      `has a stale row. This indicates a silent desync — the operation must fail loudly.`,
+    );
+  }
 }
 
 /**
@@ -941,6 +1106,17 @@ export async function importFromFile(
     });
   }
 
+  const preInferenceParsed = parseMarkdown(content, relativePath, { validate: true });
+  const preInferenceFrontmatterError = invalidYamlFrontmatterError(preInferenceParsed);
+  if (preInferenceFrontmatterError) {
+    return {
+      slug: slugifyPath(relativePath),
+      status: 'skipped',
+      chunks: 0,
+      error: preInferenceFrontmatterError,
+    };
+  }
+
   // v0.22.8 — Frontmatter inference: if the file has no frontmatter and
   // inference is enabled, synthesize it from the filesystem path + content.
   // This turns bare markdown files into fully-typed, dated, tagged pages
@@ -955,7 +1131,11 @@ export async function importFromFile(
     }
   }
 
-  const parsed = parseMarkdown(content, relativePath, { activePack: opts.activePack });
+  const parsed = parseMarkdown(content, relativePath, {
+    validate: true,
+    ...(opts.activePack ? { activePack: opts.activePack } : {}),
+  });
+  const frontmatterError = invalidYamlFrontmatterError(parsed);
 
   // Enforce path-authoritative slug. parseMarkdown prefers frontmatter.slug over
   // the path-derived slug, so a mismatch here means the frontmatter is trying
@@ -967,6 +1147,15 @@ export async function importFromFile(
   const expectedSlug = slugifyPath(relativePath);
   let resolvedSlug = expectedSlug;
   let usedFrontmatterFallback = false;
+
+  if (frontmatterError) {
+    return {
+      slug: expectedSlug,
+      status: 'skipped',
+      chunks: 0,
+      error: frontmatterError,
+    };
+  }
 
   if (expectedSlug === '') {
     if (parsed.slug && parsed.slug.length > 0) {
@@ -984,8 +1173,8 @@ export async function importFromFile(
         chunks: 0,
         error:
           `Filename "${relativePath}" produces no usable slug. ` +
-          `Add a "slug:" to the frontmatter, or rename the file to use ` +
-          `ASCII / Chinese / Japanese / Korean characters.`,
+          `Add a "slug:" to the frontmatter, or rename the file to include ` +
+          `at least one letter or number (any script).`,
       };
     }
   } else if (parsed.slug !== expectedSlug) {
@@ -1053,6 +1242,10 @@ export async function importCodeFile(
   const title = `${relativePath} (${lang})`;
   const sourceId = opts.sourceId;
   const txOpts = sourceId ? { sourceId } : undefined;
+  // PostgreSQL text columns reject U+0000 even though source files may
+  // legitimately contain it inside string/regex fixtures. Preserve a visible,
+  // searchable representation instead of dropping the entire code page.
+  const storageContent = content.replaceAll('\0', '\\0');
 
   const byteLength = Buffer.byteLength(content, 'utf-8');
   if (byteLength > MAX_FILE_SIZE) {
@@ -1094,7 +1287,7 @@ export async function importCodeFile(
   // from the chunker (nested methods carry ['ClassName'] etc.) so the
   // chunk-grain FTS trigger picks up scope for ranking and downstream
   // Layer 5 edge resolution can use scope-qualified identity.
-  const { chunks: codeChunks, edges: extractedEdges } = await chunkCodeTextFull(content, relativePath);
+  const { chunks: codeChunks, edges: extractedEdges } = await chunkCodeTextFull(storageContent, relativePath);
   const chunks: ChunkInput[] = codeChunks.map((c, i) => ({
     chunk_index: i,
     chunk_text: c.text,
@@ -1162,7 +1355,7 @@ export async function importCodeFile(
       type: 'code' as string,
       page_kind: 'code',
       title,
-      compiled_truth: content,
+      compiled_truth: storageContent,
       timeline: '',
       frontmatter: { language: lang, file: relativePath },
       content_hash: hash,
@@ -1185,6 +1378,11 @@ export async function importCodeFile(
       await tx.deleteChunks(slug, txOpts);
     }
   });
+
+  // Post-write read-back verification.
+  // Same guard as the markdown path: a code page write is not "done" until
+  // it is readable back via getPage.
+  await verifyPageReadable(engine, slug, hash, sourceId, 'importCodeFile');
 
   // v0.20.0 Cathedral II Layer 5 (A1): extracted call-site edges persist
   // in code_edges_symbol (unresolved — we don't attempt within-file target
@@ -1229,7 +1427,7 @@ export async function importCodeFile(
 
       const edgeInputs: import('./types.ts').CodeEdgeInput[] = [];
       for (const e of extractedEdges) {
-        const idx = findChunkForOffset(e.callSiteByteOffset, content, rangeList);
+        const idx = findChunkForOffset(e.callSiteByteOffset, storageContent, rangeList);
         if (idx == null) continue;
         const from = rangeList[idx]!;
         if (!from.id || !from.symbol_name_qualified) continue;
@@ -1304,6 +1502,8 @@ const NEEDS_DECODE = new Set(['.heic', '.heif', '.avif']);
 export interface ImportTransactionSpec {
   slug: string;
   hadExisting: boolean;
+  /** Source containing the page, chunks, file row, and type-specific writes. */
+  sourceId?: string;
   page: PageInput;
   /** When undefined, no chunk write happens. When [], deletes any prior chunks. */
   chunks?: ChunkInput[];
@@ -1317,23 +1517,26 @@ export async function withImportTransaction(
   engine: BrainEngine,
   spec: ImportTransactionSpec,
 ): Promise<void> {
+  const sourceId = spec.sourceId ?? 'default';
+  const txOpts = spec.sourceId ? { sourceId: spec.sourceId } : undefined;
   await engine.transaction(async (tx) => {
-    if (spec.hadExisting) await tx.createVersion(spec.slug);
-    await tx.putPage(spec.slug, spec.page);
+    if (spec.hadExisting) await tx.createVersion(spec.slug, txOpts);
+    await tx.putPage(spec.slug, spec.page, txOpts);
     if (spec.file) {
       // page_id resolution after putPage so the new row's id is available.
-      const stored = await tx.getPage(spec.slug);
+      const stored = await tx.getPage(spec.slug, txOpts);
       await tx.upsertFile({
         ...spec.file,
+        source_id: sourceId,
         page_slug: spec.slug,
         page_id: stored?.id ?? null,
       });
     }
     if (spec.chunks !== undefined) {
       if (spec.chunks.length > 0) {
-        await tx.upsertChunks(spec.slug, spec.chunks);
+        await tx.upsertChunks(spec.slug, spec.chunks, txOpts);
       } else {
-        await tx.deleteChunks(spec.slug);
+        await tx.deleteChunks(spec.slug, txOpts);
       }
     }
     if (spec.after) await spec.after(tx);
@@ -1563,10 +1766,14 @@ export async function importImageFile(
   // and slugifyPath would already preserve it). Recompute with the file
   // extension preserved so the page slug is stable + collision-free.
   const imageSlug = relativePath.replace(/[\\\/]/g, '/').toLowerCase();
+  const sourceOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
+  const linkOpts = opts.sourceId
+    ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
+    : undefined;
   const buf = readFileSync(filePath);
   const hash = createHash('sha256').update(buf).digest('hex');
 
-  const existing = await engine.getPage(imageSlug);
+  const existing = await engine.getPage(imageSlug, sourceOpts);
   if (existing?.content_hash === hash) {
     return { slug: imageSlug, status: 'skipped', chunks: 0 };
   }
@@ -1642,6 +1849,7 @@ export async function importImageFile(
   await withImportTransaction(engine, {
     slug: imageSlug,
     hadExisting: !!existing,
+    sourceId: opts.sourceId,
     page: {
       type: 'image',
       page_kind: 'image',
@@ -1659,13 +1867,14 @@ export async function importImageFile(
       // throws when the target doesn't exist; we silently skip for now and
       // let `gbrain reconcile-links` pick up later additions.
       for (const candidate of imageOfCandidates(imageSlug)) {
-        const sibling = await tx.getPage(candidate);
+        const sibling = await tx.getPage(candidate, sourceOpts);
         if (sibling) {
           try {
             await tx.addLink(
               imageSlug, candidate,
               filename,
               'image_of', 'manual', imageSlug, 'frontmatter',
+              linkOpts,
             );
           } catch { /* sibling vanished mid-tx; skip */ }
           break; // one canonical link per image

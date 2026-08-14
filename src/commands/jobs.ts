@@ -7,7 +7,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { MinionQueue } from '../core/minions/queue.ts';
 import { MinionWorker } from '../core/minions/worker.ts';
 import { WORKER_EXIT_RSS_WATCHDOG } from '../core/minions/worker-exit-codes.ts';
-import type { MinionJob, MinionJobStatus } from '../core/minions/types.ts';
+import type { MinionHandler, MinionJob, MinionJobStatus } from '../core/minions/types.ts';
 import type { PaceKeyOverrides } from '../core/pace-mode.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
@@ -20,6 +20,59 @@ function parseFlag(args: string[], flag: string): string | undefined {
 
 function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
+}
+
+/**
+ * Resolve the canonical positive-polarity pull flag while preserving queued
+ * jobs that still carry the legacy inverse `noPull` key.
+ */
+export function resolveJobPull(data: Record<string, unknown>): boolean {
+  if (typeof data.pull === 'boolean') return data.pull;
+  if (typeof data.noPull === 'boolean') return !data.noPull;
+  return true;
+}
+
+/**
+ * Long-lived workers outlive operator config changes. Re-stamp the AI gateway
+ * from DB-backed model config immediately before queued jobs enter gateway-backed
+ * paths, so a stale process-level default cannot route new work to the wrong
+ * provider.
+ */
+async function refreshGatewayForJob(engine: BrainEngine): Promise<void> {
+  const { reconfigureGatewayWithEngine } = await import('../core/ai/gateway.ts');
+  await reconfigureGatewayWithEngine(engine);
+}
+
+const GATEWAY_REFRESH_JOB_NAMES = new Set([
+  'embed',
+  'extract-conversation-facts',
+  'enrich',
+  'contextual_reindex_per_chunk',
+  'autopilot-cycle',
+  'synthesize',
+  'patterns',
+  'consolidate',
+  'extract_facts',
+  'extract-atoms-drain',
+  'embed-backfill',
+  'extract-takes-from-pages',
+  'embed-catch-up',
+]);
+
+function registerBuiltinJob(
+  worker: MinionWorker,
+  engine: BrainEngine,
+  name: string,
+  handler: MinionHandler,
+): void {
+  if (!GATEWAY_REFRESH_JOB_NAMES.has(name)) {
+    worker.register(name, handler);
+    return;
+  }
+  worker.register(name, async (job) => {
+    await refreshGatewayForJob(engine);
+    return await handler(job);
+  });
 }
 
 /** Parse `--max-waiting N` from CLI args. Returns undefined if absent.
@@ -100,6 +153,31 @@ export function resolveWorkerConcurrency(args: string[], env: NodeJS.ProcessEnv 
   return parsed;
 }
 
+/**
+ * #3026: the thin-client `list`/`get` branches receive jobs as parsed JSON
+ * off the MCP wire, where every timestamp is an ISO string — but formatJob /
+ * formatJobDetail (and the stalled-detection comparison) hold a Date
+ * contract, hydrated locally by MinionQueue.rowToJob. Rehydrate once at the
+ * unpack boundary so both paths hand the formatters real Dates. Exported for
+ * unit tests.
+ */
+const JOB_DATE_FIELDS = [
+  'created_at', 'updated_at', 'started_at', 'finished_at', 'lock_until', 'delay_until',
+] as const;
+
+export function rehydrateJobDates<T>(job: T): T {
+  if (!job || typeof job !== 'object') return job;
+  const rec = job as { [k: string]: unknown };
+  for (const field of JOB_DATE_FIELDS) {
+    const v = rec[field];
+    if (typeof v === 'string') {
+      const d = new Date(v);
+      if (!Number.isNaN(d.getTime())) rec[field] = d;
+    }
+  }
+  return job;
+}
+
 function formatJob(job: MinionJob): string {
   const dur = job.finished_at && job.started_at
     ? `${((job.finished_at.getTime() - job.started_at.getTime()) / 1000).toFixed(1)}s`
@@ -132,8 +210,22 @@ function formatJobDetail(job: MinionJob): string {
   return lines.join('\n');
 }
 
-export async function runJobs(engine: BrainEngine, args: string[]): Promise<void> {
+export async function runJobs(engineOrNull: BrainEngine | null, args: string[]): Promise<void> {
   const sub = args[0];
+
+  // Thin-client dispatch (cli.ts) passes engine=null for the subcommands
+  // with remote MCP routing (`list`, `get`) so no scratch local engine is
+  // ever built. Any other subcommand arriving with a null engine is a
+  // routing bug upstream of this function — refuse instead of crashing
+  // inside MinionQueue.
+  if (!engineOrNull && sub !== 'list' && sub !== 'get') {
+    console.error(`\`gbrain jobs ${sub ?? ''}\` needs a local engine and cannot run on a thin client.`);
+    process.exit(1);
+  }
+  // Null only ever reaches the MCP-routed `list`/`get` branches, which
+  // never touch the engine — narrowed once here so the host-only cases
+  // below typecheck unchanged.
+  const engine = engineOrNull as BrainEngine;
 
   if (!sub || sub === '--help' || sub === '-h') {
     console.log(`gbrain jobs — Minions job queue
@@ -151,7 +243,7 @@ USAGE
   gbrain jobs get <id>
   gbrain jobs cancel <id>
   gbrain jobs retry <id>
-  gbrain jobs prune [--older-than 30d]
+  gbrain jobs prune [--older-than 30d] [--dry-run]
   gbrain jobs delete <id>
   gbrain jobs stats
   gbrain jobs smoke
@@ -217,6 +309,8 @@ HANDLER TYPES (built in)
     return;
   }
 
+  // The constructor just stores the reference; on the null (thin-client
+  // list/get) paths no queue method is ever reached.
   const queue = new MinionQueue(engine);
 
   switch (sub) {
@@ -437,7 +531,7 @@ HANDLER TYPES (built in)
         const raw = await callRemoteTool(cfg!, 'list_jobs', {
           status, queue: queueName, limit,
         }, { timeoutMs: 30_000 });
-        jobs = unpackToolResult<MinionJob[]>(raw);
+        jobs = unpackToolResult<MinionJob[]>(raw).map((j) => rehydrateJobDates(j));
       } else {
         try { await queue.ensureSchema(); }
         catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
@@ -466,7 +560,7 @@ HANDLER TYPES (built in)
       if (isThinClient(cfg)) {
         try {
           const raw = await callRemoteTool(cfg!, 'get_job', { id }, { timeoutMs: 30_000 });
-          job = unpackToolResult<MinionJob | null>(raw);
+          job = rehydrateJobDates(unpackToolResult<MinionJob | null>(raw));
         } catch (e) {
           // The remote op throws `invalid_params` on not-found; surface as
           // the same "Job not found" exit-1 the local path produces.
@@ -549,8 +643,15 @@ HANDLER TYPES (built in)
       try { await queue.ensureSchema(); }
       catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
 
-      const count = await queue.prune({ olderThan: new Date(Date.now() - days * 86400000) });
-      console.log(`Pruned ${count} jobs older than ${days} days.`);
+      // #2712: --dry-run previews the count without deleting. It used to be
+      // silently ignored (the destructive default ran anyway).
+      const dryRun = hasFlag(args, '--dry-run');
+      const count = await queue.prune({ olderThan: new Date(Date.now() - days * 86400000), dryRun });
+      if (dryRun) {
+        console.log(`[dry-run] Would prune ${count} jobs older than ${days} days. Nothing deleted.`);
+      } else {
+        console.log(`Pruned ${count} jobs older than ${days} days.`);
+      }
       break;
     }
 
@@ -1323,7 +1424,7 @@ export async function registerBuiltinHandlers(
   worker.register('sync', async (job) => {
     const { performSync } = await import('./sync.ts');
     const repoPath = typeof job.data.repoPath === 'string' ? job.data.repoPath : undefined;
-    const noPull = !!job.data.noPull;
+    const noPull = !resolveJobPull(job.data);
     // noEmbed defaults to true (embed is a separate job — submit `embed --stale`
     // after sync, OR run via the autopilot cycle which has its own embed phase).
     // Caller can opt in by passing { noEmbed: false } in job params.
@@ -1423,17 +1524,22 @@ export async function registerBuiltinHandlers(
     return { ...result, embed_job_id: embedJobId, embed_skip_reason: embedSkipReason };
   });
 
-  worker.register('embed', async (job) => {
+  registerBuiltinJob(worker, engine, 'embed', async (job) => {
     const { runEmbedCore } = await import('./embed.ts');
     // Primary Minion progress channel is job.updateProgress (DB-backed,
     // readable via `gbrain jobs get <id>`). Stderr from the worker daemon
     // only emits coarse job-start / job-done lines; per-page detail lives
     // in the DB. Per Codex review #20.
-    await runEmbedCore(engine, {
+    const embedResult = await runEmbedCore(engine, {
       slug: typeof job.data.slug === 'string' ? job.data.slug : undefined,
       slugs: Array.isArray(job.data.slugs) ? (job.data.slugs as string[]) : undefined,
       all: !!job.data.all,
       stale: job.data.all ? false : (job.data.stale !== false),
+      // `embed --background` serializes dryRun into the payload (embed.ts's
+      // job-args builder). Not reading it back here meant a backgrounded
+      // preview embedded for real: API spend and NULL->vector writes from an
+      // invocation whose whole point was to do neither.
+      dryRun: !!job.data.dryRun,
       sourceId: typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined,
       // CX1+CX5: pace overrides ride in the job payload as explicit overrides
       // only; runEmbedCore re-resolves env > config > bundle at execution so
@@ -1452,7 +1558,16 @@ export async function registerBuiltinHandlers(
         job.updateProgress({ done, total, embedded, phase: 'embed.pages' }).catch(() => {});
       },
     });
-    return { embedded: true };
+    // Report what happened, not a constant. `embedded: true` claimed a dry run
+    // had embedded, which is the same lie in miniature: `gbrain jobs get`
+    // showed it. `embedded` stays the key it always was and stays truthy on a
+    // real run (it is now the count, 0 on a dry run).
+    return {
+      embedded: embedResult.embedded,
+      dry_run: !!embedResult.dryRun,
+      would_embed: embedResult.would_embed,
+      failures: embedResult.failures,
+    };
   });
 
   worker.register('lint', async (job) => {
@@ -1470,7 +1585,7 @@ export async function registerBuiltinHandlers(
   // BudgetTracker inside its own process. BudgetExhausted is caught at
   // the core level and returned as `result.budget_exhausted: true` (NOT
   // a job failure) so the user can resume with a higher cap.
-  worker.register('extract-conversation-facts', async (job) => {
+  registerBuiltinJob(worker, engine, 'extract-conversation-facts', async (job) => {
     const { runExtractConversationFactsCore } = await import('./extract-conversation-facts.ts');
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
     if (!sourceId) {
@@ -1481,7 +1596,7 @@ export async function registerBuiltinHandlers(
     }
     const types = Array.isArray(job.data.types)
       ? (job.data.types as string[]).filter((t) =>
-          ['conversation', 'meeting', 'slack', 'email'].includes(t),
+          ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'].includes(t),
         )
       : undefined;
     const result = await runExtractConversationFactsCore(engine, {
@@ -1529,7 +1644,7 @@ export async function registerBuiltinHandlers(
   // at the core level and returned as result.budget_exhausted (NOT a failure).
   // Strict per-source: the CLI fans out one job per source when --source is
   // omitted, so a job ALWAYS carries data.sourceId.
-  worker.register('enrich', async (job) => {
+  registerBuiltinJob(worker, engine, 'enrich', async (job) => {
     const { runEnrichCore } = await import('./enrich.ts');
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
     if (!sourceId) {
@@ -1593,7 +1708,44 @@ export async function registerBuiltinHandlers(
   });
 
   worker.register('extract', async (job) => {
-    const { runExtractCore } = await import('./extract.ts');
+    const { runExtractCore, extractStaleFromDB, STALE_TIME_BUDGET_MS } = await import('./extract.ts');
+    // #2849: stale mode — the durable follow-up for extraction deferred by
+    // performSync's size gate (totalChanges > 100). Runs the same DB-source
+    // watermark sweep as `gbrain extract --stale`, scoped to the source the
+    // sync that deferred it was scoped to (job.data.sourceId; absent =
+    // unscoped, matching what the CLI hint tells a default-brain operator
+    // to run). The sweep is checkout-less + idempotent, so retries and
+    // overlapping submissions converge.
+    if (job.data.stale === true) {
+      const sourceIdFilter = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
+      const r = await extractStaleFromDB(engine, {
+        dryRun: !!job.data.dryRun,
+        jsonMode: false,
+        includeFrontmatter: false,
+        sourceIdFilter,
+        catchUp: false,
+      });
+      // Internal 30-min budget hit with work remaining → chain a
+      // continuation job so a very large deferred backlog converges without
+      // waiting for the next sync. Forward-progress guard (pagesProcessed >
+      // 0) prevents an infinite chain if the sweep can't advance.
+      if (!job.data.dryRun && r.staleRemaining > 0 && r.pagesProcessed > 0) {
+        try {
+          const queue = new MinionQueue(engine);
+          // NO maxWaiting: with an unscoped (NULL-sourceId) payload the
+          // coalesce filter matches ANY waiting 'extract' job and would
+          // swallow the continuation. Each completed sweep chains at most
+          // one continuation and the sweep is an idempotent watermark scan,
+          // so there is no pile-up to guard against.
+          await queue.add(
+            'extract',
+            { ...job.data, continuation_of: job.id },
+            { timeout_ms: STALE_TIME_BUDGET_MS + 5 * 60 * 1000 },
+          );
+        } catch { /* best-effort: next sync/manual sweep picks up the rest */ }
+      }
+      return { stale: true, source_id: sourceIdFilter ?? null, ...r };
+    }
     const mode = (typeof job.data.mode === 'string' && ['links', 'timeline', 'all'].includes(job.data.mode))
       ? (job.data.mode as 'links' | 'timeline' | 'all')
       : 'all';
@@ -1605,11 +1757,54 @@ export async function registerBuiltinHandlers(
 
   worker.register('backlinks', async (job) => {
     const { runBacklinksCore } = await import('./backlinks.ts');
-    const action: 'check' | 'fix' = job.data.action === 'check' ? 'check' : 'fix';
+    // Default to 'check', not 'fix': backlinks jobs submitted with an empty
+    // payload (e.g. the sync→embed→backlinks chains enqueued after ingestion)
+    // must never rewrite tracked brain pages with generated "Referenced in"
+    // timeline bullets. Mirrors the documented intent in src/core/cycle.ts
+    // (runPhaseBacklinks). The filesystem fixer stays available explicitly
+    // via '{"action":"fix"}' or `gbrain check-backlinks fix`.
+    const action: 'check' | 'fix' = job.data.action === 'fix' ? 'fix' : 'check';
     const dir = typeof job.data.dir === 'string'
       ? job.data.dir
       : (await engine.getConfig('sync.repo_path')) ?? '.';
     return await runBacklinksCore({ action, dir, dryRun: !!job.data.dryRun });
+  });
+
+  // Local patch 2026-06-11: durable facts:absorb. One-shot CLI processes
+  // (capture/put/sync) can't finish the extraction chat before their exit
+  // drain aborts it, so backstop.ts submits this job instead and the
+  // long-lived worker does the LLM work here. Inline mode: errors throw,
+  // so minion retry/backoff handles transient gateway failures and real
+  // failures stay visible in `gbrain jobs list --status failed`.
+  worker.register('facts-absorb', async (job) => {
+    const slug = typeof job.data.slug === 'string' ? job.data.slug : '';
+    if (!slug) throw new Error('facts-absorb job requires data.slug');
+    const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : 'default';
+    const page = await engine.getPage(slug, { sourceId });
+    if (!page) return { skipped: 'page_missing', slug, sourceId };
+    const { runFactsBackstop } = await import('../core/facts/backstop.ts');
+    const KNOWN_SOURCES = ['sync:import', 'mcp:put_page', 'mcp:extract_facts', 'file_upload', 'code_import'] as const;
+    const source = (KNOWN_SOURCES as readonly string[]).includes(job.data.source as string)
+      ? (job.data.source as typeof KNOWN_SOURCES[number])
+      : 'mcp:put_page';
+    return await runFactsBackstop(
+      {
+        slug: page.slug,
+        type: page.type,
+        compiled_truth: page.compiled_truth,
+        frontmatter: (page.frontmatter ?? {}) as Record<string, unknown>,
+      },
+      {
+        engine,
+        sourceId,
+        sessionId: typeof job.data.sessionId === 'string' ? job.data.sessionId : null,
+        source,
+        mode: 'inline',
+        notabilityFilter: job.data.notabilityFilter === 'high-only' ? 'high-only' : 'all',
+        visibility: job.data.visibility === 'world' ? 'world' : 'private',
+        ...(typeof job.data.model === 'string' && job.data.model ? { model: job.data.model } : {}),
+      },
+    );
   });
 
   // Autopilot-cycle handler: delegates to runCycle. Shares the exact same
@@ -1632,13 +1827,13 @@ export async function registerBuiltinHandlers(
     const { makeContextualReindexHandler } = await import(
       '../core/minions/handlers/contextual-reindex-per-chunk.ts'
     );
-    worker.register('contextual_reindex_per_chunk', makeContextualReindexHandler({ engine }));
+    registerBuiltinJob(worker, engine, 'contextual_reindex_per_chunk', makeContextualReindexHandler({ engine }));
   }
 
   // derivation); the handler returns { partial, status, report } so
   // `gbrain jobs get <id>` shows the full structured report. Does NOT
   // throw on partial: a flaky phase must not block every future cycle.
-  worker.register('autopilot-cycle', async (job) => {
+  registerBuiltinJob(worker, engine, 'autopilot-cycle', async (job) => {
     const { runCycle } = await import('../core/cycle.ts');
     // v0.41.30 (T2): fall back to null (NOT cwd '.') when no repo is configured.
     // The queued cycle is the same primitive `gbrain dream` uses; a checkout-less
@@ -1721,8 +1916,7 @@ export async function registerBuiltinHandlers(
       ? (job.data.phases as string[]).filter(p => validPhases.has(p as any))
       : undefined;
 
-    // Pull default: legacy `true` for back-compat; explicit boolean wins.
-    const pull = typeof job.data.pull === 'boolean' ? job.data.pull : true;
+    const pull = resolveJobPull(job.data);
 
     // #2194 fix #2 / codex #5 (D4): claim-time cooldown guard. A job already
     // queued or retrying (max_attempts:2) can reach the worker after the
@@ -1743,6 +1937,7 @@ export async function registerBuiltinHandlers(
       brainDir: effectiveBrainDir,
       pull,
       signal: job.signal, // propagate abort so cycle bails on timeout/cancel
+      deadlineAtMs: job.deadlineAtMs, // #2781: phases budget sub-work from remaining time
       ...(sourceId ? { sourceId } : {}),
       ...(requestedPhases && requestedPhases.length > 0 ? { phases: requestedPhases as any } : {}),
       yieldBetweenPhases: async () => {
@@ -1780,7 +1975,9 @@ export async function registerBuiltinHandlers(
       brainDir: repoPath,
       pull: false, // brain-wide DB/maintenance work never git-pulls
       signal: job.signal,
+      deadlineAtMs: job.deadlineAtMs, // #2781: phases budget sub-work from remaining time
       phases,
+      forceGlobalOrphans: true,
       yieldBetweenPhases: async () => { await new Promise<void>((r) => setImmediate(r)); },
     });
 
@@ -1925,17 +2122,18 @@ export async function registerBuiltinHandlers(
       brainDir: repoPath,
       phases: [phase as any],
       signal: job.signal,
+      deadlineAtMs: job.deadlineAtMs, // #2781: phases budget sub-work from remaining time
     });
     return { phase, status: report.status, report };
   };
 
   // PROTECTED — internally spawn subagent children
-  worker.register('synthesize', makePhaseHandler('synthesize'));
-  worker.register('patterns', makePhaseHandler('patterns'));
-  worker.register('consolidate', makePhaseHandler('consolidate'));
+  registerBuiltinJob(worker, engine, 'synthesize', makePhaseHandler('synthesize'));
+  registerBuiltinJob(worker, engine, 'patterns', makePhaseHandler('patterns'));
+  registerBuiltinJob(worker, engine, 'consolidate', makePhaseHandler('consolidate'));
 
   // Open — DB writes only, no LLM spend
-  worker.register('extract_facts', makePhaseHandler('extract_facts'));
+  registerBuiltinJob(worker, engine, 'extract_facts', makePhaseHandler('extract_facts'));
   worker.register('resolve_symbol_edges', makePhaseHandler('resolve_symbol_edges'));
   worker.register('recompute_emotional_weight', makePhaseHandler('recompute_emotional_weight'));
 
@@ -1945,7 +2143,7 @@ export async function registerBuiltinHandlers(
   // window / defer behavior. On LockUnavailableError (the routine cycle holds
   // the per-source lock) the job completes `{ deferred: true }` and retries
   // next tick instead of failing — cooperative interleave (CODEX accepted).
-  worker.register('extract-atoms-drain', async (job) => {
+  registerBuiltinJob(worker, engine, 'extract-atoms-drain', async (job) => {
     const { runExtractAtomsDrainForSource } = await import('../core/cycle/extract-atoms-drain.ts');
     const { LockUnavailableError } = await import('../core/db-lock.ts');
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
@@ -1956,11 +2154,26 @@ export async function registerBuiltinHandlers(
         ? job.data.repoPath
         : ((await engine.getConfig('sync.repo_path')) ?? undefined);
     try {
-      return await runExtractAtomsDrainForSource(engine, {
+      const result = await runExtractAtomsDrainForSource(engine, {
         sourceId,
         windowSeconds,
         brainDir: repoPath,
       });
+      // issue #3218: every item the drain attempted failed (0 succeeded, >=1
+      // provider error) — completing this job normally would mark the
+      // durable job done while the backlog sits untouched, and no retry
+      // policy would ever fire on it again. Throw so the worker's ordinary
+      // failJob path (attempt+backoff, or dead-letter once exhausted) takes
+      // over instead — matching the existing behavior for every other
+      // handler failure. Partial success (>=1 item extracted) keeps
+      // completing normally, unchanged.
+      if (result.status === 'provider_failure') {
+        throw new Error(
+          `extract-atoms-drain: all provider calls failed this batch ` +
+          `(batches=${result.batches}, remaining=${result.remaining ?? '?'}) — retrying`,
+        );
+      }
+      return result;
     } catch (e) {
       if (e instanceof LockUnavailableError) {
         return { phase: 'extract_atoms', status: 'skipped', deferred: true, reason: 'cycle_already_running' };
@@ -1973,7 +2186,7 @@ export async function registerBuiltinHandlers(
   // Cost-bounded via D6 ($10/job BudgetTracker) + D19 (source-level cooldown
   // + 24h rolling cap, gated at submit time). NOT in PROTECTED_JOB_NAMES —
   // embedding-only spend, no API-by-the-minute risk like subagent.
-  worker.register('embed-backfill', async (job) => {
+  registerBuiltinJob(worker, engine, 'embed-backfill', async (job) => {
     const { makeEmbedBackfillHandler } = await import('../core/minions/handlers/embed-backfill.ts');
     return await makeEmbedBackfillHandler(engine)(job);
   });
@@ -1994,7 +2207,7 @@ export async function registerBuiltinHandlers(
   // (LLM-bearing). Two-gate consent enforced at the handler boundary:
   // refuses to run unless takes.bootstrap_enabled config is true, even
   // when allowProtectedSubmit was set at queue.add time.
-  worker.register('extract-takes-from-pages', async (job) => {
+  registerBuiltinJob(worker, engine, 'extract-takes-from-pages', async (job) => {
     const { extractTakesFromPages } = await import('../core/extract-takes-from-pages.ts');
     const data = (job.data ?? {}) as { sourceId?: string; maxPages?: number };
     const bootstrapCfg = await engine.getConfig('takes.bootstrap_enabled');
@@ -2021,7 +2234,7 @@ export async function registerBuiltinHandlers(
   // remediation pipeline. Wraps runEmbedCore with stale + catchUp + the
   // priority/batchSize the recommendation supplies. NOT in
   // PROTECTED_JOB_NAMES (embedding spend only).
-  worker.register('embed-catch-up', async (job) => {
+  registerBuiltinJob(worker, engine, 'embed-catch-up', async (job) => {
     const { runEmbedCore } = await import('./embed.ts');
     const data = (job.data ?? {}) as {
       sourceId?: string;
@@ -2041,8 +2254,9 @@ export async function registerBuiltinHandlers(
   // migration that retypes 25K+ pages, creates alias rows, converts edge-
   // shaped pages to link rows, AND flips the active pack at end of run.
   // manual_only via src/core/onboard/render.ts:MANUAL_ONLY_PROTECTED_JOBS.
-  // Operator path: `gbrain jobs submit unify-types --allow-protected --params
-  // '{"target_pack":"gbrain-base-v2"}'`.
+  // Dry-run preview: `gbrain jobs submit unify-types --allow-protected
+  // --params '{"target_pack":"gbrain-base-v2"}'`; apply with
+  // '{"target_pack":"gbrain-base-v2","apply":true}'.
   worker.register('unify-types', async (job) => {
     const { runUnifyTypes } = await import('../core/schema-pack/unify-types-handler.ts');
     const data = (job.data ?? {}) as {
@@ -2060,7 +2274,11 @@ export async function registerBuiltinHandlers(
     } as unknown as import('../core/operations.ts').OperationContext;
     return await runUnifyTypes(ctx, {
       target_pack: data.target_pack,
-      apply: data.apply ?? true,
+      // #1575: default matches the handler interface's "Default false
+      // (dry-run)" — a destructive one-shot migration must be opted into
+      // with apply:true (the onboard remediation + the printed migration
+      // command both carry it explicitly).
+      apply: data.apply ?? false,
       sourceId: data.sourceId,
       onProgress: (msg: string) => {
         job.updateProgress({ phase: 'unify-types', message: msg }).catch(() => {});

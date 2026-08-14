@@ -20,15 +20,20 @@ let captured: string[];
 
 function minorBump(): string {
   const v = parseSemver(VERSION)!;
-  return `${v[0]}.${v[1] + 1}.0`;
+  return `${v[0]}.${v[1] + 1}.0.0`;
+}
+
+function microBump(): string {
+  const v = parseSemver(VERSION)!;
+  return `${v[0]}.${v[1]}.${v[2]}.${v[3] + 1}`;
 }
 
 function stub(tag: string | null, changelog: string): void {
   globalThis.fetch = (async (url: any) => {
     const u = String(url);
-    if (u.includes('/releases/latest')) {
+    if (u.includes('/gbrain/master/VERSION')) {
       if (tag === null) throw new Error('network down');
-      return new Response(JSON.stringify({ tag_name: tag, published_at: '2026-01-01', html_url: 'https://x/rel' }), { status: 200 });
+      return new Response(tag + '\n', { status: 200 });
     }
     if (u.includes('CHANGELOG.md')) return new Response(changelog, { status: 200 });
     return new Response('', { status: 200 });
@@ -60,7 +65,7 @@ describe('self-upgrade --check-only surfaces what you get', () => {
     const out = JSON.parse(captured.join('\n'));
     expect(out.update_available).toBe(true);
     expect(out.latest_version).toBe(latest);
-    expect(out.release_url).toBe('https://x/rel');
+    expect(out.release_url).toBe('https://github.com/garrytan/gbrain/blob/master/CHANGELOG.md');
     expect(out.changelog_diff).toContain('Shiny new thing');
   });
 
@@ -81,6 +86,17 @@ describe('self-upgrade --check-only surfaces what you get', () => {
     const out = JSON.parse(captured.join('\n'));
     expect(out.update_available).toBe(false);
     expect(out.changelog_diff).toBe('');
+  });
+
+  test('micro release → reports update available', async () => {
+    const latest = microBump();
+    const changelog = `# Changelog\n\n## [${latest}] - 2026-01-01\n\n- Follow-up fix\n\n## [${VERSION}] - 2025-12-01\n\n- old\n`;
+    stub(`v${latest}`, changelog);
+    await runSelfUpgrade(['--check-only', '--json']);
+    const out = JSON.parse(captured.join('\n'));
+    expect(out.update_available).toBe(true);
+    expect(out.latest_version).toBe(latest);
+    expect(out.changelog_diff).toContain('Follow-up fix');
   });
 
   test('network failure → up to date, no crash', async () => {

@@ -397,11 +397,12 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   }
 
   // v0.28.5 (X1): explicitly apply pending schema migrations.
-  // apply-migrations runs orchestrator migrations and only WARNs about
-  // schema-version drift (apply-migrations.ts:296-302). Without this hook,
-  // `gbrain upgrade` leaves wedged brains wedged — the user has to read
-  // the WARN and run `gbrain init --migrate-only` themselves. We've shipped
-  // 11 wedge incidents asking users to read warnings; close the loop here.
+  // Since #3085, apply-migrations --yes applies schema-version drift itself
+  // (it previously only WARNed), so the in-process call above may have
+  // already run these — runMigrations is idempotent, making this hook a
+  // harmless second pass. It stays because it also covers paths where the
+  // preflight was skipped. We've shipped 11 wedge incidents asking users to
+  // read warnings; keep the loop closed here.
   // A1's hasPendingMigrations probe in connectEngine is belt-and-suspenders
   // for any path that bypasses upgrade (autopilot, direct CLI on stale brain).
   try {
@@ -457,6 +458,84 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
             console.log('  gbrain config set search.searchLimit 20');
             console.log('');
             await engine.setConfig('search.mode_upgrade_notice_shown', 'true');
+          }
+        } catch {
+          // Banner is cosmetic; never block the upgrade.
+        }
+
+        // #3390: ZeroEntropy sunset notice. ZE announced (2026-07-24) that
+        // its hosted endpoints — including /models/embed and /models/rerank —
+        // shut down on 2026-09-04. Any brain resolving to a zeroentropyai:*
+        // embedding model (including default-config brains that never set
+        // one) loses SEMANTIC RETRIEVAL ENTIRELY on that date: the query
+        // embedding uses the same endpoint, so existing vectors become
+        // unqueryable. One-shot per install, gated by
+        // `ze_sunset_notice_shown` (same pattern as the search-mode banner).
+        try {
+          const shown = await engine.getConfig('ze_sunset_notice_shown');
+          const { DEFAULT_EMBEDDING_MODEL, ZEROENTROPY_SUNSET_DATE } = await import('../core/ai/defaults.ts');
+          const effectiveModel = cfgSchema.embedding_model ?? DEFAULT_EMBEDDING_MODEL;
+          // Effective reranker via the plane search actually reranks with
+          // (mode bundle + search.reranker.* overrides) — the bare config
+          // key is unset by default while balanced/tokenmax rerank with the
+          // bundle's zeroentropyai model. Same resolution as the
+          // provider_sunset doctor check.
+          let rerankerModel: string | undefined;
+          try {
+            const { loadSearchModeConfig, resolveSearchMode } = await import('../core/search/mode.ts');
+            const knobs = resolveSearchMode(await loadSearchModeConfig(engine));
+            if (knobs.reranker_enabled) rerankerModel = knobs.reranker_model;
+          } catch { /* no reranker-exposure claim */ }
+          const onZeEmbedding = effectiveModel.startsWith('zeroentropyai:');
+          const onZeReranker = !!rerankerModel?.startsWith('zeroentropyai:');
+          if (shown !== 'true' && (onZeEmbedding || onZeReranker)) {
+            // Paste-ready --dim from the ACTUAL column width (config can
+            // drift): keeping the current width avoids a needless dimension
+            // transition + index rebuild when the target supports it.
+            let colDims: number | null = null;
+            try {
+              const { readContentChunksEmbeddingDim } = await import('../core/embedding-dim-check.ts');
+              colDims = (await readContentChunksEmbeddingDim(engine)).dims;
+            } catch { /* fresh brain — omit --dim */ }
+            const dimFlag = colDims ? ` --dim ${colDims}` : '';
+            console.log('');
+            console.log('═══════════════════════════════════════════════════════════════');
+            console.log(`[gbrain] ACTION REQUIRED: ZeroEntropy hosted API sunsets ${ZEROENTROPY_SUNSET_DATE}.`);
+            if (onZeEmbedding) {
+              console.log(`[gbrain] This brain embeds with ${effectiveModel}. After the sunset,`);
+              console.log('[gbrain] semantic retrieval STOPS WORKING entirely — your EXISTING');
+              console.log('[gbrain] vectors become unqueryable (queries embed through the same');
+              console.log('[gbrain] endpoint), not just new content.');
+            }
+            if (onZeReranker) {
+              console.log(`[gbrain] The reranker (${rerankerModel}) also sunsets; search falls`);
+              console.log('[gbrain] back to unreranked ordering.');
+            }
+            console.log('═══════════════════════════════════════════════════════════════');
+            console.log('');
+            console.log('Two fixes, either works:');
+            console.log('');
+            console.log('[1] Self-host the same model — zembed-1 weights are Apache-2.0. Serve');
+            console.log('    them via llama-server or Ollama and point the config at the local');
+            console.log('    endpoint. Keeps every existing vector; NO re-embed at all. See');
+            console.log('    docs/guides/embedding-migration.md ("Self-hosting instead of migrating").');
+            console.log('');
+            console.log('[2] Migrate to another provider (resumable; preview cost first):');
+            console.log(`      gbrain migrate embeddings --to <provider:model>${dimFlag} --dry-run`);
+            console.log(`      gbrain migrate embeddings --to <provider:model>${dimFlag}`);
+            if (colDims) {
+              console.log(`    (--dim ${colDims} is this brain's current index width — keep it to`);
+              console.log('    avoid a needless schema rebuild when the target supports it.)');
+            }
+            if (onZeReranker) {
+              console.log('');
+              console.log('Reranker: gbrain config set search.reranker.enabled false (or pick another).');
+            }
+            console.log('');
+            console.log(`\`gbrain doctor\` will keep flagging this until the brain is off the`);
+            console.log('provider (check name: provider_sunset).');
+            console.log('');
+            await engine.setConfig('ze_sunset_notice_shown', 'true');
           }
         } catch {
           // Banner is cosmetic; never block the upgrade.
@@ -618,18 +697,46 @@ export async function postUpgradeReferenceSweep(
     if (path.resolve(targetWorkspace) === path.resolve(gbrainRoot)) return;
 
     const result = runReferenceAll({ gbrainRoot, targetWorkspace });
-    // Print only skills that (a) the host has actually scaffolded, AND
-    // (b) have at least one differs or missing entry. Pure-`missing`
-    // skills the host never scaffolded are noise; skip them.
+    // Drifted = skills the host has actually scaffolded that now differ from
+    // the bundle (local edits are legitimate — this is advisory).
     const drifted = result.skills.filter(
       s =>
         s.summary.identical + s.summary.differs > 0 &&
         (s.summary.differs > 0 || s.summary.missing > 0),
     );
-    if (drifted.length === 0) return;
+
+    // New = skills the host never scaffolded (own body absent). These used to
+    // be filtered out as "noise", which meant an upgrade that shipped brand-new
+    // skills said nothing about them. Surface them via the currency classifier
+    // (own-files aware) so new capability is discoverable — but ONLY for a host
+    // that has already scaffolded at least one skill (a skills user missing the
+    // new ones). A host with zero scaffolded skills has opted out; surfacing
+    // every bundled skill on every upgrade would be exactly the noise the old
+    // filter avoided, so it stays silent for them.
+    let newSkills: string[] = [];
+    try {
+      const { computeSkillCurrency } = await import('../core/skillpack/skill-currency.ts');
+      const currency = computeSkillCurrency({ gbrainRoot, targetWorkspace });
+      const hasScaffolded = currency.counts.current > 0 || currency.counts.drifted > 0;
+      if (hasScaffolded) {
+        newSkills = currency.skills.filter(s => s.status === 'new').map(s => s.slug);
+      }
+    } catch {
+      // Best-effort; drift report still prints below.
+    }
+
+    if (drifted.length === 0 && newSkills.length === 0) return;
 
     console.log('');
-    console.log('Skillpack reference sweep (post-upgrade):');
+    console.log('Skillpack sweep (post-upgrade):');
+    if (newSkills.length > 0) {
+      const shown = newSkills.slice(0, 10);
+      console.log(
+        `  ${newSkills.length} new built-in skill(s) not installed here: ${shown.join(', ')}` +
+          (newSkills.length > shown.length ? `, … +${newSkills.length - shown.length} more` : ''),
+      );
+      console.log('  Add them all: `gbrain skillpack sync`');
+    }
     for (const s of drifted) {
       console.log(
         `  ${s.slug.padEnd(40)} differs:${s.summary.differs} missing:${s.summary.missing}`,
@@ -637,7 +744,7 @@ export async function postUpgradeReferenceSweep(
     }
     console.log('');
     console.log(
-      'Run `gbrain skillpack reference <slug>` to inspect per-skill diffs.\nSee `skills/_AGENT_README.md` for what your agent should do on update.\nSkip this sweep: `GBRAIN_SKIP_REFERENCE_SWEEP=1`.',
+      'New skills → `gbrain skillpack sync`. Drifted skills → `gbrain skillpack reference <slug>` (local edits are yours; nothing is overwritten).\nSee `skills/_AGENT_README.md` for what your agent should do on update.\nSkip this sweep: `GBRAIN_SKIP_REFERENCE_SWEEP=1`.',
     );
   } catch {
     // Best-effort. Never block post-upgrade.

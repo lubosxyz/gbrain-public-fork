@@ -32,6 +32,7 @@ import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { gbrainPath } from '../config.ts';
 import { ANTHROPIC_PRICING, type ModelPricing } from '../anthropic-pricing.ts';
+import { canonicalLookup } from '../model-pricing.ts';
 import { EMBEDDING_PRICING, lookupEmbeddingPrice } from '../embedding-pricing.ts';
 import { splitProviderModelId } from '../model-id.ts';
 import { isoWeekFilename, resolveAuditDir } from '../audit-week-file.ts';
@@ -156,6 +157,27 @@ const FREE_LOCAL_EMBED_PROVIDERS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Chat sibling of FREE_LOCAL_EMBED_PROVIDERS / FREE_LOCAL_RERANK_PROVIDERS.
+ *
+ * Local inference costs electricity, not tokens, so these providers price at
+ * $0 rather than TX2 hard-failing. Without this a caller that sets ANY cost cap
+ * cannot use a local chat model at all: CANONICAL_PRICING has no `ollama:*`
+ * keys, so `reserve()` throws no_pricing before the first call and every work
+ * item is skipped with `budget_exhausted: true` at $0 spent.
+ *
+ * That is not theoretical — `cycle.extract_atoms` always constructs its tracker
+ * with `maxCostUsd` (config only accepts `n > 0`, so the cap can't be unset),
+ * which made `models.dream.extract_atoms: ollama:*` silently extract nothing.
+ *
+ * `litellm` is excluded on purpose, matching the embed set: a LiteLLM proxy can
+ * front a paid provider, so pricing-unknown is the honest state there.
+ */
+const FREE_LOCAL_CHAT_PROVIDERS: ReadonlySet<string> = new Set([
+  'ollama',
+  'llama-server',
+]);
+
+/**
  * Look up `modelId` in the chat or embedding pricing maps. Returns a
  * per-1M-token price tuple, or null when unknown.
  *
@@ -166,9 +188,13 @@ const FREE_LOCAL_EMBED_PROVIDERS: ReadonlySet<string> = new Set([
  *     local-inference providers (FREE_LOCAL_EMBED_PROVIDERS) price at $0 so
  *     `--max-cost` callers don't hard-fail.
  *   - Rerank: try ANTHROPIC_PRICING (legacy path for any Claude-priced
- *     rerank); else if the provider half is in FREE_LOCAL_RERANK_PROVIDERS,
- *     return zero pricing so `--max-cost` callers don't TX2 hard-fail on
- *     local inference recipes (electricity, not tokens); else unknown.
+ *     rerank); else try lookupEmbeddingPrice — paid rerank providers (e.g.
+ *     ZeroEntropy's zerank-2) share the same provider:model-keyed,
+ *     $/1M-token table as their embedding siblings, so it's reused here
+ *     rather than duplicated into a third table; else if the provider half
+ *     is in FREE_LOCAL_RERANK_PROVIDERS, return zero pricing so `--max-cost`
+ *     callers don't TX2 hard-fail on local inference recipes (electricity,
+ *     not tokens); else unknown.
  */
 function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
   if (kind === 'embed') {
@@ -194,6 +220,14 @@ function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
     const tailHit = ANTHROPIC_PRICING[modelTail];
     if (tailHit) return tailHit;
   }
+  // Paid rerank providers (e.g. ZeroEntropy's zerank-2) aren't Claude-priced,
+  // so they miss the ANTHROPIC_PRICING checks above. Reuse the embedding
+  // pricing table (issue #3223) — same provider:model key shape, same
+  // $/1M-token unit — instead of hand-copying a third pricing surface.
+  if (kind === 'rerank') {
+    const hit = lookupEmbeddingPrice(modelId);
+    if (hit.kind === 'known') return { input: hit.pricePerMTok, output: 0 };
+  }
   // v0.40.6.1: zero-price local-inference rerank providers so the budget
   // tracker's TX2 hard-fail doesn't trip on `llama-server-reranker:<model>`
   // under `--max-cost`. Only the rerank kind — chat/embed already have
@@ -201,7 +235,30 @@ function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
   if (kind === 'rerank' && providerId && FREE_LOCAL_RERANK_PROVIDERS.has(providerId)) {
     return { input: 0, output: 0 };
   }
+  // Fall back to the full canonical pricing table so non-Anthropic chat
+  // models with a known price (openai:*, google:*, deepseek:*) resolve under
+  // --max-cost instead of TX2 no_pricing hard-failing at $0. ANTHROPIC_PRICING
+  // above is only the bare-keyed Claude view.
+  const canon = canonicalLookup(modelId);
+  if (canon) return canon;
+  // Local-inference chat providers cost electricity, not tokens. Checked AFTER
+  // the canonical table so an explicitly-priced local entry, should one ever be
+  // added, still wins over the blanket zero.
+  if (kind === 'chat' && providerId && FREE_LOCAL_CHAT_PROVIDERS.has(providerId)) {
+    return { input: 0, output: 0 };
+  }
   return null;
+}
+
+/**
+ * True when the budget tracker can price this model, i.e. when setting a cost
+ * cap is meaningful. Callers that apply a *default* cap (rather than one the
+ * user asked for) should skip the cap when this returns false — otherwise
+ * `reserve()` hard-fails with BudgetExhausted(reason:'no_pricing') and the
+ * caller silently does no work.
+ */
+export function isModelPriceable(modelId: string, kind: BudgetKind): boolean {
+  return lookupPricing(modelId, kind) !== null;
 }
 
 function costForUsage(modelId: string, inputTokens: number, outputTokens: number, kind: BudgetKind): number | null {
@@ -275,7 +332,7 @@ export class BudgetTracker {
         // pricing we can't enforce the cap, and silently ignoring it would
         // void the contract.
         const msg = `${this.opts.label}: no pricing entry for model "${estimate.modelId}" (kind=${estimate.kind}). ` +
-          `Add it to src/core/${estimate.kind === 'embed' ? 'embedding-pricing.ts' : 'anthropic-pricing.ts'} or drop --max-cost.`;
+          `Add it to src/core/${estimate.kind === 'embed' || estimate.kind === 'rerank' ? 'embedding-pricing.ts' : 'anthropic-pricing.ts'} or drop --max-cost.`;
         this.fireExhausted();
         throw new BudgetExhausted(msg, {
           reason: 'no_pricing',

@@ -216,6 +216,125 @@ describe('hybridSearch + resolver — unknown column at entry (D11)', () => {
   });
 });
 
+describe('upsertChunks — model provenance uses gateway-resolved model, not compiled default', () => {
+  // Regression (zbrain-rfi): when a caller builds ChunkInputs without an
+  // explicit `model` (as src/commands/embed.ts does), the engine used to
+  // stamp the compile-time DEFAULT_EMBEDDING_MODEL ('zeroentropyai:zembed-1')
+  // onto content_chunks.model — even though the vector was produced by the
+  // config-resolved model. That corrupted provenance the signature-drift +
+  // dim-migration logic trusts. The engine must fall back to the model the
+  // gateway ACTUALLY resolves at write time.
+  test('unspecified chunk.model records the resolved model, not zeroentropyai:zembed-1', async () => {
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'sk-test' },
+    });
+
+    await engine.putPage('docs/provenance-page', {
+      type: 'concept',
+      title: 'Provenance test page',
+      compiled_truth: 'Chunk whose model column must reflect the resolved model.',
+    });
+    // No `model` field on the input — the write-side fallback must fill it.
+    await engine.upsertChunks('docs/provenance-page', [
+      { chunk_index: 0, chunk_text: 'provenance chunk', chunk_source: 'compiled_truth' },
+    ]);
+
+    const rows = await engine.executeRaw<{ model: string }>(
+      `SELECT cc.model FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = 'docs/provenance-page'`,
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].model).toBe('openai:text-embedding-3-large');
+    expect(rows[0].model).not.toBe('zeroentropyai:zembed-1');
+
+    resetGateway();
+  });
+
+  // #3461: getEmbeddingModel() THROWS when the gateway is unconfigured — it
+  // never returns falsy — so the reland's `|| resolvedModel` guard was dead
+  // code and the catch path still stamped the compile-time default onto rows
+  // whose vectors came from the config-resolved provider. The engine must
+  // fall back to the brain's own `config.embedding_model` row instead.
+  test('#3461: unconfigured gateway falls back to the brain config model, never the compiled default', async () => {
+    await engine.setConfig('embedding_model', 'voyage:voyage-3-large');
+    // The preload's beforeEach re-configures the gateway before every test,
+    // so the reset must happen INSIDE the test body.
+    resetGateway();
+
+    await engine.putPage('docs/provenance-throw-path', {
+      type: 'concept',
+      title: 'Provenance throw-path page',
+      compiled_truth: 'Chunk written while the gateway is unconfigured.',
+    });
+    await engine.upsertChunks('docs/provenance-throw-path', [
+      { chunk_index: 0, chunk_text: 'throw-path provenance chunk', chunk_source: 'compiled_truth' },
+    ]);
+
+    const rows = await engine.executeRaw<{ model: string }>(
+      `SELECT cc.model FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = 'docs/provenance-throw-path'`,
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].model).toBe('voyage:voyage-3-large');
+
+    // Restore the value initSchema wrote for the rest of the file.
+    await engine.setConfig('embedding_model', 'openai:text-embedding-3-large');
+  });
+
+  // #3461 sibling: on a partial re-upsert that carries NO new embedding (the
+  // exact shape `embed --stale` produces for a page's non-stale chunks), the
+  // preserved vector must KEEP its original model label. The old
+  // COALESCE(EXCLUDED.model, …) relabeled it with the current gateway model.
+  test('#3461: preserved vector keeps its original model label on a no-embedding re-upsert', async () => {
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'sk-test' },
+    });
+
+    await engine.putPage('docs/provenance-preserve', {
+      type: 'concept',
+      title: 'Provenance preserve page',
+      compiled_truth: 'Chunk embedded under model A, re-upserted under model B.',
+    });
+    await engine.upsertChunks('docs/provenance-preserve', [
+      {
+        chunk_index: 0,
+        chunk_text: 'stable chunk text',
+        chunk_source: 'compiled_truth',
+        embedding: new Float32Array(VEC1536_A),
+      },
+    ]);
+
+    // Model swap: the gateway now resolves a different model, and the
+    // re-upsert (same chunk_text) carries no new embedding.
+    configureGateway({
+      embedding_model: 'voyage:voyage-3-large',
+      embedding_dimensions: 1536,
+      env: { VOYAGE_API_KEY: 'test' },
+    });
+    await engine.upsertChunks('docs/provenance-preserve', [
+      { chunk_index: 0, chunk_text: 'stable chunk text', chunk_source: 'compiled_truth' },
+    ]);
+
+    const rows = await engine.executeRaw<{ model: string; has_embedding: boolean }>(
+      `SELECT cc.model, cc.embedding IS NOT NULL AS has_embedding
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = 'docs/provenance-preserve'`,
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].has_embedding).toBe(true); // vector preserved…
+    expect(rows[0].model).toBe('openai:text-embedding-3-large'); // …and its label still describes it
+
+    resetGateway();
+  });
+});
+
 describe('buildVectorCastFragment — engine SQL composer (D3)', () => {
   test('vector descriptor emits $1::vector', () => {
     const r: ResolvedColumn = {

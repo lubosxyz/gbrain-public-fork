@@ -30,7 +30,7 @@ import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unl
 import { dirname, join } from 'node:path';
 import { gbrainPath } from './config.ts';
 import { acquirePackLock, type PackLockOpts } from './schema-pack/pack-lock.ts';
-import { isMinorOrMajorBump, isValidVersionString, parseSemver, semverGt, semverLte } from './semver.ts';
+import { isNewerVersion, isValidVersionString, parseSemver, semverGt, semverLte } from './semver.ts';
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -120,7 +120,7 @@ export interface SnoozeRecord {
 /**
  * Decide what to do about a possible upgrade. Pure: all I/O-derived inputs are
  * resolved by the caller. The version comparison is monotonic — we only ever
- * act when `latest` is a real minor/major bump strictly greater than `current`,
+ * act when `latest` is a real release strictly greater than `current`,
  * so a downgrade / yanked / prerelease-local-build can never trigger an upgrade.
  */
 export function decideSelfUpgrade(inp: DecideSelfUpgradeInputs): SelfUpgradeDecision {
@@ -148,15 +148,11 @@ export function decideSelfUpgrade(inp: DecideSelfUpgradeInputs): SelfUpgradeDeci
     return { action: 'not_behind', reason: 'already current', ...base };
   }
 
-  if (!isMinorOrMajorBump(inp.currentVersion, inp.latestVersion)) {
-    return { action: 'not_behind', reason: 'patch/micro bump only (ignored)', ...base };
-  }
-
   if (inp.failedVersions.includes(inp.latestVersion)) {
     return { action: 'known_bad', reason: `${inp.latestVersion} previously failed; not retrying`, ...base };
   }
 
-  // Genuinely behind by a minor/major bump and not known-bad.
+  // Genuinely behind by a newer release and not known-bad.
   if (inp.channel === 'invocation') {
     if (inp.snoozed) {
       return { action: 'throttled', reason: 'snoozed for this version', ...base };
@@ -324,6 +320,29 @@ export function clearUpdateCache(): void {
 export function isCacheFresh(entry: CacheEntry, now: number): boolean {
   const ttl = entry.marker.kind === 'upgrade_available' ? CACHE_TTL_UPGRADE_AVAILABLE_MS : CACHE_TTL_UP_TO_DATE_MS;
   return now - entry.mtimeMs < ttl;
+}
+
+/**
+ * The one shared "is an upgrade actually pending for THIS binary?" predicate.
+ * Returns the latest version string when the cache is present, fresh, marks an
+ * upgrade, AND that upgrade is strictly newer than the RUNNING binary — else
+ * null. The running-version comparison is the load-bearing part: the cache
+ * records the version of whatever binary WROTE it (an older gbrain on PATH can
+ * write it via the detached refresh), so consumers must never trust
+ * `marker.current` to describe themselves. Every upgrade-nag surface (CLI
+ * startup marker, doctor, advisor, get_brain_identity) routes through here so
+ * the suppression rule cannot drift per-surface. Never throws.
+ */
+export function pendingUpgradeVersion(runningVersion: string, now: number = Date.now()): string | null {
+  try {
+    const entry = readUpdateCache();
+    if (!entry || !isCacheFresh(entry, now)) return null;
+    if (entry.marker.kind !== 'upgrade_available' || !entry.marker.latest) return null;
+    if (!isNewerVersion(runningVersion, entry.marker.latest)) return null;
+    return entry.marker.latest;
+  } catch {
+    return null;
+  }
 }
 
 // ── Snooze (interactive prompting only; never overrides mode=off) ────────────

@@ -20,6 +20,7 @@ import {
   writeReceipt,
   type ExtractReceiptInput,
 } from '../../src/core/extract/receipt-writer.ts';
+import { slugifySegment } from '../../src/core/sync.ts';
 
 const BASE_INPUT: ExtractReceiptInput = {
   kind: 'facts.conversation',
@@ -81,6 +82,31 @@ describe('shortRunId / dateFromIso — pure helpers', () => {
     expect(shortRunId('op_check_abc')).toBe('op_check');
   });
 
+  // #3443 — a short form ending in '-' (e.g. propose-<timestamp> run ids)
+  // desynced the DB receipt slug from its Git-backed slug: slugifySegment()
+  // strips boundary hyphens during repo sync, so the write-through created a
+  // normalized sibling instead of materializing the existing page.
+  test('shortRunId is canonical under slugifySegment for every receipt-producing run-id family (#3443)', () => {
+    const familyRunIds = [
+      'propose-20260724103000-ab12cd34',           // cycle/propose-takes.ts
+      `atoms-${Date.now().toString(36)}-pers`,     // cycle/extract-atoms.ts
+      `efacts-${Date.now().toString(36)}-pers`,    // cycle/extract-facts.ts
+      `concepts-${Date.now().toString(36)}`,       // cycle/synthesize-concepts.ts
+      `ecf-${Date.now().toString(36)}-pers`,       // extract-conversation-facts.ts
+    ];
+    for (const runId of familyRunIds) {
+      const short = shortRunId(runId);
+      expect(slugifySegment(short)).toBe(short);
+      expect(short.length).toBeGreaterThan(0);
+    }
+  });
+
+  test('shortRunId trims boundary hyphens introduced by truncation', () => {
+    expect(shortRunId('propose-20260724103000-ab12cd34')).toBe('propose');
+    // Pathological all-separator prefix still yields a non-empty segment.
+    expect(shortRunId('--------tail')).toBe('run');
+  });
+
   test('dateFromIso extracts YYYY-MM-DD prefix', () => {
     expect(dateFromIso('2026-05-27T14:30:00Z')).toBe('2026-05-27');
     expect(dateFromIso('2026-05-27T14:30:00.123456Z')).toBe('2026-05-27');
@@ -115,6 +141,11 @@ describe('writeReceipt — frontmatter D-EXTRACT-19 belt+suspenders', () => {
     // belt + suspenders: both anti-loop flags are present
     expect(page.frontmatter?.type).toBe('extract_receipt');
     expect(page.frontmatter?.dream_generated).toBe(true);
+    // #1978: receipts are operation records, not derived documents —
+    // explicit raw-trace exemption so the doctor raw_provenance check
+    // (warn-only v1) stays quiet.
+    expect(page.frontmatter?.raw_trace_exempt).toBe(true);
+    expect(typeof page.frontmatter?.raw_trace_exempt_reason).toBe('string');
   });
 
   test('stamps optional model_id + eval_pass + eval_score when supplied', async () => {

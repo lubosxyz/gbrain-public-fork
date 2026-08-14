@@ -19,7 +19,8 @@
 
 import type { BrainEngine } from './engine.ts';
 import type { ChunkInput } from './types.ts';
-import { embedBatchWithBackoff } from '../commands/embed.ts';
+import { embedBatchWithBackoff, restampIfDemotedToTitleTier } from '../commands/embed.ts';
+import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
 import { AbortError } from './abort-check.ts';
 
@@ -189,8 +190,15 @@ export async function embedStaleForSource(
       const keySourceId = stale[0]?.source_id ?? sourceId;
       const slug = stale[0].slug;
       try {
+        // #3507: fetch the page row for its title + stored CR mode so the
+        // re-embed reproduces the page's wrapping convention instead of
+        // silently stripping contextual prefixes (mirrors
+        // src/commands/embed.ts:embedAllStale).
+        const pageRow = await observed(pacer, () =>
+          engine.getPage(slug, { sourceId: keySourceId }),
+        );
         const embeddings = await embedFn(
-          stale.map((c) => c.chunk_text),
+          wrapChunkTextsForStoredMode(pageRow, stale),
           { abortSignal: signal },
         );
         const existing = await observed(pacer, () =>
@@ -206,6 +214,22 @@ export async function embedStaleForSource(
           chunk_source: c.chunk_source,
           embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
           token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
+          // Carry through per-chunk metadata. upsertChunks writes these as
+          // EXCLUDED.<col> (not COALESCE), so omitting them here resets image
+          // rows to modality='text' (breaking the image search arm's
+          // modality='image' filter) and wipes code-chunk symbol metadata on
+          // every embed-stale pass. embedding_image is deliberately NOT
+          // carried: the upsert COALESCEs it, and getChunks returns the
+          // pgvector as a string which upsertChunks would mis-serialize.
+          modality: c.modality ?? undefined,
+          language: c.language ?? undefined,
+          symbol_name: c.symbol_name ?? undefined,
+          symbol_type: c.symbol_type ?? undefined,
+          start_line: c.start_line ?? undefined,
+          end_line: c.end_line ?? undefined,
+          parent_symbol_path: c.parent_symbol_path ?? undefined,
+          doc_comment: c.doc_comment ?? undefined,
+          symbol_name_qualified: c.symbol_name_qualified ?? undefined,
         }));
         await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
         // v0.41.31: stamp provenance only when EVERY chunk was stale (fully
@@ -215,6 +239,13 @@ export async function embedStaleForSource(
         if (signature && stale.length === existing.length) {
           await observed(pacer, () =>
             engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
+          );
+        }
+        // #3507: a FULLY re-embedded per_chunk_synopsis page landed at the
+        // title tier — keep the stamped mode honest (mixed pages stay as-is).
+        if (stale.length === existing.length) {
+          await observed(pacer, () =>
+            restampIfDemotedToTitleTier(engine, pageRow, slug, keySourceId),
           );
         }
         result.embedded += stale.length;

@@ -32,6 +32,9 @@ const get_tags = operations.find(o => o.name === 'get_tags')!;
 const get_links = operations.find(o => o.name === 'get_links')!;
 const get_backlinks = operations.find(o => o.name === 'get_backlinks')!;
 const get_timeline = operations.find(o => o.name === 'get_timeline')!;
+const get_chunks = operations.find(o => o.name === 'get_chunks')!;
+const get_raw_data = operations.find(o => o.name === 'get_raw_data')!;
+const get_versions = operations.find(o => o.name === 'get_versions')!;
 
 function ctxOf(overrides: Partial<OperationContext> = {}): OperationContext {
   return {
@@ -77,6 +80,16 @@ beforeEach(async () => {
     type: 'note', title: 'Default decoy', compiled_truth: 'default content', frontmatter: {},
   }, { sourceId: 'default' });
   await engine.addTag('secret/beta-doc', 'default-secret-tag', { sourceId: 'default' });
+  await engine.upsertChunks('secret/beta-doc', [{
+    chunk_index: 0, chunk_text: 'beta chunk', chunk_source: 'compiled_truth', token_count: 2,
+  }], { sourceId: 'beta' });
+  await engine.upsertChunks('secret/beta-doc', [{
+    chunk_index: 0, chunk_text: 'default chunk', chunk_source: 'compiled_truth', token_count: 2,
+  }], { sourceId: 'default' });
+  await engine.putRawData('secret/beta-doc', 'crm', { owner: 'beta' }, { sourceId: 'beta' });
+  await engine.putRawData('secret/beta-doc', 'crm', { owner: 'default' }, { sourceId: 'default' });
+  await engine.createVersion('secret/beta-doc', { sourceId: 'beta' });
+  await engine.createVersion('secret/beta-doc', { sourceId: 'default' });
   // Link endpoints. NOTE (Codex #7): addLink defaults BOTH endpoints to 'default'
   // unless given {fromSourceId,toSourceId} — pass them or the beta edges won't seed.
   await engine.putPage('secret/beta-target', {
@@ -185,9 +198,16 @@ describe('#2200 get_tags honors the federated grant', () => {
 });
 
 describe('#2200 get_links honors the grant and scopes BOTH endpoints (D4A)', () => {
-  test('[alpha,beta] returns the in-grant beta→beta link', async () => {
+  test('[alpha,beta] returns the in-grant beta→beta link with exact endpoint identity', async () => {
     const links = (await get_links.handler(remoteCtx(['alpha', 'beta']), { slug: 'secret/beta-doc' })) as any[];
-    expect(links.map(l => l.to_slug)).toContain('secret/beta-target');
+    const target = links.find(l => l.to_slug === 'secret/beta-target');
+    expect(target).toBeDefined();
+    expect(target).toMatchObject({
+      from_source_id: 'beta',
+      from_slug: 'secret/beta-doc',
+      to_source_id: 'beta',
+      to_slug: 'secret/beta-target',
+    });
   });
 
   test('[alpha,beta] does NOT leak the beta→default far-endpoint link', async () => {
@@ -205,8 +225,9 @@ describe('#2200 get_links honors the grant and scopes BOTH endpoints (D4A)', () 
     const links = (await get_links.handler(remoteCtx(['alpha', 'beta']), { slug: 'secret/beta-doc' })) as any[];
     const originLeakLink = links.find(l => l.link_type === 'mentions' && l.to_slug === 'secret/beta-target');
     expect(originLeakLink).toBeDefined();
-    // origin page 'default/only-doc' is out of the [alpha,beta] grant → origin_slug nulled.
+    // origin page 'default/only-doc' is out of the [alpha,beta] grant → origin identity nulled.
     expect(originLeakLink.origin_slug ?? null).toBeNull();
+    expect(originLeakLink.origin_source_id ?? null).toBeNull();
     expect(links.map(l => l.origin_slug)).not.toContain('default/only-doc');
   });
 
@@ -219,18 +240,30 @@ describe('#2200 get_links honors the grant and scopes BOTH endpoints (D4A)', () 
     expect(links.map(l => l.origin_slug)).not.toContain('default/only-doc'); // origin too
   });
 
-  test('D1: TRUSTED local CLI (remote=false) with a scalar scope keeps the cross-source view', async () => {
+  test('D1: TRUSTED local CLI scalar scope keeps cross-source view and identifies both endpoints', async () => {
     // reconcileLinks / validators depend on this — local CLI sees cross-source links.
     const ctx = ctxOf({ remote: false, sourceId: 'beta', auth: undefined });
     const links = (await get_links.handler(ctx, { slug: 'secret/beta-doc' })) as any[];
-    expect(links.map(l => l.to_slug)).toContain('default/only-doc'); // cross-source visible for trusted local
+    const crossSource = links.find(l => l.to_slug === 'default/only-doc');
+    expect(crossSource).toMatchObject({
+      from_source_id: 'beta',
+      from_slug: 'secret/beta-doc',
+      to_source_id: 'default',
+      to_slug: 'default/only-doc',
+    });
   });
 });
 
 describe('#2200 get_backlinks honors the grant and scopes BOTH endpoints (D4A)', () => {
-  test('[alpha,beta] returns the in-grant beta→beta backlink', async () => {
+  test('[alpha,beta] returns the in-grant beta→beta backlink with exact endpoint identity', async () => {
     const back = (await get_backlinks.handler(remoteCtx(['alpha', 'beta']), { slug: 'secret/beta-doc' })) as any[];
-    expect(back.map(l => l.from_slug)).toContain('secret/beta-target');
+    const referrer = back.find(l => l.from_slug === 'secret/beta-target');
+    expect(referrer).toMatchObject({
+      from_source_id: 'beta',
+      from_slug: 'secret/beta-target',
+      to_source_id: 'beta',
+      to_slug: 'secret/beta-doc',
+    });
   });
 
   test('[alpha,beta] does NOT leak the default→beta far-referrer backlink', async () => {
@@ -254,6 +287,26 @@ describe('#2200 get_timeline honors the federated grant', () => {
   test('[alpha] only → empty (isolation)', async () => {
     const tl = (await get_timeline.handler(remoteCtx(['alpha']), { slug: 'secret/beta-doc' })) as any[];
     expect(tl).toEqual([]);
+  });
+});
+
+describe('#2200 residual by-slug reads honor the federated grant', () => {
+  test('get_chunks returns only in-grant chunks', async () => {
+    const hit = await get_chunks.handler(remoteCtx(['alpha', 'beta']), { slug: 'secret/beta-doc' }) as any[];
+    expect(hit.map(c => c.chunk_text)).toEqual(['beta chunk']);
+    expect(await get_chunks.handler(remoteCtx(['alpha']), { slug: 'secret/beta-doc' })).toEqual([]);
+  });
+
+  test('get_raw_data returns only in-grant rows', async () => {
+    const hit = await get_raw_data.handler(remoteCtx(['alpha', 'beta']), { slug: 'secret/beta-doc', source: 'crm' }) as any[];
+    expect(hit.map(r => r.data.owner)).toEqual(['beta']);
+    expect(await get_raw_data.handler(remoteCtx(['alpha']), { slug: 'secret/beta-doc', source: 'crm' })).toEqual([]);
+  });
+
+  test('get_versions returns only in-grant snapshots', async () => {
+    const hit = await get_versions.handler(remoteCtx(['alpha', 'beta']), { slug: 'secret/beta-doc' }) as any[];
+    expect(hit.map(v => v.compiled_truth)).toEqual(['beta-only content']);
+    expect(await get_versions.handler(remoteCtx(['alpha']), { slug: 'secret/beta-doc' })).toEqual([]);
   });
 });
 
@@ -318,5 +371,90 @@ describe('#2200 engine secondary-fetch methods honor sourceIds[]', () => {
     await engine.addTimelineEntry('secret/beta-doc', { date: '2026-06-01', source: 'test', summary: 'june event', detail: 'd' }, { sourceId: 'beta' });
     const windowed = await engine.getTimeline('secret/beta-doc', { sourceIds: ['beta'], after: '2026-03-01', before: '2026-12-31' });
     expect(windowed.map(e => e.summary)).toEqual(['june event']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2555 — get_chunks honors the federated source grant (same class as #1393/
+// #2200, chunk read path). Pre-fix the op used the pre-#2200 scalar pattern
+// and engine.getChunks had no sourceIds[] support: a federated client that
+// could read a page via get_page got [] from get_chunks.
+// ---------------------------------------------------------------------------
+describe('#2555 get_chunks federated scope', () => {
+  const get_chunks = operations.find(o => o.name === 'get_chunks')!;
+
+  beforeEach(async () => {
+    await engine.upsertChunks('secret/beta-doc', [
+      { chunk_index: 0, chunk_text: 'beta chunk zero', chunk_source: 'compiled_truth' },
+      { chunk_index: 1, chunk_text: 'beta chunk one', chunk_source: 'compiled_truth' },
+    ], { sourceId: 'beta' });
+    // Same-slug decoy chunks in 'default' — the cross-source bleed guard.
+    await engine.upsertChunks('secret/beta-doc', [
+      { chunk_index: 0, chunk_text: 'default decoy chunk', chunk_source: 'compiled_truth' },
+    ], { sourceId: 'default' });
+  });
+
+  test('op: federated grant including the page source returns its chunks (the #2555 repro)', async () => {
+    const ctx = ctxOf({ remote: true, sourceId: undefined, auth: { token: 't', clientId: 'c', scopes: [], allowedSources: ['alpha', 'beta'] } as any });
+    const chunks = await get_chunks.handler(ctx, { slug: 'secret/beta-doc' }) as Array<{ chunk_text: string }>;
+    expect(chunks.map(c => c.chunk_text)).toEqual(['beta chunk zero', 'beta chunk one']);
+  });
+
+  test('op: grant excluding the page source stays empty — never falls through to default', async () => {
+    const ctx = ctxOf({ remote: true, sourceId: undefined, auth: { token: 't', clientId: 'c', scopes: [], allowedSources: ['alpha'] } as any });
+    const chunks = await get_chunks.handler(ctx, { slug: 'secret/beta-doc' }) as Array<{ chunk_text: string }>;
+    expect(chunks).toEqual([]);
+  });
+
+  test('op: no grant + default floor sees only the default decoy, never beta chunks', async () => {
+    const ctx = ctxOf({ remote: true, sourceId: 'default', auth: undefined });
+    const chunks = await get_chunks.handler(ctx, { slug: 'secret/beta-doc' }) as Array<{ chunk_text: string }>;
+    expect(chunks.map(c => c.chunk_text)).toEqual(['default decoy chunk']);
+  });
+
+  test('engine: sourceIds[] precedence over scalar; trimmed SELECT keeps the Chunk shape', async () => {
+    // array beats scalar: scalar 'default' would return the decoy; array ['beta'] must win.
+    const prec = await engine.getChunks('secret/beta-doc', { sourceId: 'default', sourceIds: ['beta'] });
+    expect(prec.map(c => c.chunk_text)).toEqual(['beta chunk zero', 'beta chunk one']);
+    // #2544 trim: embedding is deliberately not selected (rowToChunk discards
+    // it here anyway) and the rest of the Chunk shape survives.
+    expect(prec[0].embedding).toBeNull();
+    expect(prec[0].chunk_index).toBe(0);
+    expect(prec[0].chunk_source).toBe('compiled_truth');
+    // Unset opts keep the historical 'default' floor (importCodeFile contract).
+    const def = await engine.getChunks('secret/beta-doc');
+    expect(def.map(c => c.chunk_text)).toEqual(['default decoy chunk']);
+  });
+
+  test('#2544 structural pin: neither engine SELECTs cc.* in getChunks (the trim survives merges)', async () => {
+    // The behavioral assertion above is vacuous for the trim itself —
+    // rowToChunk hard-nulls embedding regardless of the SELECT. This pin
+    // exists because a master merge once silently restored `SELECT cc.*`
+    // while the doc comment kept claiming the trim: assert the SELECT shape
+    // at the source level for BOTH engines.
+    const { readFileSync } = await import('fs');
+    for (const enginePath of ['src/core/postgres-engine.ts', 'src/core/pglite-engine.ts']) {
+      const src = readFileSync(new URL(`../${enginePath}`, import.meta.url), 'utf-8');
+      const start = src.indexOf('async getChunks(slug');
+      expect(start).toBeGreaterThan(0);
+      // The method's own close (`\n  }` at 2-space indent) — an inline
+      // `async (tx) =>` callback must not truncate the body, and the NEXT
+      // method (e.g. buildStaleChunkWhere's `cc.embedding IS NULL` WHERE
+      // predicate) must not leak in. Strip line comments: the pin targets
+      // the SQL, not prose that may cite the anti-pattern.
+      const end = src.indexOf('\n  }\n', start + 10);
+      const body = src.slice(start, end).replace(/\/\/[^\n]*/g, '');
+      expect(body, `${enginePath} getChunks must not SELECT cc.*`).not.toContain('cc.*');
+      // Every non-vector field rowToChunk reads MUST be selected — omitting
+      // one silently degrades round-trips (embed.ts getChunks→upsertChunks
+      // rewrote image chunks as text when cc.modality was dropped).
+      for (const col of ['chunk_text', 'chunk_source', 'model', 'token_count', 'embedded_at',
+        'language', 'symbol_name', 'symbol_type', 'start_line', 'end_line',
+        'parent_symbol_path', 'doc_comment', 'symbol_name_qualified', 'modality']) {
+        expect(body, `${enginePath} getChunks must select cc.${col}`).toContain(`cc.${col}`);
+      }
+      // The vector columns stay unselected.
+      expect(body).not.toMatch(/cc\.embedding\b/);
+    }
   });
 });

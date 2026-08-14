@@ -11,6 +11,7 @@
  */
 
 import express from 'express';
+import type { Socket } from 'net';
 import type { Request, Response, NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
@@ -22,14 +23,32 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
+import { OAuthTokenRevocationRequestSchema } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { BrainEngine } from '../core/engine.ts';
-import { operations, OperationError } from '../core/operations.ts';
+import { operations, OperationError, opAllowedForBoundClient } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
-import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
+import { disabledOpsForPublishGates } from '../mcp/publish-gates.ts';
+import {
+  GBrainOAuthProvider,
+  validateTokenEndpointAuthMethod,
+  dcrRegistrationContext,
+  DEFAULT_DCR_TTL_MIN_SECONDS,
+} from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
-import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
-import { paramDefToSchema } from '../mcp/tool-defs.ts';
+import { normalizeSourceInput, normalizeFederatedReadInput } from '../core/source-id.ts';
+import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult } from '../mcp/dispatch.ts';
+import { resolveStrictParamsMode } from '../mcp/validate-params.ts';
+import { buildToolDefs } from '../mcp/tool-defs.ts';
+import {
+  filterOpsForSurface,
+  clampSurface,
+  minSurface,
+  resolveClientRowSurface,
+  resolveDefaultClientSurface,
+  type McpSurface,
+} from '../mcp/surface.ts';
+import { writeSurfaceChangeAudit } from '../core/surface-audit.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildError, serializeError } from '../core/errors.ts';
@@ -37,12 +56,15 @@ import { VERSION } from '../version.ts';
 import * as db from '../core/db.ts';
 import { sqlQueryForEngine, executeRawJsonb } from '../core/sql-query.ts';
 import { MinionQueue } from '../core/minions/queue.ts';
+import { isRetryableError } from '../core/retry-matcher.ts';
 import {
   computeContentHash,
   validateIngestionEvent,
   type IngestionContentType,
   type IngestionEvent,
 } from '../core/ingestion/types.ts';
+import { resolveOwnerHolder } from '../core/owner-holder.ts';
+import { registerCleanup } from '../core/process-cleanup.ts';
 
 /**
  * /health endpoint timeout. 3s rather than 5s: Fly.io's default
@@ -51,6 +73,110 @@ import {
  * 3s leaves 2s of headroom for TCP, response framing, and clock skew.
  */
 export const HEALTH_TIMEOUT_MS = 3000;
+
+/**
+ * The narrowest contract this module actually consumes: subscribe, unsubscribe.
+ * Every return value is discarded, so it is `unknown` rather than `this` — a
+ * `Pick<>` of the full Node types would demand a fidelity no caller needs and
+ * no test double can honestly provide.
+ */
+type EventSubscriber = {
+  once(event: string, listener: (...args: any[]) => void): unknown;
+  off(event: string, listener: (...args: any[]) => void): unknown;
+};
+/**
+ * Only what socket teardown needs. This one IS a `Pick` of the real type, on
+ * purpose: no typechecked test double has to satisfy it (fakes reach it through
+ * `emit`, which is untyped), so binding it to `net.Socket` costs nothing and
+ * buys drift detection. A hand-written structural shape here would be an
+ * unchecked assertion — method parameters are bivariant, so annotating the
+ * listener param would match our own declaration whatever a real socket does.
+ */
+type TrackedSocket = Pick<Socket, 'destroy' | 'once'>;
+type HttpServerLifecycle = EventSubscriber & {
+  readonly listening: boolean;
+  close(callback?: (error?: Error) => void): unknown;
+  // Narrowed to the one event this module subscribes with `on`, so the listener
+  // parameter is genuinely checked against TrackedSocket. A `(...args: any[])`
+  // signature here would make the annotation at the call site an unchecked
+  // assertion — the same defect this file was just cleaned of.
+  on(event: 'connection', listener: (socket: TrackedSocket) => void): unknown;
+};
+type SignalSource = EventSubscriber;
+type CleanupRegistrar = typeof registerCleanup;
+
+/**
+ * Keep the HTTP server strongly referenced and make the daemon lifetime
+ * explicit instead of relying on runtime-specific event-loop behavior for an
+ * unobserved `app.listen()` return value. The shared abnormal-termination
+ * cleanup pass closes it before process exit.
+ */
+export function waitForHttpServerLifecycle(
+  server: HttpServerLifecycle,
+  options: {
+    signals?: SignalSource;
+    register?: CleanupRegistrar;
+  } = {},
+): Promise<void> {
+  const signals = options.signals ?? process;
+  const register = options.register ?? registerCleanup;
+
+  // `close()` stops the listener and then waits for every open connection to
+  // drain. One attached admin-SSE EventSource — or any keep-alive socket —
+  // holds it open forever, so shutdown has to sever them itself. Bun 1.3.x
+  // ships `closeAllConnections()`/`closeIdleConnections()` as no-op stubs, so
+  // tracking is the only portable teardown.
+  const sockets = new Set<TrackedSocket>();
+  server.on('connection', (socket: TrackedSocket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
+
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let closePromise: Promise<void> | null = null;
+
+    const closeServer = (): Promise<void> => {
+      if (closePromise) return closePromise;
+      closePromise = new Promise<void>((closeResolve, closeReject) => {
+        if (!server.listening) {
+          closeResolve();
+          return;
+        }
+        server.close((error?: Error) => {
+          if (error) closeReject(error);
+          else closeResolve();
+        });
+        // After close() so the listener stops accepting first, then in-flight
+        // connections are severed rather than waited on.
+        for (const socket of sockets) socket.destroy();
+      });
+      return closePromise;
+    };
+
+    const deregister = register('http-server', closeServer);
+
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      server.off('close', onClose);
+      server.off('error', onError);
+      signals.off('SIGINT', onSigint);
+      deregister();
+      if (error) reject(error);
+      else resolve();
+    };
+    const onClose = () => finish();
+    const onError = (error: Error) => finish(error);
+    const onSigint = () => {
+      void closeServer().catch(onError);
+    };
+
+    server.once('close', onClose);
+    server.once('error', onError);
+    signals.once('SIGINT', onSigint);
+  });
+}
 
 /**
  * v0.36.1.x #1024: bootstrap token resolution.
@@ -90,9 +216,70 @@ export function resolveBootstrapToken(
   return { kind: 'ok', token: trimmed, fromEnv: true };
 }
 
+/**
+ * #2624: decide whether the generated admin bootstrap token is hidden from
+ * the startup banner. Fail-safe default: a generated token is NOT printed
+ * unless stderr is an interactive TTY, so containerized (non-TTY) deploys
+ * never ship the secret to centralized log storage. Env-sourced tokens are
+ * always hidden (operator already holds them). Explicit --suppress hides
+ * everything; --print-admin-token forces the raw value even on a non-TTY.
+ */
+export function shouldSuppressBootstrapPrint(opts: {
+  suppress: boolean;
+  fromEnv: boolean;
+  forcePrint: boolean;
+  isTty: boolean;
+}): boolean {
+  if (opts.suppress) return true;
+  if (opts.fromEnv) return true;
+  if (opts.forcePrint) return false;
+  return !opts.isTty;
+}
+
+export type OAuthTokenRateLimitConfig = {
+  windowMs: number;
+  max: number;
+};
+
+function parsePositiveIntEnv(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function resolveOAuthTokenRateLimit(env: NodeJS.ProcessEnv = process.env): OAuthTokenRateLimitConfig {
+  return {
+    windowMs: parsePositiveIntEnv(env.GBRAIN_OAUTH_TOKEN_RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
+    max: parsePositiveIntEnv(env.GBRAIN_OAUTH_TOKEN_RATE_LIMIT_MAX, 50),
+  };
+}
+
 export type ProbeHealthResult =
   | { ok: true; status: 200; body: { status: 'ok'; version: string; engine: string; [k: string]: unknown } }
   | { ok: false; status: 503; body: { error: 'service_unavailable'; error_description: string } };
+
+/** Narrowest contract the handshake consumes; see {@link EventSubscriber}. */
+type AdminSseResponse = {
+  setHeader(name: string, value: string): unknown;
+  flushHeaders(): void;
+  write(chunk: string): unknown;
+};
+
+/**
+ * Complete the admin EventSource handshake immediately.
+ *
+ * `flushHeaders()` alone can leave reverse proxies and browsers waiting for
+ * the first response body bytes. An SSE comment is protocol-valid, ignored by
+ * EventSource consumers, and makes the stream observable end-to-end without
+ * fabricating an application event.
+ */
+export function openAdminSseStream(res: AdminSseResponse): void {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  res.write(': connected\n\n');
+}
 
 /**
  * Pure async health probe. Races `engine.getStats()` against a timeout,
@@ -304,6 +491,23 @@ interface ServeHttpOptions {
    * tracking the regenerated value through other means.
    */
   suppressBootstrapToken?: boolean;
+  /**
+   * MEMORY_VERBS v1 + WP4: tool-surface mode. 'verbs' = exactly the seven
+   * protocol verbs; 'starter' = the STARTER_OPS daily-driver set; 'full'
+   * (default) = every non-localOnly operation. Enforced on the tool list AND
+   * in dispatch (fail-closed). WP4/D2: this is the server CEILING — each
+   * request resolves min(ceiling, client row surface ?? config default),
+   * so per-client rows can narrow below it but never widen past it.
+   */
+  surface?: McpSurface;
+  /**
+   * #2624: force-print the generated admin bootstrap token even on a
+   * non-TTY (containerized) start. By default the raw token is only printed
+   * when stderr is an interactive TTY, so it never lands in centralized log
+   * storage for headless deploys. Set this when you genuinely need the value
+   * captured to a non-interactive log and accept the leak.
+   */
+  printAdminToken?: boolean;
 }
 
 /**
@@ -400,6 +604,34 @@ export function skillPublishStatus(publishSkills: boolean): { bannerValue: strin
   };
 }
 
+/**
+ * #1196: startup embedding-width guard for stateless host deployments.
+ *
+ * `embedding_model` / `embedding_dimensions` are file/env-plane only, so a
+ * container booted WITHOUT a config.json (stateless host) resolves the
+ * compiled-in default embedding width. Against an existing brain whose
+ * `content_chunks.embedding` is a different `vector(N)`, every write then
+ * fails with an opaque dim mismatch. Run doctor's existing
+ * embedding_width_consistency check at serve startup and return a loud
+ * banner (with the paste-ready recipe) when it isn't ok. Fail-open: a check
+ * error never blocks serving read traffic.
+ */
+export async function embeddingWidthStartupWarning(engine: BrainEngine): Promise<string | null> {
+  try {
+    const { checkEmbeddingWidthConsistency } = await import('./doctor.ts');
+    const check = await checkEmbeddingWidthConsistency(engine);
+    if (check.status === 'ok') return null;
+    return (
+      `[serve-http] WARNING: embedding width check failed — writes that embed will fail until fixed.\n` +
+      `${check.message}\n` +
+      `Stateless hosts: embedding_model/embedding_dimensions resolve from env/config.json only — ` +
+      `set GBRAIN_EMBEDDING_MODEL / GBRAIN_EMBEDDING_DIMENSIONS (or mount config.json) to match the brain's schema.`
+    );
+  } catch {
+    return null;
+  }
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -422,6 +654,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     console.error(
       '[serve-http] WARNING: --public-url is set but --bind is not. Default bind changed to 127.0.0.1 in v0.34.1; remote clients reaching the public URL will be refused. Pass --bind 0.0.0.0 to accept all interfaces.',
     );
+  }
+
+  // #1196: fail-loud at startup when the resolved embedding width diverges
+  // from the brain's actual vector(N) column (stateless containers falling
+  // through to the compiled-in default). Non-fatal: reads still work.
+  {
+    const widthWarn = await embeddingWidthStartupWarning(engine);
+    if (widthWarn) console.error(widthWarn);
   }
 
   // Skill-publishing status for the banner + nudge. Mirrors readMcpPublishSkills
@@ -480,11 +720,41 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // constructor option instead of monkey-patching `_clientsStore` after
   // construction. Same outcome (no /register endpoint when --enable-dcr
   // is not passed); cleaner shape for tests and future maintainers.
+  // #2179: admin-configured clamp window for DCR-requested token TTLs.
+  // DB-plane config keys (`gbrain config set oauth.dcr_ttl_min_seconds ...`).
+  // FAIL-CLOSED defaults: an unset/invalid max is bounded by the operator's
+  // own --token-ttl (never a fixed permissive ceiling), and an inverted
+  // window collapses to the min bound — the same direction clampDcrTokenTtl
+  // itself resolves. A bad config narrows the window; it never widens it.
+  const parseDcrTtlBound = (raw: unknown, fallback: number): number => {
+    const n = Number(raw);
+    return raw != null && Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback;
+  };
+  let dcrTtlMinSeconds = DEFAULT_DCR_TTL_MIN_SECONDS;
+  let dcrTtlMaxSeconds = Math.max(tokenTtl, dcrTtlMinSeconds);
+  try {
+    dcrTtlMinSeconds = parseDcrTtlBound(await engine.getConfig('oauth.dcr_ttl_min_seconds'), DEFAULT_DCR_TTL_MIN_SECONDS);
+    dcrTtlMaxSeconds = parseDcrTtlBound(await engine.getConfig('oauth.dcr_ttl_max_seconds'), Math.max(tokenTtl, dcrTtlMinSeconds));
+  } catch {
+    // Config read is best-effort; the fail-closed defaults stand.
+    dcrTtlMaxSeconds = Math.max(tokenTtl, dcrTtlMinSeconds);
+  }
+  if (dcrTtlMinSeconds > dcrTtlMaxSeconds) {
+    console.error(
+      `[serve-http] WARNING: oauth.dcr_ttl_min_seconds (${dcrTtlMinSeconds}) exceeds ` +
+      `oauth.dcr_ttl_max_seconds (${dcrTtlMaxSeconds}); collapsing the window to ` +
+      `the min bound (${dcrTtlMinSeconds}).`,
+    );
+    dcrTtlMaxSeconds = dcrTtlMinSeconds;
+  }
+
   const oauthProvider = new GBrainOAuthProvider({
     sql,
     tokenTtl,
     dcrDisabled: !enableDcr,
     allowClientCredentialsDcr: enableDcrInsecure === true,
+    dcrTtlMinSeconds,
+    dcrTtlMaxSeconds,
   });
 
   // #1353: loud stderr security WARN when DCR is enabled. DCR is an
@@ -530,7 +800,12 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   let bootstrapToken: string = resolved.token;
   let bootstrapFromEnv: boolean = resolved.fromEnv;
   const bootstrapHash = createHash('sha256').update(bootstrapToken).digest('hex');
-  const suppressBootstrapPrint = options.suppressBootstrapToken === true;
+  const suppressBootstrapPrint = shouldSuppressBootstrapPrint({
+    suppress: options.suppressBootstrapToken === true,
+    fromEnv: bootstrapFromEnv,
+    forcePrint: options.printAdminToken === true,
+    isTty: process.stderr.isTTY === true,
+  });
   const adminSessions = new Map<string, number>(); // sessionId → expiresAt
 
   // SSE clients for live activity feed
@@ -593,16 +868,31 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.use('/register', cors(corsOAuthOptions));
   app.use('/revoke', cors(corsOAuthOptions));
 
+  // #2179: capture the optional `token_ttl_seconds` DCR extension field
+  // BEFORE the SDK's /register handler runs — its request schema strips
+  // unknown body members, so the value would never reach registerClient.
+  // The rest of the chain runs inside dcrRegistrationContext; the clients
+  // store clamps + persists it. Malformed values are ignored (fail-safe:
+  // absent → server default; out-of-range → clamped downstream; a TTL hint
+  // never rejects a registration). express.json() here is idempotent with
+  // the SDK router's own body parser.
+  app.use('/register', express.json(), (req: Request, _res: Response, next: NextFunction) => {
+    const raw = (req.body as Record<string, unknown> | null | undefined)?.token_ttl_seconds;
+    const tokenTtlSeconds = typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined;
+    dcrRegistrationContext.run({ tokenTtlSeconds }, next);
+  });
+
   // ---------------------------------------------------------------------------
   // Custom client_credentials handler (before mcpAuthRouter)
   // SDK's token handler only supports authorization_code and refresh_token
   // ---------------------------------------------------------------------------
+  const oauthTokenRateLimit = resolveOAuthTokenRateLimit();
   const ccRateLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 50,
+    windowMs: oauthTokenRateLimit.windowMs,
+    max: oauthTokenRateLimit.max,
     standardHeaders: true,
     legacyHeaders: false,
-    message: { error: 'too_many_requests', error_description: 'Rate limit exceeded. Try again in 15 minutes.' },
+    message: { error: 'too_many_requests', error_description: 'Rate limit exceeded. Try again later.' },
   });
 
   // Magic-link rate limiter: 10 requests/min/IP. The bootstrap token is
@@ -712,6 +1002,93 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
   });
 
+  // The SDK's /revoke handler compares the presented secret with
+  // client.client_secret as plaintext. GBrain stores only a SHA-256 hash, so
+  // confidential clients need the same hash-aware validation used above for
+  // authorization_code and refresh_token exchanges. Public clients present no
+  // secret and continue through to the SDK's PKCE-compatible handler.
+  app.post('/revoke', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    const rawClientId: unknown = req.body?.client_id;
+    const rawBodySecret: unknown = req.body?.client_secret;
+    const authHeader = (req.headers.authorization ?? '').toString();
+
+    // RFC 6749 §2.3: one client-authentication method per request. Reject
+    // duplicates/arrays from express.urlencoded rather than letting them reach
+    // hashToken() as non-strings and become a misleading invalid_client error.
+    const hasBasicAuth = /^Basic\b/i.test(authHeader);
+    if (
+      (rawClientId !== undefined && typeof rawClientId !== 'string') ||
+      (rawBodySecret !== undefined && typeof rawBodySecret !== 'string') ||
+      (hasBasicAuth && (rawClientId !== undefined || rawBodySecret !== undefined))
+    ) {
+      res.status(400).json({ error: 'invalid_request', error_description: 'Malformed or mixed client authentication' });
+      return;
+    }
+
+    let clientId = typeof rawClientId === 'string' ? rawClientId : undefined;
+    let presentedSecret = typeof rawBodySecret === 'string' && rawBodySecret.length > 0
+      ? rawBodySecret
+      : undefined;
+    if (hasBasicAuth) {
+      try {
+        const match = authHeader.match(/^Basic\s+([^\s]+)$/i);
+        if (!match) throw new Error('Malformed Basic authentication');
+        const decoded = Buffer.from(match[1], 'base64').toString('utf8');
+        const idx = decoded.indexOf(':');
+        if (idx < 1) throw new Error('Malformed Basic authentication');
+        clientId = decodeURIComponent(decoded.slice(0, idx).replace(/\+/g, ' '));
+        presentedSecret = decodeURIComponent(decoded.slice(idx + 1).replace(/\+/g, ' '));
+        if (!presentedSecret) throw new Error('Malformed Basic authentication');
+      } catch {
+        res.setHeader('WWW-Authenticate', 'Basic realm="gbrain"');
+        res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client' });
+        return;
+      }
+    }
+    if (!clientId || !presentedSecret) return next();
+
+    const parsedRequest = OAuthTokenRevocationRequestSchema.safeParse(req.body);
+    if (!parsedRequest.success || parsedRequest.data.token.length === 0) {
+      res.status(400).json({ error: 'invalid_request', error_description: 'Valid token required' });
+      return;
+    }
+
+    let client;
+    try {
+      client = await oauthProvider.verifyConfidentialClientSecret(clientId, presentedSecret);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : '';
+      if (msg === 'Invalid client' || msg === 'Client has been revoked') {
+        if (hasBasicAuth) res.setHeader('WWW-Authenticate', 'Basic realm="gbrain"');
+        res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client' });
+        return;
+      }
+      console.error('[serve-http] revoke client verification failed:', msg || 'Unknown error');
+      const retryable = isRetryableError(e);
+      res.status(retryable ? 503 : 500).json({
+        error: retryable ? 'temporarily_unavailable' : 'server_error',
+        error_description: retryable ? 'Token revocation temporarily unavailable' : 'Token revocation failed',
+      });
+      return;
+    }
+
+    try {
+      await oauthProvider.revokeToken(client, parsedRequest.data);
+      // RFC 7009 §2.2: successful revocation, including an unknown token, is 200.
+      res.status(200).end();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Unknown error';
+      console.error('[serve-http] token revocation failed:', msg);
+      const retryable = isRetryableError(e);
+      res.status(retryable ? 503 : 500).json({
+        error: retryable ? 'temporarily_unavailable' : 'server_error',
+        error_description: retryable ? 'Token revocation temporarily unavailable' : 'Token revocation failed',
+      });
+    }
+  });
+
   // ---------------------------------------------------------------------------
   // MCP SDK Auth Router (OAuth endpoints)
   // ---------------------------------------------------------------------------
@@ -720,6 +1097,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // (RFC 8414 §3.3). Honor --public-url for production deployments behind
   // reverse proxies / tunnels; default to localhost for dev.
   const issuerUrl = new URL(publicUrl || `http://localhost:${port}`);
+
+  // MCP authorization spec (2025-06-18 draft §5.1) and RFC 9728 require the
+  // protected resource server to return its discovery metadata URL in the
+  // WWW-Authenticate header on 401 responses:
+  //
+  //   WWW-Authenticate: Bearer resource_metadata="<URL>"
+  //
+  // Clients (claude.ai, Cursor, every other MCP-aware OAuth client) use that
+  // URL to find the authorization-server discovery doc + token endpoint
+  // without the user having to paste those URLs manually. Pre-fix the header
+  // shipped `Bearer error="invalid_token", ...` with no resource_metadata
+  // parameter, so MCP clients couldn't begin the OAuth flow from a fresh
+  // 401 — they would silently fail to connect with a generic "couldn't
+  // reach the MCP server" error.
+  const resourceMetadataUrl = `${issuerUrl.toString().replace(/\/$/, '')}/.well-known/oauth-protected-resource`;
 
   // F9: cookie `secure` flag honors both the request's TLS state (req.secure
   // is set when express trust-proxy lands an X-Forwarded-Proto: https) AND
@@ -762,6 +1154,16 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       (res as any).json = (body: any) => {
         if (body?.grant_types_supported && !body.grant_types_supported.includes('client_credentials')) {
           body.grant_types_supported.push('client_credentials');
+        }
+        if (body?.token_endpoint_auth_methods_supported) {
+          for (const method of ['client_secret_basic', 'none']) {
+            if (!body.token_endpoint_auth_methods_supported.includes(method)) {
+              body.token_endpoint_auth_methods_supported.push(method);
+            }
+          }
+        }
+        if (body?.revocation_endpoint_auth_methods_supported && !body.revocation_endpoint_auth_methods_supported.includes('client_secret_basic')) {
+          body.revocation_endpoint_auth_methods_supported.push('client_secret_basic');
         }
         return origJson(body);
       };
@@ -956,13 +1358,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // mcp_request_log, which the cycle purge phase now prunes on a TTL
       // (purgeStaleMcpRequestLog, src/core/mcp-request-log-retention.ts). Each
       // purged batch folds its per-token count + max(created_at) into
-      // mcp_request_log_purged (migration v123) before deleting, so both
+      // mcp_request_log_purged (migration v128) before deleting, so both
       // metrics here add the purged counters back into the live aggregate.
       // requests_today / error_rate stay live-only (24h window never reaches
       // the >=30-day-old rows this purge touches).
       //
       // The purged-counter table is referenced ONLY when it exists: on a
-      // pre-v123 / failed-migration brain, referencing it in a scalar subquery
+      // pre-v128 / failed-migration brain, referencing it in a scalar subquery
       // would fail to plan ("relation does not exist") and 503 the whole
       // endpoint. So gate on to_regclass and fall back to the live-only
       // expressions — GREATEST/COALESCE handle a token with no purged row, and
@@ -990,7 +1392,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const oauthClients = hasPurgedTable
         ? await sql`
             SELECT c.client_id as id, c.client_name as name, 'oauth' as auth_type,
-              c.grant_types, c.scope, c.created_at, c.token_ttl,
+              c.grant_types, c.scope, c.source_id, c.federated_read,
+              c.created_at, c.token_ttl,
               CASE WHEN c.deleted_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
               GREATEST(
                 (SELECT max(created_at) FROM mcp_request_log WHERE token_name = c.client_id),
@@ -1005,7 +1408,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           `
         : await sql`
             SELECT c.client_id as id, c.client_name as name, 'oauth' as auth_type,
-              c.grant_types, c.scope, c.created_at, c.token_ttl,
+              c.grant_types, c.scope, c.source_id, c.federated_read,
+              c.created_at, c.token_ttl,
               CASE WHEN c.deleted_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
               (SELECT max(created_at) FROM mcp_request_log WHERE token_name = c.client_id) as last_used_at,
               (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id) as total_requests,
@@ -1034,8 +1438,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
               (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name AND created_at > now() - interval '24 hours') as requests_today
             FROM access_tokens a ORDER BY a.created_at DESC
           `;
-      res.json([...oauthClients, ...legacyKeys]);
+      res.json([
+        ...oauthClients,
+        ...legacyKeys.map((key) => ({ ...key, source_id: null, federated_read: [] })),
+      ]);
     } catch (e) {
+      res.status(503).json({ error: 'service_unavailable' });
+    }
+  });
+
+  app.get('/admin/api/sources', requireAdmin, async (_req: Request, res: Response) => {
+    try {
+      const { listSources } = await import('../core/sources-ops.ts');
+      const sources = await listSources(engine);
+      res.json(sources.map(({ id, name, federated }) => ({ id, name, federated })));
+    } catch {
       res.status(503).json({ error: 'service_unavailable' });
     }
   });
@@ -1077,8 +1494,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     try {
       const now = Math.floor(Date.now() / 1000);
       const [expiring] = await sql`SELECT count(*)::int as count FROM oauth_tokens WHERE token_type = 'access' AND expires_at BETWEEN ${now} AND ${now + 86400}`;
-      const [errors] = await sql`SELECT count(*)::int as count FROM mcp_request_log WHERE status != 'success' AND created_at > now() - interval '24 hours'`;
-      const [total] = await sql`SELECT count(*)::int as count FROM mcp_request_log WHERE created_at > now() - interval '24 hours'`;
+      // Excluded from the error numerator: success and success_with_warnings
+      // (a warn-mode success); denied_after_list stays counted — a denied
+      // call IS a failure signal. surface_change is an OPERATION value (audit
+      // rows carry status='success'), so audit rows are excluded from BOTH
+      // counts — they are records of operator/self actions, not traffic.
+      const [errors] = await sql`SELECT count(*)::int as count FROM mcp_request_log WHERE status NOT IN ('success', 'success_with_warnings') AND operation != 'surface_change' AND created_at > now() - interval '24 hours'`;
+      const [total] = await sql`SELECT count(*)::int as count FROM mcp_request_log WHERE operation != 'surface_change' AND created_at > now() - interval '24 hours'`;
       const errorRate = (total as any).count > 0 ? ((errors as any).count / (total as any).count * 100).toFixed(1) : '0';
       res.json({
         expiring_soon: (expiring as any).count,
@@ -1123,7 +1545,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.get('/admin/api/calibration/pattern/:id', requireAdmin, async (req: Request, res: Response) => {
     try {
       const { getLatestProfile } = await import('./calibration.ts');
-      const holder = (req.query.holder as string) || 'garry';
+      const holder = resolveOwnerHolder({ override: (req.query.holder as string) || undefined, configValue: await engine.getConfig('emotional_weight.user_holder') });
       const profile = await getLatestProfile(engine, { holder });
       if (!profile) {
         res.status(404).json({ error: 'no_profile' });
@@ -1140,7 +1562,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // v0.36.1.0 ship state: surface the top resolved takes for the
       // holder as drill-down evidence. Per-pattern provenance is v0.37.
       const takes = await engine.executeRaw<{
-        id: number;
+        id: string;
         page_slug: string;
         row_num: number;
         claim: string;
@@ -1148,10 +1570,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         resolved_quality: string | null;
         since_date: string | null;
       }>(
-        `SELECT id, page_slug, row_num, claim, weight, resolved_quality, since_date
-           FROM takes
-           WHERE holder = $1 AND active = true AND resolved_at IS NOT NULL
-           ORDER BY weight DESC, since_date DESC
+        // `takes` has no page_slug column — it comes from the joined page.
+        // id::text — it's a BIGSERIAL (bigint); res.json() below can't serialize a
+        // raw bigint ("cannot serialize BigInt"), so project it as a string.
+        `SELECT t.id::text AS id, p.slug AS page_slug, t.row_num, t.claim, t.weight, t.resolved_quality, t.since_date
+           FROM takes t JOIN pages p ON p.id = t.page_id
+           WHERE t.holder = $1 AND t.active = true AND t.resolved_at IS NOT NULL
+           ORDER BY t.weight DESC, t.since_date DESC
            LIMIT 25`,
         [holder],
       );
@@ -1170,7 +1595,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.get('/admin/api/calibration/profile', requireAdmin, async (req: Request, res: Response) => {
     try {
       const { getLatestProfile } = await import('./calibration.ts');
-      const holder = (req.query.holder as string) || 'garry';
+      const holder = resolveOwnerHolder({ override: (req.query.holder as string) || undefined, configValue: await engine.getConfig('emotional_weight.user_holder') });
       const profile = await getLatestProfile(engine, { holder });
       res.json(profile);
     } catch (err) {
@@ -1187,7 +1612,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         renderAbandonedThreadsCard,
         renderPatternStatementsCard,
       } = await import('../core/calibration/svg-renderer.ts');
-      const holder = (req.query.holder as string) || 'garry';
+      const holder = resolveOwnerHolder({ override: (req.query.holder as string) || undefined, configValue: await engine.getConfig('emotional_weight.user_holder') });
       const type = req.params.type;
       const profile = await getLatestProfile(engine, { holder });
 
@@ -1199,7 +1624,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // proper 90-day time series will read from calibration_profiles
         // generated_at history in v0.37 once we have multiple snapshots.
         const series = profile?.brier !== null && profile?.brier !== undefined
-          ? [{ date: profile.generated_at.slice(0, 10), brier: profile.brier }]
+          // generated_at comes back from the engine as a Date (TIMESTAMPTZ), not
+          // a string — `.slice` would throw. Normalize to a YYYY-MM-DD string.
+          ? [{ date: new Date(profile.generated_at).toISOString().slice(0, 10), brier: profile.brier }]
           : [];
         return res.send(renderBrierTrend({ series }));
       }
@@ -1226,12 +1653,17 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           weight: number;
           since_date: string;
         }>(
-          `SELECT id, page_slug, claim, weight, since_date
-             FROM takes
-             WHERE active = true AND resolved_at IS NULL AND superseded_by IS NULL
-               AND weight >= 0.7
-               AND since_date::date < (now() - INTERVAL '12 months')
-             ORDER BY since_date ASC
+          // `takes` has no page_slug column — it comes from the joined page.
+          // since_date is TEXT and may be month-precision ('YYYY-MM'); '2026-06'::date
+          // throws "invalid input syntax for type date", so normalize to the 1st
+          // before casting.
+          `SELECT t.id, p.slug AS page_slug, t.claim, t.weight, t.since_date
+             FROM takes t JOIN pages p ON p.id = t.page_id
+             WHERE t.active = true AND t.resolved_at IS NULL AND t.superseded_by IS NULL
+               AND t.weight >= 0.7
+               AND (t.since_date || CASE WHEN length(t.since_date) = 7 THEN '-01' ELSE '' END)::date
+                   < (now() - INTERVAL '12 months')
+             ORDER BY t.since_date ASC
              LIMIT 5`,
         );
         const now = new Date();
@@ -1361,7 +1793,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       //     and other malformed inputs
       // normalizeScopesInput handles all four valid shapes (string, string[],
       // missing, empty) and rejects the rest with a structured 400.
-      const { name, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
+      const { name, source, federatedRead, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
       const rawScopes = (req.body as Record<string, unknown>).scopes ?? (req.body as Record<string, unknown>).scope;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
       let scopeString: string;
@@ -1393,8 +1825,27 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         });
         return;
       }
+      // v0.41.x: honor optional `source` (write source_id) and `federatedRead`
+      // (read source set) from the request body, mirroring the CLI's
+      // `--source` / `--federated-read` flags. Omitting both preserves the
+      // historical behavior (source_id='default', federated_read=[source_id]).
+      // Pre-fix this endpoint hardcoded 'default'/undefined, so an admin SPA or
+      // a proxy could never mint a client bound to a non-default brain source
+      // over HTTP — only the CLI could. Validated here for a structured 400.
+      let sourceId: string;
+      let federatedReadIds: string[] | undefined;
+      try {
+        sourceId = normalizeSourceInput(source);
+        federatedReadIds = normalizeFederatedReadInput(federatedRead);
+      } catch (e) {
+        res.status(400).json({
+          error: 'invalid_source',
+          message: e instanceof Error ? e.message : String(e),
+        });
+        return;
+      }
       const result = await oauthProvider.registerClientManual(
-        name, grants, scopeString, uris, 'default', undefined, validatedAuthMethod,
+        name, grants, scopeString, uris, sourceId, federatedReadIds, validatedAuthMethod,
       );
       // Set per-client TTL if specified
       if (tokenTtl && Number(tokenTtl) > 0) {
@@ -1419,6 +1870,65 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
   });
 
+  // v0.42.x (#1914): rescope an OAuth client's write source / federated read
+  // scope. Admin-gated on purpose — DCR clients must never self-widen their
+  // scope (fail-closed trust); only the operator rescopes, here or via
+  // `gbrain auth rescope-client`. Source ids are validated by the canonical
+  // validator inside rescopeClient.
+  app.post('/admin/api/rescope-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    try {
+      const { clientId, sourceId, federatedRead, boundSlugPrefixes, surface } = req.body ?? {};
+      if (!clientId || typeof clientId !== 'string') {
+        res.status(400).json({ error: 'clientId required' });
+        return;
+      }
+      if (federatedRead !== undefined &&
+          !(Array.isArray(federatedRead) && federatedRead.every((s: unknown) => typeof s === 'string'))) {
+        res.status(400).json({ error: 'federatedRead must be an array of source id strings' });
+        return;
+      }
+      if (sourceId !== undefined && typeof sourceId !== 'string') {
+        res.status(400).json({ error: 'sourceId must be a string' });
+        return;
+      }
+      // v0.42.72.0: tri-state write-fence rescope — omitted = untouched,
+      // null = clear, array of strings = replace (mirrors the CLI's
+      // --bound-slug-prefixes p1,p2|none).
+      if (boundSlugPrefixes !== undefined && boundSlugPrefixes !== null &&
+          !(Array.isArray(boundSlugPrefixes) && boundSlugPrefixes.every((s: unknown) => typeof s === 'string'))) {
+        res.status(400).json({ error: 'boundSlugPrefixes must be null or an array of slug-prefix strings' });
+        return;
+      }
+      // WP4: tri-state surface rescope — omitted = untouched, null = clear
+      // (surface + surface_set_by both NULL), value = set + operator lock
+      // (mirrors the CLI's --surface verbs|starter|full|clear).
+      if (surface !== undefined && surface !== null &&
+          surface !== 'verbs' && surface !== 'starter' && surface !== 'full') {
+        res.status(400).json({ error: 'surface must be null or one of: verbs, starter, full' });
+        return;
+      }
+      const result = await oauthProvider.rescopeClient(clientId, { sourceId, federatedRead, boundSlugPrefixes, surface });
+      // WP4 (amendment 32 / ENG-8): every surface mutation writes an audit
+      // row — this endpoint, the rescope CLI, and the request_tools persist.
+      if (surface !== undefined) {
+        await writeSurfaceChangeAudit(engine, {
+          actor: 'admin-api',
+          client_id: clientId,
+          old: result.surfaceOld ?? null,
+          new: result.surface ?? null,
+          via: 'admin_api',
+        });
+      }
+      res.json(result);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Rescope failed';
+      const status = /No OAuth client found/.test(message) ? 404
+        : /Invalid source_id|requires --source|cannot be empty|does not exist|cannot be an empty list|bound_slug_prefixes entr|--surface must be/.test(message) ? 400
+        : 500;
+      res.status(status).json({ error: message });
+    }
+  });
+
   // Revoke OAuth client
   app.post('/admin/api/revoke-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
     try {
@@ -1438,10 +1948,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // SSE live activity feed
   // ---------------------------------------------------------------------------
   app.get('/admin/events', requireAdmin, (req: Request, res: Response) => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders();
+    openAdminSseStream(res);
 
     sseClients.add(res);
     req.on('close', () => sseClients.delete(res));
@@ -1511,7 +2018,46 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   // MCP tool calls (bearer auth + scope enforcement)
   // ---------------------------------------------------------------------------
-  const mcpOperations = operations.filter(op => !op.localOnly);
+  // MEMORY_VERBS v1 + WP4 (D2): the server-resolved surface is the CEILING.
+  // The per-REQUEST effective surface — min(ceiling, client row surface ??
+  // config default), clamped by the GBRAIN_MCP_FORCE_SURFACE kill switch
+  // (narrow-only, FOV-6a) — is resolved inside the /mcp handler so a rescope
+  // or config flip takes effect on the client's next request without a
+  // restart, and the dispatch allow-set is recomputed per request
+  // (amendment 20). The surface filter applies AFTER the localOnly filter;
+  // the same set feeds dispatch as allowedOps so hidden ops are uncallable,
+  // not just unlisted [c2].
+  const serverSurfaceCeiling: McpSurface = options.surface ?? 'full';
+  const mcpOperationsBase = operations.filter(op => !op.localOnly);
+
+  /**
+   * WP4 (D2): resolve this request's effective surface from the caller's
+   * verified auth. The config default (`mcp.default_surface_dcr`) is read
+   * dual-plane ONLY when the client row carries no usable surface — the
+   * common full-surface path pays no extra config read. Unknown row values
+   * are ignored with a warn-once per client (amendment 18). Never throws:
+   * surface resolution must not take a request down. On a default-surface
+   * read failure the LAST successfully read default (per process) still
+   * applies, so a transient config outage cannot silently widen a client
+   * that normally resolves narrower than the ceiling; with no prior read,
+   * the ceiling is the only floor available (pre-WP4 behavior).
+   */
+  let lastKnownDefaultSurface: McpSurface | null = null;
+  async function resolveEffectiveSurface(authInfo: AuthInfo): Promise<{ ceiling: McpSurface; effective: McpSurface }> {
+    const ceiling = clampSurface(serverSurfaceCeiling);
+    // min() can never go below the narrowest surface: a 'verbs' ceiling makes
+    // the row/default resolution a no-op, so skip the awaited config read.
+    if (ceiling === 'verbs') return { ceiling, effective: ceiling };
+    const rowSurface = resolveClientRowSurface(authInfo.surface, authInfo.clientId);
+    if (rowSurface !== null) return { ceiling, effective: minSurface(ceiling, rowSurface) };
+    try {
+      const dflt = await resolveDefaultClientSurface(engine, config);
+      lastKnownDefaultSurface = dflt ?? null;
+      return { ceiling, effective: minSurface(ceiling, dflt ?? ceiling) };
+    } catch {
+      return { ceiling, effective: minSurface(ceiling, lastKnownDefaultSurface ?? ceiling) };
+    }
+  }
 
   // v0.36.x #1076: MCP Streamable HTTP spec — GET /mcp opens an optional SSE
   // backchannel for server-initiated messages. gbrain's transport is stateless
@@ -1524,7 +2070,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider }), async (req: Request, res: Response) => {
+  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
 
@@ -1534,6 +2080,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // for legacy tokens or when the JOIN row's client_name is NULL.
     const agentName = authInfo.clientName ?? authInfo.clientId;
 
+    // WP4 (D2): per-request effective surface + fail-closed allow-set,
+    // recomputed per request (amendment 20) so rescopes/request_tools
+    // persists take effect on the next request with zero restart.
+    const { ceiling: surfaceCeiling, effective: surface } = await resolveEffectiveSurface(authInfo);
+    const mcpOperations = filterOpsForSurface(mcpOperationsBase, surface);
+    const surfaceAllowedOps: ReadonlySet<string> | undefined =
+      surface === 'full' ? undefined : new Set(mcpOperations.map(o => o.name));
+
     // Create a fresh MCP server per request (stateless)
     const server = new Server(
       { name: 'gbrain', version: VERSION },
@@ -1541,10 +2095,48 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     );
 
     server.setRequestHandler(ListToolsRequestSchema, async () => {
+      // WP1 honest catalog: the advertised list is exactly what THIS token
+      // can call. Three per-request filters, cheapest first:
+      //   1. token scope — a read-only token never sees admin/write tools;
+      //   2. bound-client fence — a slug-bound client never sees ops the
+      //      dispatch fence would deny (same predicate, cannot drift);
+      //   3. publish gates — gated ops (skills/advisor) are hidden while
+      //      their gate is off; the resolver never throws (read failure =
+      //      hidden, matching the default-off consent posture) so a config
+      //      hiccup costs at most the 4 gated tools, never the whole list.
+      // Call-time enforcement (hasScope / fence / assertPublishEnabled)
+      // stays as the fail-closed backstop for all three layers.
+      // Both per-request config reads are independent — issue them
+      // concurrently (one RTT of latency on network Postgres, not two).
+      const [gateDisabled, strictParamsMode] = await Promise.all([
+        disabledOpsForPublishGates(engine, config),
+        resolveStrictParamsMode(engine, config),
+      ]);
+      // FOV-4: `agent` deliberately implies only itself, which would strand
+      // agent-only tokens with ZERO discovery — ops flagged `agentCallable`
+      // (request_tools) are visible to (and callable by, below) agent scope
+      // in addition to their declared scope.
+      const visibleOps = mcpOperations.filter(op =>
+        (hasScope(authInfo.scopes, op.scope ?? 'read')
+          || (op.agentCallable === true && hasScope(authInfo.scopes, 'agent')))
+        && opAllowedForBoundClient(authInfo, op)
+        && !gateDisabled.has(op.name),
+      );
+      // WP3 (amendment 14): ONE schema mapper — the inline map this handler
+      // carried is unified onto buildToolDefs so the byte-pin test covers the
+      // transport consumers actually use. strict_params is read dual-plane
+      // PER REQUEST (same restart-free property as the publish gates above):
+      // 'reject' closes each schema with additionalProperties:false and
+      // declares the _meta/dry_run passthrough keys (D14.1).
+      const strictParams = strictParamsMode === 'reject';
+      const tools = buildToolDefs(visibleOps, { strictParams });
       // v0.28.10: log every JSON-RPC method, not just successful tools/call.
       // Pre-fix, /admin/api/requests showed nothing for clients that only
       // ever called tools/list, and the v0.26.3 persistence regression test
       // asserting >= 2 rows after tools/list + tools/call was unreachable.
+      // Amendment 23 stopgap (full list-size telemetry deferred): the row's
+      // params carry the listed-tool count so per-token-class list sizes are
+      // queryable (`params->>'tool_count'`) without new telemetry plumbing.
       const latency = Date.now() - startTime;
       try {
         await executeRawJsonb(
@@ -1552,7 +2144,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
            VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
           [authInfo.clientId, agentName, 'tools/list', latency, 'success'],
-          [null],
+          [{ tool_count: tools.length }],
         );
       } catch { /* best effort */ }
       broadcastEvent({
@@ -1563,19 +2155,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         status: 'success',
         timestamp: new Date().toISOString(),
       });
-      return {
-        tools: mcpOperations.map(op => ({
-          name: op.name,
-          description: op.description,
-          inputSchema: {
-            type: 'object' as const,
-            properties: Object.fromEntries(
-              Object.entries(op.params).map(([k, v]) => [k, paramDefToSchema(v)]),
-            ),
-            required: Object.entries(op.params).filter(([, v]) => v.required).map(([k]) => k),
-          },
-        })),
-      };
+      return { tools };
     });
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -1613,17 +2193,26 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // hierarchy. Plain string includes() at this site would have made
       // sources_admin tokens look like they couldn't even read.)
       const requiredScope = op.scope || 'read';
-      if (!hasScope(authInfo.scopes, requiredScope)) {
+      // FOV-4: agentCallable carve-out mirrors the tools/list filter above —
+      // an op listed for an agent-only token must not scope-deny at call time.
+      const scopeSatisfied = hasScope(authInfo.scopes, requiredScope)
+        || (op.agentCallable === true && hasScope(authInfo.scopes, 'agent'));
+      if (!scopeSatisfied) {
         // v0.28.10: persist scope-rejected attempts. Same operator-visibility
         // motivation as the unknown-op path — and it makes the v0.26.3
         // persistence regression test reliable across both rejection paths.
+        // Amendment 33: a call-time scope deny is a LIST-LEVEL denial (the
+        // tools/list filter uses this same hasScope predicate, so the op was
+        // never advertised to this token — the client ignored or staled its
+        // list, or list/call drifted). status='denied_after_list' makes the
+        // honest-catalog metric a one-line count that trends to zero.
         const latency = Date.now() - startTime;
         try {
           await executeRawJsonb(
             engine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', `insufficient_scope: requires '${requiredScope}'`],
+            [authInfo.clientId, agentName, name, latency, 'denied_after_list', `insufficient_scope: requires '${requiredScope}'`],
             [null],
           );
         } catch { /* best effort */ }
@@ -1632,7 +2221,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           operation: name,
           scopes: authInfo.scopes.join(','),
           latency_ms: latency,
-          status: 'error',
+          status: 'denied_after_list',
           error: { code: 'insufficient_scope', message: `requires '${requiredScope}'` },
           timestamp: new Date().toISOString(),
         });
@@ -1676,8 +2265,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // injection via the metaHook. HTTP-specific concerns (mcp_request_log
       // persistence + SSE broadcast) stay here; the dispatcher returns the
       // ToolResult and we read isError + _meta to pick the right branch.
-      const tokenAllowList = (authInfo as AuthInfo & { takesHoldersAllowList?: string[] }).takesHoldersAllowList
-        ?? ['world'];
+      // #2529: takesHoldersAllowList is a typed AuthInfo field populated by
+      // verifyAccessToken from access_tokens.permissions.takes_holders for
+      // legacy bearer tokens ([] preserved as deny-all). The fail-closed
+      // ['world'] default covers OAuth-client tokens (no per-client storage
+      // yet — see TODOS.md) and pre-v29 brains (no permissions column →
+      // isUndefinedColumnError fallback in verifyAccessToken).
+      const tokenAllowList = authInfo.takesHoldersAllowList ?? ['world'];
       // v0.34.1 (#861, D13): AuthInfo.sourceId is now a real typed field
       // populated from oauth_clients.source_id (migration v60 backfilled
       // NULL → 'default'). Pre-fix this site cast through AuthInfo and
@@ -1691,9 +2285,17 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       try {
         toolResult = await dispatchToolCall(engine, name, params as Record<string, unknown> | undefined, {
           remote: true,
+          // WP1/D7: network transport — the dispatch-layer localOnly
+          // backstop keys off this marker.
+          transport: 'http',
           takesHoldersAllowList: tokenAllowList,
           sourceId: tokenSourceId,
           metaHook: getBrainHotMemoryMeta,
+          // MEMORY_VERBS v1: fail-closed surface enforcement + usage attribution.
+          ...(surfaceAllowedOps ? { allowedOps: surfaceAllowedOps } : {}),
+          surface,
+          // WP4 (D2): request_tools bounds its catalog + persist by this.
+          surfaceCeiling,
           // v0.31 follow-up fix: thread auth so the whoami op (and any
           // future scope-aware handlers) can introspect the caller. The
           // original D12/eE1 refactor moved dispatch into dispatchToolCall
@@ -1741,17 +2343,24 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // dispatchToolCall serializes the error into the content text;
         // for the audit log we re-extract a message string for the
         // mcp_request_log error_message column. Best-effort parse.
+        // Amendment 33 / D10: op-level denials the list should have
+        // prevented (publish-gate backstop `config_key=...`, bound-client
+        // fence op-level deny `fence=op`) log status='denied_after_list'
+        // instead of plain 'error' — the honest-catalog trend-to-zero
+        // metric. Argument-level fence denials carry no marker and stay
+        // 'error' (legitimate for a listed op).
         let errMsg = 'unknown_error';
         try {
           const parsed = JSON.parse(toolResult.content[0]?.text ?? '{}');
           errMsg = parsed.error?.message ?? parsed.message ?? errMsg;
         } catch { /* ignore */ }
+        const errStatus = requestLogStatusForResult(toolResult);
         try {
           await executeRawJsonb(
             engine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', errMsg],
+            [authInfo.clientId, agentName, name, latency, errStatus, errMsg],
             [logParamsObj],
           );
         } catch { /* best effort */ }
@@ -1761,19 +2370,24 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           params: broadcastParams,
           scopes: authInfo.scopes.join(','),
           latency_ms: latency,
-          status: 'error',
+          status: errStatus,
           error: { code: 'op_error', message: errMsg },
           timestamp: new Date().toISOString(),
         });
         return toolResult;
       }
 
+      // WP3 (amendment 13): warn-mode observability. A success whose _meta
+      // carries a non-empty warnings array logs as 'success_with_warnings' so
+      // the reject-flip decision is evidence-based (count per client via the
+      // status column). Warn CONTENTS (the raw unknown keys) are never logged.
+      const successStatus = requestLogStatusForResult(toolResult);
       try {
         await executeRawJsonb(
           engine,
           `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
            VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-          [authInfo.clientId, agentName, name, latency, 'success'],
+          [authInfo.clientId, agentName, name, latency, successStatus],
           [logParamsObj],
         );
       } catch { /* best effort */ }
@@ -1783,7 +2397,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         params: broadcastParams,
         scopes: authInfo.scopes.join(','),
         latency_ms: latency,
-        status: 'success',
+        status: successStatus,
         timestamp: new Date().toISOString(),
       });
       return toolResult;
@@ -1867,7 +2481,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.post(
     '/ingest',
     ingestRateLimiter,
-    requireBearerAuth({ verifier: oauthProvider, requiredScopes: ['write'] }),
+    requireBearerAuth({ verifier: oauthProvider, requiredScopes: ['write'], resourceMetadataUrl }),
     express.raw({ type: '*/*', limit: ingestMaxBytes }),
     async (req: Request, res: Response) => {
       const startTime = Date.now();
@@ -1957,6 +2571,31 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const sourceUri = (req.header('x-gbrain-source-uri') || `mcp-webhook:${authInfo.clientId}:${Date.now()}`).slice(0, 1024);
       const sourceId = (req.header('x-gbrain-source-id') || `webhook-${authInfo.clientId}`).slice(0, 256);
       const callerSlug = req.header('x-gbrain-slug');
+
+      // Slug-bound clients cannot use /ingest at all. The route hands its
+      // payload to the ingest_capture minion handler, which deliberately
+      // bypasses the put_page op layer — so no OperationContext exists and
+      // enforceClientSlugFence never runs, and because the payload is marked
+      // untrusted the handler also refuses to honor any source id, landing
+      // every write in the DEFAULT source. Fencing just the slug here would
+      // still write the right slug into the WRONG source, outside the
+      // client's grant. These clients have put_page over MCP, which enforces
+      // both the prefix fence and the source scope; webhook integrations use
+      // unbound clients.
+      const boundPrefixes = authInfo.boundSlugPrefixes;
+      if (boundPrefixes || authInfo.fenceProjectionDegraded) {
+        res.status(403).json({
+          error: 'permission_denied',
+          message: authInfo.fenceProjectionDegraded
+            ? 'POST /ingest is unavailable: this brain\'s oauth_clients projection is missing ' +
+              'bound_slug_prefixes, so client write bindings cannot be evaluated. ' +
+              'Run `gbrain apply-migrations --yes` on the brain host.'
+            : 'POST /ingest is not available to clients restricted to slug prefixes ' +
+              `(bound_slug_prefixes: ${boundPrefixes!.join(', ')}). Write through the MCP put_page op, ` +
+              'which enforces the prefix fence and your source scope.',
+        });
+        return;
+      }
 
       const event: IngestionEvent = {
         source_id: sourceId,
@@ -2069,8 +2708,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   //     Other event types (ping, pull_request, etc.) return 202 'ignored'
   //     so GitHub doesn't retry.
   // D15.5: HMAC compare uses the shared safeHexEqual helper.
-  // D18: submits 'sync' job with auto_embed_backfill=true and priority -10
-  //     (above autopilot's 0).
+  // D18: submits 'sync' job with extraction + auto_embed_backfill enabled and
+  //     priority -10 (above autopilot's 0). This opts normal incremental pushes
+  //     into sync's inline extraction while pagesAffected still identifies the
+  //     changed pages. The sync core can still defer large (>100) changes.
   // ---------------------------------------------------------------------------
   const githubWebhookLimiter = rateLimit({
     windowMs: 60_000,
@@ -2190,6 +2831,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           'sync',
           {
             sourceId: source.id,
+            noExtract: false,
             auto_embed_backfill: true,
             embed_reason: 'webhook',
           },
@@ -2213,7 +2855,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   const clientCount = await sql`SELECT count(*)::int as count FROM oauth_clients`;
 
-  app.listen(port, bind, () => {
+  const httpServer = app.listen(port, bind, () => {
     console.error(`
 ╔══════════════════════════════════════════════════════╗
 ║  GBrain MCP Server v${VERSION.padEnd(37)}║
@@ -2231,11 +2873,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 ║  MCP:       http://localhost:${port}/mcp${' '.repeat(Math.max(0, 21 - String(port).length))}║
 ║  Health:    http://localhost:${port}/health${' '.repeat(Math.max(0, 18 - String(port).length))}║
 ╠══════════════════════════════════════════════════════╣
-${suppressBootstrapPrint
-  ? '║  Admin Token: suppressed (--suppress-bootstrap-token) ║\n╚══════════════════════════════════════════════════════╝'
-  : bootstrapFromEnv
-    ? '║  Admin Token: from $GBRAIN_ADMIN_BOOTSTRAP_TOKEN     ║\n╚══════════════════════════════════════════════════════╝'
+${bootstrapFromEnv
+  ? '║  Admin Token: from $GBRAIN_ADMIN_BOOTSTRAP_TOKEN     ║\n╚══════════════════════════════════════════════════════╝'
+  : suppressBootstrapPrint
+    ? '║  Admin Token: hidden (non-TTY log-leak guard)        ║\n║  set $GBRAIN_ADMIN_BOOTSTRAP_TOKEN, or pass          ║\n║  --print-admin-token on a trusted terminal.          ║\n╚══════════════════════════════════════════════════════╝'
     : `║  Admin Token (paste into /admin login):              ║\n║  ${bootstrapToken.substring(0, 50)}  ║\n║  ${bootstrapToken.substring(50).padEnd(50)}  ║\n╚══════════════════════════════════════════════════════╝`}
 `);
   });
+
+  await waitForHttpServerLifecycle(httpServer);
 }

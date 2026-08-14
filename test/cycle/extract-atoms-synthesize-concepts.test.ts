@@ -17,6 +17,7 @@ import { runPhaseExtractAtoms, parseAtomsResponse } from '../../src/core/cycle/e
 import { runPhaseSynthesizeConcepts } from '../../src/core/cycle/synthesize-concepts.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import type { ChatResult, ChatOpts } from '../../src/core/ai/gateway.ts';
+import { canonicalLookup } from '../../src/core/model-pricing.ts';
 
 let engine: PGLiteEngine;
 
@@ -177,6 +178,31 @@ describe('v0.41 T5: runPhaseExtractAtoms via stubbed chat', () => {
     expect((result.details?.failures as unknown[]).length).toBe(1);
   });
 
+  // issue #3218 — when EVERY item's chat() call throws (all-provider-failed),
+  // `transcripts_processed`/`pages_processed` must stay 0 while `failures`
+  // records one entry per item. This is the exact shape the
+  // extract-atoms-drain wiring (`runExtractAtomsDrainForSource`) uses to
+  // derive `providerFailure` (failures.length > 0 && itemsSucceeded === 0),
+  // distinguishing a total outage from the partial-success case above.
+  test('all items fail: transcripts_processed/pages_processed stay 0, every item recorded in failures', async () => {
+    const chat = async (_o: ChatOpts): Promise<never> => {
+      throw new Error('provider unavailable');
+    };
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [
+        { filePath: '/a.txt', content: 'a', contentHash: 'ha' },
+        { filePath: '/b.txt', content: 'b', contentHash: 'hb' },
+      ],
+      _pages: [],
+      _chat: chat as typeof import('../../src/core/ai/gateway.ts').chat,
+    });
+    expect(result.status).toBe('warn');
+    expect(result.details?.atoms_extracted).toBe(0);
+    expect(result.details?.transcripts_processed).toBe(0);
+    expect(result.details?.pages_processed).toBe(0);
+    expect((result.details?.failures as unknown[]).length).toBe(2);
+  });
+
   // v0.41.2.1 regression case (D9 #14 wording): with _pages:[] and same
   // _transcripts, all PRE-EXISTING PhaseResult.details fields match
   // pre-fix values byte-for-byte. The new fields (pages_processed,
@@ -315,5 +341,186 @@ describe('v0.41 T6: runPhaseSynthesizeConcepts via stubbed chat', () => {
       `SELECT compiled_truth FROM pages WHERE slug = 'concepts/theme'`,
     );
     expect(rows[0].compiled_truth).toContain('Custom synthesized narrative');
+  });
+
+  // #2163: concept pages must enter the retrieval surface. The write routes
+  // through importFromContent (the same parse→chunk pipeline put_page uses),
+  // so content_chunks rows exist and source-boost's 1.3× 'concepts/' weight
+  // has something to boost. (Embeddings are skipped in this env — no
+  // provider — but chunks + search_vector land regardless.)
+  test('concept pages are chunked (#2163)', async () => {
+    const atoms = Array.from({ length: 12 }, (_, i) => ({
+      slug: `c${i}`,
+      title: `Chunk atom ${i}`,
+      body: `Chunky body ${i}.`,
+      concept_refs: ['chunked-concept'],
+    }));
+    const chat = stubChat('A concept narrative long enough to produce at least one chunk.');
+    await runPhaseSynthesizeConcepts(engine, { _atoms: atoms, _chat: chat });
+    const rows = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n
+         FROM content_chunks c JOIN pages p ON p.id = c.page_id
+        WHERE p.slug = 'concepts/chunked-concept'`,
+    );
+    expect(Number(rows[0].n)).toBeGreaterThan(0);
+    // Page metadata survives the importFromContent round-trip.
+    const page = await engine.executeRaw<{ type: string; fm: Record<string, unknown> }>(
+      `SELECT type, frontmatter AS fm FROM pages WHERE slug = 'concepts/chunked-concept'`,
+    );
+    expect(page[0].type).toBe('concept');
+    expect((page[0].fm as Record<string, unknown>).tier).toBe('T1');
+  });
+});
+
+// Canonical pricing: synthesize_concepts' estimated_spend_usd must derive
+// from the model that actually answered (ChatResult.model) through
+// canonicalLookup — not hardcoded Sonnet rates. A wrong per-model rate both
+// trips the $1.50 budget gate early (deterministic-template fallback for
+// work that had budget left) and persists an inflated cost into
+// receipts/rollups. Canonical-miss models keep Sonnet-tier pricing (the
+// same conservative fallback as skillopt/preflight's lookupPrice).
+describe('synthesize_concepts: cost estimate uses canonical per-model pricing', () => {
+  // 6 atoms on one concept → single T2 group → exactly one LLM call.
+  const t2Atoms = Array.from({ length: 6 }, (_, i) => ({
+    slug: `priced-${i}`,
+    title: `Priced ${i}`,
+    body: `Priced body ${i}.`,
+    concept_refs: ['priced-concept'],
+  }));
+
+  // 1M input + 1M output tokens → estimated_spend_usd equals
+  // (input_rate + output_rate) in dollars, read straight off the table.
+  function pricedChat(model: string): (o: ChatOpts) => Promise<ChatResult> {
+    return async (_o: ChatOpts) => ({
+      text: 'Priced narrative.',
+      blocks: [{ type: 'text', text: 'Priced narrative.' }],
+      stopReason: 'end',
+      usage: {
+        input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+      },
+      model,
+      providerId: model.split(':')[0] ?? 'anthropic',
+    });
+  }
+
+  // Expected values derive from the canonical table (never hand-copied
+  // dollar literals — the same invariant the fix enforces), so these tests
+  // survive future price refreshes in model-pricing.ts.
+  const sonnetRate = canonicalLookup('anthropic:claude-sonnet-4-6')!;
+  const gpt52Rate = canonicalLookup('openai:gpt-5.2')!;
+
+  test('non-Sonnet canonical model is priced at its own rates (openai:gpt-5.2)', async () => {
+    const result = await runPhaseSynthesizeConcepts(engine, {
+      _atoms: t2Atoms,
+      _chat: pricedChat('openai:gpt-5.2') as typeof import('../../src/core/ai/gateway.ts').chat,
+      dryRun: true,
+    });
+    // gpt-5.2's own canonical rates — NOT Sonnet's (the pre-fix hardcode).
+    // Guard the guard: the two rate cards must actually differ, or this
+    // test can't discriminate.
+    expect(gpt52Rate.input + gpt52Rate.output).not.toBeCloseTo(
+      sonnetRate.input + sonnetRate.output,
+      6,
+    );
+    expect(result.details?.estimated_spend_usd).toBeCloseTo(
+      gpt52Rate.input + gpt52Rate.output,
+      6,
+    );
+  });
+
+  test('canonical-miss model falls back to Sonnet-tier pricing', async () => {
+    const result = await runPhaseSynthesizeConcepts(engine, {
+      _atoms: t2Atoms,
+      _chat: pricedChat('acme:unpriced-model-x') as typeof import('../../src/core/ai/gateway.ts').chat,
+      dryRun: true,
+    });
+    // Not in CANONICAL_PRICING → conservative Sonnet-tier fallback.
+    expect(result.details?.estimated_spend_usd).toBeCloseTo(
+      sonnetRate.input + sonnetRate.output,
+      6,
+    );
+  });
+
+  test('control: Sonnet model estimate is unchanged by canonical routing', async () => {
+    const result = await runPhaseSynthesizeConcepts(engine, {
+      _atoms: t2Atoms,
+      _chat: pricedChat('anthropic:claude-sonnet-4-6') as typeof import('../../src/core/ai/gateway.ts').chat,
+      dryRun: true,
+    });
+    // Same Sonnet-tier rates the pre-canonical hardcode used ($3/$15 at
+    // the time of writing) → identical estimate before and after the fix.
+    expect(result.details?.estimated_spend_usd).toBeCloseTo(
+      sonnetRate.input + sonnetRate.output,
+      6,
+    );
+  });
+});
+
+// #2123 — extract_atoms must stamp `concepts` so synthesize_concepts has
+// material. The pre-fix pipeline was broken end-to-end: the extractor
+// never wrote the field, and every synthesize_concepts cycle skipped with
+// "no atoms with concept refs". The earlier describe blocks feed
+// synthesize via the `_atoms` seam, which is exactly how the gap survived
+// — so the last test here goes extractor → REAL frontmatter → real DB
+// query path → concept page.
+describe('#2123: concepts label parsing', () => {
+  test('keeps valid kebab-case labels', () => {
+    const raw = `[{"title":"T","atom_type":"insight","body":"b","concepts":["captive-portal","tls-certificates"]}]`;
+    expect(parseAtomsResponse(raw)[0].concepts).toEqual(['captive-portal', 'tls-certificates']);
+  });
+
+  test('filters non-kebab labels, keeps the rest', () => {
+    const raw = `[{"title":"T","atom_type":"insight","body":"b","concepts":["Captive Portal","tp_link","UPPER","valid-label"]}]`;
+    expect(parseAtomsResponse(raw)[0].concepts).toEqual(['valid-label']);
+  });
+
+  test('truncates to 3 labels', () => {
+    const raw = `[{"title":"T","atom_type":"insight","body":"b","concepts":["a","b","c","d","e"]}]`;
+    expect(parseAtomsResponse(raw)[0].concepts).toEqual(['a', 'b', 'c']);
+  });
+
+  test('absent / non-array / all-invalid → undefined', () => {
+    expect(parseAtomsResponse(`[{"title":"T","atom_type":"insight","body":"b"}]`)[0].concepts).toBeUndefined();
+    expect(parseAtomsResponse(`[{"title":"T","atom_type":"insight","body":"b","concepts":"not-an-array"}]`)[0].concepts).toBeUndefined();
+    expect(parseAtomsResponse(`[{"title":"T","atom_type":"insight","body":"b","concepts":["Bad Label!"]}]`)[0].concepts).toBeUndefined();
+  });
+});
+
+describe('#2123: extractor stamps concepts → synthesize_concepts consumes via real DB path', () => {
+  test('end-to-end: atoms with shared label materialize a concept page', async () => {
+    const chat = stubChat(`[
+      {"title":"Cert warning on guest wifi","atom_type":"insight","body":"Portal redirects to an IP-based HTTPS URL.","concepts":["captive-portal"]},
+      {"title":"iPhone portal popup is flaky","atom_type":"critique","body":"CNA probe behavior differs across iOS versions.","concepts":["captive-portal"]}
+    ]`);
+    const extract = await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath: '/fake/notes.txt', content: 'content', contentHash: 'cc2123' }],
+      _pages: [],
+      _chat: chat,
+    });
+    expect(extract.status).toBe('ok');
+    expect(extract.details?.atoms_extracted).toBe(2);
+
+    // Frontmatter really carries the label (a jsonb array, not a string).
+    const stamped = await engine.executeRaw<{ concepts: unknown }>(
+      `SELECT frontmatter->'concepts' AS concepts FROM pages WHERE type = 'atom'`,
+    );
+    expect(stamped.length).toBe(2);
+    for (const row of stamped) {
+      const arr = typeof row.concepts === 'string' ? JSON.parse(row.concepts) : row.concepts;
+      expect(arr).toEqual(['captive-portal']);
+    }
+
+    // NO _atoms seam: synthesize discovers the atoms through its own
+    // DB query — this is the path that was dead before the fix.
+    const synth = await runPhaseSynthesizeConcepts(engine, { _chat: stubChat('unused — T3 is deterministic') });
+    expect(synth.status).toBe('ok');
+    expect(synth.details?.concepts_written).toBe(1);
+    const concept = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE slug = 'concepts/captive-portal' AND type = 'concept'`,
+    );
+    expect(concept.length).toBe(1);
   });
 });

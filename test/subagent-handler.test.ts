@@ -90,6 +90,7 @@ async function makeCtx(input: unknown): Promise<MinionJobContext> {
     data: (input as Record<string, unknown>) ?? {},
     attempts_made: 0,
     signal: ac.signal,
+    deadlineAtMs: null,
     shutdownSignal: shutdown.signal,
     async updateProgress() {},
     async updateTokens() {},
@@ -594,5 +595,249 @@ describe('makeSubagentHandler default client construction', () => {
     expect(calls.length).toBe(1);
     expect(result.stop_reason).toBe('end_turn');
     expect(result.result).toBe('ok');
+  });
+});
+
+// ── #2778: per-turn output-token cap + max_tokens stop handling ─────
+
+import { resolveMaxOutputTokens } from '../src/core/minions/handlers/subagent.ts';
+
+describe('resolveMaxOutputTokens (#2778)', () => {
+  test('defaults to 8192 when nothing set', () => {
+    expect(resolveMaxOutputTokens(undefined, null)).toBe(8192);
+    expect(resolveMaxOutputTokens(undefined, undefined)).toBe(8192);
+  });
+
+  test('per-job value wins over config', () => {
+    expect(resolveMaxOutputTokens(2048, '5000')).toBe(2048);
+  });
+
+  test('config value used when per-job unset', () => {
+    expect(resolveMaxOutputTokens(undefined, '5000')).toBe(5000);
+  });
+
+  test('invalid values fall through to next tier', () => {
+    expect(resolveMaxOutputTokens(0, '5000')).toBe(5000);
+    expect(resolveMaxOutputTokens(-1, null)).toBe(8192);
+    expect(resolveMaxOutputTokens(Number.NaN, 'garbage')).toBe(8192);
+    expect(resolveMaxOutputTokens(undefined, '')).toBe(8192);
+    expect(resolveMaxOutputTokens(undefined, '0')).toBe(8192);
+  });
+});
+
+describe('subagent handler output-token cap (#2778)', () => {
+  test('default: SDK call carries max_tokens=8192 (was hardcoded 4096)', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'ok' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi' });
+    await handler(ctx);
+    expect(client.calls[0]!.max_tokens).toBe(8192);
+  });
+
+  test('data.max_tokens flows to the SDK call', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'ok' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi', max_tokens: 2048 });
+    await handler(ctx);
+    expect(client.calls[0]!.max_tokens).toBe(2048);
+  });
+
+  test('agent.max_output_tokens config flows to the SDK call', async () => {
+    await engine.setConfig('agent.max_output_tokens', '5000');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'ok' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      await handler(ctx);
+      expect(client.calls[0]!.max_tokens).toBe(5000);
+    } finally {
+      await engine.executeRaw(`DELETE FROM config WHERE key = 'agent.max_output_tokens'`);
+    }
+  });
+
+  test('final turn hitting the cap surfaces stop_reason=max_tokens, not a silent end_turn', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'truncated tex' }] as any, stop_reason: 'max_tokens' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi' });
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('max_tokens');
+    expect(result.result).toBe('truncated tex');
+  });
+
+  test('max_tokens stop with tool_use: truncation note injected so the model re-issues the dropped call', async () => {
+    const tool = makeEchoTool();
+    const client = new FakeMessagesClient([
+      {
+        // A complete tool_use survived, but the turn stopped on max_tokens —
+        // the API dropped whatever came after (e.g. a big put_page call).
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'echo', input: { value: 'v1' } } as any],
+        stop_reason: 'max_tokens' as any,
+      },
+      { content: [{ type: 'text', text: 'recovered' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [tool] });
+    const ctx = await makeCtx({ prompt: 'go' });
+
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.result).toBe('recovered');
+
+    // The synthesized user turn (persisted + fed to the second call) must
+    // carry the truncation note alongside the tool_result. Assert on the
+    // persisted row — client.calls[].messages is the live array the loop
+    // keeps mutating, so positional checks there are unreliable.
+    const rows = await engine.executeRaw<{ content_blocks: unknown }>(
+      `SELECT content_blocks FROM subagent_messages
+        WHERE job_id = $1 AND role = 'user' AND message_idx > 0
+        ORDER BY message_idx ASC`,
+      [ctx.id],
+    );
+    expect(rows.length).toBe(1);
+    const blocks = (typeof rows[0]!.content_blocks === 'string'
+      ? JSON.parse(rows[0]!.content_blocks as string)
+      : rows[0]!.content_blocks) as Array<{ type: string; text?: string }>;
+    expect(blocks.some(b => b.type === 'tool_result')).toBe(true);
+    const texts = blocks.filter(b => b.type === 'text').map(b => b.text ?? '');
+    expect(texts.some(t => t.includes('truncated') && t.includes('DROPPED'))).toBe(true);
+  });
+});
+
+describe('handler-entry capability gate on the config-resolved model', () => {
+  test('config-resolved models.subagent lacking tool calling is refused at dispatch', async () => {
+    // The queue submit gate only sees explicit data.model. A job that omits
+    // data.model resolves `models.subagent` inside the handler — pre-fix that
+    // path bypassed the capability check entirely and a tool-incapable model
+    // (declared supports_tools: false) ran the loop anyway.
+    await engine.setConfig('models.subagent', 'minimax:MiniMax-M2');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'should never run' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' }); // no data.model → queue gate passes
+      await expect(handler(ctx)).rejects.toThrow(/lacks native tool calling/);
+      expect(client.calls.length).toBe(0); // refused before any provider call
+    } finally {
+      await engine.unsetConfig('models.subagent');
+    }
+  });
+
+  test('already-terminal replay is NOT refused when config points at a tool-incapable model', async () => {
+    // #1151 precedent: a job whose last persisted message is a terminal
+    // assistant turn needs no provider call — the replay short-circuit
+    // returns the committed result. A capability refusal here (config
+    // repointed between submit and replay) would dead-letter completed work.
+    // Gateway loop ON: that's the only routing where the capability gate is
+    // the deciding check (the legacy path's Anthropic pin refuses
+    // non-Anthropic models regardless). The gateway path's terminal
+    // early-return runs before any provider client is constructed, so no
+    // API key is needed.
+    await engine.setConfig('models.subagent', 'minimax:MiniMax-M2');
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    try {
+      const client = new FakeMessagesClient([]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      // Persist a completed transcript: seed user + terminal assistant.
+      await engine.executeRaw(
+        `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+         VALUES ($1, 0, 'user', $2::text::jsonb), ($1, 1, 'assistant', $3::text::jsonb)`,
+        [
+          ctx.id,
+          JSON.stringify([{ type: 'text', text: 'hi' }]),
+          JSON.stringify([{ type: 'text', text: 'committed answer' }]),
+        ],
+      );
+      const result = await handler(ctx);
+      expect(result.result).toBe('committed answer');
+      // Replay short-circuit: no new turns persisted beyond the 2 seeded rows
+      // (a provider call would have appended an assistant row — and would have
+      // failed anyway, since no gateway credentials are configured here).
+      const rows = await engine.executeRaw<{ count: string }>(
+        `SELECT count(*)::text AS count FROM subagent_messages WHERE job_id = $1`,
+        [ctx.id],
+      );
+      expect(parseInt(rows[0]!.count, 10)).toBe(2);
+    } finally {
+      await engine.unsetConfig('models.subagent');
+      await engine.unsetConfig('agent.use_gateway_loop');
+    }
+  });
+
+  test('non-terminal gateway replay (pending tool-call) IS still refused on a tool-incapable model', async () => {
+    // A gateway transcript persists pending dispatch as `tool-call` blocks.
+    // A replay that still needs the loop to resume on the provider must NOT
+    // slip past the capability gate via the terminal exception.
+    await engine.setConfig('models.subagent', 'minimax:MiniMax-M2');
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    try {
+      const client = new FakeMessagesClient([]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      await engine.executeRaw(
+        `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+         VALUES ($1, 0, 'user', $2::text::jsonb), ($1, 1, 'assistant', $3::text::jsonb)`,
+        [
+          ctx.id,
+          JSON.stringify([{ type: 'text', text: 'hi' }]),
+          JSON.stringify([{ type: 'tool-call', toolCallId: 'tc_1', toolName: 'echo', input: {} }]),
+        ],
+      );
+      await expect(handler(ctx)).rejects.toThrow(/lacks native tool calling/);
+    } finally {
+      await engine.unsetConfig('models.subagent');
+      await engine.unsetConfig('agent.use_gateway_loop');
+    }
+  });
+
+  test('a BARE Anthropic id in models.subagent still runs (not refused as unknown provider)', async () => {
+    // A bare `claude-*` id (no `provider:` prefix) is a supported config value
+    // everywhere else: isAnthropicProvider() has an explicit bare-`claude-`
+    // branch and the legacy path strips the prefix before calling the Messages
+    // API. classifyCapabilities() resolves through the recipe registry, which
+    // requires an explicit provider, so classifying the raw value would report
+    // `unknown` and this gate would refuse a config that works.
+    await engine.setConfig('models.subagent', 'claude-sonnet-4-6');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'ran on the bare id' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' }); // no data.model → config resolves
+      const result = await handler(ctx);
+      expect(result.result).toBe('ran on the bare id');
+      // The provider call carries the bare id (the legacy path strips any prefix).
+      expect(client.calls.length).toBe(1);
+      expect(client.calls[0]!.model).toBe('claude-sonnet-4-6');
+    } finally {
+      await engine.unsetConfig('models.subagent');
+    }
+  });
+
+  test('a bare NON-Anthropic id in models.subagent is still refused', async () => {
+    // The normalization above is deliberately narrow: only bare ids that
+    // isAnthropicProvider() recognizes get an `anthropic:` prefix for the
+    // verdict. A bare `gpt-5` is not a recipe-resolvable model, so the gate
+    // must keep reporting `unknown` rather than classifying it as Anthropic.
+    await engine.setConfig('models.subagent', 'gpt-5');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'should never run' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      await expect(handler(ctx)).rejects.toThrow(/references an unknown provider/);
+      expect(client.calls.length).toBe(0);
+    } finally {
+      await engine.unsetConfig('models.subagent');
+    }
   });
 });

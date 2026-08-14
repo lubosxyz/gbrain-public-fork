@@ -16,8 +16,13 @@
 import { readFileSync, lstatSync, type Stats } from 'fs';
 import { join, dirname, resolve } from 'path';
 import type { BrainEngine } from './engine.ts';
-import { SOURCE_ID_RE, isValidSourceId } from './source-id.ts';
+import { isSourceFederated, parseSourceConfig } from './sources-load.ts';
+import { SOURCE_ID_RE, isValidSourceId, ALL_SOURCES } from './source-id.ts';
 import { isTrustedDotfile, realpathOrResolve } from './path-confine.ts';
+
+// Re-export so scope-resolution call sites can import the sentinel from
+// either module (#1712).
+export { ALL_SOURCES };
 
 const DOTFILE = '.gbrain-source';
 // Canonical SOURCE_ID_RE imported from `source-id.ts` (single source of truth).
@@ -82,8 +87,11 @@ export async function resolveSourceId(
   explicit: string | null | undefined,
   cwd: string = process.cwd(),
 ): Promise<string> {
-  // 1. Explicit flag wins.
+  // 1. Explicit flag wins. The __all__ sentinel passes through verbatim
+  //    (#1712) — it is not a source id, so it skips both the regex and
+  //    assertSourceExists; sourceScopeOpts gives it span-everything semantics.
   if (explicit) {
+    if (explicit === ALL_SOURCES) return ALL_SOURCES;
     if (!SOURCE_ID_RE.test(explicit)) {
       throw new Error(`Invalid --source value "${explicit}". Must match [a-z0-9-]{1,32}.`);
     }
@@ -91,9 +99,10 @@ export async function resolveSourceId(
     return explicit;
   }
 
-  // 2. Env var.
+  // 2. Env var. Same __all__ pass-through (#2140).
   const env = process.env.GBRAIN_SOURCE;
   if (env && env.length > 0) {
+    if (env === ALL_SOURCES) return ALL_SOURCES;
     if (!SOURCE_ID_RE.test(env)) {
       throw new Error(`Invalid GBRAIN_SOURCE value "${env}". Must match [a-z0-9-]{1,32}.`);
     }
@@ -161,6 +170,35 @@ export async function resolveSourceId(
 }
 
 /**
+ * Engine-free tiers (1-3) of the resolution chain: explicit flag →
+ * GBRAIN_SOURCE env → .gbrain-source dotfile walk. Used by the thin-client
+ * CLI path (#2098), which has no local engine to run tiers 4-6 or
+ * assertSourceExists against — the remote server enforces existence + grant.
+ * Returns null when no engine-free tier fires.
+ */
+export function resolveSourceIdEngineFree(
+  explicit: string | null | undefined,
+  cwd: string = process.cwd(),
+): string | null {
+  if (explicit) {
+    if (explicit === ALL_SOURCES) return ALL_SOURCES; // #1712 sentinel pass-through
+    if (!SOURCE_ID_RE.test(explicit)) {
+      throw new Error(`Invalid --source value "${explicit}". Must match [a-z0-9-]{1,32}.`);
+    }
+    return explicit;
+  }
+  const env = process.env.GBRAIN_SOURCE;
+  if (env && env.length > 0) {
+    if (env === ALL_SOURCES) return ALL_SOURCES; // #2140 sentinel pass-through
+    if (!SOURCE_ID_RE.test(env)) {
+      throw new Error(`Invalid GBRAIN_SOURCE value "${env}". Must match [a-z0-9-]{1,32}.`);
+    }
+    return env;
+  }
+  return readDotfileWalk(cwd);
+}
+
+/**
  * Returns the id of the SINGLE registered non-default source with a
  * local_path, when exactly one such row exists. Returns null when:
  *   - zero non-default sources are registered (fresh install)
@@ -171,6 +209,12 @@ export async function resolveSourceId(
  * Excludes archived sources (`archived = false`) so a soft-deleted source
  * doesn't auto-resolve. Shared by `resolveSourceId` and `resolveSourceWithTier`
  * so the heuristic can't drift between the two entry points.
+ *
+ * NOTE (#2928): this tier deliberately does NOT consult config.federated —
+ * `--no-federated` governs READ mixing, not write routing, and unqualified
+ * `sync`/`import` on a single-vault brain must keep landing in the vault
+ * (#1434, pinned by test/sync-sole-non-default-routing.test.ts). The
+ * unfederate read fix lives in `localFederatedSourceIds` below.
  */
 async function pickSoleNonDefaultSource(engine: BrainEngine): Promise<string | null> {
   // archived column was added in v34 (v0.26.5). Older brains may not have
@@ -287,8 +331,11 @@ export async function resolveSourceWithTier(
   explicit: string | null | undefined,
   cwd: string = process.cwd(),
 ): Promise<{ source_id: string; tier: SourceTier; detail?: string }> {
-  // 1. Explicit flag wins.
+  // 1. Explicit flag wins. __all__ sentinel passes through verbatim (#1712).
   if (explicit) {
+    if (explicit === ALL_SOURCES) {
+      return { source_id: ALL_SOURCES, tier: 'flag', detail: `--source ${ALL_SOURCES} (spans all sources)` };
+    }
     if (!SOURCE_ID_RE.test(explicit)) {
       throw new Error(`Invalid --source value "${explicit}". Must match [a-z0-9-]{1,32}.`);
     }
@@ -296,9 +343,12 @@ export async function resolveSourceWithTier(
     return { source_id: explicit, tier: 'flag', detail: `--source ${explicit}` };
   }
 
-  // 2. Env var.
+  // 2. Env var. Same __all__ pass-through (#2140).
   const env = process.env.GBRAIN_SOURCE;
   if (env && env.length > 0) {
+    if (env === ALL_SOURCES) {
+      return { source_id: ALL_SOURCES, tier: 'env', detail: `GBRAIN_SOURCE=${ALL_SOURCES} (spans all sources)` };
+    }
     if (!SOURCE_ID_RE.test(env)) {
       throw new Error(`Invalid GBRAIN_SOURCE value "${env}". Must match [a-z0-9-]{1,32}.`);
     }
@@ -351,6 +401,64 @@ export async function resolveSourceWithTier(
 
   // 6. Fallback: seeded 'default' source.
   return { source_id: 'default', tier: 'seed_default' };
+}
+
+/**
+ * #2561 — compute the federated read scope for an UNQUALIFIED local CLI call.
+ *
+ * `sources add --federated` promises that a `config.federated = true` source
+ * "participates in unqualified `gbrain search` results"
+ * (docs/guides/multi-source-brains.md). This helper turns that promise into a
+ * scope: given the resolved source and WHICH tier resolved it, return
+ * `[resolvedSource, ...other federated source ids]` — or `undefined` when the
+ * expansion must not apply:
+ *
+ *   - explicit tiers (`flag` / `env` / `dotfile`): the user named a source;
+ *     scalar scope stands (that IS the qualified case);
+ *   - no other federated source exists: keep the scalar fast path unchanged;
+ *   - #2928: the resolved source is explicitly isolated (config.federated =
+ *     false): it must not be mixed into a cross-source read in EITHER
+ *     direction, so the scalar scope stands.
+ *
+ * Archived sources are excluded (same rationale as pickSoleNonDefaultSource);
+ * the archived column is v34+, so fall back to the un-archived query on older
+ * brains. Callers put the result on `OperationContext.localFederatedSourceIds`
+ * — consumed only by `federatedSearchScope` and only when `remote === false`.
+ */
+export async function localFederatedSourceIds(
+  engine: BrainEngine,
+  sourceId: string,
+  tier: SourceTier,
+): Promise<string[] | undefined> {
+  if (tier === 'flag' || tier === 'env' || tier === 'dotfile') return undefined;
+  let rows: Array<{ id: string; config: unknown; archived?: boolean }>;
+  try {
+    rows = await engine.executeRaw<{ id: string; config: unknown; archived?: boolean }>(
+      `SELECT id, config, archived FROM sources WHERE archived = false ORDER BY id`,
+    );
+  } catch {
+    rows = await engine.executeRaw<{ id: string; config: unknown }>(
+      `SELECT id, config FROM sources ORDER BY id`,
+    );
+  }
+  // #2928: an EXPLICITLY isolated anchor (`sources unfederate` /
+  // `--no-federated` → config.federated = false) opted out of cross-source
+  // read mixing — never widen it into the federated set (which would drag
+  // other sources' pages into its unqualified reads and vice versa). Scalar
+  // scope stands. UNSET federated keeps the pre-#2928 widening behavior;
+  // write routing (tier 5.5 above) is deliberately untouched.
+  const resolvedRow = rows.find((row) => row.id === sourceId);
+  if (resolvedRow && parseSourceConfig(resolvedRow.config).federated === false) {
+    return undefined;
+  }
+  const ids = [
+    sourceId,
+    ...rows
+      .filter((row) => row.archived !== true && isSourceFederated(row.config))
+      .map((row) => row.id)
+      .filter((id) => id !== sourceId),
+  ];
+  return ids.length > 1 ? ids : undefined;
 }
 
 /** Exposed for tests. */

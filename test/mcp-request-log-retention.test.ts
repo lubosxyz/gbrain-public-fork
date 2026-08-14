@@ -2,7 +2,10 @@
  * KOM-277 — mcp_request_log retention.
  *
  * Verifies:
- *   - migration v123 lands mcp_request_log_purged (documented name + idempotent)
+ *   - migration v128 lands mcp_request_log_purged (documented name + idempotent).
+ *     Renumbered v123 -> v128 in the 0.42.57 -> 0.45.13 upstream merge, where
+ *     upstream claimed v123-v127; the DDL is idempotent so a brain that already
+ *     ran it as v123 re-runs it as v128 against the existing table.
  *   - purgeStaleMcpRequestLog deletes stale rows, keeps fresh ones, and folds
  *     the deleted rows' per-token count/max(created_at) into
  *     mcp_request_log_purged (round-trip, mirrors the v117 volunteer-events
@@ -44,7 +47,7 @@ async function insertLogRow(
   );
 }
 
-describe('v123 — mcp_request_log_purged_counters', () => {
+describe('v128 — mcp_request_log_purged_counters', () => {
   let engine: PGLiteEngine;
   beforeAll(async () => {
     engine = new PGLiteEngine();
@@ -55,15 +58,15 @@ describe('v123 — mcp_request_log_purged_counters', () => {
     if (engine) await engine.disconnect();
   }, 60_000);
 
-  test('v123 entry exists, named + idempotent', () => {
-    const m = MIGRATIONS.find((x) => x.version === 123);
+  test('v128 entry exists, named + idempotent', () => {
+    const m = MIGRATIONS.find((x) => x.version === 128);
     expect(m).toBeDefined();
     expect(m!.name).toBe('mcp_request_log_purged_counters');
     expect(m!.idempotent).toBe(true);
   });
 
-  test('LATEST_VERSION is at or above 123', () => {
-    expect(LATEST_VERSION).toBeGreaterThanOrEqual(123);
+  test('LATEST_VERSION is at or above 128', () => {
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(128);
   });
 
   test('table exists after initSchema with the documented columns', async () => {
@@ -92,7 +95,7 @@ describe('v123 — mcp_request_log_purged_counters', () => {
   });
 
   test('re-running the migration SQL is a no-op (idempotent CREATE TABLE IF NOT EXISTS)', async () => {
-    const m = MIGRATIONS.find((x) => x.version === 123)!;
+    const m = MIGRATIONS.find((x) => x.version === 128)!;
     await expect(engine.executeRaw(m.sql)).resolves.toBeDefined();
   });
 });
@@ -229,7 +232,7 @@ describe('purgeStaleMcpRequestLog', () => {
       expect(left.length).toBe(1);
     } finally {
       // Restore the table so later tests in this file aren't affected.
-      const m = MIGRATIONS.find((x) => x.version === 123)!;
+      const m = MIGRATIONS.find((x) => x.version === 128)!;
       await engine.executeRaw(m.sql);
     }
   });

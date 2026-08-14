@@ -26,6 +26,7 @@ Any of these commands stream events when `--progress-json` is set:
 - `gbrain lint`
 - `gbrain integrity auto`
 - `gbrain eval`
+- `gbrain eval brainbench`
 - `gbrain apply-migrations` (the orchestrator + every child command)
 
 Non-bulk commands (`stats`, `graph-query`, `get`, `put`, etc.) don't emit
@@ -134,17 +135,27 @@ sync that calls import emits `sync.import.<file>`, not `import.<file>`.
 Stable phase names shipped in v0.15.2:
 
 - `doctor.db_checks` (umbrella for all DB-side doctor checks)
+- `doctor.pglite_probe` (the #2674 scratch-store probe; only when PGLite init
+  failed with an unexplained/damage-class disk state or `--probe-pglite` was
+  passed — a cold start can take 5–20s, so the heartbeat is the only sign of
+  life)
 - `orphans.scan`
 - `embed.pages`
 - `extract.links_fs`, `extract.timeline_fs`, `extract.links_db`, `extract.timeline_db`
 - `import.files`
 - `sync.deletes`, `sync.renames`, `sync.imports`
 - `migrate.copy_pages`, `migrate.copy_links`
+- `migrate.reembed` (the re-embed pass of `gbrain migrate embeddings`; total is the
+  stale-chunk backlog at the start of the pass, so it can grow slightly if a
+  writer adds chunks mid-run)
 - `repair_jsonb.run`, `repair_jsonb.<table>.<column>`
 - `backlinks.scan`
 - `lint.pages`
 - `integrity.auto`
 - `eval.single`, `eval.ab`
+- `eval.brainbench` — ticks carry a `note` but no `total`: continuity pairs
+  replay once per (writer, reader) ordering, so the tick count exceeds the
+  fixture count and a percentage would lie
 - `export.pages`
 - `files.sync`
 

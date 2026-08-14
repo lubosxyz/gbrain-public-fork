@@ -11,9 +11,13 @@ import {
 
 describe('getPricing — fail-closed contract', () => {
   test('returns pricing for the default 3-model panel', () => {
-    expect(getPricing('openai:gpt-4o')).toBeDefined();
+    expect(getPricing('openai:gpt-5.2')).toBeDefined();
     expect(getPricing('anthropic:claude-opus-4-7')).toBeDefined();
-    expect(getPricing('google:gemini-1.5-pro')).toBeDefined();
+    expect(getPricing('google:gemini-2.0-flash')).toBeDefined();
+  });
+
+  test('retired google:gemini-1.5-pro is no longer in the allowlist (#3510)', () => {
+    expect(() => getPricing('google:gemini-1.5-pro')).toThrow(PricingNotFoundError);
   });
 
   test('throws PricingNotFoundError on unknown model', () => {
@@ -28,6 +32,12 @@ describe('getPricing — fail-closed contract', () => {
 
   test('opus 4.8 is supported and priced $5/$25 — gbrain#1819', () => {
     const p = getPricing('anthropic:claude-opus-4-8');
+    expect(p.input_per_1m).toBeCloseTo(5.0, 5);
+    expect(p.output_per_1m).toBeCloseTo(25.0, 5);
+  });
+
+  test('opus 5 is supported and priced $5/$25', () => {
+    const p = getPricing('anthropic:claude-opus-5');
     expect(p.input_per_1m).toBeCloseTo(5.0, 5);
     expect(p.output_per_1m).toBeCloseTo(25.0, 5);
   });
