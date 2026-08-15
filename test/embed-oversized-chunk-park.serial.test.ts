@@ -213,6 +213,29 @@ describe('the provider verdict is taken as final', () => {
     expect((engine as any)._calls.filter((c: any) => c.method === 'markEmbedSkip')).toHaveLength(1);
   });
 
+  test('a dry run neither embeds nor parks', async () => {
+    // Parking is a WRITE. A preview that silently marked pages embed_skip
+    // would take them out of the embed rotation without being asked, which is
+    // the one thing --dry-run promises not to do.
+    embedBatchBehavior = async () => { throw overContextError(); };
+    const chunks = [{ chunk_index: 0, chunk_text: 'TOO-BIG' }, { chunk_index: 1, chunk_text: HUGE_CHUNK }];
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: async () => staleRows('previewed-page', chunks),
+      getChunks: async () => chunkRows(chunks),
+      upsertChunks: async () => {},
+    });
+
+    const result = await runEmbedCore(engine, { stale: true, dryRun: true });
+
+    expect(embedCalls).toHaveLength(0);
+    expect(result.parked).toBe(0);
+    expect(result.failures).toBe(0);
+    const calls = (engine as any)._calls as Array<{ method: string }>;
+    expect(calls.filter(c => c.method === 'markEmbedSkip')).toHaveLength(0);
+    expect(calls.filter(c => c.method === 'upsertChunks')).toHaveLength(0);
+  });
+
   test('a failed marker write does not turn an otherwise clean run red', async () => {
     // Parking is an optimization on top of the local guard, not the guarantee.
     embedBatchBehavior = async () => { throw overContextError(); };
