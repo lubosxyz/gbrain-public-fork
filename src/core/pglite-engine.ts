@@ -2934,7 +2934,9 @@ export class PGLiteEngine implements BrainEngine {
 
   async markEmbedSkip(slug: string, opts: { sourceId?: string; marker: EmbedSkipMarker }): Promise<void> {
     // `||` merges at the top level and overwrites any existing marker, which
-    // is what re-assessment should do. COALESCE covers NULL frontmatter.
+    // is what re-assessment should do. The COALESCE is belt-and-braces: the
+    // column is `JSONB NOT NULL DEFAULT '{}'` today, and `||` against NULL
+    // would yield NULL rather than erroring if that ever relaxes.
     // PGLite's positional binding takes the patch as a JSON TEXT parameter and
     // the `::jsonb` cast parses it once — the double-encoding hazard that
     // forces sql.json() on the postgres-js side does not apply to this driver.

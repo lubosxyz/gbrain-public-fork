@@ -2781,7 +2781,9 @@ export class PostgresEngine implements BrainEngine {
 
   async markEmbedSkip(slug: string, opts: { sourceId?: string; marker: EmbedSkipMarker }): Promise<void> {
     // `||` merges at the top level and overwrites any existing marker, which
-    // is what re-assessment should do. COALESCE covers NULL frontmatter.
+    // is what re-assessment should do. The COALESCE is belt-and-braces: the
+    // column is `JSONB NOT NULL DEFAULT '{}'` today, and `||` against NULL
+    // would yield NULL rather than erroring if that ever relaxes.
     // sql.json(patch) INSIDE the template tag is mandatory here — see the
     // updateSourceConfig comment above for what positional `$1::jsonb` does
     // to a jsonb merge (double-encodes to a JSONB string, and `||` against a
