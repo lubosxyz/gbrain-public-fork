@@ -812,7 +812,10 @@ async function embedPage(
   }
   await settleParkedChunks(engine, result, slug, sourceId, outcome, toEmbed.length);
   result.pages_processed++;
-  if (!quiet) slog(`${slug}: embedded ${toEmbed.length - failed} chunks`);
+  // Parked chunks are subtracted for the same reason failed ones are: this
+  // line reports what actually landed, and `result.embedded` above already
+  // counts it that way.
+  if (!quiet) slog(`${slug}: embedded ${toEmbed.length - failed - outcome.parked} chunks`);
 }
 
 /**
