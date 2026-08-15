@@ -56,7 +56,7 @@ import { parseLlmJson } from '../llm-json.ts';
 import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey } from './anthropic-key.ts';
-import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
+import { AIConfigError, AITransientError, isInputTooLargeError, normalizeAIError } from './errors.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
 import { loadConfig } from '../config.ts';
 import { buildGatewayConfig } from './build-gateway-config.ts';
@@ -1873,8 +1873,11 @@ async function embedSubBatch(
     // On token-limit error, tighten the recipe's effective safety factor
     // (so the next embed() pre-splits smaller) and recursively halve THIS
     // batch to make forward progress without dropping work.
-    if (isTokenLimitError(err) && texts.length > MIN_SUB_BATCH) {
-      shrinkOnMiss(recipe);
+    if ((isTokenLimitError(err) || isInputTooLargeError(err)) && texts.length > MIN_SUB_BATCH) {
+      // Only a BATCH-shaped limit says the pre-split budget was too generous.
+      // A single over-context input says nothing about batch size, so shrinking
+      // there would throttle every later batch on account of one bad chunk.
+      if (isTokenLimitError(err)) shrinkOnMiss(recipe);
       const mid = Math.ceil(texts.length / 2);
       const left = await embedSubBatch(texts.slice(0, mid), model, providerOpts, expectedDims, recipe, modelId, opts);
       const right = await embedSubBatch(texts.slice(mid), model, providerOpts, expectedDims, recipe, modelId, opts);

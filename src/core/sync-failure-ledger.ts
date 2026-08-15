@@ -53,6 +53,7 @@ import {
 } from 'fs';
 import { join as _joinPath } from 'path';
 import { gbrainPath as _gbrainPath } from './config.ts';
+import { isInputTooLargeMessage } from './ai/errors.ts';
 import { createHash as _createHash } from 'crypto';
 
 export const DEFAULT_SOURCE_ID = 'default';
@@ -167,7 +168,22 @@ export function classifyErrorCode(errorMsg: string): string {
   if (/insufficient_quota|quota exceeded|exceeded.*quota|credit balance is too low|billing|EMBEDDING_QUOTA/i.test(errorMsg)) {
     return 'EMBEDDING_QUOTA';
   }
-  if (/maximum context length|max_tokens|context length|input too long|input length exceeds|tokens? exceed|too many tokens|EMBEDDING_OVERSIZE/i.test(errorMsg)) {
+  // KOM-287: OR'd with the strict predicate that DRIVES behavior, so a chunk
+  // the embed path actually parked can never report here as UNKNOWN. The two
+  // are deliberately not the same list and neither is redundant:
+  //
+  //   isInputTooLargeMessage — narrow, and authoritative for what happens. A
+  //     false positive parks embeddable content, so it must not match a
+  //     BATCH-token-limit error (which shrinking the batch fixes).
+  //   the regex below — broad, and only ever labels a row in a report. Over-
+  //     inclusion costs nothing here, and it predates the strict predicate.
+  //
+  // Widening this one to match the strict one would be safe; narrowing the
+  // strict one to match this one would not.
+  if (
+    isInputTooLargeMessage(errorMsg)
+    || /maximum context length|max_tokens|context length|input too long|input length exceeds|tokens? exceed|too many tokens|EMBEDDING_OVERSIZE/i.test(errorMsg)
+  ) {
     return 'EMBEDDING_OVERSIZE';
   }
 
