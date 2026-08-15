@@ -20,7 +20,7 @@ import {
   maxEmbedInputTokens,
   partitionEmbedInputs,
 } from '../src/core/embed-input-guard.ts';
-import { DEFAULT_MAX_CHUNK_TOKENS } from '../src/core/chunkers/token-estimate.ts';
+import { DEFAULT_MAX_CHUNK_TOKENS, estimateEmbedTokens } from '../src/core/chunkers/token-estimate.ts';
 
 /** Text comfortably over `cap` tokens: one token is at most a few chars. */
 function overCap(cap: number): string {
@@ -88,6 +88,21 @@ describe('partitionEmbedInputs', () => {
     const { sendable, oversized } = partitionEmbedInputs([overCap(100), overCap(100)], 100);
     expect(sendable).toEqual([]);
     expect(oversized).toHaveLength(2);
+  });
+
+  test('a multi-byte text under the cap in CHARACTERS is still caught', () => {
+    // The fast path skips measurement on BYTE length, not character length.
+    // A character test would be unsound in the direction that matters: emoji
+    // and CJK are one or two JS string units but several tokens each, so
+    // exactly the dense chunks this guard exists to catch would sail through.
+    const cap = 200;
+    const dense = '🎉漢字'.repeat(40); // comfortably under `cap` string units...
+    expect(dense.length).toBeLessThan(cap);
+    expect(estimateEmbedTokens(dense)).toBeGreaterThan(cap); // ...but not in tokens
+
+    const { sendable, oversized } = partitionEmbedInputs([dense], cap);
+    expect(sendable).toEqual([]);
+    expect(oversized).toHaveLength(1);
   });
 
   test('short inputs are never measured (tiktoken is superlinear on long text)', () => {

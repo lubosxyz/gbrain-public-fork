@@ -94,8 +94,13 @@ export function isEmbedInputOversized(text: string, cap: number = maxEmbedInputT
  * Fast path: measures nothing until a text is long enough to possibly breach
  * the cap. `estimateEmbedTokens` runs tiktoken, which is superlinear on long
  * inputs, and the overwhelming majority of chunks are far under the ceiling.
- * One token is at minimum one character, so a text shorter than `cap` chars
- * cannot exceed `cap` tokens and needs no measurement.
+ *
+ * The skip test is on BYTES, not characters. Every cl100k token consumes at
+ * least one byte of input, so `byteLength <= cap` genuinely implies
+ * `tokens <= cap` — while the same claim about CHARACTERS is false, and false
+ * in exactly the direction that matters: one emoji or CJK glyph is one or two
+ * JS string units but several tokens under byte fallback, so a character test
+ * would wave through the dense chunks this guard exists to catch.
  */
 export function partitionEmbedInputs(
   texts: string[],
@@ -107,7 +112,9 @@ export function partitionEmbedInputs(
 
   for (let i = 0; i < texts.length; i++) {
     const text = texts[i] ?? '';
-    if (text.length <= cap) {
+    // ASCII — the common case — has byteLength === length, so the fast path is
+    // just as effective there; multi-byte text correctly falls through.
+    if (Buffer.byteLength(text, 'utf8') <= cap) {
       sendable.push(text);
       sendableIndexes.push(i);
       continue;
