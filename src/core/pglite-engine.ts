@@ -92,7 +92,7 @@ import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, b
 import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
-import { EMBED_SKIP_FILTER_FRAGMENT } from './embed-skip.ts';
+import { EMBED_SKIP_FILTER_FRAGMENT, EMBED_SKIP_KEY, type EmbedSkipMarker } from './embed-skip.ts';
 import { QUARANTINE_FILTER_FRAGMENT } from './quarantine.ts';
 import {
   normalizeEngineColumn,
@@ -2929,6 +2929,20 @@ export class PGLiteEngine implements BrainEngine {
     await this.db.query(
       `UPDATE pages SET embedding_signature = $1 WHERE slug = $2 AND source_id = $3`,
       [opts.signature, slug, opts.sourceId ?? 'default'],
+    );
+  }
+
+  async markEmbedSkip(slug: string, opts: { sourceId?: string; marker: EmbedSkipMarker }): Promise<void> {
+    // `||` merges at the top level and overwrites any existing marker, which
+    // is what re-assessment should do. COALESCE covers NULL frontmatter.
+    // PGLite's positional binding takes the patch as a JSON TEXT parameter and
+    // the `::jsonb` cast parses it once — the double-encoding hazard that
+    // forces sql.json() on the postgres-js side does not apply to this driver.
+    await this.db.query(
+      `UPDATE pages
+          SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || $1::jsonb
+        WHERE slug = $2 AND source_id = $3`,
+      [JSON.stringify({ [EMBED_SKIP_KEY]: opts.marker }), slug, opts.sourceId ?? 'default'],
     );
   }
 

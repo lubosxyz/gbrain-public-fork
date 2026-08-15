@@ -93,7 +93,7 @@ import { DELETE_BATCH_SIZE } from './engine-constants.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
-import { EMBED_SKIP_FILTER_FRAGMENT } from './embed-skip.ts';
+import { EMBED_SKIP_FILTER_FRAGMENT, EMBED_SKIP_KEY, type EmbedSkipMarker } from './embed-skip.ts';
 import { QUARANTINE_FILTER_FRAGMENT } from './quarantine.ts';
 
 function escapeSqlStringLiteral(value: string): string {
@@ -2776,6 +2776,23 @@ export class PostgresEngine implements BrainEngine {
     await sql`
       UPDATE pages SET embedding_signature = ${opts.signature}
       WHERE slug = ${slug} AND source_id = ${opts.sourceId ?? 'default'}
+    `;
+  }
+
+  async markEmbedSkip(slug: string, opts: { sourceId?: string; marker: EmbedSkipMarker }): Promise<void> {
+    // `||` merges at the top level and overwrites any existing marker, which
+    // is what re-assessment should do. COALESCE covers NULL frontmatter.
+    // sql.json(patch) INSIDE the template tag is mandatory here — see the
+    // updateSourceConfig comment above for what positional `$1::jsonb` does
+    // to a jsonb merge (double-encodes to a JSONB string, and `||` against a
+    // string concatenates into an ARRAY, wiping the frontmatter).
+    const sql = this.sql;
+    const patch = { [EMBED_SKIP_KEY]: { ...opts.marker } } as unknown;
+    await sql`
+      UPDATE pages
+         SET frontmatter = COALESCE(frontmatter, '{}'::jsonb)
+                        || ${sql.json(patch as Parameters<typeof sql.json>[0])}
+       WHERE slug = ${slug} AND source_id = ${opts.sourceId ?? 'default'}
     `;
   }
 
