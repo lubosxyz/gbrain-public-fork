@@ -133,6 +133,6 @@ describe('markEmbedSkip', () => {
     await engine.markEmbedSkip('stale-page', { marker: buildChunkTokenLimitMarker(10) });
 
     expect(await engine.countStaleChunks()).toBe(0);
-    expect(await engine.listStaleChunks(10)).toHaveLength(0);
+    expect(await engine.listStaleChunks({ batchSize: 10 })).toHaveLength(0);
   });
 });

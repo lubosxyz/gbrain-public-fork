@@ -140,11 +140,11 @@ describe('gateway isolates an over-context input by halving the batch', () => {
     // Pre-fix: Ollama's wording matched no halving pattern, so the single
     // embedMany call for all four texts threw and every sibling stayed NULL.
     const seen: string[][] = [];
-    __setEmbedTransportForTests(async ({ values }: { values: string[] }) => {
+    __setEmbedTransportForTests((async ({ values }: { values: string[] }) => {
       seen.push([...values]);
       if (values.includes('POISON')) throw new Error(OLLAMA_MESSAGE);
       return { embeddings: values.map(() => Array.from({ length: 1024 }, () => 0.1)) };
-    });
+    }) as any);
 
     await expect(embed(['a', 'POISON', 'b', 'c'])).rejects.toBeInstanceOf(AIInputTooLargeError);
 
@@ -161,7 +161,7 @@ describe('gateway isolates an over-context input by halving the batch', () => {
   });
 
   test('a single over-context text is reported permanently, not retried', async () => {
-    __setEmbedTransportForTests(async () => { throw new Error(OLLAMA_MESSAGE); });
+    __setEmbedTransportForTests((async () => { throw new Error(OLLAMA_MESSAGE); }) as any);
     await expect(embed(['only-one'])).rejects.toBeInstanceOf(AIInputTooLargeError);
   });
 });

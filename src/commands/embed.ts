@@ -660,6 +660,9 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
       serr(
         `[embed] ${result.parked} chunk(s) exceed the embedder's context window and were parked; `
         + `their pages are marked embed_skip (chunk_token_limit) and will not be retried. `
+        + `To index that content, re-chunk the pages with the current chunker `
+        + `(\`gbrain reindex-code --force\` for code pages, \`gbrain reindex --markdown\` otherwise) — `
+        + `a re-import rewrites frontmatter, which clears the marker. `
         + `First: ${result.parked_samples[0] ?? 'unknown'}`,
       );
     }
