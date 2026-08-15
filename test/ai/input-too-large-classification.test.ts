@@ -36,6 +36,7 @@ import {
   isInputTooLargeMessage,
   normalizeAIError,
 } from '../../src/core/ai/errors.ts';
+import { classifyErrorCode } from '../../src/core/sync-failure-ledger.ts';
 
 // Sibling files share a bun process; a configured gateway with a real
 // transport would make the next file's first embed a live HTTP call.
@@ -123,6 +124,41 @@ describe('isInputTooLargeMessage covers the wordings actually seen in the wild',
     // the other says "this input can never fit".
     expect(isTokenLimitError(new Error('The max allowed tokens per submitted batch is 120000.'))).toBe(true);
     expect(isTokenLimitError(new Error(OLLAMA_MESSAGE))).toBe(false);
+  });
+});
+
+describe('the strict predicate agrees with the sync-failure ledger', () => {
+  // gbrain already had a name for this condition — `EMBEDDING_OVERSIZE` in
+  // sync-failure-ledger.ts — it just never acted on it. The two lists stay
+  // separate on purpose (see the comment at that call site: one drives
+  // behavior and must be narrow, the other labels a report and can be broad),
+  // but they must not DISAGREE: anything the embed path parks has to show up
+  // in the ledger under the code that describes it, not as UNKNOWN.
+  test.each([
+    OLLAMA_MESSAGE,
+    "This model's maximum context length is 8192 tokens, however you requested 9000 tokens.",
+    'Please reduce the length of the input and try again.',
+    'the input is too large to process. increase the physical batch size',
+    'context length exceeded for this request',
+    'input must have less than 512 tokens',
+  ])('%s → EMBEDDING_OVERSIZE', (message) => {
+    expect(isInputTooLargeMessage(message)).toBe(true);
+    expect(classifyErrorCode(message)).toBe('EMBEDDING_OVERSIZE');
+  });
+
+  test('the ledger keeps classifying what it already did', () => {
+    // The strict predicate was OR'd IN, never substituted — these wordings
+    // match only the pre-existing regex and must still land in the bucket.
+    for (const message of ['input too long for this model', 'request had too many tokens']) {
+      expect(isInputTooLargeMessage(message)).toBe(false);
+      expect(classifyErrorCode(message)).toBe('EMBEDDING_OVERSIZE');
+    }
+  });
+
+  test('a rate limit still outranks it', () => {
+    // Ordering inside classifyErrorCode matters: the rate-limit branch comes
+    // first, and a 429 is retryable however its message reads.
+    expect(classifyErrorCode('Rate limit reached. Please try again in 248ms.')).toBe('EMBEDDING_RATE_LIMIT');
   });
 });
 
