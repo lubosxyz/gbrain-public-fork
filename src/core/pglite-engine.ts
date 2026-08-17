@@ -3321,10 +3321,11 @@ export class PGLiteEngine implements BrainEngine {
     // updated_at; sites that omit it fall back to defaultExtractedAt.
     const tss = refs.map(r => r.extractedAt ?? defaultExtractedAt);
     await this.db.query(
-      `UPDATE pages p SET links_extracted_at = v.ts::timestamptz
+      `UPDATE pages p
+         SET links_extracted_at = GREATEST(v.ts::timestamptz, $4::timestamptz)
          FROM unnest($1::text[], $2::text[], $3::text[]) AS v(slug, source_id, ts)
          WHERE p.slug = v.slug AND p.source_id = v.source_id`,
-      [slugs, srcs, tss],
+      [slugs, srcs, tss, LINK_EXTRACTOR_VERSION_TS],
     );
   }
 

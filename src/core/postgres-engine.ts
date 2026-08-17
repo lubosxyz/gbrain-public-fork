@@ -3187,7 +3187,8 @@ export class PostgresEngine implements BrainEngine {
     const tss = refs.map(r => r.extractedAt ?? defaultExtractedAt);
     const sql = this.sql;
     await sql`
-      UPDATE pages p SET links_extracted_at = v.ts::timestamptz
+      UPDATE pages p
+      SET links_extracted_at = GREATEST(v.ts::timestamptz, ${LINK_EXTRACTOR_VERSION_TS}::timestamptz)
       FROM unnest(${slugs}::text[], ${srcs}::text[], ${tss}::text[]) AS v(slug, source_id, ts)
       WHERE p.slug = v.slug AND p.source_id = v.source_id
     `;
