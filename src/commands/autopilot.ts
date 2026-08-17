@@ -568,8 +568,9 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   // brain. Two exit paths must both close the engine:
   //   - autopilot's own shutdown() below (owns SIGINT + internal stops like
   //     max_crashes / cycle-failure-cap), and
-  //   - process-cleanup's SIGTERM handler (installed at cli.ts module load;
-  //     it runs the cleanup registry with a 3s deadline and then exits) —
+  //   - process-cleanup's SIGTERM handler (installed inside cli.ts's
+  //     import.meta.main seam before main() dispatches; it runs the cleanup
+  //     registry with a 3s deadline and then exits) —
   //     which is why closeEngine is ALSO registered there.
   // closeEngine aborts the in-flight inline cycle (runCycle checks the
   // signal between phases and threads it into phase sub-work), gives it a
@@ -1209,13 +1210,19 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
           // source timestamps say every source is fresh, advance the local
           // clock too; otherwise a non-empty targeted plan would be skipped
           // on every tick until the persisted 60-minute window elapsed.
-          if (result.dispatched.length > 0 || result.legacy_fallback || result.all_sources_fresh) {
+          // Coalesced counts as work-in-flight: before dispatched/coalesced
+          // split, a coalesced submission advanced this clock via dispatched —
+          // keep that behavior, or an all-coalesced tick (single-flight
+          // suppression) would retake the full-cycle branch every tick and
+          // starve the targeted-plan path for the whole in-flight window.
+          if (result.dispatched.length > 0 || result.coalesced.length > 0 || result.legacy_fallback || result.all_sources_fresh) {
             lastFullCycleAt = Date.now();
           }
           if (jsonMode) {
             process.stderr.write(JSON.stringify({
               event: 'fanout_summary',
               dispatched: result.dispatched,
+              coalesced: result.coalesced,
               skipped_fresh: result.skipped_fresh,
               skipped_cap: result.skipped_cap,
               skipped_cooldown: result.skipped_cooldown,
@@ -1225,7 +1232,8 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
             }) + '\n');
           } else if (!result.legacy_fallback) {
             console.log(
-              `[dispatch] fanout: ${result.dispatched.length} dispatched, ` +
+              `[dispatch] fanout: ${result.dispatched.length} dispatched` +
+              `${result.coalesced.length > 0 ? ` (${result.coalesced.length} coalesced onto in-flight)` : ''}, ` +
               `${result.skipped_fresh.length} fresh, ${result.skipped_cap.length} capped, ` +
               `${result.skipped_cooldown.length} cooldown ` +
               `(score=${score}, max=${fanoutMax})`,
@@ -1254,7 +1262,16 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                 submitOpts,
                 isProtected ? { allowProtectedSubmit: true } : undefined,
               );
-              if (jsonMode) {
+              // Honest-dispatch contract (same as the fanout paths): a
+              // coalesced submission never claims a dispatch that didn't
+              // insert a row.
+              if (job.coalesced) {
+                if (jsonMode) {
+                  process.stderr.write(JSON.stringify({ event: 'dispatch_coalesced', job_id: job.id, mode: 'targeted', step: step.id, score, plan_size: plan.length }) + '\n');
+                } else {
+                  console.log(`[dispatch] coalesced onto job #${job.id} ${step.job} (targeted: ${step.id}; already in flight)`);
+                }
+              } else if (jsonMode) {
                 process.stderr.write(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'targeted', step: step.id, score, plan_size: plan.length }) + '\n');
               } else {
                 console.log(`[dispatch] job #${job.id} ${step.job} (targeted: ${step.id}; score=${score})`);

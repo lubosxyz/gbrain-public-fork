@@ -159,11 +159,11 @@ export interface HookIo {
   /** TEST SEAM: user-prompt deadline override (wall-clock flake control). */
   userPromptDeadlineMs?: number;
   /**
-   * Feedback-loop attribution channel (`--harness <claude-code|codex>`).
+   * Feedback-loop attribution channel (`--harness <claude-code|codex|opencode>`).
    * Default 'claude-code' — the only harness bootstrap registers hooks for
-   * today; a codex hook registration passes the flag explicitly.
+   * today; a codex/opencode hook registration passes the flag explicitly.
    */
-  harness?: 'claude-code' | 'codex';
+  harness?: 'claude-code' | 'codex' | 'opencode';
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
@@ -175,8 +175,8 @@ Events (wired into .claude/settings.local.json by gbrain bootstrap):
                   push status, hook health) to stdout
   user-prompt     read hook JSON on stdin, request per-turn context from a
                   running 'gbrain serve' over IPC, print additionalContext JSON
-                  (--harness <claude-code|codex> sets the feedback-loop channel;
-                  default claude-code, unknown values fall back to the default)
+                  (--harness <claude-code|codex|opencode> sets the feedback-loop
+                  channel; default claude-code, unknown values fall back to the default)
   stop            append to the per-session live buffer
   session-end     ingest the session transcript into the dream corpus
                   (secret-scanned), prune old corpus files, push the workspace
@@ -195,13 +195,13 @@ export async function runHook(args: string[], io: HookIo = {}): Promise<number> 
     write(io, USAGE + '\n');
     return 0;
   }
-  // `--harness <claude-code|codex>` — feedback-loop channel attribution for
-  // user-prompt. Unknown values fall back to the default (fail-open: a bad
-  // registration must never break the hook contract).
+  // `--harness <claude-code|codex|opencode>` — feedback-loop channel
+  // attribution for user-prompt. Unknown values fall back to the default
+  // (fail-open: a bad registration must never break the hook contract).
   const harnessIdx = args.indexOf('--harness');
   if (harnessIdx >= 0 && !io.harness) {
     const v = args[harnessIdx + 1];
-    if (v === 'claude-code' || v === 'codex') io = { ...io, harness: v };
+    if (v === 'claude-code' || v === 'codex' || v === 'opencode') io = { ...io, harness: v };
   }
   if (!event || !['session-start', 'user-prompt', 'stop', 'session-end', 'compact'].includes(event)) {
     process.stderr.write(USAGE + '\n');
@@ -210,6 +210,51 @@ export async function runHook(args: string[], io: HookIo = {}): Promise<number> 
   // Kill switch — before any file/socket touch, no heartbeat (the user asked
   // for silence, and a disabled hook writing telemetry would be a lie).
   if (process.env.GBRAIN_HOOKS === '0') return 0;
+
+  // #4043 harness-lane defer guard: Claude Code MERGES user- and
+  // project-scope hook settings, so a machine wired by `bootstrap harness`
+  // (user scope) plus a real workspace bootstrap install (settings.local.json,
+  // bootstrap-v1 marker) would fire the same event twice. The workspace
+  // install wins; the harness lane yields silently (exit 0, no output, no
+  // heartbeat). Same cwd resolution as the handlers (io.cwd is the test
+  // seam; the harness runs hooks in the session's working dir). Fail-open:
+  // any read hiccup means run normally.
+  if (process.env.GBRAIN_HOOK_LANE === 'harness') {
+    try {
+      // BOTH workspace carriers count: settings.local.json (local installs)
+      // and the committed .claude/settings.json ([D12] — an event owned by
+      // the committed carrier is stripped from local, so checking only local
+      // would double-fire it against the user-scope harness wiring). The
+      // check PARSES the settings and requires a live bootstrap-v1 hook entry
+      // wiring THIS event — a raw substring match would let any repo disable
+      // the machine-wide capture lane by committing the two marker strings in
+      // an unrelated field (ship-review P1), and would over-yield events the
+      // workspace does not actually wire.
+      const eventKey = {
+        'session-start': 'SessionStart',
+        'user-prompt': 'UserPromptSubmit',
+        stop: 'Stop',
+        'session-end': 'SessionEnd',
+        compact: 'PreCompact',
+      }[event];
+      const dotClaude = join(io.cwd ?? process.cwd(), '.claude');
+      for (const file of ['settings.local.json', 'settings.json']) {
+        const p = join(dotClaude, file);
+        if (!existsSync(p)) continue;
+        const settings = JSON.parse(readFileSync(p, 'utf8')) as {
+          hooks?: Record<string, Array<{ hooks?: Array<Record<string, unknown>> }>>;
+        };
+        const groups = settings.hooks?.[eventKey ?? ''];
+        if (!Array.isArray(groups)) continue;
+        for (const g of groups) {
+          if (!Array.isArray(g?.hooks)) continue;
+          if (g.hooks.some((e) => e?._gbrain === 'bootstrap-v1')) return 0;
+        }
+      }
+    } catch {
+      /* fail-open */
+    }
+  }
 
   switch (event) {
     case 'session-start':

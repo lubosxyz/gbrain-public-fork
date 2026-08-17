@@ -150,6 +150,57 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     expect(pgResults[0]?.slug).toBe(pgliteResults[0]?.slug);
   });
 
+  test('#4152 dream verdict triage-v1 round-trip: identical shape on both engines (jsonb path)', async () => {
+    // The postgres path binds segments/entities via sql.json(); PGLite via
+    // $N::jsonb + JSON.stringify. A double-encode regression on the postgres
+    // side would come back as a jsonb STRING scalar — the parity assert on
+    // the parsed arrays catches exactly that class (#2339).
+    const input = {
+      worth_processing: true,
+      reasons: ['thesis articulated', 'names a pattern'],
+      score: 0.83,
+      content_type: 'reflection',
+      segments: [
+        { quote: 'a verbatim line with "quotes" and unicode — 🤖', note: 'why it matters' },
+        { quote: 'second segment' },
+      ],
+      entities: ['acme-example', 'fund-a'],
+      model: 'anthropic:claude-haiku-4-5-20251001',
+      triage_version: 1,
+    };
+    for (const eng of [pgEngine, pgliteEngine]) {
+      await eng.putDreamVerdict('/corpus/parity.txt', 'parity-hash-0001', input);
+      // Upsert path: overwrite with a new score, same PK.
+      await eng.putDreamVerdict('/corpus/parity.txt', 'parity-hash-0001', { ...input, score: 0.31 });
+    }
+    const pg = await pgEngine.getDreamVerdict('/corpus/parity.txt', 'parity-hash-0001');
+    const lite = await pgliteEngine.getDreamVerdict('/corpus/parity.txt', 'parity-hash-0001');
+    expect(pg).not.toBeNull();
+    expect(lite).not.toBeNull();
+    for (const v of [pg!, lite!]) {
+      expect(v.score).toBe(0.31);
+      expect(v.content_type).toBe('reflection');
+      expect(Array.isArray(v.segments)).toBe(true); // NOT a double-encoded string scalar
+      expect(v.segments).toEqual(input.segments);
+      expect(v.entities).toEqual(input.entities);
+      expect(v.model).toBe(input.model);
+      expect(v.triage_version).toBe(1);
+    }
+    // Legacy-row semantics: a boolean-era row reads back with null triage fields.
+    for (const eng of [pgEngine, pgliteEngine]) {
+      await eng.executeRaw(
+        `INSERT INTO dream_verdicts (file_path, content_hash, worth_processing, reasons)
+         VALUES ('/corpus/legacy.txt', 'legacy-hash-0001', true, '["old"]'::jsonb)
+         ON CONFLICT (file_path, content_hash) DO NOTHING`,
+      );
+      const legacy = await eng.getDreamVerdict('/corpus/legacy.txt', 'legacy-hash-0001');
+      expect(legacy!.score).toBeNull();
+      expect(legacy!.triage_version).toBeNull();
+      expect(legacy!.segments).toEqual([]);
+      expect(legacy!.entities).toEqual([]);
+    }
+  });
+
   test('email citation metadata projects identically across engines', async () => {
     const slug = 'mail/example-citation';
     const page = {
@@ -689,9 +740,20 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     expect(pgRow.updated_at).toBeInstanceOf(Date);
 
     // markPagesExtractedBatch: stamp one → count drops to 2 on both.
-    const stampAt = new Date().toISOString();
-    await pgEngine.markPagesExtractedBatch([{ slug: 'sp/1', source_id: SRC }], stampAt);
-    await pgliteEngine.markPagesExtractedBatch([{ slug: 'sp/1', source_id: SRC }], stampAt);
+    // Stamp with the row's OWN updated_at_iso (per-ref extractedAt — the
+    // #1768/D4 production semantics used by extractStaleFromDB), NOT client
+    // `new Date()`: the test client's clock and the DB server's clock are
+    // different clocks (docker VM drift under load), so a client-now stamp can
+    // land before the row's server-side `updated_at`, leaving sp/1 flagged
+    // `updated_at > links_extracted_at` and the count stuck at 3.
+    for (const eng of [pgEngine, pgliteEngine]) {
+      const sp1 = (await eng.listStalePagesForExtraction({ batchSize: 10, sourceId: SRC }))
+        .find((r) => r.slug === 'sp/1')!;
+      await eng.markPagesExtractedBatch(
+        [{ slug: 'sp/1', source_id: SRC, extractedAt: sp1.updated_at_iso }],
+        sp1.updated_at_iso,
+      );
+    }
     expect(await pgEngine.countStalePagesForExtraction({ sourceId: SRC })).toBe(2);
     expect(await pgliteEngine.countStalePagesForExtraction({ sourceId: SRC })).toBe(2);
 
@@ -700,7 +762,10 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     // stamp older than the version, even when the caller passes a pre-version
     // extractedAt (KOM fork reconcile 2026-07-09).
     for (const eng of [pgEngine, pgliteEngine]) {
-      await eng.markPagesExtractedBatch([{ slug: 'sp/2', source_id: SRC, extractedAt: '2000-01-01T00:00:00Z' }], stampAt);
+      await eng.markPagesExtractedBatch(
+        [{ slug: 'sp/2', source_id: SRC, extractedAt: '2000-01-01T00:00:00Z' }],
+        '2000-01-01T00:00:00Z',
+      );
       const [row] = await eng.executeRaw<{ links_extracted_at: string }>(
         `SELECT links_extracted_at FROM pages WHERE slug = 'sp/2' AND source_id = $1`, [SRC],
       );
@@ -1182,6 +1247,72 @@ describeBoth('Engine parity — ambient recall keyset + session cursor (v0.45.7)
       expect(st!.standing_entities).toEqual(entities);
       expect(st!.surfaced_slugs).toEqual(['ks/tie-04']);
       expect(st!.last_wake_at).toBe(KS_LATE_TS);
+    }
+  });
+});
+
+// ── unscoped getPage deterministic multi-source tiebreak ─────────────────
+// The pre-fix behavior: unscoped getPage was `LIMIT 1` with no ORDER BY, so a
+// slug present in several sources returned an ARBITRARY row (and an
+// existence-check + write pair could target different sources). Both engines
+// now pin `ORDER BY (source_id = 'default') DESC, source_id ASC` —
+// default-source first, then stable alpha. Parity here catches either engine
+// dropping the clause.
+describeBoth('Engine parity — unscoped getPage multi-source tiebreak', () => {
+  let pgEngine: BrainEngine;
+  let pgliteEngine: PGLiteEngine;
+
+  beforeAll(async () => {
+    pgEngine = await setupDB();
+    pgliteEngine = new PGLiteEngine();
+    await pgliteEngine.connect({});
+    await pgliteEngine.initSchema();
+    for (const eng of [pgEngine, pgliteEngine]) {
+      for (const src of ['archive', 'work', 'zeta']) {
+        await eng.executeRaw(
+          `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+          [src],
+        );
+      }
+      // Same slug in 'archive' AND 'default' — default must win even though
+      // 'archive' sorts first alphabetically.
+      await eng.putPage('tiebreak/with-default', {
+        type: 'note', title: 'archive row', compiled_truth: 'a', timeline: '',
+      }, { sourceId: 'archive' });
+      await eng.putPage('tiebreak/with-default', {
+        type: 'note', title: 'default row', compiled_truth: 'd', timeline: '',
+      }, { sourceId: 'default' });
+      // Same slug in 'work' AND 'zeta' only (no default row) — the
+      // alphabetically-first source wins.
+      await eng.putPage('tiebreak/no-default', {
+        type: 'note', title: 'work row', compiled_truth: 'w', timeline: '',
+      }, { sourceId: 'work' });
+      await eng.putPage('tiebreak/no-default', {
+        type: 'note', title: 'zeta row', compiled_truth: 'z', timeline: '',
+      }, { sourceId: 'zeta' });
+    }
+  }, 90_000);
+
+  afterAll(async () => {
+    await pgliteEngine.disconnect();
+    await teardownDB();
+  }, 30_000);
+
+  test('unscoped getPage prefers the default-source row on both engines', async () => {
+    for (const eng of [pgEngine, pgliteEngine]) {
+      const page = await eng.getPage('tiebreak/with-default');
+      expect(page).not.toBeNull();
+      expect(page!.source_id).toBe('default');
+      expect(page!.title).toBe('default row');
+    }
+  });
+
+  test('unscoped getPage falls back to the alphabetically-first source when no default row exists', async () => {
+    for (const eng of [pgEngine, pgliteEngine]) {
+      const page = await eng.getPage('tiebreak/no-default');
+      expect(page).not.toBeNull();
+      expect(page!.source_id).toBe('work');
+      expect(page!.title).toBe('work row');
     }
   });
 });

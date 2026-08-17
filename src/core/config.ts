@@ -1048,6 +1048,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'cycle.extract_atoms.budget_usd',
   'models.dream.patterns',
   'models.dream.synthesize_verdict',
+  // #4152: preferred triage-model key (explicit pre-read in loadSynthConfig;
+  // wins over models.dream.synthesize_verdict + dream.synthesize.verdict_model).
+  'models.dream.triage',
   'models.drift',
   'models.auto_think',
   'models.think',
@@ -1079,6 +1082,19 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'dream.synthesize.output_root',
   'dream.synthesize.subagent_timeout_ms',
   'dream.synthesize.subagent_wait_timeout_ms',
+  // #4152 two-stage cascade: subagent turn budget (default 16) + opt-in
+  // per-source daily submission cap (default 0 = disabled; 200 recommended
+  // for busy deployments).
+  'dream.synthesize.max_turns',
+  'dream.synthesize.max_submissions_per_source_per_day',
+  // #4152 triage knobs. The triage model's preferred key is
+  // `models.dream.triage` (models.* prefix, registered via the models.dream.*
+  // family); these tune the gate + sampling + pass budget.
+  'dream.triage.threshold',
+  'dream.triage.max_chars',
+  'dream.triage.max_tokens',
+  'dream.triage.max_ms',
+  'dream.triage.concurrency',
   'dream.patterns.lookback_days',
   'dream.patterns.min_evidence',
   // #2782-family: patterns-phase subagent timeouts (mirror of the
@@ -1140,6 +1156,13 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // reconcile-links, and sweep. The documented off-switch is `gbrain config
   // set auto_link false` — same unregistered-key class as auto_chronicle.
   'auto_link',
+  // v0.46.3: the provider_sunset doctor check's own suppression escape hatch
+  // (doctor.ts) and docs/guides/embedding-migration.md both document
+  // `gbrain config set doctor.suppress_provider_sunset true`, but the key was
+  // never registered — the documented command exited 1 with "Unknown config
+  // key". Same class as auto_chronicle above. Deliberately an exact key, not
+  // a blanket 'doctor.' prefix (unbounded namespaces defeat the typo gate).
+  'doctor.suppress_provider_sunset',
   // #2606: chronicle judge output-token cap (default 4000). Event-dense
   // pages overflowed the old hardcoded 1500 and were misrecorded as
   // no_events; the cap is now configurable and truncation is surfaced.
@@ -1168,6 +1191,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // stops claiming "Nothing in gbrain reads this" for a key the resolver
   // reads on every unqualified call.
   'sources.default',
+  // Alias/undeclared explicit-type warnings at sync/import (default on).
+  // Read by performSync + runImport summary aggregation; 'false'/'0'/'off'
+  // silences both surfaces (schema lint rules stay active).
+  'schema.type_warnings',
 ];
 
 /**
@@ -1188,6 +1215,12 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.* (#1685)
   'chronicle.',         // chronicle.tz + future Life Chronicle knobs (#2390)
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
+  // Queue admission control (per-name sub-keys):
+  //   minions.coalesce_params.<name>, minions.ttl_waiting_hours.<name>,
+  //   minions.quota_max_waiting.<name>, plus the one-time
+  //   minions.ttl_notice_shown flag. Booleans via the canonical truthiness
+  //   parser; numeric 0 disables.
+  'minions.',
 ];
 
 /**

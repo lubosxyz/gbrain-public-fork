@@ -123,21 +123,32 @@ describe('gbrain claw-test --scenario fresh-install (scripted)', () => {
 });
 
 describe('gbrain claw-test --list-agents', () => {
-  test('reports both built-in runners (available or not — both valid states)', () => {
-    // HERMES_BIN/OPENCLAW_BIN point at a nonexistent path so the output shape
-    // is deterministic regardless of what's installed on the box (detect
+  test('reports all four built-in runners (available or not — both valid states)', () => {
+    // *_BIN vars point at a nonexistent path so the output shape is
+    // deterministic regardless of what's installed on the box (detect
     // rejects a non-stat-able absolute path with a specific reason).
     const result = spawnSync(BIN_PATH, ['claw-test', '--list-agents'], {
       cwd: REPO_ROOT,
-      env: { ...process.env, HERMES_BIN: '/nonexistent/hermes', OPENCLAW_BIN: '/nonexistent/openclaw' },
+      env: {
+        ...process.env,
+        HERMES_BIN: '/nonexistent/hermes',
+        OPENCLAW_BIN: '/nonexistent/openclaw',
+        GROK_BIN: '/nonexistent/grok',
+        OPENCODE_BIN: '/nonexistent/opencode',
+      },
       encoding: 'utf-8',
       timeout: 60_000,
     });
     expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/^grok: unavailable: /m);
     expect(result.stdout).toMatch(/^hermes: unavailable: /m);
+    expect(result.stdout).toMatch(/^opencode: unavailable: /m);
     expect(result.stdout).toMatch(/^openclaw: unavailable: /m);
     // Alphabetical print order (the awaited-detection fix pins this).
+    // NB: 'openclaw' sorts BEFORE 'opencode' ('l' < 'o' at position 5).
+    expect(result.stdout.indexOf('grok:')).toBeLessThan(result.stdout.indexOf('hermes:'));
     expect(result.stdout.indexOf('hermes:')).toBeLessThan(result.stdout.indexOf('openclaw:'));
+    expect(result.stdout.indexOf('openclaw:')).toBeLessThan(result.stdout.indexOf('opencode:'));
   }, 60_000);
 });
 

@@ -1,7 +1,7 @@
 # GBrain Bootstrap — your harness as your agent
 
-`gbrain bootstrap` turns a Claude Code or Codex session into a persistent personal
-agent: identity files rendered from your own answers, a local PGLite brain,
+`gbrain bootstrap` turns a Claude Code, Codex, or opencode session into a
+persistent personal agent: identity files rendered from your own answers, a local PGLite brain,
 per-turn context, session-triggered schedules, and a private GitHub repo as the
 agent's durable, portable body. This guide is the full contract — what gets
 installed, what runs when, what it can and cannot do, and how to undo all of it.
@@ -19,7 +19,7 @@ follows is `BOOTSTRAP_FOR_AGENTS.md` at the repo root, fetched at the
 | Identity files (SOUL/USER/MEMORY/AGENTS/CLAUDE/HEARTBEAT/ACCESS_POLICY/GITHUB) | your workspace folder | loaded at session start |
 | `agent.json` manifest + `brain/`, `memory/`, `skills/`, `state/` | workspace | — |
 | Local brain (PGLite) | `~/.gbrain/` (never in the repo) | while a session's MCP serve is open |
-| MCP registration (`gbrain serve`) | Claude Code: project scope by default; Codex: user-global (no scope flag) | spawned by your harness per session |
+| MCP registration (`gbrain serve`) | Claude Code: project scope by default; Codex: user-global (no scope flag); opencode: user-global by default (project scope is an explicit opt-in — see the degradation matrix) | spawned by your harness per session |
 | Hooks (Claude Code, ON by default) | local installs: `.claude/settings.local.json` (gitignored); cloud sandboxes: the COMMITTED `.claude/settings.json` (PATH-resolved, fail-open commands) | each prompt; fail-open; `--no-hooks` opts out at install, `GBRAIN_HOOKS=0` disables at runtime |
 | Per-turn persistence | Stop hook → debounced, detached scan-gated push (per workspace; 5 min default, every turn in cloud sandboxes) | after each assistant turn; `GBRAIN_STOP_PUSH=0` disables; `GBRAIN_STOP_PUSH_DEBOUNCE_MIN` / config `hooks.stop_push_debounce_min` tune it |
 | Session persistence | SessionEnd hook → scan-gated commit+push | at session end (note: the harness never fires SessionEnd on `/exit` — the per-turn push is what covers that) |
@@ -154,8 +154,97 @@ you'd apply to any journal: write what you'd be comfortable persisting.
 | API keys | everything (keyless mode) | semantic search, auto-extraction |
 | GitHub / `gh` | full local agent | off-machine durability (repo re-runnable later) |
 | Hooks (Claude Code) | pull protocol via AGENTS.md gates | automatic per-turn context + session-end persistence |
-| Codex (no hook system, no MCP scope flag) | pull protocol + MCP tools | per-turn push (stated plainly; not oversold) + the ability to confine MCP reach to one folder (`codex mcp add` is always user-global) |
+| Codex (no wired hooks, no MCP scope flag) | pull protocol + MCP tools | per-turn push (stated plainly; not oversold — codex 0.147+ ships a hook system, but gbrain does not wire it yet) + the ability to confine MCP reach to one folder (`codex mcp add` is always user-global) |
+| opencode (no wired hooks; scope INVERTED: user-global by default) | pull protocol (opencode reads AGENTS.md natively) + MCP tools; project scope available as an explicit opt-in | per-turn push (opencode ships a plugin/event system, but gbrain does not wire it yet). The project-scope default is deliberately NOT offered: opencode spawns project-config servers with no trust prompt, so a committed entry would auto-execute on every collaborator machine |
+| Bootstrap at all (plugin-only install) | MCP tools (`starter` surface, `--source-guard`) + the curated skill set via the codex/claude plugin (docs/mcp/CODEX.md) | identity files, hooks/push protocol, the private-repo body — the plugin is the lightweight lane; bootstrap is the full agent |
 | Second simultaneous session | first session unaffected | second session's brain tools fail politely (one live serve per brain — v1 contract) |
+| Postgres brain (incl. harness mode) | MCP tools every session + pull protocol | per-turn hook injection (`no_pglite_path`: the hook IPC socket is PGLite-only today; hooks stay pre-wired and light up when the engine-uniform listener lands) |
+
+## Local harness mode (`gbrain bootstrap harness`, #4043)
+
+The workspace install above is built for a human's laptop. A box run by an
+agent framework (your OpenClaw, or anything that shells out to `claude -p` /
+codex exec) already hosts a brain and a running `gbrain serve --http` — and
+those framework-spawned sessions get zero brain access by default. Harness
+mode wires them in one command, with no `agent.json` and no interview:
+
+    gbrain bootstrap harness --yes
+
+- Mints a **least-privilege** bearer token (scopes `read+write`, stored in the
+  `access_tokens.scopes` column; reads span the brain's federated sources).
+  Re-runs rotate mint-first: the previous token is revoked by id only after
+  the new one is wired and smoke-tested, so clients are never dead mid-swap.
+  The smoke sends a deliberately invalid credential first — an endpoint that
+  accepts anything is not this brain's serve — and a failed smoke rolls the
+  wiring back (fresh registrations removed, replaced ones restored, the
+  headless pre-approval stripped) and retires the fresh mint immediately, so
+  nothing live is ever left pointed at an unverified endpoint. Prior wiring
+  is only cleaned up after the replacement verifies.
+- Claude Code: user-scope HTTP MCP registration, `mcp__gbrain` pre-approved in
+  user-scope `permissions.allow` (headless `claude -p` blocks MCP tools
+  without it), and the five lifecycle hooks — user scope by default, or
+  exactly the dirs you pass with repeatable `--project` (never both; the two
+  would double-fire every event). `--no-capture` wires context injection only
+  and skips the transcript-capture events.
+- Codex: one managed `[mcp_servers.gbrain]` block with the bearer token
+  INLINE in the codex config (0600) — framework-spawned codex inherits no
+  shell profile, so the env-var lane the `connect` path uses would never
+  reach it. One owner per server name: if the gbrain codex PLUGIN is
+  also enabled, two `gbrain` servers exist in different layers — the wire
+  proceeds with a loud WARNING and `gbrain doctor` reports the collision
+  (`plugin_lane_collision`); keep one (`codex plugin remove gbrain@gbrain`, or
+  `--remove` here).
+- opencode: one managed `mcp.gbrain` remote entry with the bearer header
+  INLINE in the user-global JSONC config (0600), written by the same
+  comment-preserving editor the workspace lane uses — the `{env:…}`
+  interpolation the `connect` path prefers would resolve empty under a
+  framework-spawned opencode for the same no-shell-profile reason.
+  Note: downgrading gbrain below the release that introduced opencode support
+  after wiring it leaves the opencode entry in place for manual removal —
+  edit the opencode config by hand, or re-upgrade and run
+  `gbrain bootstrap harness --remove`.
+- Honesty on Postgres brains: per-turn injection is degraded (the matrix row
+  above); MCP is the active seam and the summary says so.
+- `--status [--json]` probes the live truth (serve health, token validity via
+  host-config recovery — the Claude Code lane only recovers a bearer from a
+  registration whose URL matches the receipt; the codex managed block is read
+  from the exact path the receipt records — and per-target states) with a
+  cron-honest exit contract: 0 only when the serve, token, and every target
+  verify and the rotation has converged (honest degrades count as OK); 1 on
+  an unreachable serve, a failed token verify, failed or pending targets, an
+  unconverged rotation, or a half-removed install whose token still awaits
+  revocation. With no install at all it says so and exits 0 (2 under
+  `--json`, so machine callers can tell absence apart). `gbrain doctor`
+  carries a matching `bootstrap_harness_health` check. `--json` on the
+  install itself emits a single machine-readable document on stdout (prose
+  goes to stderr).
+- The full flag surface lives in `gbrain bootstrap --help`: `--url`/`--port`
+  point at a non-default serve (a non-loopback `--url` is refused unless you
+  also pass `--token`, which flips into registrar mode — MCP wiring only, no
+  hooks, nothing minted), `--force` replaces a foreign same-name MCP
+  registration, `--name` renames the server, `--harness` picks the hosts,
+  and `--no-hooks` skips hook wiring entirely.
+- `--remove` tears down exactly what the machine-level receipt
+  (`<home>/bootstrap/harness.json`) records — host removals are engine-free
+  and run even while a serve is live; the token revoke defers with exact
+  instructions if a live PGLite serve holds the brain. `gbrain bootstrap
+  uninstall` removes harness wiring first, automatically.
+- Everything is stated before it happens; non-interactive runs require
+  `--yes`. Close active Claude Code sessions for the cleanest user-scope
+  settings writes (the host also writes that file).
+
+PGLite note: minting needs the single-writer lock, so on a PGLite brain
+either pre-mint (`gbrain auth create bootstrap-harness --scopes read,write`
+while the serve is stopped) and pass `--token`, or stop/re-run/restart.
+Postgres brains mint fine while the serve runs. A token you supply is never
+revoked by `--remove` or rotation (it is not the harness's to revoke) —
+retire it yourself with `gbrain auth revoke` when you're done with it.
+
+Binary-downgrade note: token scoping is data-only (no migration), so a gbrain
+binary OLDER than the release that shipped it verifies every scoped token as
+FULL-ACCESS — the old verify path never reads the scopes column. If you
+downgrade after a harness install, revoke the scoped tokens first
+(`gbrain auth revoke` with the id flag) and re-mint once you upgrade again.
 
 ## Multi-device
 
@@ -195,10 +284,15 @@ that changed shape, a harness that stopped calling our MCP server):
   keyless-`init` → interview → render → `gbrain bootstrap hooks --harness codex`
   path (executing the real `codex mcp add` into a hermetic `~/.codex/config.toml`),
   asserts the rendered `AGENTS.md` carries the Gate-3 brain-first pull protocol
-  (Codex has no hook system, so the pull protocol is its per-turn seam), then
+  (gbrain does not wire Codex hooks yet, so the pull protocol is its per-turn seam), then
   spends one live `codex exec` turn to prove real codex → gbrain MCP → brain →
   a seeded, brain-only fact (falling back to a shell `gbrain query` if headless
   stdio-MCP is unavailable).
+
+opencode's real-binary door lives in
+`test/e2e/install-real-opencode.serial.test.ts` (its writer-parity leg
+handshakes gbrain's direct JSONC registration through the actual binary);
+`docs/TESTING.md` carries the full door inventory and cadence policy.
 
 These pay real API cost and take 30s–2min per turn, so they are NOT in the PR
 shard. Everything is hermetic (temp `HOME` / `CODEX_HOME` / `CLAUDE_CONFIG_DIR` /
@@ -220,12 +314,16 @@ bun test test/e2e/bootstrap-real-codex.serial.test.ts
 ## DX exploration harness (developer instrument, not a test)
 
 The door tests prove the install WORKS; they say nothing about how it FEELS.
-`test/helpers/tty-harness.ts` spawns any CLI (gbrain, `claude`, `codex`) under a
+`test/helpers/tty-harness.ts` spawns any CLI (gbrain, `claude`, `codex`, `grok`, `opencode`) under a
 real pseudo-terminal (Bun's `terminal:` spawn option) and records every output
 burst with a millisecond timestamp, so unnecessary pauses become a measurable
 artifact (`computeStalls` → `stalls.md`) instead of a vibe. Same hermetic env as
 `agent-harness.ts`; pure helpers are unit-tested in `test/tty-harness.test.ts`
 (zero subprocesses, PTY smokes self-skip where `terminal:` is unavailable).
+The harness itself also backs one required-CI test: `test/init-picker-pty.serial.test.ts`
+asserts the interactive `gbrain init` pickers under a real PTY (see the
+TTY decision table in `docs/TESTING.md`). The DX-exploration layer below stays
+an instrument — nothing in it asserts.
 
 `scripts/dx-explore.ts` drives it to capture the fresh-user funnel as timestamped
 transcripts under `.context/dx-runs/` (gitignored — nothing asserts, no CI):
@@ -235,6 +333,8 @@ bun run scripts/dx-explore.ts help              # comprehension surfaces (no key
 bun run scripts/dx-explore.ts init [--keyless]  # interactive init, naive-user autopilot
 bun run scripts/dx-explore.ts claude-install    # REAL claude running the paste-in bootstrap
 bun run scripts/dx-explore.ts codex-install     # REAL codex, same
+bun run scripts/dx-explore.ts opencode-install  # REAL opencode running the paste-in bootstrap
+bun run scripts/dx-explore.ts grok-install      # REAL grok, brain-only GROK.md install (no bootstrap path)
 bun run scripts/dx-explore.ts drive -- gbrain init   # manual: steer a live TUI via a file channel
 ```
 

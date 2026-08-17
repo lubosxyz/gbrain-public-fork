@@ -10,7 +10,7 @@
  * admin `/admin/api/agents` endpoint otherwise computes LIVE over this
  * table (see src/commands/serve-http.ts). Every batch folds the deleted
  * rows' per-token count + max(created_at) into `mcp_request_log_purged`
- * (migration v123) before dropping them, so those metrics survive the purge.
+ * (reconciliation migration v131) before dropping them, so those metrics survive the purge.
  *
  * Called from the dream cycle's purge phase (src/core/cycle.ts,
  * runPhasePurge), alongside purgeStaleVolunteerEvents / purgeStaleCheckpoints.
@@ -52,7 +52,7 @@ const MAX_BATCHES = 200;
  * counter-preserving. Returns the total number of rows deleted.
  *
  * Fail-closed: if `mcp_request_log_purged` doesn't exist yet (brain hasn't
- * run migration v123), this WARNs and returns 0 rather than either crashing
+ * run reconciliation migration v131), this WARNs and returns 0 rather than either crashing
  * the purge phase or deleting rows without preserving their counters.
  */
 export async function purgeStaleMcpRequestLog(
@@ -65,7 +65,7 @@ export async function purgeStaleMcpRequestLog(
     );
     if (!regclass[0]?.reg) {
       console.warn(
-        '[mcp-request-log-retention] mcp_request_log_purged table absent — skipping purge (migration v123 not yet applied on this brain)',
+        '[mcp-request-log-retention] mcp_request_log_purged table absent — skipping purge (migration v131 not yet applied on this brain)',
       );
       return 0;
     }

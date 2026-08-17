@@ -715,7 +715,7 @@ CREATE INDEX IF NOT EXISTS idx_mcp_log_agent_time ON mcp_request_log(agent_name,
 -- The purge phase (src/core/mcp-request-log-retention.ts) deletes stale
 -- mcp_request_log rows on a TTL and folds their per-token count/max(created_at)
 -- into this table, so serve-http's admin metrics can add the purged counters
--- back into the live COUNT(*)/max(created_at) aggregate. See migration v123.
+-- back into the live COUNT(*)/max(created_at) aggregate. See reconciliation migration v131.
 CREATE TABLE IF NOT EXISTS mcp_request_log_purged (
   token_name          TEXT PRIMARY KEY,
   purged_requests     BIGINT NOT NULL DEFAULT 0,
@@ -939,6 +939,7 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   depth            INTEGER     NOT NULL DEFAULT 0,
   max_children     INTEGER,
   timeout_ms       INTEGER,
+  lock_duration_ms INTEGER,
   timeout_at       TIMESTAMPTZ,
   remove_on_complete BOOLEAN   NOT NULL DEFAULT FALSE,
   remove_on_fail   BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -955,7 +956,8 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   CONSTRAINT chk_nonnegative CHECK (attempts_made >= 0 AND attempts_started >= 0 AND stalled_counter >= 0 AND max_attempts >= 1 AND max_stalled >= 0),
   CONSTRAINT chk_depth_nonnegative CHECK (depth >= 0),
   CONSTRAINT chk_max_children_positive CHECK (max_children IS NULL OR max_children > 0),
-  CONSTRAINT chk_timeout_positive CHECK (timeout_ms IS NULL OR timeout_ms > 0)
+  CONSTRAINT chk_timeout_positive CHECK (timeout_ms IS NULL OR timeout_ms > 0),
+  CONSTRAINT chk_lock_duration_positive CHECK (lock_duration_ms IS NULL OR (lock_duration_ms >= 5000 AND lock_duration_ms <= 3600000))
 );
 
 CREATE INDEX IF NOT EXISTS idx_minion_jobs_claim ON minion_jobs (queue, priority ASC, created_at ASC) WHERE status = 'waiting';
@@ -1131,6 +1133,15 @@ CREATE TABLE IF NOT EXISTS dream_verdicts (
   worth_processing BOOLEAN     NOT NULL,
   reasons          JSONB,
   judged_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- #4152 triage-v1 (migration v129): ordinal salience score in [0,1],
+  -- content type, candidate segments/entities, judging model + prompt
+  -- version. NULL on boolean-era rows — readers treat those as cache misses.
+  score            DOUBLE PRECISION,
+  content_type     TEXT,
+  segments         JSONB,
+  entities         JSONB,
+  model            TEXT,
+  triage_version   INT,
   PRIMARY KEY (file_path, content_hash)
 );
 

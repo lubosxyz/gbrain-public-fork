@@ -14,11 +14,13 @@
 
 import { VERSION } from '../version.ts';
 import { loadConfig } from '../core/config.ts';
-import { loadCompletedMigrations, appendCompletedMigration, preferencesPaths, type CompletedMigrationEntry } from '../core/preferences.ts';
+import { loadCompletedMigrations, appendCompletedMigration, type CompletedMigrationEntry } from '../core/preferences.ts';
 import { migrations, compareVersions, type Migration, type OrchestratorOpts, type OrchestratorResult } from './migrations/index.ts';
-
-/** Bug 3 — max consecutive partials before we wedge a migration. */
-const MAX_CONSECUTIVE_PARTIALS = 3;
+import {
+  indexCompletedEntries,
+  statusForVersion as ledgerStatusForVersion,
+  MAX_CONSECUTIVE_PARTIALS,
+} from '../core/migration-ledger.ts';
 
 interface ApplyMigrationsArgs {
   list: boolean;
@@ -117,53 +119,18 @@ interface CompletedIndex {
   byVersion: Map<string, CompletedMigrationEntry[]>;
 }
 
+// Ledger status logic moved to src/core/migration-ledger.ts (shared with the
+// get_health op's migrations block, TODOS:4063) — same semantics, same Bug 3
+// "complete wins / trailing retry overrides / consecutive-partial cap" rules.
 function indexCompleted(entries: CompletedMigrationEntry[]): CompletedIndex {
-  const byVersion = new Map<string, CompletedMigrationEntry[]>();
-  for (const e of entries) {
-    const list = byVersion.get(e.version) ?? [];
-    list.push(e);
-    byVersion.set(e.version, list);
-  }
-  return byVersion.size > 0
-    ? { byVersion }
-    : { byVersion: new Map() };
+  return { byVersion: indexCompletedEntries(entries) };
 }
 
-/**
- * Returns the resolved status for a migration based on its entries.
- *
- * Semantics (Bug 3 — keep "complete wins" safety):
- *   - If the latest entry is `retry`, the version is pending. This is the
- *     explicit escape hatch written by `--force-retry`, and it overrides an
- *     earlier `complete` entry without hand-editing the ledger.
- *   - Otherwise, if any entry is `complete`, the version is complete.
- *   - Otherwise, if any entry is `partial`, the version is partial.
- *   - Otherwise, pending.
- *
- * `complete` never regresses accidentally. A later `partial` append cannot
- * undo a completed migration; only a trailing, explicit `retry` marker can.
- */
 function statusForVersion(
   version: string,
   idx: CompletedIndex,
 ): 'complete' | 'partial' | 'pending' | 'wedged' {
-  const entries = idx.byVersion.get(version) ?? [];
-  if (entries.length === 0) return 'pending';
-  const latest = entries[entries.length - 1];
-  if (latest.status === 'retry') return 'pending';
-  if (entries.some(e => e.status === 'complete')) return 'complete';
-  // Bug 3 attempt cap — count consecutive partials from the end (stopping
-  // at any 'retry' or 'complete'). If we hit MAX_CONSECUTIVE_PARTIALS,
-  // the migration is wedged and needs explicit --force-retry to try again.
-  let consecutive = 0;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    if (e.status === 'partial') consecutive++;
-    else break;
-  }
-  if (consecutive >= MAX_CONSECUTIVE_PARTIALS) return 'wedged';
-  if (entries.some(e => e.status === 'partial')) return 'partial';
-  return 'pending';
+  return ledgerStatusForVersion(version, idx.byVersion);
 }
 
 interface Plan {
@@ -305,16 +272,11 @@ function orchestratorOptsFrom(cli: ApplyMigrationsArgs): OrchestratorOpts {
   };
 }
 
-/**
- * Render the failed phases of an orchestrator result as printable lines.
- * The v0.13.0 wedge (KOM-250) shipped a bare "reported status=failed" while
- * the real reason (`column "event_page_id" does not exist`) sat unprinted in
- * the ledger's phases[].detail for three runs — surface it with the failure.
- */
+/** Render actionable details for every failed orchestrator phase. */
 function failedPhaseLines(phases: OrchestratorResult['phases']): string[] {
   return phases
-    .filter(p => p.status === 'failed')
-    .map(p => `  phase '${p.name}' failed${p.detail ? `: ${p.detail}` : ' (no detail recorded)'}`);
+    .filter((phase) => phase.status === 'failed')
+    .map((phase) => `  phase '${phase.name}' failed${phase.detail ? `: ${phase.detail}` : ' (no detail recorded)'}`);
 }
 
 /**
@@ -452,13 +414,9 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // Bug 3 — surface wedged migrations as a loud, actionable error.
   if (plan.wedged.length > 0) {
     for (const m of plan.wedged) {
-      // Point at the REAL ledger (GBRAIN_HOME-aware): the 'partial' entries'
-      // phases[].detail fields carry the per-phase failure reasons. The old
-      // hint referenced ~/.gbrain/upgrade-errors.jsonl, which nothing writes.
       console.error(
         `\nMigration v${m.version} is WEDGED (${MAX_CONSECUTIVE_PARTIALS}+ consecutive partials with no completion). ` +
-        `Check the 'partial' entries for ${m.version} in ${preferencesPaths.completedJsonl()} ` +
-        `(phases[].detail has the failure reasons), fix the underlying issue, then run:\n` +
+        `Check ~/.gbrain/upgrade-errors.jsonl for the last failure reasons, fix the underlying issue, then run:\n` +
         `  gbrain apply-migrations --force-retry ${m.version}\n` +
         `Then re-run \`gbrain apply-migrations --yes\`.`,
       );
@@ -502,10 +460,8 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
       const result = await m.orchestrator(orchestratorOptsFrom(cli));
       if (result.status === 'failed') {
         console.error(`Migration v${m.version} reported status=failed.`);
-        // Surface each failed phase's detail — the ledger records it, but the
-        // operator needs it on stderr to act (#921). Upstream landed the same
-        // idea inline on this path only; the shared helper also covers the
-        // PARTIAL path below and is unit-pinned via __testing.
+        // Surface each failed phase's detail — the ledger records it, but
+        // the operator needs it on stderr to act (#921 / KOM-250).
         for (const line of failedPhaseLines(result.phases)) console.error(line);
         // Record the attempt as 'partial' (not 'complete') so the cap counts
         // it. Don't let a failed orchestrator look like it never ran.
@@ -573,6 +529,6 @@ export const __testing = {
   buildPlan,
   indexCompleted,
   statusForVersion,
-  failedPhaseLines,
   resolveSchemaBehind,
+  failedPhaseLines,
 };
