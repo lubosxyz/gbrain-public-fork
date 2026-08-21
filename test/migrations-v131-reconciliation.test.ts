@@ -43,7 +43,10 @@ describe('migration v131 — fork/upstream v128 reconciliation', () => {
 
     const result = await runMigrations(engine);
 
-    expect(result.applied).toBe(1);
+    // Everything past v130 applies on this brain (v131 + any newer tail
+    // migrations) — the assertion tracks the registry so a new tail
+    // migration doesn't break this reconciliation test.
+    expect(result.applied).toBe(MIGRATIONS.filter(m => m.version > 130).length);
     const rows = await engine.executeRaw<{ table_name: string }>(
       `SELECT table_name FROM information_schema.tables
        WHERE table_name = 'mcp_request_log_purged'`,

@@ -71,6 +71,13 @@ interface FakeEngineConfig {
   revokedTokens?: Set<string>;
   /** If true, every SELECT throws (simulating DB outage). */
   dbDown?: boolean;
+  /**
+   * v132: if true, ONLY the primary (tenant-column) projection throws a
+   * generic (non-undefined-column) error while the narrow fallback would
+   * succeed — pins that validateToken fails CLOSED instead of degrading a
+   * tenant token into a grandfathered full-access bearer.
+   */
+  newProjectionError?: boolean;
 }
 
 function makeFakeEngine(cfg: FakeEngineConfig = {}): FakeEngine {
@@ -91,8 +98,17 @@ function makeFakeEngine(cfg: FakeEngineConfig = {}): FakeEngine {
     const norm = normalizeSql(query);
 
     // SELECT id, name, permissions FROM access_tokens WHERE token_hash = $1 AND revoked_at IS NULL
+    // v132 lane: the primary projection also reads scopes + company_slug +
+    // expires_at; this mock returns rows WITHOUT tenant metadata, i.e. the
+    // grandfathered shape (tenant-scoped behavior is covered by
+    // test/tenant-token-minting.test.ts over a real engine).
+    if (cfg.newProjectionError &&
+        norm.startsWith('select id, name, permissions, scopes, company_slug, expires_at from access_tokens')) {
+      throw new Error('transient projection failure (not an undefined column)');
+    }
     if (norm.startsWith('select id, name from access_tokens') ||
-        norm.startsWith('select id, name, permissions from access_tokens')) {
+        norm.startsWith('select id, name, permissions from access_tokens') ||
+        norm.startsWith('select id, name, permissions, scopes, company_slug, expires_at from access_tokens')) {
       const tokenHash = values[0] as string;
       if (revokedTokens.has(tokenHash)) return [];
       const row = validTokens.get(tokenHash);
@@ -201,6 +217,23 @@ describe('http-transport: auth', () => {
     });
   });
   afterAll(() => srv.stop());
+
+  test('v132: primary-projection transient failure fails CLOSED (401), never degrades to grandfathered access', async () => {
+    const failing = await startTest({
+      validTokens: new Map([[hash(VALID_TOKEN), { id: 'tok-1', name: 'test' }]]),
+      newProjectionError: true,
+    });
+    try {
+      const r = await fetch(`${failing.url}/mcp`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${VALID_TOKEN}`, 'Content-Type': 'application/json' },
+        body: rpc('tools/list'),
+      });
+      expect(r.status).toBe(401);
+    } finally {
+      failing.stop();
+    }
+  });
 
   test('1. valid token → 200 + tools/list returns ops', async () => {
     const r = await fetch(`${srv.url}/mcp`, {

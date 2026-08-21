@@ -29,6 +29,7 @@ import { assertValidSourceId } from './source-id.ts';
 import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions, normalizeTokenScopes } from './legacy-token-scope.ts';
+import { writeAuthAudit } from './auth-audit.ts';
 
 /**
  * A slug-prefix write binding is only meaningful if every entry actually
@@ -877,6 +878,9 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         clientName: (row.client_name as string | null) ?? undefined,
         scopes: (row.scopes as string[]) || [],
         expiresAt,
+        // v132: server-derived token kind — whoami keys its shape off this,
+        // never off the (caller-influenced) clientId prefix.
+        tokenKind: 'oauth',
         resource: row.resource ? new URL(row.resource as string) : undefined,
         // v0.34.1 (#861, D2): source-isolation scope from oauth_clients.
         // Undefined when the row predates v60 or when the brain itself
@@ -900,14 +904,37 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // rows may carry permissions.source_id from the pre-OAuth bearer-token
     // path; OAuth transport must preserve that same source grant instead of
     // pinning every legacy token to `default`.
+    //
+    // v132 tenant-remediation lane: the projection also reads id +
+    // company_slug + expires_at + minted_by. A row carrying tenant/mint
+    // metadata is a tenant-scoped short-TTL token: its expiry is enforced
+    // here against server time (fail-closed, audited), and company_slug is
+    // threaded into AuthInfo as the ONLY tenant source whoami may report.
+    // Pre-v132 brains hit the new degrade rung and keep the historical
+    // grandfathered semantics.
     let legacyRows: Record<string, unknown>[];
     try {
       legacyRows = await this.sql`
-        SELECT name, permissions, scopes FROM access_tokens
+        SELECT id, name, permissions, scopes, company_slug, expires_at, minted_by FROM access_tokens
         WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
       `;
-    } catch (err) {
-      if (isUndefinedColumnError(err, 'permissions')) {
+    } catch (errT) {
+      const missingLegacyColumn = (e: unknown): boolean =>
+        isUndefinedColumnError(e, 'company_slug') ||
+        isUndefinedColumnError(e, 'expires_at') ||
+        isUndefinedColumnError(e, 'minted_by') ||
+        isUndefinedColumnError(e, 'permissions') ||
+        isUndefinedColumnError(e, 'scopes');
+      if (!missingLegacyColumn(errT)) throw errT;
+      try {
+        // Pre-v132 rung: no tenant/mint columns. Tokens verify with the
+        // historical grandfathered semantics (no expiry, no tenant).
+        legacyRows = await this.sql`
+          SELECT id, name, permissions, scopes FROM access_tokens
+          WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
+        `;
+      } catch (err) {
+        if (!missingLegacyColumn(err)) throw err;
         // Pre-v38 brain: no permissions column. scopes is ORIGINAL schema, so
         // it must stay in the degraded SELECT — dropping it here would route
         // normalizeTokenScopes(undefined) into the grandfather branch and
@@ -917,29 +944,61 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // name-only — and that brain predates scoped minting entirely.
         try {
           legacyRows = await this.sql`
-            SELECT name, scopes FROM access_tokens
+            SELECT id, name, scopes FROM access_tokens
             WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
           `;
         } catch (err2) {
           if (!isUndefinedColumnError(err2, 'scopes')) throw err2;
           legacyRows = await this.sql`
-            SELECT name FROM access_tokens
+            SELECT id, name FROM access_tokens
             WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
           `;
         }
-      } else {
-        throw err;
       }
     }
 
     if (legacyRows.length > 0) {
+      const row = legacyRows[0];
       // For legacy tokens, name = clientId = clientName (single identifier).
-      // Update last_used_at
-      await this.sql`
-        UPDATE access_tokens SET last_used_at = now() WHERE token_hash = ${tokenHash}
-      `;
-      const name = legacyRows[0].name as string;
-      const permissions = coerceLegacyPermissions(legacyRows[0].permissions);
+      const name = row.name as string;
+      const tokenId = row.id != null ? String(row.id) : undefined;
+      // v132: tenant/mint metadata. undefined on pre-v132 brains (degraded
+      // projection above) and on grandfathered rows (columns NULL).
+      const companySlug = typeof row.company_slug === 'string' ? row.company_slug : undefined;
+      const rawExpiry = row.expires_at;
+      const expiryEpoch =
+        rawExpiry == null ? undefined : Math.floor(new Date(rawExpiry as string | Date).getTime() / 1000);
+      const tenantScoped = companySlug !== undefined || expiryEpoch !== undefined;
+      // Fail-closed expiry deny, validated against server UTC time on every
+      // request. A tenant row with a NULL/unparseable expiry is ALSO a deny
+      // — the synthetic 1-year fallback below is a grandfathered-token
+      // convenience and must never resurrect a tenant token whose expiry
+      // metadata is missing or damaged. Audited (redacted); the deny stands
+      // whether or not the audit row lands. Deliberately BEFORE the
+      // last_used_at update — a deny performs no writes beyond the audit row.
+      const expiryInvalid = expiryEpoch !== undefined && (Number.isNaN(expiryEpoch) || expiryEpoch <= now);
+      const tenantMissingExpiry = companySlug !== undefined && expiryEpoch === undefined;
+      if (expiryInvalid || tenantMissingExpiry) {
+        await writeAuthAudit(this.sql, {
+          decision: 'deny',
+          method: 'token_verify',
+          reason: tenantMissingExpiry ? 'invalid_token_metadata' : 'token_expired',
+          tokenId,
+          tokenName: name,
+          companySlug,
+        });
+        throw new InvalidTokenError('Token expired');
+      }
+      // Update last_used_at — grandfathered tokens only. Tenant-scoped
+      // tokens skip it entirely: a later gate deny (e.g. a write attempt)
+      // must leave zero non-audit writes behind, and the short-TTL rows
+      // don't need the observability nicety.
+      if (!tenantScoped) {
+        await this.sql`
+          UPDATE access_tokens SET last_used_at = now() WHERE token_hash = ${tokenHash}
+        `;
+      }
+      const permissions = coerceLegacyPermissions(row.permissions);
       const { sourceId, allowedSources } = parseLegacyTokenScope(permissions?.source_id);
       // #2529: thread the stored takes-holders grant, mirroring the legacy
       // HTTP transport's validateToken (both decode via coerceLegacyPermissions
@@ -952,20 +1011,55 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       // the scope store. NULL/absent (every token minted before this feature)
       // → grandfathered full access, byte-identical behavior. An array is
       // filtered to known scopes and honored as-is — including [] as deny.
-      const grantedScopes = normalizeTokenScopes(legacyRows[0].scopes);
+      const grantedScopes = normalizeTokenScopes(row.scopes);
       return {
         token,
         clientId: name,
         clientName: name,
+        // v132: server-derived token kind (this is the access_tokens branch)
+        // — a legacy token NAMED 'gbrain_cl_*' still reports as legacy.
+        tokenKind: 'legacy',
         scopes: grantedScopes ?? ['read', 'write', 'admin'],
-        expiresAt: Math.floor(Date.now() / 1000) + 365 * 24 * 3600, // Legacy tokens never expire — set 1yr future
+        // v132: tenant-scoped tokens carry their REAL server-side expiry;
+        // grandfathered tokens keep the historical synthetic 1yr-future value
+        // (they never expire; the SDK requires a numeric expiresAt).
+        expiresAt: expiryEpoch ?? Math.floor(Date.now() / 1000) + 365 * 24 * 3600,
         // Legacy tokens without an explicit permissions.source_id grant keep
         // the historical 'default' source floor. Array grants become
         // allowedSources for federated reads, matching legacy HTTP transport.
         sourceId,
         allowedSources,
         takesHoldersAllowList,
+        ...(companySlug !== undefined ? { companySlug } : {}),
+        ...(tokenId !== undefined ? { tokenId } : {}),
+        ...(tenantScoped ? { tenantScoped: true } : {}),
       } as CoreAuthInfo as SdkAuthInfo;
+    }
+
+    // v132: no ACTIVE row — distinguish a revoked token (auditable identity)
+    // from a token this brain has never seen. Revocation denies are part of
+    // the durable audit contract; unknown-token spray stays a transport-level
+    // concern (mcp_request_log auth_failed): there is no identity to record
+    // and no token material may ever be written. The probe degrades silently
+    // on pre-v132 brains.
+    try {
+      const revokedRows = await this.sql`
+        SELECT id, name, company_slug FROM access_tokens
+        WHERE token_hash = ${tokenHash} AND revoked_at IS NOT NULL
+      `;
+      if (revokedRows.length > 0) {
+        const r = revokedRows[0];
+        await writeAuthAudit(this.sql, {
+          decision: 'deny',
+          method: 'token_verify',
+          reason: 'token_revoked',
+          tokenId: r.id != null ? String(r.id) : undefined,
+          tokenName: typeof r.name === 'string' ? r.name : undefined,
+          companySlug: typeof r.company_slug === 'string' ? r.company_slug : undefined,
+        });
+      }
+    } catch {
+      /* pre-v132 projection or probe failure — the deny below stands. */
     }
 
     throw new InvalidTokenError('Invalid token');

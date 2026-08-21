@@ -5914,6 +5914,76 @@ export const MIGRATIONS: Migration[] = [
          );
     `,
   },
+  {
+    version: 132,
+    name: 'tenant_scoped_tokens_and_auth_audit',
+    // Server-derived tenant identity + scoped short-TTL minting + fail-closed
+    // auth audit (fork tenant-remediation lane).
+    //
+    // access_tokens gains three nullable columns:
+    //   - company_slug: server-stored tenant identity. whoami derives its
+    //     tenant answer from THIS column (never from anything the client
+    //     asserts). NULL = grandfathered legacy token → whoami keeps the
+    //     historical `transport: 'legacy'` marker and never fabricates a slug.
+    //   - expires_at: per-token expiry for the scoped short-TTL mint path
+    //     (mintScopedTenantToken caps TTL at 60 minutes). NULL = grandfathered
+    //     token, never expires (pre-existing behavior, unchanged on upgrade).
+    //   - minted_by: server-stamped minting principal (immutable actor
+    //     metadata for the audit trail; informational, never a trust input).
+    //
+    // auth_audit is the durable, REDACTED audit sink for auth decisions
+    //   (mint / verify / deny / revoke). Rows carry identifiers and reason
+    //   codes only — never raw token material or request payloads. Writes go
+    //   through src/core/auth-audit.ts, which enforces the fail-closed
+    //   contract (audit unavailable → tenant-scoped requests are DENIED, not
+    //   silently unaudited). Dedicated columns over a JSONB bag: the same
+    //   wipe-immunity argument as token-mint.ts's scopes-column decision, and
+    //   it keeps the writer scalar-only (no jsonb binding class).
+    //
+    // Columns are plain nullable adds with no new index on access_tokens (the
+    // verify path rides the existing idx_access_tokens_hash lookup); both
+    // verify paths carry an isUndefinedColumnError degrade rung so pre-v132
+    // brains keep verifying tokens (grandfathered semantics) until
+    // apply-migrations runs. RLS intentionally follows the newest-table
+    // precedent (v131 mcp_request_log_purged): not enabled here; the
+    // Supabase-facing doctor RLS sweep names any table that needs it.
+    idempotent: true,
+    sql: `
+      ALTER TABLE access_tokens ADD COLUMN IF NOT EXISTS company_slug TEXT;
+      ALTER TABLE access_tokens ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+      ALTER TABLE access_tokens ADD COLUMN IF NOT EXISTS minted_by TEXT;
+
+      -- Structural tenant invariants (drop-then-add idempotent pattern, v7
+      -- precedent). App-layer validation is the first line; these CHECKs make
+      -- a hand-edited or partially-written tenant row unrepresentable rather
+      -- than relying on every verify path to reject it: a tenant row must
+      -- carry a well-formed slug, a real expiry, and the exact read-only
+      -- grant. All-NULL grandfathered rows satisfy all three trivially.
+      ALTER TABLE access_tokens DROP CONSTRAINT IF EXISTS chk_access_tokens_company_slug_format;
+      ALTER TABLE access_tokens ADD CONSTRAINT chk_access_tokens_company_slug_format
+        CHECK (company_slug IS NULL OR company_slug ~ '^[a-z0-9][a-z0-9-]{0,62}$');
+      ALTER TABLE access_tokens DROP CONSTRAINT IF EXISTS chk_access_tokens_tenant_expiry;
+      ALTER TABLE access_tokens ADD CONSTRAINT chk_access_tokens_tenant_expiry
+        CHECK ((company_slug IS NULL AND expires_at IS NULL AND minted_by IS NULL) OR (company_slug IS NOT NULL AND expires_at IS NOT NULL AND minted_by IS NOT NULL));
+      ALTER TABLE access_tokens DROP CONSTRAINT IF EXISTS chk_access_tokens_tenant_read_only;
+      ALTER TABLE access_tokens ADD CONSTRAINT chk_access_tokens_tenant_read_only
+        CHECK (company_slug IS NULL OR (scopes IS NOT NULL AND scopes = ARRAY['read']::text[]));
+
+      CREATE TABLE IF NOT EXISTS auth_audit (
+        id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        correlation_id TEXT NOT NULL,
+        decision       TEXT NOT NULL,
+        method         TEXT,
+        reason         TEXT,
+        token_id       TEXT,
+        token_name     TEXT,
+        company_slug   TEXT,
+        actor          TEXT,
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_auth_audit_created ON auth_audit (created_at DESC);
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

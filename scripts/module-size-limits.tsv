@@ -4,7 +4,7 @@
 # the same commit as any peel (the guard fails on >50 lines of stale slack).
 # Columns: path	max_lines	policy	note
 src/commands/doctor.ts	4270	ratchet	peel target: containment sprint C8-C13; grown v0.46.11.0 five-issue wave
-src/core/operations.ts	303	ratchet	peel target: containment sprint C4-C7
+src/core/operations.ts	312	ratchet	peel target: containment sprint C4-C7; +9 tenant lane (authTokenOperations splice + OP_AREAS)
 src/core/postgres-engine.ts	5770	ratchet	peel target: containment sprint C15; grown v0.46.11.0 five-issue wave
 src/core/pglite-engine.ts	5660	ratchet	peel target: containment sprint C15; grown v0.46.11.0 five-issue wave
 src/core/migrate.ts	668	region-exempt	append-only MIGRATIONS array grows freely; runner logic is ratcheted
@@ -12,7 +12,7 @@ src/commands/sync.ts	4300	ratchet	peel target: containment sprint C13-C14; grown
 src/core/ai/gateway.ts	4120	ratchet	KOM merge bff23a: retain single-input over-context handling beside upstream batch-limit retry; peel retry policy next
 src/cli.ts	3388	ratchet	KOM merge bff23a: retain search-output redaction at the upstream dispatch seam; logic remains in core/search/output-redaction.ts
 src/core/cycle.ts	2948	ratchet	KOM merge bff23a: retain MCP request-log TTL purge and audit counter; retention logic is isolated in core/mcp-request-log-retention.ts
-src/commands/serve-http.ts	2900	ratchet	KOM merge bff23a: retain purged request-counter reconciliation while preserving upstream OAuth routes; extract admin-client query builder next
+src/commands/serve-http.ts	3010	ratchet	KOM merge bff23a: retain purged request-counter reconciliation while preserving upstream OAuth routes; extract admin-client query builder next; +47 tenant lane pre-handler auth gate
 src/commands/jobs.ts	2950	ratchet	grown v0.46.11.0 five-issue wave
 src/core/search/hybrid.ts	2479	ratchet
 src/core/engine.ts	2364	ratchet	KOM merge bff23a: retain embed-skip engine contract; marker construction lives in core/embed-skip.ts
@@ -33,3 +33,5 @@ src/core/minions/worker.ts	1560	ratchet	grandfathered at merge (grew past the 15
 src/commands/sources.ts	1586	ratchet
 src/core/bootstrap/harness.ts	1947	ratchet
 src/commands/hook.ts	1525	ratchet
+src/core/oauth-provider.ts	1565	ratchet	tenant lane: v132 legacy projection + expiry deny + revoked-deny audit pushed it over the unlisted 1500 cap; peel token verification next
+src/core/schema-embedded.ts	1535	ratchet	AUTO-GENERATED from schema.sql (build:schema); grows with every schema table — never hand-peel

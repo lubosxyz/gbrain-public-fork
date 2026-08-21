@@ -56,6 +56,8 @@ import { buildError, serializeError } from '../core/errors.ts';
 import { VERSION } from '../version.ts';
 import * as db from '../core/db.ts';
 import { sqlQueryForEngine, executeRawJsonb } from '../core/sql-query.ts';
+import { gateRemoteToolCall } from '../core/auth-gate.ts';
+import { writeAuthAudit } from '../core/auth-audit.ts';
 import { MinionQueue } from '../core/minions/queue.ts';
 import { isRetryableError } from '../core/retry-matcher.ts';
 import {
@@ -1778,6 +1780,27 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const hash = hashToken(token);
       const id = (await import('crypto')).randomUUID();
       await sql`INSERT INTO access_tokens (id, name, token_hash) VALUES (${id}, ${name}, ${hash})`;
+      // v132: the admin-console mint is a legacy-token lane (no tenant
+      // metadata, no expiry — grandfathered semantics by design), but it is
+      // FAIL-CLOSED on audit: an issued credential must have a durable audit
+      // record. If the audit write fails, revoke the just-created row and
+      // return 503 rather than hand out an unaudited token.
+      const mintAudit = await writeAuthAudit(sql, {
+        decision: 'mint',
+        method: 'admin_api_keys',
+        reason: 'legacy_admin_console_mint',
+        tokenId: id,
+        tokenName: name,
+        actor: 'admin_console',
+      });
+      if (!mintAudit.ok) {
+        try { await sql`UPDATE access_tokens SET revoked_at = now() WHERE id = ${id}::uuid`; } catch { /* best effort */ }
+        res.status(503).json({
+          error: 'audit_unavailable',
+          message: 'auth audit is unavailable; the token was revoked and not issued (fail-closed).',
+        });
+        return;
+      }
       res.json({ name, token, id });
     } catch (e) {
       res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to create API key' });
@@ -1788,7 +1811,24 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     try {
       const { name } = req.body;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
-      await sql`UPDATE access_tokens SET revoked_at = now() WHERE name = ${name} AND revoked_at IS NULL`;
+      const revokedRows = await sql`
+        UPDATE access_tokens SET revoked_at = now()
+        WHERE name = ${name} AND revoked_at IS NULL
+        RETURNING id
+      `;
+      // v132: audit the admin-console revoke — ONE row PER revoked token
+      // (names are not unique; a by-name revoke may sweep several rows,
+      // tenant tokens included, and each needs its own durable record).
+      for (const r of revokedRows) {
+        await writeAuthAudit(sql, {
+          decision: 'revoke',
+          method: 'admin_api_keys_revoke',
+          reason: 'legacy_admin_console_revoke',
+          tokenId: r.id != null ? String(r.id) : undefined,
+          tokenName: name,
+          actor: 'admin_console',
+        });
+      }
       res.json({ revoked: true });
     } catch (e) {
       res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
@@ -2085,9 +2125,65 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
+  // v132: parse the JSON-RPC body BEFORE the handler so the tenant auth gate
+  // can classify the method/tool without consuming the stream the SDK
+  // transport needs. `transport.handleRequest(req, res, req.body)` already
+  // consumes this pre-parsed body (it was undefined before — the transport
+  // fell back to reading the raw stream), so populating it here is
+  // transport-safe. Generous limit: MCP tool arguments (e.g. put_page
+  // content) can be large; a smaller cap would reject legitimate calls.
+  const mcpJsonParser = express.json({ limit: process.env.GBRAIN_HTTP_MAX_BODY_BYTES || '25mb' });
+  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), mcpJsonParser, async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
+
+    // v132 tenant-remediation lane: ONE shared pre-handler auth gate for the
+    // WHOLE JSON-RPC surface — initialize, tools/list, tools/call,
+    // notifications, everything — evaluated before the SDK transport sees
+    // the request. A no-op for OAuth clients and grandfathered legacy tokens
+    // (byte-identical behavior below); for tenant-scoped short-TTL tokens it
+    // re-reads the token row (revocation/expiry/grant/identity re-validated
+    // against server state) and requires a durably written redacted audit
+    // row BEFORE anything runs — audit timeout or persistence failure is a
+    // DENY, never a silent allow; with the audit sink down a tenant token
+    // gets nothing, not even the handshake. The deny path performs NO
+    // writes beyond the audit row: no mcp_request_log row, no SSE
+    // broadcast, no handler. Scope classification reads the FULL operations
+    // registry (a surface-hidden write op denies as insufficient_scope, it
+    // never audits as an allowed read); non-tools/call methods classify as
+    // reads. Raw method/tool-name strings are sanitized at the audit-writer
+    // boundary, so a pasted secret can never land in the audit or alerts.
+    if (authInfo.tenantScoped === true) {
+      const rpcBody = req.body as { method?: unknown; params?: { name?: unknown }; id?: unknown } | undefined;
+      const rpcMethod = typeof rpcBody?.method === 'string' ? rpcBody.method : 'unknown_operation';
+      const toolName =
+        rpcMethod === 'tools/call' && typeof rpcBody?.params?.name === 'string'
+          ? rpcBody.params.name
+          : undefined;
+      const gateOp = toolName !== undefined ? operations.find(o => o.name === toolName) : undefined;
+      const gateScope = toolName !== undefined ? (gateOp?.scope ?? 'read') : 'read';
+      const gate = await gateRemoteToolCall(
+        sqlQueryForEngine(engine),
+        authInfo,
+        toolName ?? rpcMethod,
+        gateScope,
+      );
+      if (!gate.allow) {
+        res.status(403).json({
+          jsonrpc: '2.0',
+          id: (rpcBody?.id as string | number | null | undefined) ?? null,
+          error: {
+            code: -32000,
+            message: `Denied by the auth gate (${gate.reason ?? 'denied'}).`,
+            data: {
+              error: gate.reason === 'audit_unavailable' ? 'audit_unavailable' : 'permission_denied',
+              correlation_id: gate.correlationId,
+            },
+          },
+        });
+        return;
+      }
+    }
 
     // Human-readable agent name is now threaded through AuthInfo by
     // verifyAccessToken (which JOINs oauth_clients in its existing token
@@ -2121,6 +2217,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       //      hiccup costs at most the 4 gated tools, never the whole list.
       // Call-time enforcement (hasScope / fence / assertPublishEnabled)
       // stays as the fail-closed backstop for all three layers.
+      // (v132: tenant tokens were already gated at the top of the /mcp
+      // handler — every JSON-RPC method, tools/list included.)
       // Both per-request config reads are independent — issue them
       // concurrently (one RTT of latency on network Postgres, not two).
       const [gateDisabled, strictParamsMode] = await Promise.all([
@@ -2176,6 +2274,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: params } = request.params;
       const op = mcpOperations.find(o => o.name === name);
+      // (v132: tenant tokens were already gated — with the tool's true
+      // scope from the full registry — at the top of the /mcp handler; the
+      // dispatch call below passes tenantGateDone so the shared backstop
+      // doesn't double-audit.)
+
       if (!op) {
         // v0.28.10: persist unknown-op attempts. Operators investigating
         // misbehaving agents need to see the full attempt log, not just
@@ -2317,6 +2420,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           // but forgot to pass authInfo; whoami fell through to the
           // unknown_transport throw because ctx.auth was undefined.
           auth: authInfo,
+          // v132: this transport already ran gateRemoteToolCall above —
+          // suppress the dispatcher's backstop so the decision isn't
+          // double-audited.
+          tenantGateDone: true,
           logger: {
             info: (msg: string) => console.error(`[INFO] ${msg}`),
             warn: (msg: string) => console.error(`[WARN] ${msg}`),

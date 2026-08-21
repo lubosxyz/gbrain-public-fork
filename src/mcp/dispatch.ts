@@ -13,6 +13,8 @@ import { loadConfig } from '../core/config.ts';
 import { VERB_NAMES, MEMORY_VERBS_VERSION } from '../core/verbs.ts';
 import { logVerbUsage } from '../core/verbs/usage-log.ts';
 import { sourceGuardBlocksWrite } from '../core/source-resolver.ts';
+import { gateRemoteToolCall } from '../core/auth-gate.ts';
+import { sqlQueryForEngine } from '../core/sql-query.ts';
 import { suggestNearest } from '../core/levenshtein.ts';
 import {
   normalizeOptionalParams,
@@ -111,6 +113,16 @@ export interface DispatchOpts {
     name: string,
     ctx: OperationContext,
   ) => Promise<Record<string, unknown> | undefined>;
+  /**
+   * v132 tenant-remediation lane: set true by a transport that ALREADY ran
+   * `gateRemoteToolCall` for this call (both HTTP transports do, so they can
+   * shape their own deny envelope and skip request-log/SSE side effects).
+   * When absent/false and the caller is tenant-scoped, dispatchToolCall runs
+   * the gate itself as a fail-closed backstop — the shared dispatcher is the
+   * choke point, so a future or internal transport cannot reach a handler
+   * ungated by omission.
+   */
+  tenantGateDone?: boolean;
   /**
    * OAuth auth info threaded through from the HTTP MCP transport. Set so
    * the whoami op (and any future scope-aware op handlers) can introspect
@@ -432,14 +444,43 @@ export async function dispatchToolCall(
     });
   };
 
+  const op = operations.find(o => o.name === name);
+
+  // v132 tenant-remediation lane: fail-closed backstop for tenant-scoped
+  // tokens, evaluated FIRST — before the unknown-op, localOnly, and every
+  // other early-return branch — so EVERY dispatch attempt on the tenant
+  // path is an audited auth decision. Both HTTP transports gate before
+  // dispatch (and mark tenantGateDone so the decision isn't double-audited);
+  // any other caller that threads a tenant-scoped auth without gating is
+  // gated HERE, before validation or handler code runs. Scope
+  // classification uses the FULL op registry (unknown names classify as
+  // 'read' — they can never reach a handler anyway). Deny returns the
+  // standard error envelope with the audit correlation id.
+  if (opts.auth?.tenantScoped === true && opts.tenantGateDone !== true) {
+    const gate = await gateRemoteToolCall(sqlQueryForEngine(engine), opts.auth, name, op?.scope ?? 'read');
+    if (!gate.allow) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            error: gate.reason === 'audit_unavailable' ? 'audit_unavailable' : 'permission_denied',
+            message: `Operation ${name} denied by the auth gate (${gate.reason ?? 'denied'}).`,
+            correlation_id: gate.correlationId,
+          }),
+        }],
+        isError: true,
+      };
+    }
+  }
+
   // [c2] surface enforcement at the SHARED layer: a hidden op is uncallable
   // on every transport, not just unlisted. Same envelope as unknown ops so
-  // the surface doesn't leak which names exist.
+  // the surface doesn't leak which names exist. (Runs AFTER the tenant
+  // backstop above so every tenant dispatch attempt is an audited decision.)
   if (opts.allowedOps && !opts.allowedOps.has(name)) {
     return unknownToolEnvelope(name, opts.allowedOps);
   }
 
-  const op = operations.find(o => o.name === name);
   if (!op) {
     // Always return JSON-shaped error content. v0.31 e2e tests
     // (sources-remote-mcp.test.ts) parse content via JSON.parse so a

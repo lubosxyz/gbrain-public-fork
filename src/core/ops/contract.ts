@@ -237,6 +237,44 @@ export interface AuthInfo {
    * unset or the projection degraded.
    */
   surfaceSetBy?: string;
+  /**
+   * v132: which VERIFICATION BRANCH authenticated this caller — 'oauth'
+   * (oauth_tokens row) or 'legacy' (access_tokens row). Set at
+   * token-verification time by both verify paths so identity consumers
+   * (whoami) never have to infer the token kind from the caller-chosen
+   * name/clientId (a legacy token NAMED like an OAuth client id must not
+   * masquerade). Undefined on contexts that predate the field (whoami then
+   * falls back to the historical clientId-prefix heuristic).
+   */
+  tokenKind?: 'oauth' | 'legacy';
+  /**
+   * v132 tenant-remediation lane: SERVER-verified tenant identity from
+   * `access_tokens.company_slug`, threaded at token-verification time.
+   * This is the ONLY tenant source whoami (or any consumer) may report —
+   * it derives from the authenticated token's DB row, never from anything
+   * the client asserts. Undefined = grandfathered legacy token (no tenant
+   * metadata) or a brain whose projection degraded pre-v132; consumers
+   * MUST fall back to the historical `transport: 'legacy'` marker and
+   * never fabricate a slug.
+   */
+  companySlug?: string;
+  /**
+   * v132: `access_tokens.id` of the verified legacy-table token row.
+   * Threaded so the auth gate and audit trail can reference the token by
+   * its immutable row id (names are not unique) without re-querying.
+   * Undefined for OAuth tokens and degraded projections.
+   */
+  tokenId?: string;
+  /**
+   * v132: true when the verified token row carries tenant/mint metadata
+   * (company_slug or expires_at non-NULL) — i.e. it was minted through the
+   * scoped short-TTL path. Selects the FAIL-CLOSED auth posture: the serve
+   * gate requires a durably written audit row before dispatching, denies
+   * any non-read operation pre-handler, and treats audit unavailability as
+   * deny. Grandfathered tokens (undefined/false) keep their historical
+   * best-effort behavior — backward compatibility for existing fleets.
+   */
+  tenantScoped?: boolean;
 }
 
 export interface OperationContext {

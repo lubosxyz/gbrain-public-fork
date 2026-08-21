@@ -2,6 +2,53 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.46.12.4] - 2026-08-21
+
+**The MCP server can now hand out short-lived, read-only tokens whose tenant identity it vouches for itself.**
+
+Until now a remote MCP caller told gbrain who it was, and `whoami` mostly echoed that back. If you run one gbrain server per company and want the server, not the client, to be the source of truth for "which company is this," there was no clean way to get it. This release adds that: an operator (or an admin-level token) can mint a token bound to a company slug that the server stores and reports. The caller cannot set, change, or invent its own tenant. Tokens minted this way are read-only and expire in an hour or less, so a leaked one is a small, short window, not a standing key.
+
+Nothing changes for the tokens you already have. Existing bearer tokens keep working exactly as before: no expiry, same scopes, same `whoami` answer. The new behavior only turns on for tokens minted through the new path.
+
+**How to use it**
+
+Mint a scoped token (operator/local, or an admin-scoped MCP token):
+
+    gbrain token-mint-scoped <name> <company-slug> --ttl-seconds 3600
+
+It prints the token once. Wire it immediately; the server stores only a hash. Revoke by id:
+
+    gbrain token-revoke <id>
+
+Over MCP the same two operations are `token_mint_scoped` and `token_revoke` (admin scope). A scoped token calling `whoami` gets back `{transport: "tenant", company_slug, ...}` with the slug the server stored, never one the caller supplied.
+
+**What you'd see**
+
+| Token kind | `whoami` transport | Expires? | Can it write? |
+|---|---|---|---|
+| Existing bearer token | `legacy` | no (unchanged) | yes (unchanged) |
+| New scoped token | `tenant` | yes, <= 60 min | no, read-only |
+| OAuth client | `oauth` | per client | per scope |
+
+**Things to watch**
+
+Run `gbrain apply-migrations` on the brain after upgrade. It adds the token columns and an audit table; existing tokens are untouched. Every auth decision on the scoped-token path (mint, verify, deny, revoke) is written to a durable, redacted audit trail that records identifiers and reason codes only, never token values. If that audit cannot be written, the request is denied rather than served, and a freshly minted token that cannot be audited is revoked instead of handed out. This is a deploy-time posture: the host controller rolls it out; nothing here reaches out or deploys on its own.
+
+**What we caught and fixed before merging**
+
+The design went through several rounds of adversarial review. Findings we closed: the tenant check now reads the live token row on every call, so a revoked or expired token stops working immediately rather than at the next handshake; the audit trail is the one place all four decision types land, and untrusted input can never ride into it; and the one server path that could have skipped the check on the initial handshake now gates every message.
+
+### Itemized changes
+
+- Migration v132 (`tenant_scoped_tokens_and_auth_audit`): adds nullable `company_slug`/`expires_at`/`minted_by` to `access_tokens` (all-NULL = grandfathered, unchanged) with all-or-none + read-only + slug-format CHECK constraints, and the `auth_audit` table. Mirrored in `src/schema.sql` + `src/core/pglite-schema.ts`; both verify paths carry an undefined-column degrade rung for pre-v132 brains.
+- `src/core/token-mint.ts`: `mintScopedTenantToken` (validate-before-write: slug format, integer TTL 1..3600 deny-not-clamp, exact `['read']`, server-time `expires_at`; `ScopedMintDenied` with stable reason codes, zero rows on deny).
+- `src/core/auth-audit.ts`: `writeAuthAudit` (durable redacted row + 2s hard timeout + fail-closed `ok:false`; sanitizes method/reason/slug at the boundary so no caller value reaches the row/alert; timeout-superseded correction row) + `createAuthAlertSink` (bounded, deduped, rate-limited, in-process).
+- `src/core/auth-gate.ts`: `gateRemoteToolCall` — server-authoritative pre-handler resolver keyed on `(id AND token_hash)` with tenant-identity binding, server-time expiry, exact-read grant from the row, read-only dispatch, audited-allow.
+- `src/core/ops/auth-tokens.ts`: `token_mint_scoped` + `token_revoke` ops (admin scope; principal allowlist; fail-closed mint audit; a scoped token can never mint/revoke).
+- `whoami` (`src/core/ops/sources.ts`) gains the `tenant` shape; token kind is server-stamped (`AuthInfo.tokenKind`) so a legacy token named like an OAuth client can't masquerade.
+- Both HTTP MCP transports (`src/commands/serve-http.ts` production OAuth path, `src/mcp/http-transport.ts` legacy bearer) gate every JSON-RPC method on the tenant path; the shared dispatcher (`src/mcp/dispatch.ts`) runs the gate as a fail-closed backstop. CLI `auth create`/`revoke` and the admin-console token endpoints are audited (admin mint is fail-closed).
+- Tests: `test/tenant-token-minting.test.ts` (RED/GREEN unit matrix + dispatch backstop) and `test/e2e/serve-http-tenant.test.ts` (production `gbrain serve --http` allow/deny/audit-down/expired).
+
 ## [0.46.12.3] - 2026-08-16
 
 **Supply-chain hardening for how gbrain updates and how community code lands.**
