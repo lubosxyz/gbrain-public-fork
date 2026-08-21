@@ -30,6 +30,9 @@ import type { BrainEngine } from '../core/engine.ts';
 import { buildToolDefs } from './tool-defs.ts';
 import { operations } from '../core/operations.ts';
 import type { AuthInfo } from '../core/operations.ts';
+import { gateRemoteToolCall } from '../core/auth-gate.ts';
+import { writeAuthAudit } from '../core/auth-audit.ts';
+import { isUndefinedColumnError } from '../core/utils.ts';
 import { VERSION } from '../version.ts';
 import { dispatchToolCall, requestLogStatusForResult } from './dispatch.ts';
 import { parseStrictParamsMode } from './validate-params.ts';
@@ -38,7 +41,7 @@ import { disabledOpsForPublishGates } from './publish-gates.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
-import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions } from '../core/legacy-token-scope.ts';
+import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions, normalizeTokenScopes } from '../core/legacy-token-scope.ts';
 export { parseLegacyTokenScope };
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
@@ -79,6 +82,14 @@ interface HttpTransportOptions {
 
 interface AuthResult {
   ok: boolean;
+  /**
+   * v132: the deny was a TENANT-token auth decision already recorded in
+   * auth_audit (expired / revoked / damaged metadata). The 401 branch skips
+   * its `mcp_request_log(auth_failed)` write for these — a tenant deny
+   * writes nothing beyond its audit row. Grandfathered denies keep the
+   * historical request-log behavior.
+   */
+  tenantDeny?: boolean;
   tokenId?: string;
   tokenName?: string;
   /** v0.28: per-token allow-list for takes.holder. Default ['world'] when permissions row absent. */
@@ -230,20 +241,88 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
     const token = authHeader.slice(7);
     const hash = hashToken(token);
     try {
-      const [row] = await sql`
-        SELECT id, name, permissions FROM access_tokens
-        WHERE token_hash = ${hash} AND revoked_at IS NULL
-      `;
-      if (!row) return { ok: false };
+      // v132 tenant-remediation lane: read tenant/mint metadata too. The
+      // degrade rung fires ONLY on a missing column (pre-v132 brain,
+      // grandfathered semantics) — any other error is a fail-closed deny.
+      // A broad catch here would let a transient error reclassify a tenant
+      // token as a grandfathered full-access bearer.
+      let row: Record<string, unknown> | undefined;
+      try {
+        [row] = await sql`
+          SELECT id, name, permissions, scopes, company_slug, expires_at FROM access_tokens
+          WHERE token_hash = ${hash} AND revoked_at IS NULL
+        `;
+      } catch (err) {
+        if (
+          !isUndefinedColumnError(err, 'company_slug') &&
+          !isUndefinedColumnError(err, 'expires_at') &&
+          !isUndefinedColumnError(err, 'scopes')
+        ) {
+          return { ok: false };
+        }
+        [row] = await sql`
+          SELECT id, name, permissions FROM access_tokens
+          WHERE token_hash = ${hash} AND revoked_at IS NULL
+        `;
+      }
+      if (!row) {
+        // v132: distinguish a revoked token (auditable identity) from an
+        // unknown one, mirroring verifyAccessToken. Degrades silently on
+        // pre-v132 brains; the deny below stands either way.
+        try {
+          const [revoked] = await sql`
+            SELECT id, name, company_slug FROM access_tokens
+            WHERE token_hash = ${hash} AND revoked_at IS NOT NULL
+          `;
+          if (revoked) {
+            const revokedSlug = typeof revoked.company_slug === 'string' ? revoked.company_slug : undefined;
+            await writeAuthAudit(sql, {
+              decision: 'deny',
+              method: 'token_verify',
+              reason: 'token_revoked',
+              tokenId: revoked.id != null ? String(revoked.id) : undefined,
+              tokenName: typeof revoked.name === 'string' ? revoked.name : undefined,
+              companySlug: revokedSlug,
+            });
+            if (revokedSlug !== undefined) return { ok: false, tenantDeny: true };
+          }
+        } catch { /* pre-v132 projection — unaudited deny stands */ }
+        return { ok: false };
+      }
       const rowId = row.id as string;
       const rowName = row.name as string;
-      // Debounced last_used_at update — only writes once per token per 60s.
+      const companySlug = typeof row.company_slug === 'string' ? row.company_slug : undefined;
+      // v132: server-time expiry enforcement for tenant-scoped short-TTL
+      // tokens (expires_at NULL = grandfathered, never expires — but a
+      // tenant row missing its expiry is a deny, never a grant). Audited,
+      // fail-closed, BEFORE the last_used_at touch — a deny performs no
+      // writes here beyond the audit row.
+      const rawExpiry = row.expires_at;
+      const expMs = rawExpiry == null ? undefined : new Date(rawExpiry as string | Date).getTime();
+      const expiryInvalid = expMs !== undefined && (Number.isNaN(expMs) || expMs <= Date.now());
+      const tenantMissingExpiry = companySlug !== undefined && expMs === undefined;
+      if (expiryInvalid || tenantMissingExpiry) {
+        await writeAuthAudit(sql, {
+          decision: 'deny',
+          method: 'token_verify',
+          reason: tenantMissingExpiry ? 'invalid_token_metadata' : 'token_expired',
+          tokenId: rowId,
+          tokenName: rowName,
+          companySlug,
+        });
+        return { ok: false, tenantDeny: true };
+      }
+      const tenantScoped = companySlug !== undefined || rawExpiry != null;
+      // Debounced last_used_at update — grandfathered tokens only (tenant
+      // rows must leave zero non-audit writes behind a later gate deny).
       // SQL-level WHERE clause keeps this race-tolerant even under concurrent requests.
-      sql`UPDATE access_tokens
-          SET last_used_at = now()
-          WHERE id = ${rowId}
-            AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')`
-        .catch(() => { /* fire-and-forget */ });
+      if (!tenantScoped) {
+        sql`UPDATE access_tokens
+            SET last_used_at = now()
+            WHERE id = ${rowId}
+              AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')`
+          .catch(() => { /* fire-and-forget */ });
+      }
       // v0.28: extract per-token takes-holder allow-list. Fail-safe default
       // is ['world'] — a token with no permissions row sees public claims only.
       // #2529: decode + parse via the shared core helpers so this transport and
@@ -259,9 +338,24 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         token,
         clientId: rowId,
         clientName: rowName,
-        scopes: [],
+        // v132: server-derived token kind (this transport only verifies
+        // access_tokens rows).
+        tokenKind: 'legacy',
+        // v132: tenant-scoped tokens thread their REAL stored grant (the
+        // gate requires exactly ['read']); grandfathered tokens keep this
+        // transport's historical empty-scopes behavior byte-identical.
+        scopes: tenantScoped ? (normalizeTokenScopes(row.scopes) ?? []) : [],
         sourceId,
         ...(allowedSources ? { allowedSources } : {}),
+        // v132: tenant threading — whoami reports company_slug from HERE
+        // (server-derived), and the shared auth gate keys its fail-closed
+        // posture off tenantScoped.
+        ...(companySlug !== undefined ? { companySlug } : {}),
+        tokenId: rowId,
+        ...(tenantScoped ? { tenantScoped: true } : {}),
+        ...(rawExpiry != null
+          ? { expiresAt: Math.floor(new Date(rawExpiry as string | Date).getTime() / 1000) }
+          : {}),
       };
       return {
         ok: true,
@@ -352,7 +446,12 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       // Auth.
       const auth = await validateToken(req.headers.get('Authorization'));
       if (!auth.ok) {
-        logRequest(null, 'unknown', 'auth_failed', Date.now() - startedMs);
+        // v132: a tenant deny is already durably recorded in auth_audit and
+        // must leave no other writes behind; grandfathered/unknown denies
+        // keep the historical auth_failed request-log row.
+        if (!auth.tenantDeny) {
+          logRequest(null, 'unknown', 'auth_failed', Date.now() - startedMs);
+        }
         return Response.json(
           { error: 'invalid_token', message: 'Bearer token required. Create one: gbrain auth create <name>' },
           { status: 401, headers: corsHeaders(origin) },
@@ -385,6 +484,25 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       }
 
       const { method, params, id } = body;
+
+      // v132 tenant-remediation lane: on the tenant path EVERY MCP method is
+      // an audited auth decision — initialize and tools/list included (with
+      // the audit sink down, a tenant token gets nothing, not even the
+      // handshake or the catalog). No-op for grandfathered tokens. The deny
+      // path emits no request-log row (the audit row is the record).
+      if (auth.auth?.tenantScoped === true && (method === 'initialize' || method === 'tools/list')) {
+        const methodGate = await gateRemoteToolCall(sql, auth.auth, method, 'read');
+        if (!methodGate.allow) {
+          return Response.json(
+            {
+              error: methodGate.reason === 'audit_unavailable' ? 'audit_unavailable' : 'permission_denied',
+              message: `${method} denied by the auth gate (${methodGate.reason ?? 'denied'}).`,
+              correlation_id: methodGate.correlationId,
+            },
+            { status: 403, headers: corsHeaders(origin) },
+          );
+        }
+      }
 
       // initialize
       if (method === 'initialize') {
@@ -435,6 +553,41 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       if (method === 'tools/call') {
         const toolName: string = params?.name ?? 'unknown';
         const args: Record<string, unknown> = params?.arguments ?? {};
+        // v132 tenant-remediation lane: the same shared pre-handler auth gate
+        // as the OAuth transport (no-op for grandfathered tokens; row
+        // re-check + fail-closed expiry + exact-['read'] + audited-allow for
+        // tenant-scoped tokens). Deny writes NOTHING beyond the audit row —
+        // no request-log entry, no dispatch.
+        // Scope classification for the gate reads the FULL operations list,
+        // not the surface-filtered set (a surface-hidden write op must deny
+        // as insufficient_scope, not audit as a read).
+        const calledOp = operations.find(o => o.name === toolName);
+        const gate = await gateRemoteToolCall(
+          sql,
+          auth.auth,
+          toolName,
+          calledOp?.scope ?? 'read',
+        );
+        if (!gate.allow) {
+          return Response.json(
+            {
+              result: {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    error: gate.reason === 'audit_unavailable' ? 'audit_unavailable' : 'permission_denied',
+                    message: `Operation ${toolName} denied by the auth gate (${gate.reason ?? 'denied'}).`,
+                    correlation_id: gate.correlationId,
+                  }),
+                }],
+                isError: true,
+              },
+              jsonrpc: '2.0',
+              id,
+            },
+            { headers: corsHeaders(origin) },
+          );
+        }
         // v0.28: thread per-token takes-holder allow-list so takes_list /
         // takes_search / query (when it returns takes) can server-side filter.
         // v0.34.1 (#861): thread source-isolation scope. Legacy access_tokens
@@ -462,6 +615,10 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
           auth: auth.auth,
           // MEMORY_VERBS v1 [c1/c2]: fail-closed surface enforcement here too.
           ...(surfaceAllowedOps ? { allowedOps: surfaceAllowedOps } : {}),
+          // v132: this transport already ran gateRemoteToolCall above —
+          // suppress the dispatcher's backstop so the decision isn't
+          // double-audited.
+          tenantGateDone: true,
           surface,
           // WP4 (D2): this transport has no per-client rows, so its surface
           // IS the ceiling request_tools bounds catalog + persist by.

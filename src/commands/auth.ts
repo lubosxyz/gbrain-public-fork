@@ -27,6 +27,7 @@ import { assertAllowedScopes } from '../core/scope.ts';
 import { TOKEN_ID_RE } from '../core/token-mint.ts';
 import { normalizeTokenScopes } from '../core/legacy-token-scope.ts';
 import { sqlQueryForEngine, executeRawJsonb, type SqlQuery } from '../core/sql-query.ts';
+import { writeAuthAudit } from '../core/auth-audit.ts';
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -104,23 +105,36 @@ async function create(name: string, opts: { takesHolders?: string[]; scopes?: st
       // via an array literal through a TEXT param — values are allowlisted,
       // so the literal needs no quoting and runs identically on both engines.
       // Omitted → NULL → the historical grandfathered full-access grant.
+      let newId: string | undefined;
       if (opts.scopes !== undefined) {
-        await executeRawJsonb(
+        const rows = await executeRawJsonb<{ id: string }>(
           engine,
           `INSERT INTO access_tokens (name, token_hash, permissions, scopes)
-           VALUES ($1, $2, $4::jsonb, $3::text[])`,
+           VALUES ($1, $2, $4::jsonb, $3::text[]) RETURNING id`,
           [name, hash, `{${opts.scopes.join(',')}}`],
           [permissions],
         );
+        newId = rows[0]?.id;
       } else {
-        await executeRawJsonb(
+        const rows = await executeRawJsonb<{ id: string }>(
           engine,
           `INSERT INTO access_tokens (name, token_hash, permissions)
-           VALUES ($1, $2, $3::jsonb)`,
+           VALUES ($1, $2, $3::jsonb) RETURNING id`,
           [name, hash],
           [permissions],
         );
+        newId = rows[0]?.id;
       }
+      // v132: audit the local CLI mint (best-effort — a local operator mint
+      // keeps its historical availability; degrades silently on pre-v132
+      // brains without an auth_audit table).
+      await writeAuthAudit(sqlQueryForEngine(engine), {
+        decision: 'mint',
+        method: 'cli_auth_create',
+        tokenId: newId,
+        tokenName: name,
+        actor: 'local_operator',
+      });
       const scopeLine = opts.scopes !== undefined
         ? `scopes=${JSON.stringify(opts.scopes)}`
         : 'scopes=full access (grandfathered — pass --scopes read,write to narrow)';
@@ -225,11 +239,26 @@ async function revoke(name: string) {
     const rows = await sql`
       UPDATE access_tokens SET revoked_at = now()
       WHERE name = ${name} AND revoked_at IS NULL
-      RETURNING 1
+      RETURNING id
     `;
     if (rows.length === 0) {
       console.error(`No active token found with name "${name}".`);
       process.exit(1);
+    }
+    // v132: every revocation lands in the durable auth audit, one row per
+    // revoked token (names are not unique; id is the durable link — the
+    // audit reader joins tenant metadata from the token row). Best-effort —
+    // revocation only narrows access; a failed audit write alerts but never
+    // un-revokes, and a pre-v132 brain (no auth_audit table) degrades inside
+    // writeAuthAudit without breaking the revoke.
+    for (const r of rows) {
+      await writeAuthAudit(sql, {
+        decision: 'revoke',
+        method: 'cli_auth_revoke',
+        tokenId: r.id != null ? String(r.id) : undefined,
+        tokenName: name,
+        actor: 'local_operator',
+      });
     }
     if (rows.length > 1) {
       console.log(`Note: ${rows.length} active tokens carried the name "${name}" — all revoked. Use revoke --id for precision.`);
@@ -257,6 +286,14 @@ async function revokeById(id: string) {
       console.error(`No active token found with id "${id}".`);
       process.exit(1);
     }
+    // v132: durable audit for the by-id CLI revoke (best-effort — see revoke()).
+    await writeAuthAudit(sql, {
+      decision: 'revoke',
+      method: 'cli_auth_revoke',
+      tokenId: id,
+      tokenName: typeof rows[0].name === 'string' ? (rows[0].name as string) : undefined,
+      actor: 'local_operator',
+    });
     console.log(`Token "${rows[0].name}" (${id}) revoked.`);
   });
 }

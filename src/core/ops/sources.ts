@@ -14,9 +14,13 @@ import { OperationError } from './contract.ts';
 const whoami: Operation = {
   name: 'whoami',
   description:
-    'Introspect the calling identity. Returns one of three transport shapes: ' +
+    'Introspect the calling identity. Returns one of five transport shapes: ' +
     '{transport: "oauth", client_id, client_name, scopes, expires_at, source_id, federated_read}, ' +
-    '{transport: "legacy", token_name, scopes, expires_at: null}, or ' +
+    '{transport: "tenant", company_slug, token_name, scopes, expires_at, source_id, federated_read} ' +
+    'for tenant-scoped short-TTL tokens (company_slug is SERVER-verified — derived from the ' +
+    'authenticated token row, never from anything the caller asserts), ' +
+    '{transport: "legacy", token_name, scopes, expires_at: null} for grandfathered bearer ' +
+    'tokens without tenant metadata (never a fabricated slug), ' +
     '{transport: "local", scopes: []}, or {transport: "stdio", scopes: []} ' +
     'for the auth-less stdio MCP pipe. Throws unknown_transport when the ' +
     'context is ambiguous (remote=true without auth and no transport marker) ' +
@@ -46,10 +50,36 @@ const whoami: Operation = {
           'or set ctx.remote === false.',
       );
     }
-    // OAuth tokens have client_id starting with 'gbrain_cl_'; legacy
-    // access_tokens reuse `name` as both clientId and clientName (verifyAccessToken
-    // at oauth-provider.ts:417-430). Detect by inspecting the prefix.
-    const isOauth = ctx.auth.clientId.startsWith('gbrain_cl_');
+    // v132 tenant-remediation lane: the tenant branch runs FIRST. A token
+    // whose row carries a server-stored company_slug reports the tenant
+    // shape regardless of what its (user-chosen) name looks like — the
+    // OAuth prefix heuristic below inspects clientId, which for legacy
+    // tokens is the caller-chosen NAME, so a name crafted to start with
+    // 'gbrain_cl_' must never reclassify a tenant token as an OAuth client
+    // (mint also refuses such names, defense in depth). The slug comes
+    // exclusively from verifyAccessToken's read of the token row — the
+    // client cannot assert, override, or fabricate it. Tokens without
+    // tenant metadata keep the explicit `transport: 'legacy'` marker; a
+    // fabricated slug is never synthesized.
+    if (typeof ctx.auth.companySlug === 'string' && ctx.auth.companySlug.length > 0) {
+      return {
+        transport: 'tenant',
+        company_slug: ctx.auth.companySlug,
+        token_name: ctx.auth.clientName ?? ctx.auth.clientId,
+        scopes: ctx.auth.scopes,
+        expires_at: ctx.auth.expiresAt ?? null,
+        source_id: ctx.auth.sourceId ?? null,
+        federated_read: ctx.auth.allowedSources ?? [],
+      };
+    }
+    // v132: the token kind is SERVER-derived — verifyAccessToken stamps
+    // `tokenKind` from the verification branch that matched (oauth_tokens vs
+    // access_tokens), so a legacy token NAMED with the 'gbrain_cl_' prefix
+    // cannot masquerade as an OAuth client. The clientId-prefix heuristic
+    // remains only as a fallback for contexts that predate the field.
+    const isOauth = ctx.auth.tokenKind !== undefined
+      ? ctx.auth.tokenKind === 'oauth'
+      : ctx.auth.clientId.startsWith('gbrain_cl_');
     if (isOauth) {
       return {
         transport: 'oauth',

@@ -108,6 +108,8 @@ import { skilloptOperations } from './ops/skillopt.ts';
 import { chronicleOperations } from './ops/chronicle.ts';
 import { extractionOperations } from './ops/extraction.ts';
 import { requestToolsOperations } from './ops/request-tools.ts';
+// v132 tenant-remediation lane: token_mint_scoped + token_revoke.
+import { authTokenOperations } from './ops/auth-tokens.ts';
 
 // parseTtlParam moved to ops/facts.ts with the facts cluster; the `remember`
 // verb (verbs.ts) loads it from THIS module at runtime — re-exported so every
@@ -167,6 +169,9 @@ export const operations: Operation[] = [
   ...takesOperations,
   // v0.28: whoami + scoped sources management — ops/sources.ts
   ...sourcesOperations,
+  // v132 tenant-remediation lane: tenant-scoped short-TTL token lifecycle
+  // (token_mint_scoped, token_revoke) — ops/auth-tokens.ts
+  ...authTokenOperations,
   // WP4 (T9): discovery + pull-based per-client surface unlock (D4/D5/D9) —
   // ops/request-tools.ts
   ...requestToolsOperations,
@@ -250,6 +255,7 @@ const OP_AREAS: Record<string, string> = {
   migrate_embeddings: 'admin', code_traversal_cache_clear: 'admin',
   // identity
   whoami: 'identity', get_brain_identity: 'identity',
+  token_mint_scoped: 'identity', token_revoke: 'identity',
   // skills
   list_skills: 'skills', get_skill: 'skills', list_brain_skillpack: 'skills',
   // advisor

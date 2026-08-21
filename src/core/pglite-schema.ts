@@ -856,10 +856,40 @@ CREATE TABLE IF NOT EXISTS access_tokens (
   scopes       TEXT[],
   created_at   TIMESTAMPTZ DEFAULT now(),
   last_used_at TIMESTAMPTZ,
-  revoked_at   TIMESTAMPTZ
+  revoked_at   TIMESTAMPTZ,
+  -- v132 tenant-remediation lane (see src/schema.sql for the canonical
+  -- comment). NULL on all three = grandfathered legacy token.
+  company_slug TEXT,
+  expires_at   TIMESTAMPTZ,
+  minted_by    TEXT,
+  CONSTRAINT chk_access_tokens_company_slug_format
+    CHECK (company_slug IS NULL OR company_slug ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
+  CONSTRAINT chk_access_tokens_tenant_expiry
+    CHECK ((company_slug IS NULL AND expires_at IS NULL AND minted_by IS NULL) OR (company_slug IS NOT NULL AND expires_at IS NOT NULL AND minted_by IS NOT NULL)),
+  CONSTRAINT chk_access_tokens_tenant_read_only
+    CHECK (company_slug IS NULL OR (scopes IS NOT NULL AND scopes = ARRAY['read']::text[]))
 );
 
 CREATE INDEX IF NOT EXISTS idx_access_tokens_hash ON access_tokens (token_hash) WHERE revoked_at IS NULL;
+
+-- ============================================================
+-- auth_audit: durable REDACTED audit of auth decisions (v132)
+-- ============================================================
+-- See src/schema.sql for the canonical comment. Mirrored here because
+-- pglite-schema.ts is hand-maintained (DRIFT WARNING at the top of this file).
+CREATE TABLE IF NOT EXISTS auth_audit (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  correlation_id TEXT NOT NULL,
+  decision       TEXT NOT NULL,
+  method         TEXT,
+  reason         TEXT,
+  token_id       TEXT,
+  token_name     TEXT,
+  company_slug   TEXT,
+  actor          TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_auth_audit_created ON auth_audit (created_at DESC);
 
 -- ============================================================
 -- mcp_request_log: usage logging for MCP requests

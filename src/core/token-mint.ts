@@ -102,6 +102,150 @@ export async function mintLegacyToken(
   return { token, id, name: opts.name, scopes: [...opts.scopes] };
 }
 
+// ---------------------------------------------------------------------------
+// v132 tenant-remediation lane: scoped short-TTL tenant minting.
+// ---------------------------------------------------------------------------
+
+/** Hard TTL ceiling for tenant-scoped tokens (normative: 60 minutes). */
+export const MAX_SCOPED_TOKEN_TTL_SECONDS = 3600;
+export const DEFAULT_SCOPED_TOKEN_TTL_SECONDS = 3600;
+
+/** Same shape as sources.id / identity companySlug conventions. */
+export const COMPANY_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+export interface MintScopedTenantTokenOpts {
+  name: string;
+  /**
+   * Server-stored tenant identity. Supplied by the ALLOWLISTED minting
+   * principal (which owns the canonical company registry); after mint it is
+   * the only tenant source whoami reports for this token.
+   */
+  companySlug: string;
+  /** 1..3600 seconds; > MAX_SCOPED_TOKEN_TTL_SECONDS is a DENY, not a clamp. */
+  ttlSeconds?: number;
+  /**
+   * Requested grant. When provided it MUST be exactly ['read'] — every
+   * non-exact variant (wider, narrower, reordered additions) is refused
+   * before any row is written. Omitted = ['read'].
+   */
+  requestedScopes?: string[];
+  /** Optional federation grant, same semantics as MintLegacyTokenOpts. */
+  sourceGrant?: string[];
+  /** Server-stamped minting principal (audit actor; never a trust input). */
+  mintedBy: string;
+}
+
+export interface MintedScopedTenantToken extends MintedLegacyToken {
+  companySlug: string;
+  /** ISO timestamp of the DB-computed (server-time) expiry. */
+  expiresAt: string;
+}
+
+/** Thrown on any pre-insert validation deny; carries a stable reason code. */
+export class ScopedMintDenied extends Error {
+  constructor(public readonly reason: string, message: string) {
+    super(message);
+    this.name = 'ScopedMintDenied';
+  }
+}
+
+/**
+ * Mint a tenant-scoped, short-TTL, read-only bearer token. All validation
+ * happens BEFORE any write — a deny leaves zero rows behind (the caller
+ * audits the deny). Expiry is computed in the DATABASE from server time
+ * (`now() + ttl`), never from caller-supplied clocks.
+ */
+export async function mintScopedTenantToken(
+  engine: BrainEngine,
+  opts: MintScopedTenantTokenOpts,
+): Promise<MintedScopedTenantToken> {
+  if (!opts.name || !opts.name.trim()) {
+    throw new ScopedMintDenied('invalid_name', 'token name is required');
+  }
+  // whoami distinguishes OAuth clients by the `gbrain_cl_` clientId prefix;
+  // legacy tokens reuse `name` as clientId, so a token NAMED with that
+  // prefix would masquerade as an OAuth identity and suppress the tenant/
+  // legacy marker. Refuse it at mint time.
+  if (/^gbrain_cl_/i.test(opts.name.trim())) {
+    throw new ScopedMintDenied('invalid_name', "token name must not start with the OAuth client prefix 'gbrain_cl_'");
+  }
+  if (!COMPANY_SLUG_RE.test(opts.companySlug ?? '')) {
+    throw new ScopedMintDenied(
+      'invalid_company_slug',
+      'company_slug must match ' + COMPANY_SLUG_RE.source,
+    );
+  }
+  const ttl = opts.ttlSeconds ?? DEFAULT_SCOPED_TOKEN_TTL_SECONDS;
+  if (!Number.isInteger(ttl) || ttl < 1 || ttl > MAX_SCOPED_TOKEN_TTL_SECONDS) {
+    throw new ScopedMintDenied(
+      'ttl_exceeded',
+      `ttl_seconds must be an integer in [1, ${MAX_SCOPED_TOKEN_TTL_SECONDS}] (60-minute hard cap)`,
+    );
+  }
+  if (opts.requestedScopes !== undefined) {
+    const s = opts.requestedScopes;
+    const exactRead = Array.isArray(s) && s.length === 1 && s[0] === 'read';
+    if (!exactRead) {
+      // Deliberately does NOT echo the submitted value: `scopes` is
+      // untrusted caller input and this message lands in mcp_request_log /
+      // SSE via the transport error path — a pasted secret must never
+      // round-trip into logs.
+      throw new ScopedMintDenied(
+        'invalid_scope_request',
+        "scoped tenant tokens carry exactly ['read'] (submitted value withheld from this message)",
+      );
+    }
+  }
+  if (!opts.mintedBy || !opts.mintedBy.trim()) {
+    throw new ScopedMintDenied('invalid_minter', 'mintedBy principal is required');
+  }
+
+  const token = generateToken('gbrain_');
+  const hash = hashToken(token);
+  const permissions: Record<string, unknown> = { takes_holders: ['world'] };
+  if (opts.sourceGrant && opts.sourceGrant.length > 0) {
+    permissions.source_id = opts.sourceGrant;
+  }
+
+  let rows: Array<{ id: string; expires_at: string | Date }>;
+  try {
+    rows = await executeRawJsonb<{ id: string; expires_at: string | Date }>(
+      engine,
+      `INSERT INTO access_tokens (name, token_hash, permissions, scopes, company_slug, expires_at, minted_by)
+       VALUES ($1, $2, $6::jsonb, '{read}'::text[], $3, now() + ($4::int * interval '1 second'), $5)
+       RETURNING id, expires_at`,
+      [opts.name, hash, opts.companySlug, ttl, opts.mintedBy],
+      [permissions],
+    );
+  } catch (e) {
+    if (
+      isUndefinedColumnError(e, 'company_slug') ||
+      isUndefinedColumnError(e, 'expires_at') ||
+      isUndefinedColumnError(e, 'minted_by') ||
+      isUndefinedColumnError(e, 'scopes') ||
+      isUndefinedColumnError(e, 'permissions')
+    ) {
+      throw new ScopedMintDenied(
+        'schema_out_of_date',
+        'this brain is missing tenant-token columns on access_tokens — run `gbrain apply-migrations` and retry.',
+      );
+    }
+    throw e;
+  }
+  const row = rows[0];
+  if (!row?.id) throw new Error('token insert returned no id');
+  const expiresAt =
+    row.expires_at instanceof Date ? row.expires_at.toISOString() : new Date(row.expires_at).toISOString();
+  return {
+    token,
+    id: row.id,
+    name: opts.name,
+    scopes: ['read'],
+    companySlug: opts.companySlug,
+    expiresAt,
+  };
+}
+
 /**
  * Revoke exactly one token by row id. Returns false when no ACTIVE row with
  * that id exists (already revoked or never existed) — callers treat that as

@@ -620,10 +620,45 @@ CREATE TABLE IF NOT EXISTS access_tokens (
   scopes       TEXT[],
   created_at   TIMESTAMPTZ DEFAULT now(),
   last_used_at TIMESTAMPTZ,
-  revoked_at   TIMESTAMPTZ
+  revoked_at   TIMESTAMPTZ,
+  -- v132 tenant-remediation lane: server-stored tenant identity + scoped
+  -- short-TTL minting metadata. NULL on all three = grandfathered legacy
+  -- token (never expires, whoami reports \`transport: 'legacy'\`). The CHECKs
+  -- make a partial/hand-edited tenant row unrepresentable: a tenant row must
+  -- carry a well-formed slug, a real expiry, and the exact read-only grant.
+  company_slug TEXT,
+  expires_at   TIMESTAMPTZ,
+  minted_by    TEXT,
+  CONSTRAINT chk_access_tokens_company_slug_format
+    CHECK (company_slug IS NULL OR company_slug ~ '^[a-z0-9][a-z0-9-]{0,62}\$'),
+  CONSTRAINT chk_access_tokens_tenant_expiry
+    CHECK ((company_slug IS NULL AND expires_at IS NULL AND minted_by IS NULL) OR (company_slug IS NOT NULL AND expires_at IS NOT NULL AND minted_by IS NOT NULL)),
+  CONSTRAINT chk_access_tokens_tenant_read_only
+    CHECK (company_slug IS NULL OR (scopes IS NOT NULL AND scopes = ARRAY['read']::text[]))
 );
 
 CREATE INDEX IF NOT EXISTS idx_access_tokens_hash ON access_tokens (token_hash) WHERE revoked_at IS NULL;
+
+-- ============================================================
+-- auth_audit: durable REDACTED audit of auth decisions (v132)
+-- ============================================================
+-- One row per auth decision (mint / verify / deny / revoke) on the
+-- tenant-scoped token path. Identifiers + reason codes only — never raw
+-- token material or request payloads. Written via src/core/auth-audit.ts
+-- (fail-closed: audit unavailable => tenant-scoped requests are denied).
+CREATE TABLE IF NOT EXISTS auth_audit (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  correlation_id TEXT NOT NULL,
+  decision       TEXT NOT NULL,
+  method         TEXT,
+  reason         TEXT,
+  token_id       TEXT,
+  token_name     TEXT,
+  company_slug   TEXT,
+  actor          TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_auth_audit_created ON auth_audit (created_at DESC);
 
 -- ============================================================
 -- mcp_request_log: usage logging for remote MCP requests
