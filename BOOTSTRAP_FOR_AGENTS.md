@@ -1,4 +1,4 @@
-<!-- gbrain-runbook-stamp: 0.46.12.4 -->
+<!-- gbrain-runbook-stamp: 0.50.0.0 -->
 <!-- This stamp must equal the VERSION file at every release; CI enforces it
      (scripts/check-bootstrap-tag.sh). `gbrain bootstrap status` compares it to
      the installed binary and warns on skew. -->
@@ -89,15 +89,30 @@ registration only with `--mcp-even-if-plugin`.
    `gh auth login -h github.com -p https -w` (you run it; they click Authorize).
    Then `gbrain bootstrap status` — it is idempotent and resume-aware; after any
    partial failure, re-run it and continue where it points.
-2. **Engine.** `gbrain init --pglite` (2 seconds, no server). Search mode is
+2. **Engine.** Two lanes; default to the first:
+   - **PGLite (default):** `gbrain init --pglite` (2 seconds, no server). This is
+     the lane that keeps the per-turn hook context injection working — the hook
+     IPC listener is PGLite-only today.
+   - **Postgres-first (harness installs):** `gbrain init --prefer-postgres` walks
+     a 5-rung ladder (env URL → Supabase token discovery → local Postgres →
+     `--allow-docker` → PGLite floor) for installs that want concurrent
+     connections or multi-machine access. Tradeoff, stated plainly: a Postgres
+     brain gets MCP tools every session plus the pull protocol, but gives up the
+     per-turn hook lane until the engine-uniform listener lands (the degradation
+     matrix in `docs/guides/bootstrap.md` carries the row; INSTALL_FOR_AGENTS.md
+     "Engine preference for harness installs" carries the ladder detail).
+
+   Search mode is
    auto-selected silently (conservative when keyless, tokenmax with an
    expansion key) and printed with an `[AGENT]` cost matrix — surface that
    matrix to the human and confirm before running high-volume queries (see
    INSTALL_FOR_AGENTS.md Step 3.5); they can change it any time with
    `gbrain search modes`. The one thing to raise here is the OPTIONAL provider
    key — with no key you run keyless: keyword search plus memory you author
-   yourself through the write tools; everything works, one key upgrades search to
-   semantic and enables automatic fact extraction. Never pressure for a key. If the
+   yourself through the write tools; everything works. One key upgrades
+   capabilities per provider: OpenAI unlocks semantic search + automatic fact
+   extraction; Voyage unlocks semantic search; Anthropic unlocks automatic fact
+   extraction. Never pressure for a key. If the
    human provides one, pass it to the CLI prompt — it goes to the 0600 config file,
    never into the interview answers, never into chat logs you keep.
 3. **Interview.** `gbrain bootstrap interview --init`, then ask the questions from
@@ -236,11 +251,15 @@ placeholder). Trust the CLI's detection over your own guesses.
 Two things the human must UNDERSTAND before you finish — say them plainly, in
 this order, and confirm they landed:
 
-1. **They own the brain.** Every memory you keep is a markdown file in THEIR
-   private GitHub repo — name the URL. Owning it means: they can read it any
-   time, take it to a second machine (`gbrain bootstrap attach`), or delete the
-   repo and the brain is gone. If they went local-only, say that instead, with
-   `gbrain bootstrap repo` as the any-time upgrade.
+1. **They own the brain.** Their private GitHub repo holds the agent's identity
+   files and committed Markdown pages — name the URL. They can read those files
+   or clone the workspace on another machine and run `gbrain bootstrap attach`.
+   Facts, corrections, jobs, and accounting can exist only in the database, so
+   a Git clone is not a complete memory backup. Back up and restore the full
+   database separately. Deleting the repository does not erase database records,
+   history, source material, or backups. If they went local-only, say the files
+   and database remain on this machine; `gbrain bootstrap repo` can add a private
+   GitHub copy of the workspace files later.
 2. **The first skill to run is cold-start.** An empty brain is a database; a
    filled one is a memory — and every flagship skill (book-mirror, briefings,
    meeting prep) only becomes magical once the brain holds their real life.

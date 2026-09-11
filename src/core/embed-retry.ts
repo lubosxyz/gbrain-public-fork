@@ -11,6 +11,7 @@
  * break. `src/commands/embed.ts` re-exports everything here (façade rule), so
  * historical import sites and tests never chase the peel.
  */
+import { isInputTooLargeError } from './ai/errors.ts';
 
 import { embedBatch } from './embedding.ts';
 import { serr } from './console-prefix.ts';
@@ -254,6 +255,11 @@ export async function embedBatchWithBackoff(
  * providers whose wrappers strip `cause.status`.
  */
 export function isEmbedRetriableError(e: unknown): boolean {
+  // KOM-287: a permanent over-context rejection is never retriable, even when
+  // the provider wrapped it with a gateway-ish status (cause.status 502/503/504
+  // survives normalizeAIError) — retrying identical oversized bytes only delays
+  // the parking path. Permanent classification wins over gateway detection.
+  if (isInputTooLargeError(e)) return false;
   const msg = e instanceof Error ? e.message : String(e);
   return (
     detect429FromCause(e) ||

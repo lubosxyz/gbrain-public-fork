@@ -26,15 +26,15 @@ beforeEach(async () => {
   await engine.executeRaw('DELETE FROM minion_jobs');
 });
 
-describe('migration v131 — fork/upstream v128 reconciliation', () => {
+describe('migration v150 — fork/upstream reconciliation (v128 lane replayed after the 0.50 merge renumbered it out of v131)', () => {
   test('contains both independently shipped v128 semantics and is idempotent', () => {
-    const migration = MIGRATIONS.find((candidate) => candidate.version === 131);
-    expect(migration?.name).toBe('fork_upstream_v128_reconciliation');
+    const migration = MIGRATIONS.find((candidate) => candidate.version === 150);
+    expect(migration?.name).toBe('fork_upstream_v131_v132_reconciliation');
     expect(migration?.idempotent).toBe(true);
     expect(migration?.sql).toContain('CREATE TABLE IF NOT EXISTS mcp_request_log_purged');
     expect(migration?.sql).toContain('UPDATE minion_jobs');
     expect(migration?.sql).toContain("error_text = 'v131: superseded duplicate autopilot cycle'");
-    expect(LATEST_VERSION).toBeGreaterThanOrEqual(131);
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(150);
   });
 
   test('repairs an upstream-shaped v130 brain that never created the fork table', async () => {

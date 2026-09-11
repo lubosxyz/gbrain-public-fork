@@ -22,7 +22,7 @@ import { markKeywordHits } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { HybridSearchMeta } from '../types.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
-import { redactSearchResults } from '../search/output-redaction.ts';
+import { redactSearchResults, redactCredentialLikeText } from '../search/output-redaction.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-descriptions.ts';
@@ -651,7 +651,10 @@ const query: Operation = {
               embedQuestion: (q) => embedQuery(q),
             });
             crag.think = {
-              answer: t.answer,
+              // Fork: the think answer synthesizes retrieved content, so it can
+              // carry the same credential-like material redactSearchResults
+              // scrubs from the result envelope — scrub it with the same pass.
+              answer: redactCredentialLikeText(t.answer),
               citations: t.citations.length,
               ...(t.synthesis_status ? { synthesis_status: t.synthesis_status } : {}),
               model: t.modelUsed,

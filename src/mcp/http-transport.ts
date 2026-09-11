@@ -279,10 +279,25 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         ) {
           return { ok: false };
         }
-        [row] = await sql`
-          SELECT id, name, permissions FROM access_tokens
-          WHERE token_hash = ${hash} AND revoked_at IS NULL
-        `;
+        // Degrade ladder mirrors oauth-provider: losing the TENANT columns
+        // must not also drop `scopes` — that would grandfather a scoped token
+        // into full access on a pre-v132 brain (#4043). Only when `scopes`
+        // itself is missing (pre-#4043 schema) does the projection fall to
+        // permissions-only, and that brain predates scoped minting entirely.
+        try {
+          [row] = await sql`
+            SELECT id, name, permissions, scopes FROM access_tokens
+            WHERE token_hash = ${hash} AND revoked_at IS NULL
+          `;
+        } catch (err2) {
+          if (!isUndefinedColumnError(err2, 'scopes') && !isUndefinedColumnError(err2, 'permissions')) {
+            return { ok: false };
+          }
+          [row] = await sql`
+            SELECT id, name, permissions FROM access_tokens
+            WHERE token_hash = ${hash} AND revoked_at IS NULL
+          `;
+        }
       }
       if (!row) {
         // v132: distinguish a revoked token (auditable identity) from an

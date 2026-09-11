@@ -314,6 +314,8 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   remove_link: 'ok',
   add_timeline_entry: 'ok',
   revert_version: 'error',
+  token_mint_scoped: 'error',
+  token_revoke: 'error',
   put_raw_data: 'error',
   log_ingest: 'error',
   takes_add: 'ok',

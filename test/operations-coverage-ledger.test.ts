@@ -101,6 +101,8 @@ const LEDGER: Record<string, string> = {
   takes_resolve: 'test/takes-write-ops.test.ts',
   takes_supersede: 'test/takes-write-ops.test.ts',
   whoami: 'test/whoami.test.ts',
+  token_mint_scoped: 'test/tenant-token-minting.test.ts',
+  token_revoke: 'test/tenant-token-minting.test.ts',
   sources_add: 'test/sources-mcp.test.ts',
   sources_list: 'test/sources-mcp.test.ts',
   sources_remove: 'test/sources-mcp.test.ts',

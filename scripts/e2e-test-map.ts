@@ -270,6 +270,9 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   // + ingest_capture Minion handler all feed the in-process roundtrip
   // E2E AND the HTTP contract E2E for the webhook route.
   "src/core/oauth-provider.ts": ["test/e2e/oauth-grant-transactions.test.ts", "test/e2e/serve-http-oauth.test.ts"],
+  // Fork (KOM): tenant lane + last_retrieved_at read-surface exposure.
+  "src/core/auth-gate.ts": ["test/e2e/serve-http-tenant.test.ts"],
+  "src/core/last-retrieved.ts": ["test/e2e/last-retrieved-at-exposure.test.ts"],
   "src/core/oauth-grants.ts": ["test/e2e/oauth-grant-transactions.test.ts", "test/e2e/serve-http-consent.test.ts"],
   "src/commands/serve-http-oauth.ts": ["test/e2e/serve-http-consent.test.ts"],
   "src/commands/serve-http.ts": [
