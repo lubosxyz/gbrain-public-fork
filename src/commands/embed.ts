@@ -1140,7 +1140,7 @@ async function embedPage(
     recordFailure(result, failed, slug, firstError);
     serr(`  ${slug}: ${failed} chunk(s) failed to embed; embedded the other ${toEmbed.length - failed}`);
   }
-  await settleParkedChunks(engine, result, slug, sourceId, outcome, toEmbed.length);
+  await settleParkedChunks(engine, result, slug, sourceId, outcome, toEmbed.length, failed);
   result.pages_processed++;
   // Parked chunks are subtracted for the same reason failed ones are: this
   // line reports what actually landed, and `result.embedded` above already
@@ -1336,7 +1336,7 @@ async function embedAll(
         recordFailure(result, failed, page.slug, firstError);
         serr(`\n  ${page.slug}: ${failed} chunk(s) failed to embed; embedded the other ${toEmbed.length - failed}`);
       }
-      await settleParkedChunks(engine, result, page.slug, pageSourceId, outcome, toEmbed.length);
+      await settleParkedChunks(engine, result, page.slug, pageSourceId, outcome, toEmbed.length, failed);
     } catch (e: unknown) {
       // #3037: count the darkened page so the run can't exit 0 (abort is a
       // shutdown, not a failure).
@@ -1892,6 +1892,11 @@ async function embedAllStale(
   const stamp = await resolveProvenanceStamp(engine, signature); // column resolved once per drain, not per page
   try {
     // eslint-disable-next-line no-constant-condition
+    // Round-3 P2: provider park verdicts, remembered per page for the whole
+    // drain — two provider-rejected chunks of one page landing in different
+    // keyset batches must not each treat the other as "still embeddable"
+    // (that would defer the embed_skip marker forever across runs).
+    const providerParkedByPage = new Map<string, Set<number>>();
     while (true) {
       if (effectiveSignal.aborted) {
         if (!budgetExitNotified) {
@@ -2040,30 +2045,44 @@ async function embedAllStale(
             recordFailure(result, failed, slug, firstError);
             serr(`\n  ${slug}: ${failed} chunk(s) failed to embed; embedded the other ${stale.length - failed}`);
           }
-          // Round-2 P2: the keyset drain has no page alignment (#4825) — a
+          // Round-2/3 P2: the keyset drain has no page alignment (#4825) — a
           // page straddling a batch boundary can still have embeddable stale
           // chunks waiting in a LATER batch. Writing the embed_skip marker now
           // would hide the page from stale selection and orphan those healthy
           // chunks unembedded. Park only when nothing embeddable remains
-          // outside this batch; the marker is an optimization, so a deferred
-          // park costs one local pre-guard re-skip on a later pass, never a
-          // lost chunk.
-          const staleIdxThisBatch = new Set(stale.map((c) => c.chunk_index));
-          const embeddableElsewhere = existing.some((c) =>
-            !staleIdxThisBatch.has(c.chunk_index)
-            && c.embedded_at == null
-            && !isEmbedInputOversized(c.chunk_text));
-          if (!embeddableElsewhere) {
-            await settleParkedChunks(engine, result, slug, keySourceId, outcome, stale.length);
-          } else if (outcome.parked > 0) {
-            result.parked += outcome.parked;
-            if (result.parked_samples.length < FAILURE_SAMPLE_CAP) {
-              result.parked_samples.push(`${slug}: ${outcome.firstParkedDetail ?? 'exceeds the embedder context'}`);
+          // outside this batch. "Embeddable" is judged on the ACTIVE vector
+          // state (embedding IS NULL), not embedded_at — a schema restore can
+          // leave a stamped row with no vector; and chunks the PROVIDER
+          // already rejected earlier in this drain are excluded via the
+          // remembered verdicts, so two parked chunks in different batches
+          // cannot defer each other forever.
+          if (outcome.parked > 0) {
+            const known = providerParkedByPage.get(key) ?? new Set<number>();
+            for (const idx of outcome.parkedIndexes) {
+              const row = stale[idx];
+              if (row) known.add(row.chunk_index);
             }
-            serr(
-              `\n  ${slug}: ${outcome.parked}/${stale.length} chunk(s) exceed the embedder's context window — `
-              + `embed_skip deferred: the page still has embeddable chunk(s) pending in a later batch.`,
-            );
+            providerParkedByPage.set(key, known);
+            const staleIdxThisBatch = new Set(stale.map((c) => c.chunk_index));
+            const fresh = await observed(pacer, () =>
+              engine.getChunks(slug, { sourceId: keySourceId, includeEmbedding: true }));
+            const embeddableElsewhere = fresh.some((c) =>
+              !staleIdxThisBatch.has(c.chunk_index)
+              && !known.has(c.chunk_index)
+              && c.embedding == null
+              && !isEmbedInputOversized(c.chunk_text));
+            if (!embeddableElsewhere) {
+              await settleParkedChunks(engine, result, slug, keySourceId, outcome, stale.length, failed);
+            } else {
+              result.parked += outcome.parked;
+              if (result.parked_samples.length < FAILURE_SAMPLE_CAP) {
+                result.parked_samples.push(`${slug}: ${outcome.firstParkedDetail ?? 'exceeds the embedder context'}`);
+              }
+              serr(
+                `\n  ${slug}: ${outcome.parked}/${stale.length} chunk(s) exceed the embedder's context window — `
+                + `embed_skip deferred: the page still has embeddable chunk(s) pending in a later batch.`,
+              );
+            }
           }
           // #3622: reaching here means at least one chunk persisted (a total
           // embed failure throws) — progress, so the quarantine counter resets.
@@ -2192,6 +2211,12 @@ interface PageEmbedOutcome {
   parkedBytes: number;
   /** First parked chunk's reason, for the operator-facing sample. */
   firstParkedDetail?: string;
+  /**
+   * Positions (in the caller's input array) of every parked chunk — the
+   * caller maps them to chunk_index rows to carry provider verdicts across
+   * keyset batches (round-3 P2).
+   */
+  parkedIndexes: number[];
   firstError?: unknown;
 }
 
@@ -2203,19 +2228,21 @@ async function embedPageTexts(
   let parked = 0;
   let parkedBytes = 0;
   let firstParkedDetail: string | undefined;
-  const park = (detail: string, chars: number) => {
+  const parkedIndexes: number[] = [];
+  const park = (detail: string, chars: number, index: number) => {
     parked++;
     parkedBytes = Math.max(parkedBytes, chars);
     firstParkedDetail ??= detail;
+    parkedIndexes.push(index);
   };
 
   // KOM-287, first line: never spend a provider call on a text that already
   // breaches gbrain's own chunk budget. Catches chunks left behind by an
   // older chunker version, which no re-chunk sweep has reached yet.
   const { sendable, sendableIndexes, oversized } = partitionEmbedInputs(texts);
-  for (const o of oversized) park(describeOversizedInput(o), o.chars);
+  for (const o of oversized) park(describeOversizedInput(o), o.chars, o.index);
   if (sendable.length === 0) {
-    return { embeddings, failed: 0, parked, parkedBytes, firstParkedDetail };
+    return { embeddings, failed: 0, parked, parkedBytes, firstParkedDetail, parkedIndexes };
   }
   const scatter = (vectors: (Float32Array | null | undefined)[]) => {
     for (let i = 0; i < sendableIndexes.length; i++) {
@@ -2225,7 +2252,7 @@ async function embedPageTexts(
 
   try {
     scatter(await embedBatchWithBackoff(sendable, opts));
-    return { embeddings, failed: 0, parked, parkedBytes, firstParkedDetail };
+    return { embeddings, failed: 0, parked, parkedBytes, firstParkedDetail, parkedIndexes };
   } catch (e: unknown) {
     if (opts.abortSignal?.aborted) throw e; // shutdown, not a chunk problem
     // KOM-287, second line: an over-context rejection is about ONE input, so
@@ -2254,7 +2281,7 @@ async function embedPageTexts(
       } catch (chunkErr: unknown) {
         if (opts.abortSignal?.aborted) throw chunkErr;
         if (isInputTooLargeError(chunkErr)) {
-          park(chunkErr instanceof Error ? chunkErr.message : String(chunkErr), t.length);
+          park(chunkErr instanceof Error ? chunkErr.message : String(chunkErr), t.length, sendableIndexes[i]);
           continue;
         }
         failed++;
@@ -2265,7 +2292,7 @@ async function embedPageTexts(
     // every chunk was parked is not a failure — it is a settled verdict, and
     // the caller records it as such.
     if (failed > 0 && failed === sendable.length) throw firstError ?? e;
-    return { embeddings, failed, parked, parkedBytes, firstParkedDetail, firstError };
+    return { embeddings, failed, parked, parkedBytes, firstParkedDetail, parkedIndexes, firstError };
   }
 }
 
@@ -2285,11 +2312,22 @@ async function settleParkedChunks(
   sourceId: string | undefined,
   outcome: PageEmbedOutcome,
   totalChunks: number,
+  unresolvedFailures = 0,
 ): Promise<void> {
   if (outcome.parked === 0) return;
   result.parked += outcome.parked;
   if (result.parked_samples.length < FAILURE_SAMPLE_CAP) {
     result.parked_samples.push(`${slug}: ${outcome.firstParkedDetail ?? 'exceeds the embedder context'}`);
+  }
+  // Round-3 P2: a transiently-failed sibling still needs the next stale run
+  // to see this page — the marker would hide it. Count the parked chunks but
+  // defer the marker until a pass with no unresolved failures.
+  if (unresolvedFailures > 0) {
+    serr(
+      `\n  ${slug}: ${outcome.parked}/${totalChunks} chunk(s) exceed the embedder's context window — `
+      + `embed_skip deferred: ${unresolvedFailures} sibling chunk(s) failed transiently and must stay retryable.`,
+    );
+    return;
   }
   serr(
     `\n  ${slug}: ${outcome.parked}/${totalChunks} chunk(s) exceed the embedder's context window — `

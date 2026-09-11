@@ -407,3 +407,108 @@ describe('round-2 P2 — batch-boundary parking', () => {
     expect((engine as any)._calls.filter((c: any) => c.method === 'markEmbedSkip')).toHaveLength(0);
   });
 });
+
+describe('round-3 P2 — parking verdicts and unresolved failures', () => {
+  test('two provider-rejected chunks in different batches still converge on the marker', async () => {
+    // c1 parks in batch 1, c3 parks in batch 2. Without the per-drain verdict
+    // memory each batch would treat the OTHER parked chunk as "still
+    // embeddable" and the marker would never be written in any run.
+    embedBatchBehavior = async (texts: string[]) => {
+      if (texts.some(x => x.startsWith('TOO-BIG'))) throw overContextError();
+      return texts.map(() => new Float32Array(1536));
+    };
+    const chunks = [
+      { chunk_index: 0, chunk_text: 'good-a' },
+      { chunk_index: 1, chunk_text: 'TOO-BIG-1' },
+      { chunk_index: 2, chunk_text: 'good-b' },
+      { chunk_index: 3, chunk_text: 'TOO-BIG-2' },
+    ];
+    let listCalls = 0;
+    const embeddedIdx = new Set<number>();
+    const engine = mockEngine({
+      countStaleChunks: async () => 4,
+      listStaleChunks: async () => {
+        listCalls += 1;
+        if (listCalls === 1) return staleRows('two-verdicts-page', chunks.slice(0, 2));
+        if (listCalls === 2) return staleRows('two-verdicts-page', chunks.slice(2));
+        return [];
+      },
+      // Stateful: chunks embedded by an earlier batch show their vector, the
+      // way the real engine would.
+      getChunks: async () => chunkRows(chunks).map(c => ({
+        ...c,
+        embedding: embeddedIdx.has(c.chunk_index) ? new Float32Array(1536) : null,
+      })),
+      upsertChunks: async (_slug: string, rows: any[]) => {
+        for (const r of rows) if (r.embedding) embeddedIdx.add(r.chunk_index);
+      },
+      executeRaw: async () => [{ complete: false }],
+    });
+
+    const result = await runEmbedCore(engine, { stale: true, batchSize: 2 });
+
+    expect(result.failures).toBe(0);
+    expect(result.parked).toBe(2);
+    // Batch 2 knows batch 1's verdict — nothing embeddable remains, so the
+    // page IS parked (exactly once).
+    expect((engine as any)._calls.filter((c: any) => c.method === 'markEmbedSkip')).toHaveLength(1);
+  });
+
+  test('a transiently-failed sibling in the same batch defers the marker', async () => {
+    // One over-context chunk + one transient 500 in one page/batch: the page
+    // must stay visible to the next stale run so the failure can retry.
+    embedBatchBehavior = async (texts: string[]) => {
+      if (texts.length > 1) throw overContextError(); // force isolation
+      if (texts[0] === 'TOO-BIG') throw overContextError();
+      if (texts[0] === 'FLAKY') { const e: any = new Error('boom'); e.cause = { status: 500 }; throw e; }
+      return texts.map(() => new Float32Array(1536));
+    };
+    const chunks = [
+      { chunk_index: 0, chunk_text: 'TOO-BIG' },
+      { chunk_index: 1, chunk_text: 'FLAKY' },
+    ];
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: (() => { let done = false; return async () => {
+        if (done) return []; done = true; return staleRows('flaky-sibling-page', chunks);
+      }; })(),
+      getChunks: async () => chunkRows(chunks),
+      upsertChunks: async () => {},
+      executeRaw: async () => [{ complete: false }],
+    });
+
+    const result = await runEmbedCore(engine, { stale: true });
+
+    expect(result.parked).toBe(1);
+    expect(result.failures).toBe(1);
+    expect((engine as any)._calls.filter((c: any) => c.method === 'markEmbedSkip')).toHaveLength(0);
+  });
+
+  test('a stamped row with a NULL vector still counts as embeddable (schema-restore shape)', async () => {
+    // c2 has embedded_at set but no vector — the active-vector check must
+    // treat it as pending work and defer the marker.
+    embedBatchBehavior = async (texts: string[]) => {
+      if (texts.includes('TOO-BIG')) throw overContextError();
+      return texts.map(() => new Float32Array(1536));
+    };
+    const chunks = [
+      { chunk_index: 0, chunk_text: 'good-a' },
+      { chunk_index: 1, chunk_text: 'TOO-BIG' },
+    ];
+    const restoreShaped = { chunk_index: 2, chunk_text: 'restored', chunk_source: 'compiled_truth' as const, embedded_at: new Date(), embedding: null, token_count: 1 };
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: (() => { let done = false; return async () => {
+        if (done) return []; done = true; return staleRows('restore-page', chunks);
+      }; })(),
+      getChunks: async () => [...chunkRows(chunks), restoreShaped],
+      upsertChunks: async () => {},
+      executeRaw: async () => [{ complete: false }],
+    });
+
+    const result = await runEmbedCore(engine, { stale: true });
+
+    expect(result.parked).toBe(1);
+    expect((engine as any)._calls.filter((c: any) => c.method === 'markEmbedSkip')).toHaveLength(0);
+  });
+});
