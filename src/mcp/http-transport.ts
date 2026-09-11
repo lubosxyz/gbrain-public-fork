@@ -631,7 +631,9 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         const gate = await gateRemoteToolCall(
           sql,
           auth.auth,
-          toolName,
+          // Registry-validated only — a raw params.name can be a pasted
+          // credential and must not reach the audit table (round-2 P1).
+          calledOp ? toolName : 'unknown_tool',
           calledOp?.scope ?? 'read',
         );
         if (!gate.allow) {

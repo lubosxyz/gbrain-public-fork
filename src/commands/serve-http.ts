@@ -2380,10 +2380,17 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           : undefined;
       const gateOp = toolName !== undefined ? operations.find(o => o.name === toolName) : undefined;
       const gateScope = toolName !== undefined ? (gateOp?.scope ?? 'read') : 'read';
+      // Audit only registry/protocol-validated names — params.name and method
+      // are caller input; a pasted credential must not reach auth_audit
+      // (round-2 P1).
+      const KNOWN_RPC_METHODS = ['initialize', 'tools/list', 'tools/call', 'notifications/initialized', 'ping'];
+      const auditMethod = toolName !== undefined
+        ? (gateOp ? toolName : 'unknown_tool')
+        : (KNOWN_RPC_METHODS.includes(rpcMethod) ? rpcMethod : 'unknown_operation');
       const gate = await gateRemoteToolCall(
         sqlQueryForEngine(engine),
         authInfo,
-        toolName ?? rpcMethod,
+        auditMethod,
         gateScope,
       );
       if (!gate.allow) {

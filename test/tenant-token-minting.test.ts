@@ -194,6 +194,12 @@ describe('writeAuthAudit', () => {
     const rows = await sql`SELECT method, reason, company_slug FROM auth_audit WHERE correlation_id = ${res.correlationId}`;
     expect(rows[0].method).toBe('unknown_operation'); // never the raw value
     expect(rows[0].reason).toBe('unspecified');
+    // Round-2 P1: a 40-char GitHub-style token fits the OLD 64-char charset
+    // regex; the tightened lowercase-snake shape must reject it too.
+    const ghShaped = 'ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789';
+    const res2 = await writeAuthAudit(sql, { decision: 'deny', method: ghShaped }, { alertSink: sink });
+    const rows2 = await sql`SELECT method FROM auth_audit WHERE correlation_id = ${res2.correlationId}`;
+    expect(rows2[0].method).toBe('unknown_operation');
     expect(rows[0].company_slug).toBeNull();
     // The row must not contain the secret-ish string anywhere.
     expect(JSON.stringify(rows[0])).not.toContain(secretish);
@@ -414,6 +420,34 @@ describe('token_mint_scoped op', () => {
     } finally {
       await engine.executeRaw('ALTER TABLE auth_audit_hidden RENAME TO auth_audit');
     }
+  });
+});
+
+describe('round-2 P2 — dry run performs no writes', () => {
+  test('token_mint_scoped honors ctx.dryRun: preview only, nothing minted, nothing audited', async () => {
+    const before = (await sql`SELECT count(*)::int AS n FROM access_tokens`)[0].n;
+    const result = (await token_mint_scoped.handler(
+      { ...localCtx(), dryRun: true },
+      { name: 'dry-mint', company_slug: 'acme-example' },
+    )) as any;
+    expect(result.dry_run).toBe(true);
+    expect(result.token).toBeUndefined();
+    const after = (await sql`SELECT count(*)::int AS n FROM access_tokens`)[0].n;
+    expect(after).toBe(before);
+  });
+
+  test('token_revoke honors ctx.dryRun: the token stays valid', async () => {
+    const minted = (await token_mint_scoped.handler(localCtx(), {
+      name: 'dry-revoke-target',
+      company_slug: 'acme-example',
+    })) as any;
+    const result = (await token_revoke.handler(
+      { ...localCtx(), dryRun: true },
+      { id: minted.id },
+    )) as any;
+    expect(result.dry_run).toBe(true);
+    const rows = await sql`SELECT revoked_at FROM access_tokens WHERE id = ${minted.id}::uuid`;
+    expect(rows[0].revoked_at).toBeNull();
   });
 });
 

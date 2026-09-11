@@ -540,7 +540,9 @@ export async function dispatchToolCall(
   // 'read' — they can never reach a handler anyway). Deny returns the
   // standard error envelope with the audit correlation id.
   if (opts.auth?.tenantScoped === true && opts.tenantGateDone !== true) {
-    const gate = await gateRemoteToolCall(sqlQueryForEngine(engine), opts.auth, name, op?.scope ?? 'read');
+    // Audit only registry-validated names: `name` is caller input and must
+    // never land in auth_audit as a pasted credential (round-2 P1).
+    const gate = await gateRemoteToolCall(sqlQueryForEngine(engine), opts.auth, op ? name : 'unknown_tool', op?.scope ?? 'read');
     if (!gate.allow) {
       return {
         content: [{

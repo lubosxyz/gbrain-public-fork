@@ -17,7 +17,7 @@ import { invalidateStaleSignatureEmbeddingsGuarded } from '../core/embedding-inv
 import { loadConfig } from '../core/config.ts';
 import { slog, serr } from '../core/console-prefix.ts';
 import { buildChunkTokenLimitMarker, filterOutEmbedSkipped } from '../core/embed-skip.ts';
-import { describeOversizedInput, partitionEmbedInputs } from '../core/embed-input-guard.ts';
+import { describeOversizedInput, isEmbedInputOversized, partitionEmbedInputs } from '../core/embed-input-guard.ts';
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { isAborted, anySignal, AbortError } from '../core/abort-check.ts';
 import { type DbPacer, createDbPacer, createNoopPacer, observed } from '../core/db-pacer.ts';
@@ -2040,7 +2040,31 @@ async function embedAllStale(
             recordFailure(result, failed, slug, firstError);
             serr(`\n  ${slug}: ${failed} chunk(s) failed to embed; embedded the other ${stale.length - failed}`);
           }
-          await settleParkedChunks(engine, result, slug, keySourceId, outcome, stale.length);
+          // Round-2 P2: the keyset drain has no page alignment (#4825) — a
+          // page straddling a batch boundary can still have embeddable stale
+          // chunks waiting in a LATER batch. Writing the embed_skip marker now
+          // would hide the page from stale selection and orphan those healthy
+          // chunks unembedded. Park only when nothing embeddable remains
+          // outside this batch; the marker is an optimization, so a deferred
+          // park costs one local pre-guard re-skip on a later pass, never a
+          // lost chunk.
+          const staleIdxThisBatch = new Set(stale.map((c) => c.chunk_index));
+          const embeddableElsewhere = existing.some((c) =>
+            !staleIdxThisBatch.has(c.chunk_index)
+            && c.embedded_at == null
+            && !isEmbedInputOversized(c.chunk_text));
+          if (!embeddableElsewhere) {
+            await settleParkedChunks(engine, result, slug, keySourceId, outcome, stale.length);
+          } else if (outcome.parked > 0) {
+            result.parked += outcome.parked;
+            if (result.parked_samples.length < FAILURE_SAMPLE_CAP) {
+              result.parked_samples.push(`${slug}: ${outcome.firstParkedDetail ?? 'exceeds the embedder context'}`);
+            }
+            serr(
+              `\n  ${slug}: ${outcome.parked}/${stale.length} chunk(s) exceed the embedder's context window — `
+              + `embed_skip deferred: the page still has embeddable chunk(s) pending in a later batch.`,
+            );
+          }
           // #3622: reaching here means at least one chunk persisted (a total
           // embed failure throws) — progress, so the quarantine counter resets.
           _embedFailureCounts.delete(key);

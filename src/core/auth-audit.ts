@@ -158,7 +158,11 @@ export interface WriteAuthAuditOptions {
  * pasted secret (e.g. a bearer value sent as a tool name or a company slug)
  * into the audit table or the alert stream.
  */
-const SAFE_METHOD_RE = /^[a-zA-Z0-9_/.:-]{1,64}$/;
+// Lowercase snake_case op / protocol names only ('tools/list' keeps the
+// slash). Deliberately rejects mixed-case and dash/dot/colon shapes so a
+// pasted credential (e.g. a GitHub token) can never pass as a method name;
+// call sites additionally registry-validate tool names (round-2 P1).
+const SAFE_METHOD_RE = /^[a-z][a-z0-9_/]{0,63}$/;
 const SAFE_REASON_RE = /^[a-z0-9_]{1,64}$/;
 const SAFE_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 

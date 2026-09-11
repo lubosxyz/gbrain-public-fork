@@ -131,6 +131,17 @@ const token_mint_scoped: Operation = {
       }
     }
 
+    // Dry run stops BEFORE any mutation or credential creation: preview only,
+    // nothing minted, nothing audited as a mint (round-2 P2).
+    if (ctx.dryRun) {
+      return {
+        dry_run: true,
+        action: 'token_mint_scoped',
+        name: typeof p.name === 'string' ? p.name : undefined,
+        company_slug: companySlug,
+      };
+    }
+
     let minted: Awaited<ReturnType<typeof mintScopedTenantToken>>;
     try {
       minted = await mintScopedTenantToken(ctx.engine, {
@@ -238,6 +249,11 @@ const token_revoke: Operation = {
         actor: principal.actor,
       });
       throw new OperationError('invalid_params', 'not a token id (expected a UUID)');
+    }
+    // Dry run stops BEFORE the revocation write: `token-revoke --dry-run`
+    // must never actually revoke (round-2 P2).
+    if (ctx.dryRun) {
+      return { dry_run: true, action: 'token_revoke', id };
     }
     // Pre-read identity for the audit row (id is unique; the row may already
     // be revoked — that still audits with full identity).

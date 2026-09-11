@@ -360,3 +360,50 @@ describe('retryable failures keep their existing treatment', () => {
     expect((engine as any)._calls.filter((c: any) => c.method === 'markEmbedSkip')).toHaveLength(0);
   });
 });
+
+describe('round-2 P2 — batch-boundary parking', () => {
+  test('a page straddling the keyset batch boundary defers embed_skip until no embeddable chunk remains', async () => {
+    // Repro from the merge review: 3 chunks, batch of 2 — one embeds, one is
+    // parked by the pre-guard, the third (healthy) lives in the NEXT batch.
+    // Writing the marker in batch 1 would hide the page from stale selection
+    // and orphan the healthy chunk unembedded.
+    // Provider-parked (not pre-guard): the oversized chunk passes the local
+    // cap but the PROVIDER rejects it, so the heal path stays out of the way
+    // and the keyset batches stay as listed.
+    embedBatchBehavior = async (texts: string[]) => {
+      if (texts.includes('TOO-BIG')) throw overContextError();
+      return texts.map(() => new Float32Array(1536));
+    };
+    const chunks = [
+      { chunk_index: 0, chunk_text: 'good-a' },
+      { chunk_index: 1, chunk_text: 'TOO-BIG' },
+      { chunk_index: 2, chunk_text: 'good-b' },
+    ];
+    let listCalls = 0;
+    const upserts: Array<{ slug: string; chunks: any[] }> = [];
+    const engine = mockEngine({
+      countStaleChunks: async () => 3,
+      listStaleChunks: async () => {
+        listCalls += 1;
+        if (listCalls === 1) return staleRows('straddle-page', chunks.slice(0, 2));
+        if (listCalls === 2) return staleRows('straddle-page', chunks.slice(2));
+        return [];
+      },
+      getChunks: async () => chunkRows(chunks),
+      upsertChunks: async (slug: string, rows: any[]) => { upserts.push({ slug, chunks: rows }); },
+      // #4825 provenance stamp probes DB state; report incomplete (chunk 1 is
+      // parked, its provenance stays NULL) so no stamp fires.
+      executeRaw: async () => [{ complete: false }],
+    });
+
+    const result = await runEmbedCore(engine, { stale: true, batchSize: 2 });
+
+    expect(result.failures).toBe(0);
+    expect(result.parked).toBe(1);
+    // The healthy chunk from the second batch was embedded, not orphaned.
+    const embeddedIdx = upserts.flatMap(u => u.chunks.filter((c: any) => c.embedding).map((c: any) => c.chunk_index));
+    expect(embeddedIdx).toContain(2);
+    // And the page was NOT hidden from stale selection mid-drain.
+    expect((engine as any)._calls.filter((c: any) => c.method === 'markEmbedSkip')).toHaveLength(0);
+  });
+});
