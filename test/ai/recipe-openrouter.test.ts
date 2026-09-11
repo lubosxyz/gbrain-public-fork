@@ -18,7 +18,7 @@ import {
   openrouterSupportsPromptCache,
 } from '../../src/core/ai/recipes/openrouter.ts';
 import { defaultResolveAuth } from '../../src/core/ai/gateway.ts';
-import { assertTouchpoint } from '../../src/core/ai/model-resolver.ts';
+import { assertTouchpoint, embeddingDimsForModel } from '../../src/core/ai/model-resolver.ts';
 import { AIConfigError } from '../../src/core/ai/errors.ts';
 
 // D5 shape regex: provider/model slug, allowing letters, digits, dots, hyphens,
@@ -45,18 +45,40 @@ describe('recipe: openrouter', () => {
     expect(r.touchpoints.embedding).toBeDefined();
     const e = r.touchpoints.embedding!;
     expect(e.models[0]).toBe('openai/text-embedding-3-small');
-    expect(e.default_dims).toBe(1536);
     expect(e.dims_options).toEqual([512, 768, 1024, 1536]);
     expect(e.max_batch_tokens).toBe(300_000);
+  });
+
+  test('2b. #4114 — per-model dims for the documented catalog; unlisted ids resolve to 0 (explicit dims required)', () => {
+    const r = getRecipe('openrouter')!;
+    // Known catalog ids resolve to their live native width.
+    expect(embeddingDimsForModel(r, 'openrouter:openai/text-embedding-3-small')).toBe(1536);
+    expect(embeddingDimsForModel(r, 'openrouter:openai/text-embedding-3-large')).toBe(3072);
+    expect(embeddingDimsForModel(r, 'openrouter:qwen/qwen3-embedding-8b')).toBe(4096);
+    expect(embeddingDimsForModel(r, 'openrouter:bge-m3')).toBe(1024);
+    expect(embeddingDimsForModel(r, 'openrouter:baai/bge-m3')).toBe(1024);
+    // Unknown ids must NOT inherit a plausible-wrong 1536: 0 forces the
+    // explicit --dim path (migrate embeddings throws its actionable error).
+    expect(embeddingDimsForModel(r, 'openrouter:some/unknown-embedder')).toBe(0);
+    expect(embeddingDimsForModel(r, 'openrouter:google/gemini-embedding-2-preview')).toBe(0);
+    // Explicit override stays trusted for unlisted models.
+    expect(r.touchpoints.embedding!.trust_custom_dims).toBe(true);
   });
 
   test('3. chat touchpoint accepts arbitrary provider/model IDs (openai-compat tier)', () => {
     const r = getRecipe('openrouter')!;
     expect(r.touchpoints.chat).toBeDefined();
     expect(r.touchpoints.chat!.supports_tools).toBe(true);
-    // supports_subagent_loop is informational; isAnthropicProvider() is the
-    // real gate. Field stays false per the recipe docstring.
-    expect(r.touchpoints.chat!.supports_subagent_loop).toBe(false);
+    const loop = r.touchpoints.chat!.supports_subagent_loop;
+    expect(typeof loop).toBe('function');
+    if (typeof loop === 'function') {
+      expect(loop('anthropic/claude-haiku-4.5')).toBe(true);
+      expect(loop('anthropic/claude-sonnet-4.6')).toBe(true);
+      expect(loop('deepseek/deepseek-v4-flash')).toBe(true);
+      expect(loop('deepseek/deepseek-chat')).toBe(true);
+      expect(loop('openai/gpt-5.2')).toBe(false);
+      expect(loop('google/gemini-3-flash-preview')).toBe(false);
+    }
     expect(() =>
       assertTouchpoint(r, 'chat', 'some/provider-model'),
     ).not.toThrow();
@@ -166,8 +188,19 @@ describe('recipe: openrouter', () => {
     expect(openrouterSupportsPromptCache('openai/text-embedding-3-small')).toBe(false);
     expect(openrouterSupportsPromptCache('anthropic/claude-sonnet-4.6')).toBe(true);
     expect(openrouterSupportsPromptCache('anthropic/claude-opus-4.7')).toBe(true);
-    expect(openrouterSupportsPromptCache('deepseek/deepseek-chat')).toBe(false);
+    // DeepSeek routes cache automatically, same as the OpenAI ones — and the
+    // native `deepseek` recipe says so too, so the two routes must agree.
+    expect(openrouterSupportsPromptCache('deepseek/deepseek-chat')).toBe(true);
     expect(openrouterSupportsPromptCache('google/gemini-3-flash-preview')).toBe(false);
+
+    // Routing variants (`:online`, `:nitro`, `:floor`, …) are an OpenRouter
+    // concept, not part of the upstream model id, so they must not change the
+    // answer either way.
+    expect(openrouterSupportsPromptCache('openai/gpt-4o:online')).toBe(true);
+    expect(openrouterSupportsPromptCache('openai/gpt-4.1:nitro')).toBe(true);
+    expect(openrouterSupportsPromptCache('openai/o1:floor')).toBe(true);
+    expect(openrouterSupportsPromptCache('openai/gpt-4-turbo:online')).toBe(false);
+    expect(openrouterSupportsPromptCache('deepseek/deepseek-chat:free')).toBe(true);
   });
 
   test('13. only Anthropic Claude routes require the explicit cache_control rewrite', () => {
@@ -223,6 +256,145 @@ describe('recipe: openrouter', () => {
       await post('anthropic/claude-sonnet-4.6', false);
       const noMarker = JSON.parse(calls[2].init!.body as string);
       expect(noMarker.messages[0]).toEqual({ role: 'system', content: 'stable system prompt' });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('16. fetch shim promotes reasoning_content when content is empty (DeepSeek-via-OpenRouter, #4753)', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: '', reasoning_content: 'the answer' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch;
+    try {
+      const res = await openrouterCompatFetch('https://openrouter.ai/api/v1/chat/completions');
+      const json = await res.json();
+      expect(json.choices[0].message.content).toBe('the answer');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('17. fetch shim does not promote on tool-call turns or non-empty content', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === 'string' ? init.body : '';
+      const kind = body.includes('tool') ? 'tool' : 'content';
+      if (kind === 'tool') {
+        return new Response(JSON.stringify({
+          choices: [{ finish_reason: 'tool_calls', message: {
+            content: null,
+            reasoning_content: 'INTERNAL CHAIN OF THOUGHT — must not leak',
+            tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'brain_search', arguments: '{}' } }],
+          } }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'real content', reasoning_content: 'ignored' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const toolRes = await openrouterCompatFetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek/deepseek-v4-flash-0731', kind: 'tool' }),
+      });
+      const toolJson = await toolRes.json();
+      expect(toolJson.choices[0].message.content).toBeNull();
+      expect(toolJson.choices[0].message.tool_calls).toHaveLength(1);
+
+      const textRes = await openrouterCompatFetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek/deepseek-v4-flash-0731' }),
+      });
+      expect((await textRes.json()).choices[0].message.content).toBe('real content');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('18. cache_control rewrite still runs, then reasoning_content is promoted on the response', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ init?: RequestInit }> = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init });
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '   ', reasoning_content: 'from ws' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const res = await openrouterCompatFetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { [OPENROUTER_CACHE_HEADER]: '1' },
+        body: JSON.stringify({
+          model: 'anthropic/claude-sonnet-4.6',
+          messages: [
+            { role: 'system', content: 'stable system prompt' },
+            { role: 'user', content: 'hello' },
+          ],
+        }),
+      });
+      const rewritten = JSON.parse(calls[0].init!.body as string);
+      expect(rewritten.messages[0].content).toEqual([
+        { type: 'text', text: 'stable system prompt', cache_control: { type: 'ephemeral' } },
+      ]);
+      expect(new Headers(calls[0].init!.headers as any).has(OPENROUTER_CACHE_HEADER)).toBe(false);
+      expect((await res.json()).choices[0].message.content).toBe('from ws');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('19. non-JSON body + marker: body forwarded unchanged, marker stripped, and the reasoning_content promote still composes', async () => {
+    // Fail-open request path: a body the shim cannot parse is sent as-is
+    // (the provider surfaces its own error), the in-process marker header
+    // must STILL never leave the process, and the response-side promote is
+    // composed regardless of the request-side parse failure (#4753).
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ init?: RequestInit }> = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init });
+      return new Response(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: '', reasoning_content: 'x' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const rawBody = 'this is not json {';
+      const res = await openrouterCompatFetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { [OPENROUTER_CACHE_HEADER]: '1', 'content-length': String(rawBody.length) },
+        body: rawBody,
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].init!.body).toBe(rawBody);
+      const forwarded = new Headers(calls[0].init!.headers as any);
+      expect(forwarded.has(OPENROUTER_CACHE_HEADER)).toBe(false);
+      // Body untouched → the caller's content-length is still truthful and kept.
+      expect(forwarded.get('content-length')).toBe(String(rawBody.length));
+      expect((await res.json()).choices[0].message.content).toBe('x');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('20. marker without any body (GET-shaped init) still strips the marker and promotes', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ init?: RequestInit }> = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init });
+      return new Response(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: '', reasoning_content: 'x' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const res = await openrouterCompatFetch('https://openrouter.ai/api/v1/chat/completions', {
+        headers: { [OPENROUTER_CACHE_HEADER]: '1' },
+      });
+      expect(calls[0].init!.body).toBeUndefined();
+      expect(new Headers(calls[0].init!.headers as any).has(OPENROUTER_CACHE_HEADER)).toBe(false);
+      expect((await res.json()).choices[0].message.content).toBe('x');
     } finally {
       globalThis.fetch = originalFetch;
     }

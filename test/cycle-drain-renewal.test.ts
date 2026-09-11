@@ -14,11 +14,16 @@
 
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
+// Import through the synthesize re-export deliberately: the drain was peeled
+// to inline-drain.ts (dream-wave C7) and the re-export is part of its public
+// surface (patterns.ts + __testing depend on it).
 import { runDrainRenewalTick } from '../src/core/cycle/synthesize.ts';
 
 describe('drain-loop wiring (structural — the shape guard only covers worker.ts)', () => {
+  // The drain body lives in inline-drain.ts post-peel; the structural guard
+  // follows the code.
   const src = readFileSync(
-    new URL('../src/core/cycle/synthesize.ts', import.meta.url),
+    new URL('../src/core/cycle/inline-drain.ts', import.meta.url),
     'utf-8',
   );
   test('the renewTimer interval is guarded and routes through runDrainRenewalTick', () => {
@@ -27,6 +32,17 @@ describe('drain-loop wiring (structural — the shape guard only covers worker.t
     // The pre-fix inline shape (an unguarded queue.renewLock(...).then chain
     // inside the interval) must not come back.
     expect(src).not.toMatch(/setInterval\(\(\) => \{\s*\n\s*queue\.renewLock\(/);
+  });
+
+  test('the handler invocation carries its own chat phase (worker.ts #4218 parity)', () => {
+    // Red-team regression: the bare `await handler(context)` inherited the
+    // CALLER's AsyncLocalStorage phase, so a cycle phase that wraps its own
+    // work (dream synthesize wraps `phase:synthesize`) silently absorbed every
+    // inline-drained child's gateway spend into the phase tag — exactly the
+    // double-counting the phase telemetry's one-ledger-per-surface rule
+    // forbids. The child's own `job:<name>` tag must win.
+    expect(src).toContain("withChatPhase(`job:${job.name}`, () => handler(context))");
+    expect(src).not.toMatch(/result = await handler\(context\);/);
   });
 });
 

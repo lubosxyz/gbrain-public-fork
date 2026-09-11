@@ -33,6 +33,7 @@ import { join } from 'node:path';
 import { DEFAULT_BYTES_BLOCK } from '../content-sanity.ts';
 import { redactFindings } from '../secret-scan.ts';
 import { loadPatterns } from '../skillpack/harvest-lint.ts';
+import { sanitizeForJsonb } from '../batch-rows.ts';
 import { ensureWellFormed, truncateUtf8 } from '../text-safe.ts';
 import { BUILTIN_PATTERNS } from '../conversation-parser/builtins.ts';
 import type { ParsedSession, TranscriptMessage } from './types.ts';
@@ -122,7 +123,10 @@ export function redactSession(
   let imperativesFlagged = 0;
 
   const clean = (text: string): string => {
-    let out = ensureWellFormed(text);
+    // sanitizeForJsonb (NUL-strip + well-form): transcripts capture raw tool
+    // output that legitimately carries U+0000, which Postgres text/jsonb
+    // reject at the write boundary (#4392).
+    let out = sanitizeForJsonb(text);
     const r = redactFindings(out);
     redactionCount += r.redactions.length;
     out = r.text;
@@ -196,6 +200,22 @@ export function escapeAnchorLines(text: string): string {
     .join('\n');
 }
 
+/**
+ * Neutralize QUOTED facts/takes fence markers in a message body:
+ * `gbrain:facts:begin` → `gbrain\:facts:begin`. A session that read another
+ * page (context pack, get_page) quotes that page's `<!--- gbrain:facts:begin -->`
+ * verbatim, and the per-message char cap routinely keeps the begin marker
+ * while dropping the end — a live, unbalanced fence on a transcript page that
+ * has no fence (FACTS_FENCE_UNBALANCED on every dream cycle), or a quoted
+ * fence indexed as the transcript's own facts. Every fence consumer is an
+ * exact-substring matcher on the marker token, so the backslash lands INSIDE
+ * the token (a leading space would not break them); the text stays readable
+ * and greppable, matching the backslash idiom of escapeAnchorLines (#4821).
+ */
+export function escapeFenceMarkers(text: string): string {
+  return text.replace(/gbrain:(facts|takes):(begin|end)/g, 'gbrain\\:$1:$2');
+}
+
 export interface RenderedPart {
   slug: string;
   /** Full page content: YAML frontmatter + body. */
@@ -262,7 +282,7 @@ export function renderSessionParts(
   const blocks: string[] = messages.map((m) => {
     const ts = m.timestamp || lastTs;
     lastTs = ts;
-    const text = escapeAnchorLines(truncateUtf8(m.text, MESSAGE_CHAR_CAP));
+    const text = escapeFenceMarkers(escapeAnchorLines(truncateUtf8(m.text, MESSAGE_CHAR_CAP)));
     const [head, ...rest] = text.split('\n');
     const anchor = `**${speakerLabel(m)}** (${anchorTimestamp(ts)}): ${head}`;
     return rest.length ? `${anchor}\n${rest.join('\n')}` : anchor;

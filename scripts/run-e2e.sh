@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Run E2E tests ONE FILE AT A TIME.
+# Run E2E tests ONE FILE AT A TIME (within a shard).
 #
 # Bun's default is to run test files in parallel (each in its own worker).
-# Our E2E suite shares one Postgres database across all 13 files, and
-# `setupDB()` does TRUNCATE CASCADE + fixture import. When files run in
-# parallel, file A's TRUNCATE can race with file B's fixture import,
-# producing observed fails like "expected 16 pages, got 8", missing
-# links, orphaned timeline entries, etc. The flakiness was visible on
-# ~3 of every 5 runs pre-fix.
+# Our E2E suite shares one Postgres database across the whole test/e2e glob
+# (220+ files), and `setupDB()` does TRUNCATE CASCADE + fixture import. When
+# files run in parallel against ONE database, file A's TRUNCATE can race with
+# file B's fixture import, producing observed fails like "expected 16 pages,
+# got 8", missing links, orphaned timeline entries, etc. The flakiness was
+# visible on ~3 of every 5 runs pre-fix.
 #
-# Running files sequentially eliminates the race entirely. It also costs
-# some startup overhead (each file spins up a fresh bun process) but for
-# a suite this size that is measured in ~1-2s per file, amortized under
-# the natural per-file test time of 5-10s.
+# Running files sequentially eliminates the race entirely. Parallelism is
+# recovered ACROSS databases instead: the SHARD=N/M env below fans shards out
+# against separate Postgres containers (scripts/ci-local.sh runs 4). Within a
+# shard, per-file bun startup (~1-2s) amortizes under the natural per-file
+# test time of 5-10s.
 #
 # Exits non-zero on the first failing file so CI fails fast.
 #
@@ -54,6 +55,11 @@ fi
 # bare `bun test` runs while DATABASE_URL/GBRAIN_DATABASE_URL is ambient; the
 # per-file name floor (test/helpers/db-guard.ts) still applies after this.
 export GBRAIN_TEST_ALLOW_DATABASE_URL=1
+# Provider keys: the unit-lane preload (provider-keys-preload.ts) strips
+# ambient ANTHROPIC/OPENAI keys for keyless-CI parity; e2e is the lane where
+# real keys are deliberate (live embed/parity tests skip-gate on them), so
+# opt back in at this boundary.
+export GBRAIN_TEST_KEEP_PROVIDER_KEYS=1
 # The e2e suite runs on DATABASE_URL only; an ambient GBRAIN_DATABASE_URL
 # would pass the opt-in yet reach CLI-subprocess paths with no name floor —
 # drop it here so only the floored variable crosses the boundary.
@@ -111,6 +117,10 @@ for _e2e_var in $(env | grep -oE '^(CONDUCTOR_|MCP_|OPENCLAW_|HERMES_|GROK_|OPEN
     GBRAIN_HOME) ;;  # required for HOME isolation (set above) — keep
     GBRAIN_PGLITE_SNAPSHOT) ;;  # snapshot fast-path fixture (exported by ci-local.sh / runners) — keep
     GBRAIN_TEST_ALLOW_DATABASE_URL) ;;  # #3485 preload opt-in (set above) — keep
+    GBRAIN_TEST_KEEP_PROVIDER_KEYS) ;;  # provider-keys preload opt-in (set above) — keep
+    GBRAIN_CI_DISABLE_TEST_ENV_FILE) ;;  # CI forbids loading checkout-local .env.testing — keep through Bun startup
+    GBRAIN_TEST_DB) ;;  # explicit schema-reset opt-in for service hosts; schema-drift still requires a test-shaped DB name
+    GBRAIN_PGBOUNCER_URL|GBRAIN_PGBOUNCER_DIRECT_URL|GBRAIN_CI_REQUIRE_PGBOUNCER) ;; # explicit pooler test target and execution requirement
     GBRAIN_E2E_FILE_TIMEOUT) ;;  # per-file cap override — read AFTER this scrub, so it must survive it
     GBRAIN_E2E_ALLOW_DB) ;;  # #3485 name-floor opt-in — the guard's own error
                              # message tells operators to set it; stripping it
@@ -180,6 +190,22 @@ if [ "${#files[@]}" -eq 0 ]; then
   exit 0
 fi
 
+# PGLite snapshot fast path — ~90 e2e files boot in-memory PGLite; a cold boot
+# replays every migration (~3.5x per booting file). Every other runner already
+# activates this; the env scrub above deliberately keep-lists the var. Placed
+# AFTER --dry-run-list so list mode stays instant. Non-fatal on build failure
+# (tests fall back to cold init; the loader's schema-hash gate is authoritative).
+# Files asserting the path TO post-initSchema state carry their own per-file
+# `delete process.env.GBRAIN_PGLITE_SNAPSHOT` opt-out.
+. scripts/lib/test-env.sh
+ensure_pglite_snapshot "run-e2e"
+# Absolutize: e2e tests spawn CLI subprocesses with varying cwd; a relative
+# path would silently miss the tar there (cold-init fallback, benefit lost).
+# Same reason COVERAGE_DIR is normalized to absolute above.
+if [ -n "${GBRAIN_PGLITE_SNAPSHOT:-}" ] && [ "${GBRAIN_PGLITE_SNAPSHOT#/}" = "$GBRAIN_PGLITE_SNAPSHOT" ]; then
+  export GBRAIN_PGLITE_SNAPSHOT="$PWD/$GBRAIN_PGLITE_SNAPSHOT"
+fi
+
 pass_files=0
 fail_files=0
 fail_list=()
@@ -227,13 +253,17 @@ for f in "${files[@]}"; do
   # assertion output, which reads like a mystery failure. CI runs those
   # files in their own job WITHOUT this wrapper (see .github/workflows/
   # e2e.yml tier2), so the cap only ever bit local runs: give them 4x.
+  # serve-http-multi-agent rides the same carve-out for a different reason:
+  # it spawns TWO `gbrain serve --http` subprocesses (19133 + a chaos serve
+  # on 19134) plus several CLI register subprocesses, so its wall clock is
+  # process-spawn-bound, not test-bound.
   file_timeout="${GBRAIN_E2E_FILE_TIMEOUT:-${E2E_FILE_TIMEOUT_SECS:-180}}"
   # Digits-only validation (same strict positive-int posture as the TS env
   # knobs): a malformed value falls back to the default instead of
   # word-splitting into extra gtimeout arguments or breaking the 4x math.
   case "$file_timeout" in ''|*[!0-9]*) file_timeout=180 ;; esac
   case "$f" in
-    */skills.test.ts|*/zeroentropy-live.test.ts) file_timeout=$((file_timeout * 4)) ;;
+    */skills.test.ts|*/zeroentropy-live.test.ts|*/serve-http-multi-agent.test.ts) file_timeout=$((file_timeout * 4)) ;;
   esac
   if command -v gtimeout >/dev/null 2>&1; then
     TIMEOUT_CMD="gtimeout $file_timeout"
@@ -243,6 +273,15 @@ for f in "${files[@]}"; do
     TIMEOUT_CMD=""
   fi
   if output=$($TIMEOUT_CMD bun test --timeout=60000 ${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"} "$f" 2>&1); then
+    if [ "$f" = "test/e2e/pgbouncer-teardown.test.ts" ] && \
+       [ "${GBRAIN_CI_REQUIRE_PGBOUNCER:-0}" = "1" ] && \
+       ! printf '%s\n' "$output" | grep -qE '^[[:space:]]*[1-9][0-9]* pass$'; then
+      fail_files=$((fail_files + 1))
+      fail_list+=("$name")
+      echo "$output"
+      echo "FAILED: required PgBouncer tests did not execute"
+      continue
+    fi
     pass_files=$((pass_files + 1))
     # Extract pass/fail counts from bun's summary (e.g., "123 pass")
     p=$(echo "$output" | grep -oE '[0-9]+ pass' | tail -1 | grep -oE '[0-9]+' || echo 0)

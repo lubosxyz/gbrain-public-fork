@@ -19,7 +19,7 @@ import { MinionQueue } from '../core/minions/queue.ts';
 import { isQueueQuotaExceededError } from '../core/minions/admission.ts';
 import { waitForCompletion, TimeoutError } from '../core/minions/wait-for-completion.ts';
 import type { MinionJobInput, SubagentHandlerData, AggregatorHandlerData } from '../core/minions/types.ts';
-import { resolveSourceId, ALL_SOURCES } from '../core/source-resolver.ts';
+import { resolveSourceId, isResolverUserError, ALL_SOURCES } from '../core/source-resolver.ts';
 import { fetchSource } from '../core/sources-load.ts';
 import { runAgentLogs } from './agent-logs.ts';
 
@@ -38,20 +38,40 @@ function isKnownFlag(s: string): boolean {
 
 // ── command dispatcher ────────────────────────────────────
 
-export async function runAgent(engine: BrainEngine, args: string[]): Promise<void> {
+export async function runAgent(engine: BrainEngine | null, args: string[]): Promise<void> {
   const sub = args[0];
   if (!sub || sub === '--help' || sub === '-h') {
     printHelp();
     return;
   }
 
+  // Subcommand-aware help that STOPS at the `--` terminator: `agent run --
+  // --help` submits the LITERAL prompt; only a pre-`--` --help/-h is a help
+  // request. Answered before any engine or queue work, so the
+  // SELF_HELP_WITHOUT_ENGINE lane (engine === null) prints real help on a
+  // brainless machine and can never submit a job (cathedral-6 eng review).
+  const rest = args.slice(1);
+  const dd = rest.indexOf('--');
+  const helpScan = dd === -1 ? rest : rest.slice(0, dd);
+  const wantsHelp = helpScan.includes('--help') || helpScan.includes('-h');
+
   switch (sub) {
     case 'run':
-      await runAgentRun(engine, args.slice(1));
+      if (wantsHelp) { printHelp(); return; }
+      if (!engine) { console.error('gbrain agent run needs a configured brain. Run `gbrain init` first.'); process.exit(1); }
+      await runAgentRun(engine, rest);
       return;
     case 'logs':
-      await runAgentLogsCmd(engine, args.slice(1));
+      if (wantsHelp) { printHelp(); return; }
+      if (!engine) { console.error('gbrain agent logs needs a configured brain. Run `gbrain init` first.'); process.exit(1); }
+      await runAgentLogsCmd(engine, rest);
       return;
+    case 'register': {
+      const { printRegisterHelp, runAgentRegister } = await import('./agent-register.ts');
+      if (wantsHelp) { printRegisterHelp(); return; }
+      await runAgentRegister(engine, rest);
+      return;
+    }
     default:
       console.error(`gbrain agent: unknown subcommand "${sub}"`);
       printHelp();
@@ -65,6 +85,7 @@ function printHelp(): void {
 USAGE
   gbrain agent run <prompt> [flags]
   gbrain agent logs <job_id> [--follow] [--since <spec>]
+  gbrain agent register <name> --harness <h> [flags]   (see: gbrain agent register --help)
 
 SUBMITTING
   gbrain agent run <prompt>
@@ -110,8 +131,10 @@ NOTES
   Accepted values: true / 1 / yes / on.
 
   The gateway loop needs a provider whose recipe supports chat WITH tool
-  calling — not every recipe under src/core/ai/recipes/ qualifies. A model
-  that cannot call tools is refused at job start with the reason named.
+  calling AND declares supports_subagent_loop: true — not every recipe under
+  src/core/ai/recipes/ qualifies. A model that cannot call tools, or whose
+  tool_call_ids are not replay-stable, is refused at job start with the
+  reason named.
 `);
 }
 
@@ -210,20 +233,6 @@ function parseRunFlags(args: string[]): { flags: RunFlags; rest: string[] } {
     }
   }
   return { flags, rest };
-}
-
-/**
- * Predicate: is this error one of the source resolver's user-facing throws
- * we want to surface as a clean stderr line + exit 1? Mirrors
- * dream.ts:isResolverUserError — anything else (connection failures,
- * genuine bugs) propagates with a stack trace.
- */
-function isResolverUserError(e: unknown): boolean {
-  if (!(e instanceof Error)) return false;
-  const m = e.message;
-  return (m.startsWith('Source "') && m.includes(' not found.'))
-      || m.startsWith('Invalid --source value')
-      || m.startsWith('Invalid GBRAIN_SOURCE value');
 }
 
 /**

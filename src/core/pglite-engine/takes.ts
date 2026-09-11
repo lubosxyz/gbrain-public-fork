@@ -7,6 +7,7 @@ import type { PGlite } from '@electric-sql/pglite';
 import type {
   BatchOpts,
   TakeBatchInput, Take, TakesListOpts, TakeHit, StaleTakeRow,
+  TakeEmbeddingInput,
   TakeResolution, SynthesisEvidenceInput,
   TakesScorecard, TakesScorecardOpts, CalibrationBucket, CalibrationCurveOpts,
 } from '../engine.ts';
@@ -18,7 +19,8 @@ import type { SqlValue } from '../sql-query.ts';
 import { deriveResolutionTuple, finalizeScorecard } from '../takes-resolution.ts';
 import { normalizeWeightForStorage } from '../takes-fence.ts';
 import { buildTakeRows } from '../batch-rows.ts';
-import { takeRowToTake, takeHitRowToHit } from '../utils.ts';
+import { staleTakeRowToRow, takeRowToTake, takeHitRowToHit } from '../utils.ts';
+import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 
 /** Narrow slice of PGLiteEngine the takes operations use. */
 export interface PgliteTakesDeps {
@@ -281,6 +283,7 @@ export async function listTakes(deps: PgliteTakesDeps, opts: TakesListOpts = {})
          AND ($7::text[] IS NULL OR t.holder = ANY($7::text[]))
          AND ($11::text[] IS NULL OR p.source_id = ANY($11::text[]))
          AND ($12::text   IS NULL OR p.source_id = $12::text)
+         ${opts.excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : ''}
        ORDER BY
          CASE WHEN $8 = 'weight'      THEN t.weight     END DESC NULLS LAST,
          CASE WHEN $8 = 'since_date'  THEN t.since_date END DESC NULLS LAST,
@@ -319,6 +322,7 @@ export async function searchTakes(
        JOIN pages p ON p.id = t.page_id
        WHERE t.active
          AND $1 <% t.claim
+         ${opts.excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : ''}
          AND ($2::text[] IS NULL OR t.holder = ANY($2::text[]))
          AND ($4::text[] IS NULL OR p.source_id = ANY($4::text[]))
          AND ($5::text IS NULL OR p.source_id = $5::text)
@@ -352,6 +356,7 @@ export async function searchTakesVector(
        JOIN pages p ON p.id = t.page_id
        WHERE t.active
          AND t.embedding IS NOT NULL
+         ${opts.excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : ''}
          AND ($2::text[] IS NULL OR t.holder = ANY($2::text[]))
          AND ($4::text[] IS NULL OR p.source_id = ANY($4::text[]))
          AND ($5::text IS NULL OR p.source_id = $5::text)
@@ -406,8 +411,54 @@ export async function listStaleTakes(deps: PgliteTakesDeps): Promise<StaleTakeRo
        ORDER BY t.id
        LIMIT 100000`
     );
-    return rows as unknown as StaleTakeRow[];
+    return rows.map((row) => staleTakeRowToRow(row as Record<string, unknown>));
   }
+
+export async function updateTakeEmbeddings(
+  deps: PgliteTakesDeps,
+  rowsIn: TakeEmbeddingInput[],
+  opts?: BatchOpts,
+): Promise<number> {
+  if (rowsIn.length === 0) return 0;
+  return deps.batchRetry(
+    opts?.auditSite ?? 'updateTakeEmbeddings',
+    opts?.signal,
+    () => _updateTakeEmbeddingsOnce(deps, rowsIn),
+    rowsIn.length,
+  );
+}
+
+async function _updateTakeEmbeddingsOnce(
+  deps: PgliteTakesDeps,
+  rowsIn: TakeEmbeddingInput[],
+): Promise<number> {
+  const seen = new Set<number>();
+  const rows = rowsIn.map(({ take_id, embedding }) => {
+    if (!Number.isInteger(take_id) || take_id <= 0) throw new Error(`invalid take_id: ${take_id}`);
+    if (seen.has(take_id)) throw new Error(`duplicate take_id in embedding batch: ${take_id}`);
+    seen.add(take_id);
+    const values = Array.from(embedding);
+    if (values.length === 0 || values.some(v => !Number.isFinite(v))) {
+      throw new Error(`invalid embedding for take_id=${take_id}`);
+    }
+    return { take_id, embedding: `[${values.join(',')}]` };
+  });
+  const result = await deps.executeRawJsonb(
+    `WITH updated AS (
+       UPDATE takes AS t
+          SET embedding = v.embedding::vector,
+              embedded_at = now(),
+              updated_at = now()
+         FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(take_id bigint, embedding text)
+        WHERE t.id = v.take_id AND t.active
+        RETURNING t.id
+     )
+     SELECT id FROM updated`,
+    [],
+    [{ rows }],
+  );
+  return result.length;
+}
 
 export async function updateTake(
   deps: PgliteTakesDeps,
@@ -530,6 +581,7 @@ export async function getScorecard(deps: PgliteTakesDeps, opts: TakesScorecardOp
     // shares the SQL dialect with real Postgres so the math expressions match.
     const params: unknown[] = [];
     const clauses: string[] = [];
+    if (opts.excludePrivate) clauses.push(`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${privatePagesFilterFragment('p')})`);
     if (opts.holder !== undefined) { params.push(opts.holder); clauses.push(`AND holder = $${params.length}`); }
     if (opts.domainPrefix !== undefined) {
       params.push(opts.domainPrefix + '%');
@@ -576,6 +628,7 @@ export async function getCalibrationCurve(deps: PgliteTakesDeps, opts: Calibrati
     const maxIdx = Math.floor(1 / bucketSize) - 1;
     const params: unknown[] = [bucketSize, maxIdx];
     const clauses: string[] = [];
+    if (opts.excludePrivate) clauses.push(`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${privatePagesFilterFragment('p')})`);
     if (opts.holder !== undefined) { params.push(opts.holder); clauses.push(`AND holder = $${params.length}`); }
     if (allowList !== undefined) { params.push(allowList); clauses.push(`AND holder = ANY($${params.length}::text[])`); }
     // #2200-class: source scope via the take's page (EXISTS — no pages JOIN here).

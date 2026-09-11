@@ -96,6 +96,14 @@ export interface Page {
   created_at: Date;
   updated_at: Date;
   /**
+   * `updated_at` at the column's microsecond precision, as an ISO string
+   * (`2026-08-10T12:00:00.000123Z`). Projected by `listPages` so keyset
+   * callers can resume from the exact row (`updatedAfterKeyset.updatedAt`);
+   * a JS Date holds milliseconds only and would re-select every row in the
+   * last row's millisecond. Absent on paths that do not project it.
+   */
+  updated_at_iso?: string;
+  /**
    * v0.26.5: when present, the page is soft-deleted. Hidden from search and
    * from `getPage` / `listPages` by default; surface via `include_deleted: true`.
    * The autopilot purge phase hard-deletes rows where `deleted_at < now() - 72h`.
@@ -228,6 +236,14 @@ export interface PageInput {
   compiled_truth: string;
   timeline?: string;
   frontmatter?: Record<string, unknown>;
+  /**
+   * #3694: page tags for content-hash parity with the importer. The importer
+   * (parseMarkdown) hoists `tags` out of frontmatter; putPage callers usually
+   * leave them inside `frontmatter.tags`. `contentHash` accepts either
+   * (`page.tags ?? frontmatter.tags`, sorted) so both spellings hash the same.
+   * Optional — omitting it keeps existing callers source-compatible.
+   */
+  tags?: string[];
   content_hash?: string;
   /**
    * v0.19.0: distinguishes markdown vs code pages at the DB level. Defaults
@@ -311,9 +327,12 @@ export interface PageFilters {
    * v0.45.7 — keyset cursor for deterministic pagination through pages sharing
    * one `updated_at`. `WHERE p.updated_at > ts OR (p.updated_at = ts AND
    * p.slug > slug)`. Supersedes `updated_after` when set; pair with
-   * `sort: 'updated_asc'` (total order). Used by the `delta` verb's session
+   * `sort: 'updated_asc'` (a total order: updated_at, slug, source_id, id —
+   * slug alone is unique only per source). Used by the `delta` verb's session
    * cursor so a >limit same-timestamp cluster pages cleanly instead of
-   * livelocking. `slug` empty ⇒ start of the `ts` bucket.
+   * livelocking. `slug` empty ⇒ start of the `ts` bucket. `updatedAt` should
+   * be the row's `updated_at_iso` (column precision); a millisecond-rounded
+   * value re-selects same-millisecond rows.
    */
   updatedAfterKeyset?: { updatedAt: string; slug: string };
   /**
@@ -353,10 +372,35 @@ export interface PageFilters {
    * pre-v0.34 unscoped behavior is preserved for local CLI callers.
    */
   sourceIds?: string[];
+  /** Inclusive bounds on semantic page time. NULL effective dates do not match. */
+  effective_after?: string;
+  effective_before?: string;
+  /**
+   * #4352 remediation — hide pages whose frontmatter carries
+   * `visibility: private` (absent visibility defaults to 'world'). Set by
+   * list_pages for untrusted callers via resolveExcludePrivatePages; trusted
+   * local listing is unchanged. Predicate matches privatePagesFilterFragment
+   * (search/private-visibility.ts) in BOTH engines.
+   */
+  excludePrivate?: boolean;
 }
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */
-export interface GetPageOpts {
+export interface PageReadScope {
+  sourceId?: string;
+  sourceIds?: string[];
+  /** Resolved by the trusted operation layer, never from MCP parameters. */
+  excludePrivate?: boolean;
+  /** Untrusted chunk reads require a verified protected-body index, even with visibility opt-outs. */
+  requireSafeChunks?: boolean;
+}
+
+export interface PageReadPolicy extends PageReadScope {
+  /** Undefined is unrestricted; an empty list permits no holders. */
+  takesHoldersAllowList?: string[];
+}
+
+export interface GetPageOpts extends PageReadScope {
   /** Filter to a specific source. When omitted, getPage returns the first slug match across sources (pre-existing semantics). */
   sourceId?: string;
   /**
@@ -377,9 +421,16 @@ export const PAGE_SORT_SQL: Record<NonNullable<PageFilters['sort']>, string> = {
   // cluster of pages sharing one updated_at (bulk syncs stamp identical
   // now() across a transaction). Without the tiebreaker, rows at the same
   // timestamp order arbitrarily and a >limit tie cluster is unpageable.
-  updated_asc:  'p.updated_at ASC, p.slug ASC',
+  // The cursor must carry the column's microsecond precision to be exact:
+  // resume from `Page.updated_at_iso`, never from a JS Date. Slug is unique
+  // only per source, so a federated listing needs source_id + id behind it to
+  // stay a total order (same tiebreakers as `slug` below).
+  updated_asc:  'p.updated_at ASC, p.slug ASC, p.source_id ASC, p.id ASC',
   created_desc: 'p.created_at DESC',
-  slug:         'p.slug ASC',
+  // Slug uniqueness is per (source_id, slug), so a federated listing can hold
+  // the same slug from several sources; source_id + id make slug+offset paging
+  // a TOTAL order (same class as the updated_asc tiebreaker above).
+  slug:         'p.slug ASC, p.source_id ASC, p.id ASC',
 };
 
 /**
@@ -441,7 +492,11 @@ export interface DomainBankRow {
   representative_chunk_id: number | null;
 }
 
-export interface SalienceOpts {
+export interface SalienceOpts extends PageReadPolicy {
+  /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
+  sourceId?: string;
+  /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
+  sourceIds?: string[];
   /** Window in days. Default 14. */
   days?: number;
   /** Max rows to return (clamped at 100). Default 20. */
@@ -492,10 +547,10 @@ export interface SalienceResult {
  *
  * Why a dedicated engine method instead of composing `listPages` +
  * `getBacklinkCounts` in memory:
- *   - `getBacklinkCounts` groups by bare `slug`, so the same slug in two
- *     sources collapses/contaminates the count. This query counts inbound
- *     links per page row (`to_page_id = p.id`), which is source-correct by
- *     construction.
+ *   - `getBacklinkCounts` is page-id-keyed (source-correct since #4380),
+ *     but composing it with `listPages` in memory still costs a second
+ *     round-trip. This query counts inbound links per page row
+ *     (`to_page_id = p.id`) inside the one source-scoped query.
  *   - `listPages` returns full `Page` rows (bodies). 500 stub bodies per
  *     type per source is not a memory guarantee. This projection carries
  *     only `body_len`, never the body.
@@ -551,12 +606,18 @@ export const ENRICH_ORDER_SQL: Record<EnrichCandidatesOpts['order'], string> = {
  * the number of distinct pages touched on `since`. A cohort is anomalous when its
  * current count exceeds `mean + sigma * stddev`. Year cohort deferred to v0.30.
  */
-export interface AnomaliesOpts {
+export interface AnomaliesOpts extends PageReadScope {
+  /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
+  sourceId?: string;
+  /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
+  sourceIds?: string[];
   /** ISO date (YYYY-MM-DD). Default = today (UTC). */
   since?: string;
   /** Days of history for the baseline. Default 30. */
   lookback_days?: number;
-  /** Sigma threshold. Default 3.0. */
+  /** Sigma threshold. Default 3.0. Scope note: the source scope above is
+   *  applied to BOTH the baseline and today windows so the anomaly math
+   *  stays consistent. */
   sigma?: number;
 }
 
@@ -645,7 +706,7 @@ export interface StaleChunkRow {
   slug: string;
   chunk_index: number;
   chunk_text: string;
-  chunk_source: 'compiled_truth' | 'timeline';
+  chunk_source: 'compiled_truth' | 'timeline' | 'fenced_code';
   model: string | null;
   token_count: number | null;
   /** v0.31.12: source_id so embed --stale can thread it through getChunks/upsertChunks. */
@@ -768,6 +829,22 @@ export interface SearchResult {
    */
   content_flag?: { reason: string; detail: string };
   /**
+   * 2026-09 fix wave (#3617 follow-up): true when this row came from the
+   * keyword/title arm's AND→OR zero-strict-recall fallback rather than a
+   * strict websearch match. Stamped by the ENGINES inside the fallback
+   * branch (both engines, keyword + title arms — parity-pinned). hybridSearch
+   * reads it at fusion time: relaxed rows only vote in RRF when EVERY vector
+   * list is empty (the fallback's designed rescue case — keyword-only /
+   * keyless / degraded paths). When the vector arm is healthy, relaxed rows
+   * are dropped pre-fusion: OR-of-common-terms matches carry noise-shaped
+   * rank evidence, and letting them vote at full RRF weight demonstrably
+   * outvotes correct semantic results (LongMemEval receipt: hybrid
+   * recall_all@5 51.3% with them voting vs vector-only 93.8%; disabling the
+   * fallback restored gold to ranks 0-2 on probed questions). Absent on
+   * strict-match rows.
+   */
+  keyword_relaxed?: boolean;
+  /**
    * Extraction quarantine lane (issue #160): true when the result's page is
    * an unverified auto-extracted entity stub (frontmatter
    * `provenance: 'auto-extracted'` + `status: 'unverified'`). Such pages are
@@ -778,6 +855,17 @@ export interface SearchResult {
    * pages.
    */
   unverified?: boolean;
+  /**
+   * #4220: the page's raw `frontmatter.status` value (e.g. 'draft',
+   * 'superseded', 'restricted', 'unverified', 'verified'), surfaced so agents
+   * can weigh lifecycle state without a follow-up page fetch. Stamped
+   * pre-fusion by `stampUnverifiedExtractions` (hybrid.ts) from the same
+   * batched query that powers the quarantine lane. Absent when the page has
+   * no status frontmatter. NOTE: `unverified` stays the load-bearing
+   * quarantine flag (requires provenance='auto-extracted' too); `status`
+   * alone is informational.
+   */
+  status?: string;
   /**
    * v0.36 (cross-modal wave): the chunk's modality discriminator from
    * content_chunks.modality. 'text' for the existing text-embedding rows,
@@ -838,6 +926,13 @@ export interface SearchResult {
   /** Shortest connecting slug path seed→…→result (for "how I know this"). */
   relational_path?: string[];
   /**
+   * Ranker wave — set when `pinRelationalRows` (relational-rerank-pin.ts)
+   * re-pinned this relational-arm row above the reranked text rows. Autocut
+   * preserves stamped rows and excludes them from its cliff computation (they
+   * carry low cross-encoder scores by construction). Absent otherwise.
+   */
+  relational_pinned?: boolean;
+  /**
    * v0.40.4 full attribution (D12=A) — per-stage score deltas for the
    * `gbrain search --explain` formatter. Every boost stage stamps its
    * contribution so the formatter can reconstruct the score derivation.
@@ -847,6 +942,15 @@ export interface SearchResult {
    */
   /** RRF + cosine score BEFORE any boost stage mutated it. */
   base_score?: number;
+  /**
+   * v0.46.15 — RAW query↔chunk cosine similarity from cosineReScore's
+   * hydration (the active embedding column's space). Absent on keyword-only
+   * / no-embedding paths. This is the ONLY calibrated semantic signal on the
+   * result — evidence's `high_vector_match` keys off it, never off the
+   * blended/boosted score (the #3963 class: a keyword+boost pile-up reading
+   * as a vector match).
+   */
+  cosine?: number;
   /** Multiplier applied by applyBacklinkBoost (1.0 = unchanged). */
   backlink_boost?: number;
   /** Multiplier applied by applySalienceBoost. */
@@ -882,6 +986,22 @@ export interface SearchResult {
    */
   alias_resolved_boost?: number;
   /**
+   * supersession — set when this page is the target of a `supersedes` link
+   * (a newer/canon page supersedes it). The page-level analogue of the
+   * `superseded_by`/`expired_at` temporal awareness recall.ts already applies
+   * to the facts table: the post-fusion supersession stage stamps
+   * `superseded=true`, records the superseding (canon) page's slug in
+   * `superseded_by`, and multiplies score by `supersede_penalty` (<1.0) so
+   * current canon out-scores stale material. Absent when the page is current.
+   * Consumers (`gbrain search --explain`, the contradiction probe, agent
+   * renderers) surface a SUPERSEDED flag. The flag is authoritative even in
+   * reranked modes where the cross-encoder owns the final head order.
+   */
+  superseded?: boolean;
+  superseded_by?: string;
+  /** Multiplier applied by the supersession stage (<1.0; absent = unchanged). */
+  supersede_penalty?: number;
+  /**
    * T2 (retrieval-maxpool incident) — multiplier applied by applyTitleBoost
    * (1.0 = unchanged; default ~1.25x). Fires when the normalized query is a
    * contiguous token-run inside the page title (or an exact full-title match).
@@ -899,6 +1019,24 @@ export interface SearchResult {
    * decision keys off (T4).
    */
   alias_hit?: boolean;
+  /**
+   * #3783 — set when this result was surfaced by a LEXICAL arm (chunk-grain
+   * keyword FTS or the page-grain title arm). Stamped pre-fusion by
+   * markKeywordHits and OR-propagated through RRF fusion so a row that
+   * arrived via both vector and keyword arms keeps the flag regardless of
+   * which copy fusion saw first. `evidence: keyword_exact` fires ONLY on
+   * rows carrying this flag — a pure-vector row with a solid blended score
+   * is no longer mislabeled as a keyword match.
+   */
+  keyword_hit?: boolean;
+  /**
+   * #1663 — set when the structural exact-lookup tier promoted/injected this
+   * result (query was the page's slug or exact normalized title). Drives the
+   * autocut preserve predicate (tier hits carry no rerank_score) and
+   * `--explain` telemetry; evidence still reads via alias_hit /
+   * title_match_boost so the frozen EVIDENCE_ENUM is untouched.
+   */
+  exact_lookup?: 'slug' | 'title';
   /**
    * T4 — the strongest signal that surfaced this page (alias_hit >
    * exact_title_match > high_vector_match > keyword_exact > weak_semantic).
@@ -980,9 +1118,19 @@ export interface ResolvedColumn {
   embeddingModel: string;
 }
 
-export interface SearchOpts {
+export interface SearchOpts extends PageReadPolicy {
   limit?: number;
   offset?: number;
+  /**
+   * v0.46.15 — out-channel for searchVector's bounded pagination escalation
+   * (retrieval-cathedral P1: one dense page could consume the whole inner
+   * candidate pool before the per-page DISTINCT collapse, underfilling the
+   * result). Engines have no telemetry sink; the HYBRID layer passes a
+   * collector here and owns the emit. Called at most once per searchVector
+   * call, only when the escalation loop ended with the page set still
+   * underfilled at the HNSW substrate cap (ef_search hard ceiling).
+   */
+  onVectorPoolMeta?: (m: { underfilled: boolean; escalations: number; innerLimit: number }) => void;
   /**
    * v0.42 — intent-aware adaptive return-sizing. `true` enables with config/
    * default caps; an object overrides caps per-call; omitted/`false` = off
@@ -1151,6 +1299,17 @@ export interface SearchOpts {
    */
   tokenBudget?: number;
   /**
+   * #4352 — page-level `visibility: private` enforcement for untrusted
+   * callers. When true, both engines' search paths (keyword, titles,
+   * keyword-chunks, vector) add
+   * `COALESCE(p.frontmatter->>'visibility','world') <> 'private'` to the
+   * visibility clause. Callers resolve trust + the config gate via
+   * `resolveExcludePrivatePages` (search/private-visibility.ts):
+   * ctx.remote !== false → true unless the operator opted out. Omitted /
+   * false = pre-fix behavior (trusted local reads see everything).
+   */
+  excludePrivate?: boolean;
+  /**
    * v0.32.x (search-lite): enable/disable the semantic query cache for this
    * call. When undefined, the cache decision falls back to global config
    * (search.cache.enabled, default true). Set to `false` to force a fresh
@@ -1230,6 +1389,16 @@ export interface SearchOpts {
    */
   relationalRetrieval?: boolean;
   relationalRetrievalDepth?: number;
+  /**
+   * Ranker wave — per-call override for `search.relational_rerank_pin`
+   * (relational-arm rows re-pinned above reranked text rows; `0` disables).
+   * Per-call wins over config wins over the mode bundle; out-of-range values
+   * (negative, > 10, fractional, NaN) are treated as unset through the ONE
+   * range contract `normalizeRelationalRerankPin` (relational-rerank-pin.ts),
+   * in BOTH the inner search and the cache resolver (knobs hash reflects it).
+   * Eval A/B gates drive it here.
+   */
+  relationalRerankPin?: number;
 }
 
 /**
@@ -1344,7 +1513,9 @@ export interface RelationalFanoutRow {
 }
 
 /** Options for BrainEngine.relationalFanout. */
-export interface RelationalFanoutOpts {
+export interface RelationalFanoutOpts extends PageReadPolicy {
+  /** Resolved seed identities; separate from the read grant for edge origins. */
+  seedRefs?: Array<{ source_id: string; slug: string }>;
   /** Edge types to traverse; null/empty = type-agnostic. */
   linkTypes?: string[] | null;
   /** Direction from each seed. Default 'both'. */
@@ -1379,7 +1550,7 @@ export interface TimelineInput {
   detail?: string;
 }
 
-export interface TimelineOpts {
+export interface TimelineOpts extends PageReadScope {
   limit?: number;
   after?: string;
   before?: string;
@@ -1415,7 +1586,7 @@ export interface ChronicleTimelineRow {
   kind: string | null;        // event.kind from the event page frontmatter
 }
 
-export interface ChronicleTimelineOpts {
+export interface ChronicleTimelineOpts extends PageReadScope {
   /** getTimelineForDate: expand to the ISO week (Mon–Sun) containing `date`. */
   week?: boolean;
   /** getSince: filter event projections by `event.kind`. */
@@ -1476,7 +1647,12 @@ export interface OntologyConflict {
   dimension: string;
   values: { value: string; source: string | null; confidence: number; fact_id: number }[];
 }
-export interface OntologyReadOpts {
+// excludePrivate (from PageReadScope) drops observations whose provenance page
+// is `visibility: private` BEFORE per-dimension resolution, so an untrusted
+// caller resolves the newest value they may see — never a private one, never
+// a hole where one was. Set by the op layer (readPolicyOpts); engines never
+// decide trust.
+export interface OntologyReadOpts extends PageReadScope {
   asof?: string;
   minConfidence?: number;
   includeQuarantined?: boolean;
@@ -1510,6 +1686,14 @@ export interface BrainStats {
   timeline_entry_count: number;
   pages_by_type: Record<string, number>;
 }
+
+/**
+ * gbrain#4147: minimum entity pages before the entity-scoped coverage ratios
+ * (link_coverage / timeline_coverage) are statistically worth reporting.
+ * Behavior: 0 entities → null (0/0 used to read as a hard 0%); 1..4 → null
+ * (a one-page "100% ± 0.0%" is noise, cf. #3945); >= 5 → the real ratio.
+ */
+export const MIN_ENTITY_PAGES_FOR_COVERAGE = 5;
 
 export interface BrainHealth {
   page_count: number;
@@ -1547,10 +1731,24 @@ export interface BrainHealth {
    * DELETEs can produce dangling references.
    */
   dead_links: number;
-  /** Fraction of entity pages (person/company) with >= 1 inbound link. */
-  link_coverage: number;
-  /** Fraction of entity pages (person/company) with >= 1 structured timeline entry. */
-  timeline_coverage: number;
+  /**
+   * gbrain#4147: entity pages in the coverage denominator. Surfaced so
+   * consumers can tell "0% coverage" from "no entities to grade".
+   */
+  entity_page_count: number;
+  /**
+   * Entity link coverage, or null when entity_page_count is below
+   * MIN_ENTITY_PAGES_FOR_COVERAGE — a 0/0 or single-page ratio is
+   * statistically meaningless and used to read as a hard 0%/100%
+   * (gbrain#4147). Null means "not enough entity pages to grade"; consumers
+   * suppress the percentage AND its remediation actions.
+   */
+  link_coverage: number | null;
+  /**
+   * Fraction of entity pages (person/company) with >= 1 structured timeline
+   * entry, or null below the same small-N floor as link_coverage (#4147).
+   */
+  timeline_coverage: number | null;
   /** Top 5 entities by total link count (in + out). */
   most_connected: Array<{ slug: string; link_count: number }>;
   /**
@@ -1688,6 +1886,23 @@ export interface EvalCaptureFailure {
  *                        it was the primary recall arm (vector unavailable)
  *   cache_prestamp     — served from a cache row written before the
  *                        degradation stamp existed; cleanliness unprovable
+ *   reranker_skipped   — the mode enables the reranker but it did not run:
+ *                        reason `no_key` (provider key absent) or
+ *                        `sunset_short_circuit` (provider dead past its
+ *                        announced date); results are in RRF order
+ *   rerank_passthrough — the reranker was enabled and the provider answered
+ *                        SUCCESSFULLY but with an empty/malformed result set,
+ *                        so results passed through in raw RRF order with no
+ *                        rerank_score (#4648 — distinguishes "reranker off"
+ *                        from "reranker died silently")
+ *   keyword_relaxed_carried — OR-relaxed lexical rows VOTED in fusion because
+ *                        every text vector list came back empty on a
+ *                        vector-enabled run (e.g. mid embed-backfill). The
+ *                        result set leans on noise-shaped rank evidence, so
+ *                        the cache write takes the degraded (short) TTL —
+ *                        otherwise a transitional relaxed-carried row would
+ *                        shadow the recovered pipeline for the full TTL
+ *                        under the same knobs hash (2026-09 red-team).
  */
 export const DEGRADED_STAGES = [
   'embed_unavailable',
@@ -1700,6 +1915,9 @@ export const DEGRADED_STAGES = [
   'budget_truncated',
   'keyword_zero',
   'cache_prestamp',
+  'reranker_skipped',
+  'rerank_passthrough',
+  'keyword_relaxed_carried',
 ] as const;
 export type DegradedStage = (typeof DEGRADED_STAGES)[number];
 
@@ -1716,12 +1934,40 @@ export const DEGRADED_REASONS = [
   'variant_embed_failed',
   'original_embed_failed',
   'first_result_truncated',
+  'no_key',
+  'sunset_short_circuit',
+  // #4648 — rerank_passthrough reasons (mirror RerankPassThroughReason).
+  'empty_result_set',
+  'malformed_shape',
 ] as const;
 export type DegradedReason = (typeof DEGRADED_REASONS)[number];
 
 export interface DegradedStageEntry {
   stage: DegradedStage;
   reason?: DegradedReason;
+}
+
+/**
+ * Stages that change RANKING but never RECALL: the result set is complete,
+ * only its order is not what the mode promised. Consumers that reason about
+ * "was recall impaired?" (empty-result copy, the short degraded cache TTL)
+ * skip these; consumers that report "what did not run" keep them.
+ *
+ * Membership is a deliberate list, not "anything reranker-shaped":
+ *   - `reranker_skipped` IS ranking-only: it is a CONFIG state (no key / dead
+ *     provider) that a short TTL cannot fix, so the cache keeps the full TTL.
+ *   - `rerank_passthrough` (#4648) is NOT listed on purpose: the provider
+ *     answered 200 with an empty/malformed set — a TRANSIENT fault where the
+ *     short degraded TTL lets the next query recover a reranked result set
+ *     (master's v0.48.1.0 behavior, kept at the merge). It never reaches the
+ *     empty-result copy because a pass-through implies a non-empty batch.
+ *   - `keyword_relaxed_carried` is recall-shaped by definition (see above).
+ * Pinned by test/degraded-stages-recall.test.ts; a new fail-open stage must be
+ * classified here in the same commit that adds it.
+ */
+export const RANKING_ONLY_DEGRADED_STAGES: ReadonlySet<DegradedStage> = new Set<DegradedStage>(['reranker_skipped']);
+export function affectsRecall(d: { stage?: string; reason?: string } | undefined | null): boolean {
+  return !!d?.stage && !RANKING_ONLY_DEGRADED_STAGES.has(d.stage as DegradedStage);
 }
 
 /**
@@ -1744,18 +1990,64 @@ export interface HybridSearchMeta {
    * command can show "intent: temporal" alongside results to make the
    * weighting decision auditable.
    */
-  intent?: 'entity' | 'temporal' | 'event' | 'general';
+  intent?: 'entity' | 'temporal' | 'event' | 'concept' | 'general';
   /**
    * v0.42 — adaptive return-sizing decision (intent, cap, kept, total).
    * Omitted when the gate is off. Surfaced for `gbrain search --explain`.
    */
   adaptive_return?: import('./search/return-policy.ts').AdaptiveReturnDecision;
   /**
+   * v0.46.15 — searchVector's bounded pagination escalation ended at the HNSW
+   * substrate cap with the page set still underfilled (dense-corpus signal:
+   * the caller asked for more distinct pages than the candidate pool could
+   * yield). Omitted on clean runs. Exhaustion is VISIBLE, not silent.
+   */
+  vector_pool_underfilled?: { escalations: number; innerLimit: number };
+  /**
    * v0.42.3.0 — autocut decision (signal, cut point, kept/total, gapRatio).
    * Omitted when autocut didn't run (no reranker). Surfaced for
    * `gbrain search --explain`.
    */
   autocut?: import('./search/autocut.ts').AutocutDecision;
+  /**
+   * #3995 — guaranteed page-1 relational evidence slot. Present only when a
+   * fired relational arm's answer had to be promoted from beyond the limit
+   * window (fusion overflow) or re-injected after autocut/trim dropped it.
+   * Omitted on clean runs (evidence already on page 1) and when the arm
+   * didn't fire. Surfaced for `gbrain search --explain`.
+   */
+  relational_evidence_slot?: import('./search/relational-recall.ts').RelationalEvidenceSlotDecision;
+  /**
+   * Ranker wave — relational rerank pin decision (knob, relational pages in
+   * the pool, the pinned rows with from/to/fused ranks, how many moved).
+   * Present only when the reranker reordered the pool AND at least one
+   * relational-arm row was pinned; omitted for non-relational queries, pin 0,
+   * and every reranker fail-open path. Surfaced for `gbrain search --explain`.
+   */
+  relational_rerank_pin?: import('./search/relational-rerank-pin.ts').RelationalRerankPinDecision;
+  /**
+   * Ranker wave (Phase E2, Cat 13) — keyword-arm confidence decision:
+   * `margin_ratio` (scale-free `top / (top + second)` over the keyword arm's
+   * fused rows; 1 single row; 0 empty), the raw `top_score` (diagnostics),
+   * and `downweighted` (did the keyword + title lists fuse at weight 0.5).
+   * Present on every main RRF-path result — INCLUDING with the floor off
+   * (`downweighted: false`) — so an operator can calibrate
+   * `search.keyword_arm_confidence_floor` from per-probe margins. Omitted on
+   * the keyword-only fallback paths (no vector arm → no decision).
+   */
+  keyword_arm_confidence?: import('./search/arm-confidence.ts').KeywordArmConfidenceDecision;
+  /**
+   * Ranker wave (Phase E3, Cat 13) — metadata boost gate decision: the
+   * resolved `gate` (`always` | `lexical`), `lexical_voted` (did a strict
+   * keyword, title-arm or relational row reach fusion), `boosts_applied` (did
+   * the backlink / salience / recency / graph-signal / alias-resolved stages
+   * run) and the `reason`. Present on every main RRF-path result — INCLUDING
+   * under `always` (`boosts_applied: true`) — so an operator can count
+   * vector-only-voter queries before flipping `search.metadata_boost_gate`.
+   * Omitted on the keyword-only fallback paths (the lexical arms are the
+   * recall there; the gate is never consulted).
+   */
+  metadata_boost_gate?: import('./search/metadata-boost-gate.ts').MetadataBoostGateDecision;
   /**
    * v0.32.x (search-lite): token budget enforcement metadata. Omitted when
    * no budget was applied (backward-compatible with pre-search-lite
@@ -1781,6 +2073,17 @@ export interface HybridSearchMeta {
    * existed (surfaced as `cache_prestamp` at hit time).
    */
   degraded?: DegradedStageEntry[];
+  /**
+   * 2026-09 fix wave (#3617 follow-up): count of OR-relaxed lexical rows
+   * fetched but EXCLUDED from RRF fusion because the text vector arm was
+   * healthy (the designed demotion). NOT a degraded stage — muting relaxed
+   * noise on a healthy run is normal operation and common (any query with
+   * zero strict lexical matches), so it must not shorten the cache TTL —
+   * but without this field `_meta` implies the lexical arms voted when they
+   * contributed nothing, hiding the demotion from an operator debugging a
+   * miss. Omitted when zero.
+   */
+  relaxed_dropped?: number;
   /**
    * WP2/T3 — pre-budget hit count: how many results retrieval produced for
    * this page BEFORE token-budget enforcement. Lets a consumer distinguish

@@ -4,6 +4,7 @@
  * under its original name (tests and external callers import them from
  * doctor.ts) and buildChecks / doctorReportRemote consume them.
  */
+import { isZeroEntropyModel, NEW_INSTALL_DEFAULT_RERANKER_MODEL } from '../../../core/ai/defaults.ts';
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 
@@ -238,7 +239,7 @@ export async function checkZeEmbeddingHealth(engine: BrainEngine): Promise<Check
     const { loadConfigFileOnly } = await import('../../../core/config.ts');
     let model = '';
     try { model = getEmbeddingModel(); } catch { /* gateway unconfigured */ }
-    if (!model.startsWith('zeroentropyai:')) {
+    if (!isZeroEntropyModel(model)) {
       return {
         name: 'ze_embedding_health',
         status: 'ok',
@@ -330,7 +331,7 @@ export async function checkProviderSunset(engine: BrainEngine, now: number = Dat
         message: 'Check suppressed via doctor.suppress_provider_sunset (unset it to re-enable).',
       };
     }
-    const { DEFAULT_EMBEDDING_MODEL, ZEROENTROPY_SUNSET_DATE } = await import('../../../core/ai/defaults.ts');
+    const { DEFAULT_EMBEDDING_MODEL, ZEROENTROPY_SUNSET_DATE, sunsetDateHasPassed } = await import('../../../core/ai/defaults.ts');
     // Effective model: gateway when configured (file/env plane, the runtime
     // truth); the shipped default otherwise — an unset-config brain resolves
     // to the default at runtime, so it is just as affected.
@@ -355,8 +356,8 @@ export async function checkProviderSunset(engine: BrainEngine, now: number = Dat
     } catch {
       // Mode resolution failed — make no reranker-exposure claim.
     }
-    const onSunsetEmbedding = model.startsWith('zeroentropyai:');
-    const onSunsetReranker = !!reranker?.startsWith('zeroentropyai:');
+    const onSunsetEmbedding = isZeroEntropyModel(model);
+    const onSunsetReranker = isZeroEntropyModel(reranker);
     // Custom embedding columns can route queries through a ZE-backed model
     // even when the primary embedding + reranker are clear — without this arm
     // the check reports ok while those columns die on the date.
@@ -375,7 +376,9 @@ export async function checkProviderSunset(engine: BrainEngine, now: number = Dat
         message: `No configured provider has an announced shutdown (embedding: ${model}).`,
       };
     }
-    const past = now >= Date.parse(`${ZEROENTROPY_SUNSET_DATE}T00:00:00Z`);
+    // Shared date-itself-counts comparison with the gateway's rerank
+    // short-circuit (defaults.ts:sunsetDateHasPassed) — the two cannot drift.
+    const past = sunsetDateHasPassed(ZEROENTROPY_SUNSET_DATE, new Date(now));
     const parts: string[] = [];
     let hasVectors = false;
     if (onSunsetEmbedding) {
@@ -418,7 +421,7 @@ export async function checkProviderSunset(engine: BrainEngine, now: number = Dat
     if (onSunsetReranker) {
       parts.push(
         `The reranker (${reranker}) is on the same provider; after the shutdown search falls back to unreranked ordering. ` +
-        `Fix: gbrain config set search.reranker.model voyage:rerank-2.5 (needs VOYAGE_API_KEY), or disable: gbrain config set search.reranker.enabled false.`,
+        `Fix: gbrain config set search.reranker.model ${NEW_INSTALL_DEFAULT_RERANKER_MODEL} (needs VOYAGE_API_KEY), or disable: gbrain config set search.reranker.enabled false.`,
       );
     }
     if (onSunsetColumns) {
@@ -632,6 +635,124 @@ export async function checkFactsEmbeddingWidthConsistency(engine: BrainEngine): 
       name: 'facts_embedding_width_consistency',
       status: 'warn',
       message: `Could not check facts.embedding width: ${msg}`,
+    };
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// #4222 junk_entity_hubs — near-empty entity pages with huge edge counts
+// ---------------------------------------------------------------------------
+
+/**
+ * Default thresholds for the junk-hub heuristic: a page with almost no
+ * content of its own (<= JUNK_HUB_MAX_CHUNKS chunks) but a very large edge
+ * count (> JUNK_HUB_EDGE_THRESHOLD links in either direction) is almost
+ * always an extractor-minted generic-token entity ("Will", "Info") that the
+ * by-mention auto-linker turned into a mega-hub. Exported so tests and
+ * out-of-tree tooling reference the shipped numbers instead of copying them.
+ */
+export const JUNK_HUB_EDGE_THRESHOLD = 1000;
+export const JUNK_HUB_MAX_CHUNKS = 2;
+
+/**
+ * #4222 junk_entity_hubs doctor check.
+ *
+ * Surfaces (warn + list — NEVER auto-delete) pages whose edge count dwarfs
+ * their content: chunks <= maxChunks AND total edges (from + to) >
+ * edgeThreshold. These poison graph signals and relational recall. The
+ * mint gate (enrichEntity) and gazetteer drop (buildGazetteer) stop NEW
+ * accretion; this check finds hubs that predate those gates so the owner
+ * can review/merge/delete them deliberately.
+ *
+ * The shape this heuristic looks for — near-empty content, many inbound
+ * edges — is also the intended shape of a deliberately thin index/hub page
+ * (e.g. external tooling that creates a `topic/X` page via `capture`/
+ * `put_page` specifically to aggregate mentions across many member pages).
+ * Callers that mint such pages on purpose can opt them out with
+ * `junk_hub_exempt: true` in frontmatter (optionally paired with a
+ * `junk_hub_exempt_reason` string) — same "flag by default, let the owner
+ * declare intent" idea as the `raw_trace_exempt` / `raw_trace_exempt_reason`
+ * escape hatch `rawProvenanceCheck` (#1978) uses, though that one exempts on
+ * key *presence* while this one requires the value `true` specifically.
+ *
+ * `opts` exists for tests (small corpora can't reach 1000 edges); the
+ * production call site uses the exported defaults.
+ */
+export async function checkJunkEntityHubs(
+  engine: BrainEngine,
+  opts?: { edgeThreshold?: number; maxChunks?: number },
+): Promise<Check> {
+  const edgeThreshold = opts?.edgeThreshold ?? JUNK_HUB_EDGE_THRESHOLD;
+  const maxChunks = opts?.maxChunks ?? JUNK_HUB_MAX_CHUNKS;
+  try {
+    const rows = await engine.executeRaw<{
+      slug: string;
+      source_id: string | null;
+      edges: number;
+      chunks: number;
+    }>(
+      `WITH edge_counts AS (
+         SELECT page_id, COUNT(*)::int AS edges FROM (
+           SELECT from_page_id AS page_id FROM links
+           UNION ALL
+           SELECT to_page_id AS page_id FROM links
+         ) e
+         GROUP BY page_id
+         HAVING COUNT(*) > $1
+       ),
+       chunk_counts AS (
+         SELECT page_id, COUNT(*)::int AS chunks
+         FROM content_chunks
+         GROUP BY page_id
+       )
+       SELECT p.slug, p.source_id, ec.edges, COALESCE(cc.chunks, 0)::int AS chunks
+       FROM edge_counts ec
+       JOIN pages p ON p.id = ec.page_id AND p.deleted_at IS NULL
+       LEFT JOIN chunk_counts cc ON cc.page_id = ec.page_id
+       WHERE COALESCE(cc.chunks, 0) <= $2
+         AND COALESCE(p.frontmatter ->> 'junk_hub_exempt', 'false') <> 'true'
+       ORDER BY ec.edges DESC
+       LIMIT 20`,
+      [edgeThreshold, maxChunks],
+    );
+
+    if (rows.length === 0) {
+      return {
+        name: 'junk_entity_hubs',
+        status: 'ok',
+        message: `No junk entity hubs (pages with <=${maxChunks} chunks and >${edgeThreshold} edges)`,
+      };
+    }
+
+    const list = rows
+      .map(r => `  ${r.slug}${(r.source_id ?? 'default') !== 'default' ? ` [${r.source_id}]` : ''} — ${r.edges} edges, ${r.chunks} chunk(s)`)
+      .join('\n');
+    return {
+      name: 'junk_entity_hubs',
+      status: 'warn',
+      message:
+        `${rows.length} near-empty page(s) with >${edgeThreshold} edges — likely generic-token entities ` +
+        `("Will", "Info") minted by an extractor and inflated by mention auto-links:\n${list}\n` +
+        `Review each page and merge/delete deliberately (nothing is auto-deleted). ` +
+        `New accretion is already gated: enrichEntity refuses generic single-token mints and ` +
+        `buildGazetteer drops single-generic-token person titles. If a page is an intentional thin ` +
+        `hub/index page, opt it out with junk_hub_exempt: true in frontmatter.`,
+      details: {
+        hubs: rows.map(r => ({
+          slug: r.slug,
+          source_id: r.source_id ?? 'default',
+          edges: r.edges,
+          chunks: r.chunks,
+        })),
+      },
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      name: 'junk_entity_hubs',
+      status: 'warn',
+      message: `Could not check for junk entity hubs: ${msg}`,
     };
   }
 }

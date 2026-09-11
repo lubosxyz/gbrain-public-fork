@@ -143,9 +143,12 @@ describeE2E('sources-remote-mcp E2E (gstack /setup-gbrain Path 4)', () => {
     };
 
     // Register a sources_admin-scoped client (the "gstack token").
+    // New grants can reference only active sources. sources_admin permits
+    // creating a source, but read access is granted explicitly afterward.
     const reg1 = execSync(
       'bun run src/cli.ts auth register-client e2e-sources-admin ' +
-        '--grant-types client_credentials --scopes "read sources_admin"',
+        '--grant-types client_credentials --scopes "read sources_admin" ' +
+        '--federated-read default',
       { cwd: process.cwd(), encoding: 'utf8', env: subprocessEnv },
     );
     clientId = reg1.match(/Client ID:\s+(gbrain_cl_\S+)/)?.[1];
@@ -269,6 +272,26 @@ describeE2E('sources-remote-mcp E2E (gstack /setup-gbrain Path 4)', () => {
     expect(existsSync(join(GBRAIN_HOME, '.gbrain', 'clones', 'e2e-yc-artifacts', '.git'))).toBe(true);
   });
 
+  test('a newly created source stays hidden until rescope; the existing token sees the live grant', async () => {
+    const issuedToken = token!;
+    const before = await callMcp(issuedToken, 'sources_list', {});
+    expect(before.sources.find((s: any) => s.id === 'e2e-yc-artifacts')).toBeUndefined();
+    const denied = await callMcp(issuedToken, 'sources_status', { id: 'e2e-yc-artifacts' });
+    expect(denied.__isError).toBe(true);
+    expect(JSON.stringify(denied.parsed)).toMatch(/not_found/);
+
+    const { execFileSync } = await import('child_process');
+    execFileSync('bun', ['run', 'src/cli.ts', 'auth', 'rescope-client', clientId!,
+      '--federated-read', 'default,e2e-yc-artifacts'], {
+      cwd: process.cwd(), encoding: 'utf8', env: { ...process.env, GBRAIN_HOME },
+    });
+
+    const identity = await callMcp(issuedToken, 'whoami', {});
+    expect(identity.federated_read).toEqual(['default', 'e2e-yc-artifacts']);
+    const after = await callMcp(issuedToken, 'sources_list', {});
+    expect(after.sources.find((s: any) => s.id === 'e2e-yc-artifacts')).toBeDefined();
+  });
+
   test('sources_status reports clone_state=healthy', async () => {
     const result = await callMcp(token!, 'sources_status', { id: 'e2e-yc-artifacts' });
     expect(result.clone_state).toBe('healthy');
@@ -315,6 +338,10 @@ describeE2E('sources-remote-mcp E2E (gstack /setup-gbrain Path 4)', () => {
   test('read-only token CAN list sources (read-scoped)', async () => {
     const result = await callMcp(readOnlyToken!, 'sources_list', {});
     expect(Array.isArray(result.sources)).toBe(true);
+    // #4433: the listing is row-filtered to the caller's federated read
+    // grant. This client kept the registration default (['default']), so a
+    // source outside its grant must not leak into its listing.
+    expect(result.sources.find((s: any) => s.id === 'e2e-yc-artifacts')).toBeUndefined();
   });
 
   test('CLI register-client rejects bogus scope (allowlist)', async () => {

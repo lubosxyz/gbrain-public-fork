@@ -50,6 +50,25 @@ carries the disambiguation rules for overlapping matches. If the two disagree,
 frontmatter wins. (There is no machine-managed block inside `RESOLVER.md` or
 `AGENTS.md`; that pattern was retired.)
 
+## The memory loop
+
+Preserve the existing agent's identity, native memory, and unrelated instructions.
+Start with keyless recall and explicit remembering:
+
+1. Read relevant entity/project context before answering.
+2. Save facts the user explicitly asks to remember, with provenance and the
+   intended brain/source. Automatic capture is off until the user opts in.
+3. Read the stored record before correcting it, retire the old fact, and save
+   the correction. `forget` withdraws active memory; history and backups may remain.
+4. Verify with `recall`, `entity`, or `get_page` before claiming the change landed.
+
+After explicit automatic-capture opt-in, apply the bundled `signal-detector`
+contract to substantive messages. Delegation and paid enrichment require their
+own authority. Reading context, installing skills, or possessing an API key does
+not authorize capture. A chat-only request suppresses writes for that message.
+Native skill activation and recall in a new conversation need actual harness
+evidence; generating files alone establishes neither.
+
 ## When the user invokes a skill
 
 Read the entire `skills/<slug>/SKILL.md` file. Follow its `## Phases`,

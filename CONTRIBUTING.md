@@ -32,7 +32,7 @@ frontmatter will read as absent. Refresh it once, from the repository root:
 git rm --cached -r . -q
 git reset --hard
 bash -n scripts/run-unit-parallel.sh          # silence means bash can read the scripts
-git ls-files --eol -- '*.md' | grep -c w/crlf # 0 means Markdown is clean
+git ls-files --eol -- '*.md' | grep -cE 'w/(crlf|mixed)' # 0 means Markdown is clean
 ```
 
 Every `check:*` entry in `package.json` invokes its script as `bash scripts/<name>.sh`
@@ -103,7 +103,7 @@ lifecycle is [`docs/TESTING.md`](docs/TESTING.md). The short version:
 bun run test                      # parallel 4-shard fan-out (memory-adaptive) + serial post-pass; PGLite snapshot default-on
 bun test test/markdown.test.ts    # specific unit test
 
-# Pre-push gate (40+ parallel checks + typecheck)
+# Pre-push gate (50+ parallel checks + typecheck)
 bun run verify
 
 # Pre-merge sanity (everything CI runs)
@@ -111,7 +111,7 @@ bun run test:full                 # verify + parallel unit + slow + smart e2e
 
 # Slow / serial / e2e in isolation
 bun run test:slow                 # *.slow.test.ts only (cold-path correctness)
-bun run test:serial               # *.serial.test.ts only (--max-concurrency=1)
+bun run test:serial               # *.serial.test.ts only (pooled per-file processes, heaviest-first)
 bun run test:e2e                  # real-Postgres E2E (requires DATABASE_URL)
 
 # E2E setup (Postgres with pgvector)
@@ -134,7 +134,7 @@ the database name must carry "test" as a word segment (like `gbrain_test`
 above) or destructive tests refuse to run — opt a differently-named database
 in one-shot with `GBRAIN_E2E_ALLOW_DB=<name>`.
 
-Use `bun run verify` before pushing. It runs 40+ guard checks in parallel
+Use `bun run verify` before pushing. It runs 50+ guard checks in parallel
 (`scripts/run-verify-parallel.sh`), including: banned fork-name leaks
 (`scripts/check-privacy.sh`), `JSON.stringify(x)::jsonb` interpolation
 patterns (`scripts/check-jsonb-pattern.sh`), `\r` progress bleed to stdout
@@ -171,6 +171,46 @@ a paired `afterAll(disconnect)`.
 — read that before writing a new test file.** Files that predate the rules are
 listed in `scripts/check-test-isolation.allowlist`; the allow-list MUST shrink
 over time — never add new entries.
+
+### Discrimination test — required for every fix (#3665)
+
+A fix's test is only worth anything if it **fails without the fix**. A test
+that passes both ways is worse than no test: it inflates reviewer confidence,
+gets weighted into the CI shards forever, and keeps passing after a future
+refactor silently breaks the behavior. (An adversarial review pass found PRs
+where 7 of 8 new tests passed on master.)
+
+Every PR that fixes behavior must fill the **Discrimination test** field in
+the PR template with the actual result of checking this:
+
+> Discrimination test: reverted `<source file(s)>` to `<ref>`, ran
+> `<test file>` → `N pass / M fail`. Restored → all pass.
+
+The helper does the whole dance in one command:
+
+```bash
+bash scripts/check-test-discriminates.sh <test-file> <source-file> [<source-file>...]
+```
+
+It reverts the source files to the pre-fix state (plain file copies, no git
+stash), runs the test file, requires at least one EXECUTED test to fail —
+exit ≠ 0 alone does not count, because a missing file or import crash also
+exits non-zero (exit 3, the vacuous-failure class) — restores, and prints the
+paste-ready field line. Exit 1 means the test passed with the fix reverted:
+tighten the assertions before asking for review.
+
+Vacuous-assertion shapes to avoid (they recur):
+- asserting only `exit ≠ 0` (a missing binary also exits non-zero);
+- asserting membership in a set that covers every reachable value
+  (`['warn','fail']` when those are the only outputs);
+- asserting a substring that would also appear in the broken output —
+  assert parsed structure instead.
+
+Relatedly: a test whose only assertion is a regex over `readFileSync`'d
+source text pins spelling, not behavior. New tests that read `src/` text
+need a `test-reads-source-ok: <why>` comment (or a behavioral assertion
+alongside); `test/test-reads-source-smell.test.ts` enforces this for new
+files and ratchets the pre-existing list down.
 
 ### Local CI gate (recommended before pushing)
 

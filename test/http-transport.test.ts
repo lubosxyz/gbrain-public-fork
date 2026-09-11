@@ -17,6 +17,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { createHash } from 'crypto';
 import { startHttpTransport } from '../src/mcp/http-transport.ts';
 import { RateLimiter } from '../src/mcp/rate-limit.ts';
+import { GBRAIN_MCP_INSTRUCTIONS } from '../src/mcp/instructions.ts';
 
 type SqlResult = unknown[] | unknown;
 type SqlHandler = (query: string, values: unknown[]) => SqlResult | Promise<SqlResult>;
@@ -66,7 +67,7 @@ interface FakeEngineConfig {
    * `permissions` JSONB column. Default permissions = {takes_holders: ['world']}
    * when unset, matching the migration v33 default.
    */
-  validTokens?: Map<string, { id: string; name: string; permissions?: { takes_holders?: string[] } }>;
+  validTokens?: Map<string, { id: string; name: string; scopes?: string[] | null; permissions?: { takes_holders?: string[] } }>;
   /** Tokens that are present but revoked (revoked_at IS NOT NULL — query returns empty). */
   revokedTokens?: Set<string>;
   /** If true, every SELECT throws (simulating DB outage). */
@@ -165,13 +166,16 @@ let mockNow = 0;
 function freezeClock(at: number) { mockNow = at; }
 function advanceClock(deltaMs: number) { mockNow += deltaMs; }
 
-async function startTest(cfg: FakeEngineConfig & { lruCap?: number; ipLimit?: number; tokenLimit?: number; corsOrigin?: string; bodyCap?: number; trustProxy?: boolean } = {}): Promise<TestServer> {
+async function startTest(cfg: FakeEngineConfig & { lruCap?: number; ipLimit?: number; tokenLimit?: number; corsOrigin?: string; bodyCap?: number; trustProxy?: boolean; mcpInstructions?: string } = {}): Promise<TestServer> {
   if (cfg.corsOrigin) process.env.GBRAIN_HTTP_CORS_ORIGIN = cfg.corsOrigin;
   else delete process.env.GBRAIN_HTTP_CORS_ORIGIN;
   if (cfg.bodyCap) process.env.GBRAIN_HTTP_MAX_BODY_BYTES = String(cfg.bodyCap);
   else delete process.env.GBRAIN_HTTP_MAX_BODY_BYTES;
   if (cfg.trustProxy) process.env.GBRAIN_HTTP_TRUST_PROXY = '1';
   else delete process.env.GBRAIN_HTTP_TRUST_PROXY;
+  // #4748: deployment identity via the env override plane.
+  if (cfg.mcpInstructions) process.env.GBRAIN_MCP_INSTRUCTIONS = cfg.mcpInstructions;
+  else delete process.env.GBRAIN_MCP_INSTRUCTIONS;
 
   const engine = makeFakeEngine(cfg);
   const clock = () => mockNow || Date.now();
@@ -200,6 +204,21 @@ async function startTest(cfg: FakeEngineConfig & { lruCap?: number; ipLimit?: nu
 function rpc(method: string, params?: unknown, id: number = 1) {
   return JSON.stringify({ jsonrpc: '2.0', id, method, ...(params !== undefined ? { params } : {}) });
 }
+
+test('read-only legacy tokens hide and deny write operations while retaining read discovery', async () => {
+  const token = 'fixture-read-only';
+  const srv = await startTest({ validTokens: new Map([[hash(token), { id: 'readonly-id', name: 'fixture', scopes: ['read'] }]]) });
+  try {
+    const request = (method: string, params?: unknown) => fetch(`${srv.url}/mcp`, { method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: rpc(method, params) });
+    const list = await (await request('tools/list')).json() as { result: { tools: { name: string }[] } };
+    expect(list.result.tools.some(t => t.name === 'get_page')).toBe(true);
+    expect(list.result.tools.some(t => t.name === 'put_page')).toBe(false);
+    const call = await (await request('tools/call', { name: 'put_page', arguments: { slug: 'example', content: 'fixture' } })).json() as { result: { isError: boolean; content: { text: string }[] } };
+    expect(call.result.isError).toBe(true);
+    expect(call.result.content[0].text).toContain('permission_denied');
+  } finally { srv.stop(); }
+});
 
 // --------------------------------------------------------------------------
 // Auth path
@@ -246,6 +265,50 @@ describe('http-transport: auth', () => {
     expect(body.result.tools).toBeArray();
     expect(body.result.tools.length).toBeGreaterThan(0);
     expect(body.jsonrpc).toBe('2.0');
+  });
+
+  test('initialize returns the same canonical agent contract as stdio', async () => {
+    const r = await fetch(`${srv.url}/mcp`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${VALID_TOKEN}`, 'Content-Type': 'application/json' },
+      body: rpc('initialize', {
+        protocolVersion: '2025-03-26',
+        capabilities: {},
+        clientInfo: { name: 'raw-http-contract-test', version: '1.0.0' },
+      }),
+    });
+    expect(r.status).toBe(200);
+    const body = await r.json() as { result?: { instructions?: string } };
+    expect(body.result?.instructions).toBe(GBRAIN_MCP_INSTRUCTIONS);
+  });
+
+  test('initialize appends the deployment identity to the canonical contract (#4748)', async () => {
+    const identityServer = await startTest({
+      validTokens: new Map([[hash(VALID_TOKEN), { id: 'tok-1', name: 'test' }]]),
+      mcpInstructions: 'COMPANY BRAIN — shared business memory.',
+    });
+    try {
+      const r = await fetch(`${identityServer.url}/mcp`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${VALID_TOKEN}`, 'Content-Type': 'application/json' },
+        body: rpc('initialize', {
+          protocolVersion: '2025-03-26',
+          capabilities: {},
+          clientInfo: { name: 'deployment-identity-test', version: '1.0.0' },
+        }),
+      });
+      expect(r.status).toBe(200);
+      const body = await r.json() as { result?: { instructions?: string } };
+      // Append-only: the canonical safety contract is preserved verbatim
+      // and the identity rides UNDER it.
+      expect(body.result?.instructions).toStartWith(GBRAIN_MCP_INSTRUCTIONS);
+      expect(body.result?.instructions).toEndWith(
+        'Deployment identity:\nCOMPANY BRAIN — shared business memory.',
+      );
+    } finally {
+      identityServer.stop();
+      delete process.env.GBRAIN_MCP_INSTRUCTIONS;
+    }
   });
 
   test('2. missing Authorization header → 401', async () => {

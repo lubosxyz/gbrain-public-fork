@@ -3,7 +3,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { loadStorageConfig, validateStorageConfig, getStorageTier } from '../core/storage-config.ts';
 import type { StorageConfig, StorageTier } from '../core/storage-config.ts';
 import { walkBrainRepo, type DiskFileEntry } from '../core/disk-walk.ts';
-import { getDefaultSourcePath } from '../core/source-resolver.ts';
+import { getDefaultSourcePath, resolveSourceForRepoPath } from '../core/source-resolver.ts';
 
 /**
  * Distinct nominal types for the two tier-keyed numeric maps. Both shapes
@@ -33,7 +33,32 @@ export interface StorageStatusResult {
 
 // ── Dispatcher ────────────────────────────────────────────
 
+// #3686: real usage, reachable via `gbrain storage --help` (the generic
+// one-line CLI_ONLY stub used to shadow this surface entirely).
+const STORAGE_HELP = `gbrain storage — storage-tier status for the brain repo
+
+USAGE
+  gbrain storage [status] [--repo <path>] [--json]
+
+SUBCOMMANDS
+  status            (default) Report page counts and disk usage per storage
+                    tier, list DB pages whose repo file is missing, and
+                    validate the storage config.
+
+OPTIONS
+  --repo <path>     Brain repo to walk (default: resolved from the storage
+                    config / default source path)
+  --json            Machine-readable output
+  --help, -h        Show this help
+`;
+
 export async function runStorage(engine: BrainEngine, args: string[]): Promise<void> {
+  // Help first — before the engine argument is touched, so `--help` works
+  // with no brain configured (dispatched engine-free from cli.ts).
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(STORAGE_HELP);
+    return;
+  }
   const subcommand = args[0];
   if (!subcommand || subcommand === 'status') {
     await runStorageStatus(engine, args.slice(1));
@@ -121,7 +146,11 @@ export async function getStorageStatus(
   // per directory + one stat per .md file, plus O(1) lookups below.
   const fileMap: Map<string, DiskFileEntry> = repoPath ? walkBrainRepo(repoPath) : new Map();
 
-  const pages = await engine.listPages({ limit: 1_000_000 });
+  const source = repoPath ? await resolveSourceForRepoPath(engine, repoPath) : null;
+  const pages = await engine.listPages({
+    limit: 1_000_000,
+    ...(source ? { sourceId: source.source_id } : {}),
+  });
 
   for (const page of pages) {
     const tier = config ? getStorageTier(page.slug, config) : 'unspecified';

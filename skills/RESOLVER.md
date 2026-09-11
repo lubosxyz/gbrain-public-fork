@@ -9,11 +9,18 @@ map of the same routing: one place to scan every skill and its trigger
 phrases. If a row here and a skill's frontmatter disagree, the frontmatter
 wins; fix the row.
 
-## Always-on (every message)
+## Memory defaults
+
+Preserve the existing agent's identity and instructions. Ordinary setup adds
+keyless memory; personal-agent bootstrap requires an explicit request. Recall
+and explicit remembering do not require automatic capture. Ambient capture is
+off until the user opts in, and paid enrichment is a separate choice.
+
+## Always-on recall and opt-in capture
 
 | Trigger | Skill |
 |---------|-------|
-| Every inbound message (spawn parallel, don't block) | `skills/signal-detector/SKILL.md` |
+| Every substantive inbound message, only after automatic-capture opt-in | `skills/signal-detector/SKILL.md` (delegation additionally requires authorization) |
 | Any brain read/write/lookup/citation | `skills/brain-ops/SKILL.md` |
 
 ## Brain operations
@@ -56,6 +63,7 @@ wins; fix the row.
 | "bulk ingest", "bulk import", "ingest all", "ingestion pipeline" | `skills/bulk-ingestion/SKILL.md` |
 | "ingest this publication", "ingest this whole blog", "ingest this feed", "ingest this newsletter archive" | `skills/blog-ingest/SKILL.md` |
 | "chatgpt export", "claude export", "perplexity export", "conversation history" | `skills/conversation-archive/SKILL.md` |
+| "connect my chatgpt", "connect my claude account", "sync my chat history", "chatgpt oauth", "auto-import my chats", "keep my conversations synced" | `skills/chat-connectors/SKILL.md` |
 
 ## Thinking skills (from GStack)
 
@@ -76,6 +84,7 @@ wins; fix the row.
 | Task add/remove/complete/defer/review | `skills/daily-task-manager/SKILL.md` |
 | Morning prep, meeting context, day planning | `skills/daily-task-prep/SKILL.md` |
 | Daily briefing, "what's happening today" | `skills/briefing/SKILL.md` |
+| "connect gmail" / "connect google", "who is waiting on me", "open loops", "unanswered email" | `skills/google-loops/SKILL.md` |
 | Cron scheduling, quiet hours, job staggering | `skills/cron-scheduler/SKILL.md` |
 | "get more out of gbrain", "is my brain set up right", "weekly brain checkup", "advise me on my brain", "gbrain advisor" | `skills/gbrain-advisor/SKILL.md` |
 | Save or load reports | `skills/reports/SKILL.md` |
@@ -86,6 +95,7 @@ wins; fix the row.
 | "Is gbrain healthy?", morning health check, skillpack-check | `skills/skillpack-check/SKILL.md` |
 | "harvest this skill into gbrain", "publish this skill to gbrain", "lift this skill upstream", "share this skill with other gbrain clients", "promote my skill to gbrain" | `skills/skillpack-harvest/SKILL.md` |
 | Post-restart health + auto-fix, "did the container restart break anything", smoke test | `skills/smoke-test/SKILL.md` |
+| `GBRAIN_DB_ACCESS`, "gbrain database error", "gbrain connection refused", "brain database is down", "cannot reach the brain database", "fix gbrain database access", "repair gbrain postgres" | `skills/db-repair/SKILL.md` |
 | Cross-modal review, second opinion | `skills/cross-modal-review/SKILL.md` |
 | "Validate skills", skill health check | `skills/testing/SKILL.md` |
 | Webhook setup, external event processing | `skills/webhook-transforms/SKILL.md` |
@@ -100,10 +110,11 @@ wins; fix the row.
 
 | Trigger | Skill |
 |---------|-------|
-| "Set up GBrain", first boot | `skills/setup/SKILL.md` |
+| "Set up GBrain", "install gbrain into this agent workspace", "add gbrain to my agent", first boot | `skills/setup/SKILL.md` (existing identity, keyless memory by default) |
 | "Now what?", "fill my brain", "cold start", "bootstrap my data", "import my data", "what should I import first" | `skills/cold-start/SKILL.md` |
-| "agent workspace bootstrap", "install gbrain into this agent workspace", "gbrain bootstrap", "paste-in install", "set up the maintenance sweep" | Run `gbrain bootstrap` (paste-in workspace install: interview + identity files + hooks + sweep). See `docs/guides/bootstrap.md` |
+| Explicit request to create a new personal agent with identity and private repository, "gbrain bootstrap" | Run `gbrain bootstrap`; see `BOOTSTRAP_FOR_AGENTS.md`. A generic paste-in install request routes to `skills/setup/SKILL.md`. |
 | "wire this box's coding agents to the brain", "framework-spawned sessions need brain access", "wire gbrain hooks without a workspace", "hook Claude Code/Codex to the running serve" | Run `gbrain bootstrap harness --yes` (machine-level wiring to a running `serve --http`: scoped token + user-scope MCP + headless pre-approval + hooks; no agent.json). See the "Local harness mode" section of `docs/guides/bootstrap.md` |
+| "which gbrain engine", "pglite or postgres", "gbrain engine status", "upgrade to postgres", "switch gbrain to postgres", "install postgres for gbrain", "move my brain to supabase", "set up postgres for the brain" | `skills/postgres-adopt/SKILL.md` |
 | "Migrate from Obsidian/Notion/Logseq" | `skills/migrate/SKILL.md` |
 | "Switch embedding provider" / "migrate my embeddings" / "switch reranker" / "ZeroEntropy" / "provider_sunset" / "search stopped working after a provider shutdown" | `skills/migrations/v0.46.3.0.md` |
 | Brain health check, maintenance run | `skills/maintain/SKILL.md` |
@@ -133,7 +144,7 @@ When multiple skills could match:
 3. If the user mentions a person/company, check if enrich or query fits better
 4. Chaining is explicit in each skill's Phases section
 5. When in doubt, ask the user (see `skills/ask-user/SKILL.md` for the choice-gate pattern)
-6. Publication/feed URL or a whole blog archive → blog-ingest; a single article/tweet URL → idea-ingest; video/audio/PDF → media-ingest; AI-chat exports or session transcripts → conversation-archive
+6. Publication/feed URL or a whole blog archive → blog-ingest; a single article/tweet URL → idea-ingest; video/audio/PDF → media-ingest; AI-chat export FILE or session transcripts → conversation-archive; CONNECT an account for live/automatic sync ("connect my chatgpt", "keep synced") → chat-connectors
 7. Identity/personality content (who the agent is, voice, persona) → soul-audit; token/structure hygiene of the always-loaded context stack → context-audit
 8. "Why is X slow/stale" measurement-first ops triage → measure-before-you-fix; code debugging ("why is this function broken") → investigate (GStack)
 

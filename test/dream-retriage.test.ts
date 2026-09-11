@@ -96,8 +96,8 @@ async function seedJob(rig: Rig, opts: {
   sourceId?: string;
 }): Promise<number> {
   const rows = await rig.engine.executeRaw<{ id: number }>(
-    `INSERT INTO minion_jobs (name, queue, status, data, idempotency_key)
-     VALUES ('subagent', $1, $2, jsonb_build_object('source_id', $3::text), $4)
+    `INSERT INTO minion_jobs (submission_authority, name, queue, status, data, idempotency_key)
+     VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', $1, $2, jsonb_build_object('source_id', $3::text), $4)
      RETURNING id`,
     [opts.queue ?? 'dream-inline-1700000000000-deadbeef', opts.status ?? 'waiting', opts.sourceId ?? 'default', opts.key],
   );
@@ -221,16 +221,19 @@ describe('dream retriage — reconcile matrix', () => {
       expect(await jobStatus(rig, aboveStale)).toBe('cancelled'); // converted_for_resubmit
       expect(await jobStatus(rig, unscoredJob)).toBe('waiting');
       expect(await jobStatus(rig, unmatchedJob)).toBe('waiting');
-      expect(await jobStatus(rig, legacyJob)).toBe('waiting');   // legacy grammar → unmatched, untouched
+      // #4250: a legacy-grammar row stranded in a provably-DEAD inline queue
+      // is exactly the never-claimable orphan class doctor now flags — it
+      // converts for resubmit instead of being invisibly stranded (pre-fix it
+      // wasn't even selected). Legacy rows in live/non-inline queues stay out
+      // of scope (the SELECT's queue arm only adds dream-inline rows).
+      expect(await jobStatus(rig, legacyJob)).toBe('cancelled');
       expect(await jobStatus(rig, completedJob)).toBe('completed'); // terminal rows never selected
 
       expect(summary.queue.cancelled).toBe(1);
-      expect(summary.queue.converted_for_resubmit).toBe(1);
+      expect(summary.queue.converted_for_resubmit).toBe(2); // aboveStale + legacy dead-queue row
       expect(summary.queue.kept_unscored).toBe(1);
-      // deleted-file only: the legacy dream:synth: key is excluded at the SQL
-      // LIKE 'dream:synth-v2:%' filter — it never even becomes a candidate.
-      expect(summary.queue.unmatched).toBe(1);
-      expect(summary.queue.candidates).toBe(4); // completed row is status-excluded as well
+      expect(summary.queue.unmatched).toBe(1); // deleted-file synth-v2 key with no corpus match
+      expect(summary.queue.candidates).toBe(5); // completed row is status-excluded
       expect(process.exitCode ?? 0).toBe(0);
     } finally {
       await rig.cleanup();
@@ -249,6 +252,44 @@ describe('dream retriage — reconcile matrix', () => {
       const { out } = await captureStdout(() => withoutAnthropicKey(() => runDreamRetriage(rig.engine, ['--reconcile-queue', '--json'])));
       const summary = JSON.parse(out) as { queue: { kept_above_threshold: number } };
       expect(await jobStatus(rig, liveJob)).toBe('waiting');
+      expect(summary.queue.kept_above_threshold).toBe(1);
+    } finally {
+      await rig.cleanup();
+    }
+  }, 30_000);
+
+  test('F2: a rescued-band job SURVIVES reconcile (the one-gate rule); the same score without segments cancels', async () => {
+    const rig = await setupRig();
+    try {
+      const buried = writeTranscript(rig.corpusDir, '2026-08-05-buried.txt');
+      const plain = writeTranscript(rig.corpusDir, '2026-08-06-plain.txt');
+      // Verified segments: verbatim (normalized) substrings of the transcript,
+      // each over the 40-normalized-char substantive bar and DISTINCT after
+      // normalization (duplicates count once).
+      const n = '2026-08-05-buried.txt';
+      await rig.engine.putDreamVerdict(buried.filePath, buried.hash, {
+        worth_processing: false,
+        reasons: ['seed'],
+        score: 0.35,
+        content_type: 'mixed',
+        segments: [
+          { quote: `conversation in ${n}\nconversation in ${n}` },
+          { quote: `in ${n} conversation in ${n} conversation` },
+        ],
+        entities: [],
+        model: TIER_DEFAULTS.utility,
+        triage_version: TRIAGE_VERSION,
+      });
+      await seedScore(rig, plain.filePath, plain.hash, 0.35); // same band, NO segments
+      const rescuedJob = await seedJob(rig, { key: synthKey('default', basename(buried.filePath), buried.hash16), queue: 'default' });
+      const plainJob = await seedJob(rig, { key: synthKey('default', basename(plain.filePath), plain.hash16), queue: 'default' });
+
+      const { out } = await captureStdout(() => withoutAnthropicKey(() => runDreamRetriage(rig.engine, ['--reconcile-queue', '--json'])));
+      const summary = JSON.parse(out) as { queue: { cancelled: number; kept_above_threshold: number }; reports?: Array<{ filePath: string; rescued?: boolean }> };
+
+      expect(await jobStatus(rig, rescuedJob)).toBe('waiting');   // rescue admitted it — sweep must not cancel
+      expect(await jobStatus(rig, plainJob)).toBe('cancelled');   // genuine reject
+      expect(summary.queue.cancelled).toBe(1);
       expect(summary.queue.kept_above_threshold).toBe(1);
     } finally {
       await rig.cleanup();
@@ -474,16 +515,18 @@ describe('dream retriage — reconcile matrix', () => {
     }
   }, 30_000);
 
-  test('SR-P2: a live cycle lock marks even OLD inline queues possibly-live (no conversions)', async () => {
+  test('SR-P2/#4250: a live lock that could OWN the queue (acquired before its birth) keeps it possibly-live', async () => {
     const rig = await setupRig();
     try {
       const above = writeTranscript(rig.corpusDir, '2026-08-28-locked.txt');
       await seedScore(rig, above.filePath, above.hash, 0.9);
-      const job = await seedJob(rig, { key: synthKey('default', basename(above.filePath), above.hash16) });
-      // Simulate a running cycle: an unexpired cycle-lock row.
+      // Queue born 2h ago (past the liveness grace); the running cycle's lock
+      // was acquired BEFORE that, so it could own the queue — never convert.
+      const queue = `dream-inline-${Date.now() - 2 * 3600_000}-deadbee1`;
+      const job = await seedJob(rig, { key: synthKey('default', basename(above.filePath), above.hash16), queue });
       await rig.engine.executeRaw(
-        `INSERT INTO gbrain_cycle_locks (id, holder_pid, ttl_expires_at)
-         VALUES ('gbrain-cycle:default', 12345, NOW() + interval '10 minutes')`,
+        `INSERT INTO gbrain_cycle_locks (id, holder_pid, acquired_at, ttl_expires_at)
+         VALUES ('gbrain-cycle:default', 12345, NOW() - interval '3 hours', NOW() + interval '10 minutes')`,
       );
       const { out } = await captureStdout(() => withoutAnthropicKey(() =>
         runDreamRetriage(rig.engine, ['--reconcile-queue', '--json'])));
@@ -491,6 +534,49 @@ describe('dream retriage — reconcile matrix', () => {
       expect(await jobStatus(rig, job)).toBe('waiting');
       expect(summary.queue.kept_live_queue).toBe(1);
       expect(summary.queue.converted_for_resubmit).toBe(0);
+    } finally {
+      await rig.cleanup();
+    }
+  }, 30_000);
+
+  test('#4250: a live lock acquired AFTER the queue was born cannot own it — the old orphan converts', async () => {
+    // The doctor↔retriage alignment fix: doctor flags a pre-lock orphan, so
+    // retriage must be able to repair it even while a NEW cycle runs.
+    const rig = await setupRig();
+    try {
+      const above = writeTranscript(rig.corpusDir, '2026-08-28-prelock.txt');
+      await seedScore(rig, above.filePath, above.hash, 0.9);
+      const queue = `dream-inline-${Date.now() - 2 * 3600_000}-deadbee2`;
+      const job = await seedJob(rig, { key: synthKey('default', basename(above.filePath), above.hash16), queue });
+      await rig.engine.executeRaw(
+        `INSERT INTO gbrain_cycle_locks (id, holder_pid, acquired_at, ttl_expires_at)
+         VALUES ('gbrain-cycle:default', 12345, NOW() - interval '30 minutes', NOW() + interval '10 minutes')`,
+      );
+      const { out } = await captureStdout(() => withoutAnthropicKey(() =>
+        runDreamRetriage(rig.engine, ['--reconcile-queue', '--json'])));
+      const summary = JSON.parse(out) as { queue: { kept_live_queue: number; converted_for_resubmit: number } };
+      expect(await jobStatus(rig, job)).toBe('cancelled');
+      expect(summary.queue.converted_for_resubmit).toBe(1);
+      expect(summary.queue.kept_live_queue).toBe(0);
+    } finally {
+      await rig.cleanup();
+    }
+  }, 30_000);
+
+  test('#4250: a NON-synth child (patterns-style key) in a provably-dead inline queue converts for resubmit', async () => {
+    // Doctor's orphaned_private_queue check flags patterns queues too; the
+    // advertised retriage repair must select and convert them, not report
+    // unmatched.
+    const rig = await setupRig();
+    try {
+      const queue = `dream-inline-${Date.now() - 2 * 3600_000}-deadbee3`;
+      const job = await seedJob(rig, { key: 'patterns:child:not-a-synth-key', queue });
+      const { out } = await captureStdout(() => withoutAnthropicKey(() =>
+        runDreamRetriage(rig.engine, ['--reconcile-queue', '--json'])));
+      const summary = JSON.parse(out) as { queue: { converted_for_resubmit: number; unmatched: number } };
+      expect(await jobStatus(rig, job)).toBe('cancelled');
+      expect(summary.queue.converted_for_resubmit).toBe(1);
+      expect(summary.queue.unmatched).toBe(0);
     } finally {
       await rig.cleanup();
     }
@@ -569,6 +655,49 @@ describe('dream retriage — reconcile matrix', () => {
         expect(summary.audit.sampled).toBe(2);
         expect(summary.audit.disagreements).toBe(2);
         expect(summary.audit.disagreement_rate).toBe(1);
+      } finally {
+        __setChatTransportForTests(null);
+        resetGateway();
+      }
+    } finally {
+      await rig.cleanup();
+    }
+  }, 30_000);
+
+  test('F2 regression: --audit-rejects samples only NON-rescued rejects (rescued band files are accepted, not rejects)', async () => {
+    const rig = await setupRig();
+    try {
+      const { __setChatTransportForTests, resetGateway } = await import('../src/core/ai/gateway.ts');
+      const rescued = writeTranscript(rig.corpusDir, '2026-08-25-rescued.txt');
+      const plain = writeTranscript(rig.corpusDir, '2026-08-26-plain-reject.txt');
+      const n = '2026-08-25-rescued.txt';
+      await rig.engine.putDreamVerdict(rescued.filePath, rescued.hash, {
+        worth_processing: false,
+        reasons: ['seed'],
+        score: 0.35,
+        content_type: 'mixed',
+        segments: [
+          { quote: `conversation in ${n}\nconversation in ${n}` },
+          { quote: `in ${n} conversation in ${n} conversation` },
+        ],
+        entities: [],
+        model: TIER_DEFAULTS.utility,
+        triage_version: TRIAGE_VERSION,
+      });
+      await seedScore(rig, plain.filePath, plain.hash, 0.35); // same band, no segments → true reject
+      __setChatTransportForTests(async () => ({
+        text: '{"score": 0.9, "content_type": "idea", "segments": [], "entities": [], "reasons": ["frontier disagrees"]}',
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 10, output_tokens: 50, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'test:stub',
+        providerId: 'test',
+      }));
+      try {
+        const { out } = await captureStdout(() => withEnv({ ANTHROPIC_API_KEY: 'sk-test-audit' }, () =>
+          runDreamRetriage(rig.engine, ['--audit-rejects', '5', '--yes', '--json'])));
+        const summary = JSON.parse(out) as { audit: { sampled: number } };
+        expect(summary.audit.sampled).toBe(1); // the plain reject only — never the rescued file
       } finally {
         __setChatTransportForTests(null);
         resetGateway();

@@ -303,7 +303,12 @@ describe('retryable failures keep their existing treatment', () => {
     // The whole point of the split: "come back later" must not be silenced
     // into "never again". A brain whose embedder was briefly down must still
     // re-embed those chunks on the next run.
-    embedBatchBehavior = async () => { throw new AITransientError('upstream 502', { status: 502 }); };
+    // #3966 (0.50 merge): gateway 502s now go through embedBatchWithBackoff's
+    // retry ladder before failing. Shrink the floors and carry a retry hint so
+    // the exhaustion path runs in milliseconds, not 5x60s of wall clock.
+    const { _setRateLimitFloorsForTests } = await import('../src/commands/embed.ts');
+    _setRateLimitFloorsForTests([1, 1, 1, 1, 1]);
+    embedBatchBehavior = async () => { throw new AITransientError('upstream 502, try again in 1ms', { status: 502 }); };
     const chunks = [
       { chunk_index: 0, chunk_text: 'a' },
       { chunk_index: 1, chunk_text: 'b' },
@@ -320,9 +325,12 @@ describe('retryable failures keep their existing treatment', () => {
 
     expect(result.failures).toBe(3);
     expect(result.parked).toBe(0);
-    // Still no fan-out on a transient error (#3037 cost bounding).
-    expect(embedCalls).toHaveLength(1);
+    // Still no per-chunk fan-out on a transient error (#3037 cost bounding):
+    // every call is the SAME full batch — retries (#3966), not isolation.
+    expect(embedCalls.length).toBeGreaterThanOrEqual(1);
+    for (const call of embedCalls) expect(call).toHaveLength(3);
     expect((engine as any)._calls.filter((c: any) => c.method === 'markEmbedSkip')).toHaveLength(0);
+    _setRateLimitFloorsForTests(null);
   });
 
   test('a permanent request-shaped 400 still fans out and still counts as a failure', async () => {

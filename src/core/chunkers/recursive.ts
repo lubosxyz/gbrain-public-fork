@@ -20,9 +20,11 @@
  * Lossless invariant: non-overlapping portions reassemble to original.
  */
 
-import { countCJKAwareWords, CJK_SENTENCE_DELIMITERS, CJK_CLAUSE_DELIMITERS } from '../cjk.ts';
+import { countCJKAwareWords, isCJKDominant, CJK_SENTENCE_DELIMITERS, CJK_CLAUSE_DELIMITERS } from '../cjk.ts';
 import { estimateEmbedTokens, DEFAULT_MAX_CHUNK_TOKENS } from './token-estimate.ts';
 import { safeSplitIndex } from '../text-safe.ts';
+import { sanitizeRemoteBody } from '../remote-body.ts';
+import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
 
 /**
  * Markdown chunker version. Folded into the per-page chunker_version column
@@ -30,6 +32,9 @@ import { safeSplitIndex } from '../text-safe.ts';
  * rebuild them on the new shape. Bump on any change that affects chunk
  * boundaries (delimiters, word counting, maxChars cap) OR the per-chunk
  * embedding shape (wrapper prefix added at embed time).
+ *
+ * v4: strict full-body Facts/Takes sanitation covers repeated, nested and
+ * unterminated protected fences before splitting or embedding.
  *
  * v3 (v0.40.3.0): chunks embed with optional contextual retrieval wrapper
  * per Anthropic's published methodology. Wrapper is built JUST IN TIME at
@@ -39,7 +44,7 @@ import { safeSplitIndex } from '../text-safe.ts';
  * post-upgrade reembed sweep. See
  * `src/core/contextual-retrieval-service.ts`.
  */
-export const MARKDOWN_CHUNKER_VERSION = 3;
+export const MARKDOWN_CHUNKER_VERSION = SAFE_FENCE_CHUNKER_VERSION;
 
 const DELIMITERS: string[][] = [
   ['\n\n'],                          // L0: paragraphs
@@ -53,6 +58,17 @@ export interface ChunkOptions {
   chunkSize?: number;    // target words per chunk (default 300)
   chunkOverlap?: number; // overlap words (default 50)
   maxChars?: number;     // hard cap on any chunk's char length (default 6000)
+  /**
+   * #4530: hard cap on any chunk's ESTIMATED embedding tokens (default
+   * DEFAULT_MAX_CHUNK_TOKENS). Callers on strict per-input embedding models
+   * (e.g. nvidia/nv-embedqa-e5-v5's 512) thread
+   * resolveMaxChunkTokens() (src/core/embedding-input-limit.ts) so oversize
+   * text is SPLIT to fit — never truncated, never left permanently
+   * unembeddable. Chunk boundaries are unchanged for callers that don't pass
+   * it (or whose model has no declared limit), so MARKDOWN_CHUNKER_VERSION
+   * does not bump.
+   */
+  maxTokens?: number;
 }
 
 export interface TextChunk {
@@ -60,10 +76,9 @@ export interface TextChunk {
   index: number;
 }
 
-// v0.28: import takes-fence stripper as a pre-processing pass. Takes content
+// The strict full-body sanitizer removes all Takes and non-world Facts. Takes content
 // lives in the takes table only; duplicating it inside content_chunks would
 // bypass the per-token MCP allow-list (Codex P0 #3 privacy fix).
-import { stripTakesFence } from '../takes-fence.ts';
 
 // v0.32.2 (Codex R2-#1 P0): same posture for facts — private fact rows must
 // not reach content_chunks.chunk_text, embeddings, or search. Pass
@@ -72,12 +87,17 @@ import { stripTakesFence } from '../takes-fence.ts';
 // at the row level. The fence shell stays in the chunked body so callers
 // that re-import the chunk content can still parse it; only the private
 // rows go.
-import { stripFactsFence } from '../facts-fence.ts';
 
 export function chunkText(text: string, opts?: ChunkOptions): TextChunk[] {
   const chunkSize = opts?.chunkSize || 300;
   const chunkOverlap = opts?.chunkOverlap || 50;
   const maxChars = opts?.maxChars || 6000;
+  // #4530: per-call token budget, clamped to the historical default so a
+  // misconfigured larger value can't emit chunks the rest of the pipeline
+  // (tsvector limits, context assembly) was never sized for.
+  const maxTokens = opts?.maxTokens && opts.maxTokens > 0
+    ? Math.min(opts.maxTokens, DEFAULT_MAX_CHUNK_TOKENS)
+    : DEFAULT_MAX_CHUNK_TOKENS;
 
   if (!text || text.trim().length === 0) return [];
 
@@ -89,13 +109,13 @@ export function chunkText(text: string, opts?: ChunkOptions): TextChunk[] {
   // v0.32.2: also strip private facts (Codex R2-#1). World facts stay so
   // search retains its public-knowledge surface; private rows are filtered
   // out at the fence-row level via stripFactsFence({keepVisibility:['world']}).
-  const stripped = stripFactsFence(stripTakesFence(text), { keepVisibility: ['world'] });
+  const stripped = sanitizeRemoteBody(text);
   if (!stripped || stripped.trim().length === 0) return [];
 
   const wordCount = countWords(stripped);
   if (wordCount <= chunkSize) {
     // Single-chunk path: still apply the maxChars cap.
-    const capped = capByChars(stripped.trim(), maxChars);
+    const capped = capByChars(stripped.trim(), maxChars, maxTokens);
     return capped.map((t, i) => ({ text: t, index: i }));
   }
 
@@ -108,7 +128,7 @@ export function chunkText(text: string, opts?: ChunkOptions): TextChunk[] {
   // exceed 8192 OpenAI embedding tokens at any word count).
   const capped: string[] = [];
   for (const chunk of withOverlap) {
-    capped.push(...capByChars(chunk.trim(), maxChars));
+    capped.push(...capByChars(chunk.trim(), maxChars, maxTokens));
   }
   return capped.map((t, i) => ({ text: t, index: i }));
 }
@@ -139,19 +159,24 @@ export function chunkText(text: string, opts?: ChunkOptions): TextChunk[] {
  * safe" note rested on maxChars=6000 and stride=5500 both being even;
  * deriving the window from density retired that guarantee.)
  */
-function capByChars(text: string, maxChars: number, knownEst?: number): string[] {
+function capByChars(
+  text: string,
+  maxChars: number,
+  maxTokens: number = DEFAULT_MAX_CHUNK_TOKENS,
+  knownEst?: number,
+): string[] {
   if (text.length === 0) return [];
   const est = knownEst ?? probeEmbedTokens(text);
-  const window = est <= DEFAULT_MAX_CHUNK_TOKENS
+  const window = est <= maxTokens
     ? maxChars
-    : Math.max(1, Math.min(maxChars, Math.floor((text.length * DEFAULT_MAX_CHUNK_TOKENS) / est)));
+    : Math.max(1, Math.min(maxChars, Math.floor((text.length * maxTokens) / est)));
   if (text.length <= window) {
     // Emitting the text whole is the one path that skips the per-slice
     // re-check below, so a PROBED estimate has to be confirmed exactly first:
     // a sparse ASCII head can under-read a dense CJK tail.
     if (knownEst !== undefined || text.length <= DENSITY_PROBE_CHARS) return [text];
     const exact = estimateEmbedTokens(text);
-    return exact <= DEFAULT_MAX_CHUNK_TOKENS ? [text] : capByChars(text, maxChars, exact);
+    return exact <= maxTokens ? [text] : capByChars(text, maxChars, maxTokens, exact);
   }
   // The stride keeps its nominal window-minus-overlap value. Evening the
   // windows out (as the header-budget hard split does) is WRONG here: that
@@ -169,11 +194,11 @@ function capByChars(text: string, maxChars: number, knownEst?: number): string[]
     const slice = text.slice(i, end).trim();
     if (slice.length > 0) {
       const sliceEst = estimateEmbedTokens(slice);
-      if (sliceEst > DEFAULT_MAX_CHUNK_TOKENS) {
+      if (sliceEst > maxTokens) {
         // Denser than the text average — re-derive locally, reusing the exact
         // figure just measured (it also guarantees window < slice.length, so
         // the recursion strictly shrinks).
-        out.push(...capByChars(slice, maxChars, sliceEst));
+        out.push(...capByChars(slice, maxChars, maxTokens, sliceEst));
       } else {
         out.push(slice);
       }
@@ -294,9 +319,16 @@ function splitOnWhitespace(text: string, target: number): string[] {
     if (text.trim().length === 0) return [];
     const pieces: string[] = [];
     const charsPerPiece = Math.max(1, target);
-    for (let i = 0; i < text.length; i += charsPerPiece) {
-      const slice = text.slice(i, i + charsPerPiece);
+    // Cursor advances to wherever safeSplitIndex actually cut, so no astral
+    // pair (emoji, non-BMP CJK) is halved and no code unit is skipped or
+    // repeated. A window too narrow to hold a pair takes the pair whole.
+    let i = 0;
+    while (i < text.length) {
+      let end = safeSplitIndex(text, Math.min(text.length, i + charsPerPiece));
+      if (end <= i) end = Math.min(text.length, i + 2);
+      const slice = text.slice(i, end);
       if (slice.trim().length > 0) pieces.push(slice);
+      i = end;
     }
     return pieces;
   }
@@ -360,6 +392,11 @@ function applyOverlap(chunks: string[], overlapWords: number): string[] {
  * If a sentence boundary exists within the last N words, start there.
  */
 function extractTrailingContext(text: string, targetWords: number): string {
+  // CJK-dominant chunks count chars, not whitespace tokens (see countWords);
+  // the whitespace path below would return '' (whole chunk = one token) or
+  // duplicate most of the chunk. English path is unchanged.
+  if (isCJKDominant(text)) return extractTrailingContextCJK(text, targetWords);
+
   const words = text.match(/\S+\s*/g) || [];
   if (words.length <= targetWords) return '';
 
@@ -373,6 +410,42 @@ function extractTrailingContext(text: string, targetWords: number): string {
     if (afterSentence.trim().length > 0) {
       return afterSentence;
     }
+  }
+
+  return trailing;
+}
+
+/**
+ * Sentence end for the CJK overlap aligner: a CJK delimiter needs no trailing
+ * whitespace; an ASCII one still does, so "3.5" inside CJK prose is not a
+ * boundary.
+ */
+const CJK_SENTENCE_END = new RegExp(`[${CJK_SENTENCE_DELIMITERS.join('')}]\\s*|[.!?]\\s+`);
+
+/**
+ * CJK-dominant twin of extractTrailingContext: walks back targetWords
+ * non-whitespace code units (the unit countCJKAwareWords counts), then
+ * aligns to a sentence end the same way. Changes chunk boundaries only for
+ * CJK-dominant pages chunked from now on; re-chunking existing pages needs a
+ * MARKDOWN_CHUNKER_VERSION bump (see TODOS.md).
+ */
+function extractTrailingContextCJK(text: string, targetWords: number): string {
+  if (countCJKAwareWords(text) <= targetWords) return '';
+
+  let count = 0;
+  let i = text.length;
+  while (i > 0 && count < targetWords) {
+    i--;
+    if (!/\s/.test(text[i])) count++;
+  }
+  // Code-unit walk can stop between an astral pair's halves; move the cut to
+  // the pair start (one extra overlap char beats a lone surrogate).
+  const trailing = text.slice(safeSplitIndex(text, i));
+
+  const sentenceEnd = CJK_SENTENCE_END.exec(trailing);
+  if (sentenceEnd && sentenceEnd.index < trailing.length / 2) {
+    const afterSentence = trailing.slice(sentenceEnd.index + sentenceEnd[0].length);
+    if (afterSentence.trim().length > 0) return afterSentence;
   }
 
   return trailing;

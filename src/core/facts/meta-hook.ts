@@ -25,8 +25,9 @@ const DEFAULT_TOP_K = 10;
  * Hard bound on cache entries. The key folds caller-controlled
  * `_meta.session_id`, so without a bound a remote caller could grow the map
  * without limit by minting fresh session ids per call. On overflow the entry
- * with the OLDEST expiry is evicted (it dies soonest anyway; with a uniform
- * TTL this is insertion order).
+ * with the OLDEST expiry is evicted (it dies soonest anyway; expiries are
+ * near-uniform, clamped shorter only when a row's valid_until lands inside
+ * the window).
  */
 export const HOT_MEMORY_CACHE_MAX_ENTRIES = 1000;
 
@@ -90,7 +91,12 @@ export async function getBrainHotMemoryMeta(
   // encodeCacheField (F5): source_id / session_id are caller-controlled and
   // may contain the '::' delimiter; percent-encode ':' so bumpHotMemoryCache's
   // split('::') can never mis-slice a component.
-  const cacheKey = `${encodeCacheField(sourceId)}::${tier}::${encodeCacheField(sessionId ?? '_')}::${allowListHash}`;
+  // The ENGINE is part of the key: one process can serve multiple brains
+  // (hosted multi-tenant, test shards, mounted brains), and two engines with
+  // the same source id / tier / session must never share hot-memory payloads
+  // — a cached entry from brain A served to brain B's caller is a cross-brain
+  // fact leak through the cache, not through any query.
+  const cacheKey = `${engineCacheField(ctx.engine)}::${encodeCacheField(sourceId)}::${tier}::${encodeCacheField(sessionId ?? '_')}::${allowListHash}`;
 
   const ttl = Math.max(1000, opts.ttlMs ?? DEFAULT_TTL_MS);
   const topK = Math.max(1, Math.min(opts.topK ?? DEFAULT_TOP_K, 25));
@@ -148,27 +154,56 @@ export async function getBrainHotMemoryMeta(
         // last wake" filters on WHEN the fact was learned, not its semantic
         // validity date (a fact recorded today about last month is NEW).
         created_at: r.created_at.toISOString(),
+        // #4206: provenance context (e.g. the source_slug extract_facts threaded
+        // in) rides the pack/delta projections instead of being recall-only.
+        context: r.context ?? null,
         confidence: Number(effectiveConfidence(r, now).toFixed(3)),
       })),
     },
   };
-  cacheSet(cacheKey, { expiresAt: Date.now() + ttl, payload });
+  // Read-time TTL honesty (adversarial review, this wave): a row whose
+  // valid_until lands INSIDE the cache window would otherwise keep riding
+  // the ambient channel for up to `ttl` past its expiry even though the
+  // underlying reads now filter it — clamp this entry's cache deadline to
+  // the earliest retained valid_until so the next call re-reads on time.
+  let expiresAt = Date.now() + ttl;
+  for (const r of rows) {
+    const vu = r.valid_until?.getTime();
+    if (vu !== undefined && Number.isFinite(vu) && vu < expiresAt) expiresAt = vu;
+  }
+  cacheSet(cacheKey, { expiresAt, payload });
   return payload;
 }
 
 /** Invalidate the cache for a (source_id, session_id) pair after extraction. */
 export function bumpHotMemoryCache(sourceId: string, sessionId: string | null): void {
   // Walk the cache and prune any entry matching this source+session
-  // (regardless of visibility tier or allow-list hash — key layout is
-  // encField(source)::tier::encField(session)::allowHash since v0.45.7).
-  // Components are ':'-encoded, so split('::') slices cleanly even when the
-  // source/session id itself contains '::' (F5).
+  // regardless of visibility tier, allow-list hash, OR engine — key layout is
+  // engine::encField(source)::tier::encField(session)::allowHash. Pruning
+  // across engines is deliberate over-invalidation: a bump is a freshness
+  // signal and a stale-drop on a sibling engine costs one rebuild, never a
+  // leak. Components are ':'-encoded, so split('::') slices cleanly even
+  // when the source/session id itself contains '::' (F5).
   const encSource = encodeCacheField(sourceId);
   const encSession = encodeCacheField(sessionId ?? '_');
   for (const k of _cache.keys()) {
     const parts = k.split('::');
-    if (parts[0] === encSource && parts[2] === encSession) _cache.delete(k);
+    if (parts[1] === encSource && parts[3] === encSession) _cache.delete(k);
   }
+}
+
+// Engine identity for the cache key: a WeakMap-issued serial, so the key
+// stays a flat string (the bounded Map + prefix pruning keep working) and a
+// disconnected engine can be garbage-collected.
+const ENGINE_KEYS = new WeakMap<object, string>();
+let engineKeySeq = 0;
+function engineCacheField(engine: object): string {
+  let k = ENGINE_KEYS.get(engine);
+  if (!k) {
+    k = `e${++engineKeySeq}`;
+    ENGINE_KEYS.set(engine, k);
+  }
+  return k;
 }
 
 /** Percent-encode ':' so a caller-controlled id can't inject the '::' key

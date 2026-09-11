@@ -1,3 +1,4 @@
+import { harnessAdapter } from '../core/harness/registry.ts';
 /**
  * `gbrain connect` — one-command coding-agent onboarding from a bearer token
  * (or OAuth 2.1 client credentials).
@@ -51,6 +52,7 @@ import {
 import { promptLine } from '../core/cli-util.ts';
 import {
   NAME_RE,
+  OAUTH_SECRET_NOTE,
   REDACTED,
   buildClaudeMcpAddArgv,
   buildCodexMcpAddArgv,
@@ -69,6 +71,7 @@ import {
 // commands). Re-exported so this module's public surface — and every test
 // that imports from it — is unchanged.
 export {
+  OAUTH_SECRET_NOTE,
   REDACTED,
   buildClaudeMcpAddArgv,
   buildCodexMcpAddArgv,
@@ -104,17 +107,14 @@ interface AgentSpec {
   supportsOAuth: boolean; // accepts OAuth client-credentials connector fields
 }
 
-export const AGENT_SPECS: Record<AgentId, AgentSpec> = {
-  'claude-code': { id: 'claude-code', label: 'Claude Code', binary: 'claude', installable: true, supportsOAuth: false },
-  codex: { id: 'codex', label: 'Codex', binary: 'codex', installable: true, supportsOAuth: false },
-  // No `binary`: the opencode --install lane never execs a CLI (direct JSONC
-  // write), and it branches before the exec lane's `spec.binary` read.
-  opencode: { id: 'opencode', label: 'opencode', installable: true, supportsOAuth: false },
-  perplexity: { id: 'perplexity', label: 'Perplexity Computer', installable: false, supportsOAuth: true },
-  generic: { id: 'generic', label: 'your agent', installable: false, supportsOAuth: true },
-};
-
 export const AGENT_IDS: AgentId[] = ['claude-code', 'codex', 'opencode', 'perplexity', 'generic'];
+
+// Preserve the legacy command surface while deriving adapter facts centrally.
+export const AGENT_SPECS = Object.fromEntries(AGENT_IDS.map(id => {
+  const adapter = harnessAdapter(id);
+  const binary = adapter.connection === 'codex-toml' ? 'codex' : adapter.connection === 'claude-json' ? 'claude' : undefined;
+  return [id, { id, label: adapter.label, binary, installable: adapter.connection !== 'manual', supportsOAuth: adapter.renewable }];
+})) as Record<AgentId, AgentSpec>;
 
 // The named tools MUST be real MCP-exposed ops (verified by the round-trip
 // E2E). `capture` earned its slot in the CLI→MCP gap-closure wave (D2A):
@@ -133,9 +133,8 @@ const SECRET_NOTE =
   'Note: that bearer token is a long-lived, full-access secret — keep it private and ' +
   'prefer a scoped/short-lived token if your host supports one.';
 
-const OAUTH_SECRET_NOTE =
-  'Note: the client secret is sensitive — store it like a password. It mints ' +
-  'short-lived, scoped access tokens; revoke with `gbrain auth revoke-client`.';
+// OAUTH_SECRET_NOTE moved to src/core/mcp-registration.ts (imported +
+// re-exported above; text unchanged).
 
 const PERPLEXITY_REMOTE_NOTE = [
   'Perplexity connects remotely, so the brain must be reachable over HTTPS. On the',
@@ -146,7 +145,11 @@ const PERPLEXITY_REMOTE_NOTE = [
 const HELP = `gbrain connect — wire a coding agent to a remote gbrain over MCP
 
 Usage:
+  gbrain connect <mcp-url> --harness <id> --credentials-file <private-file> --install
   gbrain connect <mcp-url> [--token <bearer>] [flags]
+
+The private-handoff path separates host provisioning from installation here.
+Thin CLI adapters require --root <absolute-persistent-root>. See gbrain mcp --help.
 
 Prints a copy-paste setup block for your agent, or wires it up directly with
 --install (claude-code, codex + opencode). The MCP URL is your remote
@@ -635,6 +638,10 @@ function resolveOAuthCreds(f: ParsedFlags, url: string, deps: ConnectDeps): OAut
 }
 
 export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps): Promise<void> {
+  if (args.includes('--harness') || args.includes('--credentials-file')) {
+    const { runHarnessConnect } = await import('./harness-connect.ts');
+    return runHarnessConnect(args);
+  }
   const f = parseArgs(args);
   if (f.help) {
     console.log(HELP);

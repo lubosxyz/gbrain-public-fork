@@ -83,7 +83,7 @@ Sell the upgrade. The user should feel "hell yeah, I want that." Lead with
 what they can DO now that they couldn't before, not what files changed.
 
 ```
-> **GBrain v0.5.0 is available** (you're on v0.4.0)
+> **GBrain vX.Y.Z is available** (you're on vX.Y.W)
 >
 > What's new:
 > - Your brain never falls behind. Live sync keeps the vector DB current
@@ -135,7 +135,7 @@ full_upgrade():
       read_and_execute(migration)  // in order, don't skip
 
   // Step 5: Schema sync — suggest new, respect declined
-  state = read("~/.gbrain/update-state.json")
+  state = read("~/.gbrain/upgrade-state.json")
   for recommendation in new_schema_recommendations:
     if recommendation not in state.declined:
       suggest_to_user(recommendation)
@@ -149,7 +149,7 @@ full_upgrade():
 
 Migration files live at `skills/migrations/vX.Y.Z.md`. They contain agent
 instructions (not scripts) for post-upgrade actions that make the new version
-work for existing users. Example: v0.5.0 migration sets up live sync and
+work for existing users. Example: a migration that sets up live sync and
 runs the verification runbook.
 
 The agent reads migration files in version order and executes them step by
@@ -170,7 +170,9 @@ Prompt: "Run gbrain check-update --json. If update_available is true,
 ### Frequency Preferences
 
 Default: daily. Store in agent memory as `gbrain_update_frequency: daily|weekly|off`.
-Also persist in `~/.gbrain/update-state.json` so it survives agent context resets.
+Also persist in `~/.gbrain/upgrade-state.json` so it survives agent context resets
+(the runtime's own bookkeeping lives beside it as `~/.gbrain/last-update-check`
+and `~/.gbrain/update-snoozed`).
 
 ### Standalone Skillpack Users
 

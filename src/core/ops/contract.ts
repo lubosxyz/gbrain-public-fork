@@ -137,6 +137,8 @@ export interface Logger {
 export interface AuthInfo {
   token: string;
   clientId: string;
+  /** Durable, verifier-derived identity. Never infer this from a display name or request data. */
+  principal?: { kind: 'oauth_client' | 'legacy_token'; id: string };
   /**
    * Human-readable agent name resolved at token-verification time.
    * For OAuth clients this is `oauth_clients.client_name`; for legacy
@@ -147,6 +149,22 @@ export interface AuthInfo {
    */
   clientName?: string;
   scopes: string[];
+  /** Operator-approved operation snapshot; NULL/undefined keeps legacy grants. */
+  allowedOperations?: string[] | null;
+  issuedScopes?: string[];
+  sourceActive?: boolean;
+  boundTools?: string[] | null;
+  boundSourceId?: string | null;
+  boundBrainId?: string | null;
+  delegatedNamespace?: 'prefixes' | 'job';
+  boundMaxConcurrent?: number;
+  budgetUsdPerDay?: string | null;
+  grantRevision?: number;
+  grantProfile?: string | null;
+  grantRepairReasons?: string[];
+  delegatedSlugPrefixes?: string[] | null;
+  /** Missing grant projection on a profile client is fail-closed. */
+  grantProjectionDegraded?: boolean;
   expiresAt?: number;
   /**
    * v0.34.1 (#861, D2): the source the calling OAuth client is scoped
@@ -165,6 +183,15 @@ export interface AuthInfo {
    * `gbrain auth scope-client`.
    */
   sourceId?: string;
+  /**
+   * #3242 (serve --http parity): distinguishes an operator-set source scope
+   * from the historical no-grant 'default' floor. `false` ONLY for a legacy
+   * bearer token whose `access_tokens.permissions.source_id` is absent —
+   * the one case whose unqualified reads may widen to the federated set.
+   * `true` (or undefined, e.g. OAuth clients) never widens. Mirrors
+   * `AuthResult.hasSourceGrant` in `src/mcp/http-transport.ts`.
+   */
+  hasSourceGrant?: boolean;
   /**
    * v0.34.1 (#876): array of source ids this OAuth client may READ
    * from (federation). Sourced from `oauth_clients.federated_read`.
@@ -230,6 +257,8 @@ export interface AuthInfo {
    * projection degraded, or the brain predates migration v127.
    */
   surface?: string;
+  /** Current transport ceiling applied to this authenticated request. */
+  effectiveSurface?: 'verbs' | 'starter' | 'full';
   /**
    * WP4 (amendment 19) — who set `surface`: 'operator' (rescope CLI/admin
    * endpoint; request_tools persist may NOT override it), 'self'
@@ -284,8 +313,9 @@ export interface OperationContext {
   dryRun: boolean;
   /**
    * OAuth auth info (v0.8+). Present when the caller authenticated via OAuth 2.1
-   * through `gbrain serve --http`. Contains clientId and granted scopes for
-   * per-operation scope enforcement.
+   * through `gbrain serve --http`, or a remote-owned delegated worker tool.
+   * Worker auth carries the current read grant; explicit tool bindings grant
+   * delegated operations independently of the parent's direct read/write scopes.
    */
   auth?: AuthInfo;
   /**
@@ -352,8 +382,8 @@ export interface OperationContext {
    * through this field. put_page enforces it BEFORE the legacy
    * `wiki/agents/<id>/...` namespace check.
    *
-   * Trust comes from the SUBMITTER (subagent jobs are gated by
-   * PROTECTED_JOB_NAMES — MCP cannot submit them), not from `remote`.
+   * Local jobs receive these from the trusted submitter. Remote-owned jobs
+   * receive intersected grant prefixes and auth; prefixes alone grant no trust.
    * Every subagent tool call has `remote=true` for auto-link safety,
    * so basing trust on `remote` is incoherent (would always reject).
    *
@@ -361,6 +391,17 @@ export interface OperationContext {
    * v0.15 behavior; pure addition, no regression).
    */
   allowedSlugPrefixes?: string[];
+  /**
+   * #4216 — defer chunk embeddings on put_page writes: importFromContent runs
+   * noEmbed and the standing embed machinery (embed phase / phase-end
+   * backfill / the stale-embed sweep) picks the chunks up via the
+   * `embedding IS NULL` partial index. Set ONLY by server-side dispatchers
+   * (the oneshot runner's programmatic writes); never hydrated from any wire
+   * payload, so remote callers cannot toggle it. (Flag spelled without dashes
+   * here on purpose — the flag-registry generator harvests bare dash-dash
+   * tokens from comments.)
+   */
+  deferEmbeds?: boolean;
   /**
    * Resolved global CLI options (--quiet / --progress-json / --progress-interval).
    * CLI callers populate this from `getCliOptions()`. MCP / library callers
@@ -449,7 +490,8 @@ export interface OperationContext {
    * `config.federated = true` source, so an unqualified read/search spans
    * federated sources as docs/guides/multi-source-brains.md promises.
    *
-   * Consumed exclusively by `federatedSearchScope`. Fail-closed remains:
+   * Consumed exclusively by `federatedSearchScope` and the graph-four
+   * re-route `routeCodeIntelScope` (#4011). Fail-closed remains:
    * a grant (`ctx.auth.allowedSources`) or a per-call `source_id` always
    * wins, and a context without this field never widens.
    */

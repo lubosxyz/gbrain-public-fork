@@ -10,6 +10,7 @@ type PgSql = ReturnType<typeof postgres>;
 import type {
   BatchOpts,
   TakeBatchInput, Take, TakesListOpts, TakeHit, StaleTakeRow,
+  TakeEmbeddingInput,
   TakeResolution, SynthesisEvidenceInput,
   TakesScorecard, TakesScorecardOpts, CalibrationBucket, CalibrationCurveOpts,
 } from '../engine.ts';
@@ -21,7 +22,8 @@ import type { SqlValue } from '../sql-query.ts';
 import { deriveResolutionTuple, finalizeScorecard } from '../takes-resolution.ts';
 import { normalizeWeightForStorage } from '../takes-fence.ts';
 import { buildTakeRows } from '../batch-rows.ts';
-import { takeRowToTake, takeHitRowToHit, tryParseEmbedding } from '../utils.ts';
+import { staleTakeRowToRow, takeRowToTake, takeHitRowToHit, tryParseEmbedding } from '../utils.ts';
+import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 
 /** Narrow slice of PostgresEngine the takes operations use. */
 export interface PgTakesDeps {
@@ -298,6 +300,7 @@ export async function listTakes(deps: PgTakesDeps, opts: TakesListOpts = {}): Pr
       FROM takes t
       JOIN pages p ON p.id = t.page_id
       WHERE 1=1
+        ${opts.excludePrivate ? sql.unsafe(`AND ${privatePagesFilterFragment('p')}`) : sql``}
         AND (${opts.page_id ?? null}::int   IS NULL OR t.page_id = ${opts.page_id ?? null}::int)
         AND (${opts.page_slug ?? null}::text IS NULL OR p.slug   = ${opts.page_slug ?? null}::text)
         AND (${opts.holder ?? null}::text   IS NULL OR t.holder  = ${opts.holder ?? null}::text)
@@ -338,6 +341,7 @@ export async function searchTakes(deps: PgTakesDeps, query: string, opts: Search
       JOIN pages p ON p.id = t.page_id
       WHERE t.active
         AND ${query} <% t.claim
+        ${opts.excludePrivate ? sql.unsafe(`AND ${privatePagesFilterFragment('p')}`) : sql``}
         AND (
           ${opts.takesHoldersAllowList ?? null}::text[] IS NULL
           OR t.holder = ANY(${opts.takesHoldersAllowList ?? null}::text[])
@@ -373,6 +377,7 @@ export async function searchTakesVector(
       JOIN pages p ON p.id = t.page_id
       WHERE t.active
         AND t.embedding IS NOT NULL
+        ${opts.excludePrivate ? sql.unsafe(`AND ${privatePagesFilterFragment('p')}`) : sql``}
         AND (
           ${opts.takesHoldersAllowList ?? null}::text[] IS NULL
           OR t.holder = ANY(${opts.takesHoldersAllowList ?? null}::text[])
@@ -419,8 +424,54 @@ export async function listStaleTakes(deps: PgTakesDeps): Promise<StaleTakeRow[]>
       ORDER BY t.id
       LIMIT 100000
     `;
-    return rows as unknown as StaleTakeRow[];
+    return rows.map((row) => staleTakeRowToRow(row as Record<string, unknown>));
   }
+
+export async function updateTakeEmbeddings(
+  deps: PgTakesDeps,
+  rowsIn: TakeEmbeddingInput[],
+  opts?: BatchOpts,
+): Promise<number> {
+  if (rowsIn.length === 0) return 0;
+  return deps.batchRetry(
+    opts?.auditSite ?? 'updateTakeEmbeddings',
+    opts?.signal,
+    () => _updateTakeEmbeddingsOnce(deps, rowsIn),
+    rowsIn.length,
+  );
+}
+
+async function _updateTakeEmbeddingsOnce(
+  deps: PgTakesDeps,
+  rowsIn: TakeEmbeddingInput[],
+): Promise<number> {
+  const seen = new Set<number>();
+  const rows = rowsIn.map(({ take_id, embedding }) => {
+    if (!Number.isInteger(take_id) || take_id <= 0) throw new Error(`invalid take_id: ${take_id}`);
+    if (seen.has(take_id)) throw new Error(`duplicate take_id in embedding batch: ${take_id}`);
+    seen.add(take_id);
+    const values = Array.from(embedding);
+    if (values.length === 0 || values.some(v => !Number.isFinite(v))) {
+      throw new Error(`invalid embedding for take_id=${take_id}`);
+    }
+    return { take_id, embedding: `[${values.join(',')}]` };
+  });
+  const result = await deps.executeRawJsonb(
+    `WITH updated AS (
+       UPDATE takes AS t
+          SET embedding = v.embedding::vector,
+              embedded_at = now(),
+              updated_at = now()
+         FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(take_id bigint, embedding text)
+        WHERE t.id = v.take_id AND t.active
+        RETURNING t.id
+     )
+     SELECT id FROM updated`,
+    [],
+    [{ rows }],
+  );
+  return result.length;
+}
 
 export async function updateTake(
   deps: PgTakesDeps,
@@ -548,6 +599,7 @@ export async function getScorecard(deps: PgTakesDeps, opts: TakesScorecardOpts, 
         )::float                                                                               AS brier
       FROM takes
       WHERE 1=1 ${holderClause} ${domainClause} ${sinceClause} ${untilClause} ${allowed} ${sourceFilter}
+        ${opts.excludePrivate ? sql.unsafe(`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${privatePagesFilterFragment('p')})`) : sql``}
     `;
     const r = rows[0] as { total_bets: number; resolved: number; correct: number; incorrect: number; partial: number; unresolvable_count: number; brier: number | null };
     return finalizeScorecard(r);
@@ -589,6 +641,7 @@ export async function getCalibrationCurve(deps: PgTakesDeps, opts: CalibrationCu
         FROM takes
         WHERE resolved_quality IN ('correct','incorrect')
           ${holderClause} ${allowed} ${sourceFilter}
+          ${opts.excludePrivate ? sql.unsafe(`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${privatePagesFilterFragment('p')})`) : sql``}
       )
       SELECT
         (bucket_idx::numeric * ${bucketSize}::numeric)::float       AS bucket_lo,

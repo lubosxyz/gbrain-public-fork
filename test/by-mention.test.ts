@@ -23,6 +23,8 @@
  *   15. Determinism across 10 calls
  *   16. Self-link guard (D13)
  *   17. Cross-source guard
+ *   17b. Cross-source guard lifts under allowCrossSource
+ *   17c. Own-source same-name twin outranks the cross-source twin
  *   18. Hardcoded type filter (meeting NOT in gazetteer)
  *   19. Min-length + ignore-list interaction
  *   20. Code-block + token interaction
@@ -242,6 +244,36 @@ describe('findMentionedEntities — pure cases', () => {
       fromSlug: 'writing/post-1', fromSourceId: 'team-a', // different source
     });
     expect(mentions).toEqual([]);
+  });
+
+  test('17b. cross-source guard lifts under allowCrossSource — mention carries the entity\'s own source_id', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'companies/acme', source_id: 'team-b', title: 'Acme' },
+    ]);
+    const opts = { fromSlug: 'writing/post-1', fromSourceId: 'team-a' };
+    expect(findMentionedEntities('We met Acme today.', g, opts)).toEqual([]);
+    const mentions = findMentionedEntities('We met Acme today.', g, { ...opts, allowCrossSource: true });
+    expect(mentions).toHaveLength(1);
+    expect(mentions[0]!.slug).toBe('companies/acme');
+    expect(mentions[0]!.source_id).toBe('team-b');
+  });
+
+  test('17c. same-name twin in the scanning page\'s own source outranks the cross-source twin', () => {
+    // Bucket order is length-only, so the foreign twin sits first: without the
+    // own-source preference the guard drops the mention (allowCrossSource off)
+    // or links the foreign page (allowCrossSource on).
+    const g = gazetteerFromEntries([
+      { slug: 'companies/acme', source_id: 'team-b', title: 'Acme' },
+      { slug: 'companies/acme-local', source_id: 'team-a', title: 'Acme' },
+    ]);
+    for (const allowCrossSource of [false, true]) {
+      const mentions = findMentionedEntities('We met Acme today.', g, {
+        fromSlug: 'writing/post-1', fromSourceId: 'team-a', allowCrossSource,
+      });
+      expect(mentions).toHaveLength(1);
+      expect(mentions[0]!.slug).toBe('companies/acme-local');
+      expect(mentions[0]!.source_id).toBe('team-a');
+    }
   });
 
   test('20. code-block + token interaction — body text outside block linked, inside skipped', () => {
@@ -646,6 +678,75 @@ describe('buildGazetteer — engine integration', () => {
     // gazetteer presence wins per CK12 rule.
     expect(g.has('apple')).toBe(true);
     expect(g.get('apple')![0]!.slug).toBe('companies/apple');
+  });
+
+  test('alias entries (v0.46.15, #3801): page_aliases become gazetteer entries', async () => {
+    await engine.putPage('people/saoirse-x', {
+      type: 'person', title: 'Saoirse Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.setPageAliases('people/saoirse-x', 'default', ['saoirse']);
+    const g = await buildGazetteer(engine);
+    const bucket = g.get('saoirse');
+    expect(bucket).toBeDefined();
+    expect(bucket!.some((e) => e.slug === 'people/saoirse-x')).toBe(true);
+  });
+
+  test('REGRESSION (v0.46.15): ignore-list rejects ALIAS entries case-insensitively; CK12 title behavior unchanged', async () => {
+    // Title side (unchanged CK12 policy): a real page titled "Apple" stays.
+    await engine.putPage('companies/apple', {
+      type: 'company', title: 'Apple', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    // Alias side (new teeth): an alias "apple" on an unrelated page is
+    // suppressed — aliases are not user-created pages; the cased ignore list
+    // must match the normalized-lowercase alias store.
+    await engine.putPage('people/annie-p', {
+      type: 'person', title: 'Annie P Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.setPageAliases('people/annie-p', 'default', ['apple']);
+    const g = await buildGazetteer(engine);
+    const bucket = g.get('apple') ?? [];
+    expect(bucket.some((e) => e.slug === 'companies/apple')).toBe(true); // title entry survives
+    expect(bucket.some((e) => e.slug === 'people/annie-p')).toBe(false); // alias entry rejected
+  });
+
+  test('alias entries: ambiguous alias (two slugs, same source) is skipped', async () => {
+    await engine.putPage('people/sable-one', {
+      type: 'person', title: 'Sable One Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.putPage('people/sable-two', {
+      type: 'person', title: 'Sable Two Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.setPageAliases('people/sable-one', 'default', ['sable']);
+    await engine.setPageAliases('people/sable-two', 'default', ['sable']);
+    const g = await buildGazetteer(engine);
+    // Title entries ("Sable One Example" etc.) legitimately share the key —
+    // the ALIAS-shaped entries (single-token) must be absent.
+    expect((g.get('sable') ?? []).filter((e) => e.tokens.length === 1)).toHaveLength(0);
+  });
+
+  test('alias entries: alias colliding with an existing page TITLE in the same source is skipped', async () => {
+    await engine.putPage('companies/acme-corp', {
+      type: 'company', title: 'Acme', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.putPage('people/andy-c', {
+      type: 'person', title: 'Andy C Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.setPageAliases('people/andy-c', 'default', ['acme']);
+    const g = await buildGazetteer(engine);
+    const bucket = g.get('acme') ?? [];
+    expect(bucket.some((e) => e.slug === 'companies/acme-corp')).toBe(true);
+    expect(bucket.some((e) => e.slug === 'people/andy-c')).toBe(false);
+  });
+
+  test('alias entries: sub-MIN_NAME_LENGTH aliases are skipped', async () => {
+    await engine.putPage('people/jt-example', {
+      type: 'person', title: 'JT Example Person', compiled_truth: 'b', timeline: '', frontmatter: {},
+    });
+    await engine.setPageAliases('people/jt-example', 'default', ['jt']);
+    const g = await buildGazetteer(engine);
+    // The multi-token TITLE entry may share the key; the single-token alias
+    // entry ('jt' < MIN_NAME_LENGTH) must be absent.
+    expect((g.get('jt') ?? []).filter((e) => e.tokens.length === 1)).toHaveLength(0);
   });
 
   test('13. all entity pages soft-deleted → empty gazetteer', async () => {

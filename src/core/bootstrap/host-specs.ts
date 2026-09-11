@@ -74,7 +74,11 @@ export const TARGETS: Record<string, HostSpecTarget> = {
       'SessionStart stdin carries source:"startup"|"resume"|"clear"|"compact" ' +
       '(+"fork" since Claude Code v2.1.214); source:"compact" fires after auto ' +
       'or manual compaction and is the rehydration re-entry the PreCompact ' +
-      'bank serves a warm pack through.',
+      'bank serves a warm pack through. Skills: user-scope native SKILL.md ' +
+      'discovery reads CLAUDE_CONFIG_DIR-else-HOME /.claude/skills ' +
+      '(claudeUserSkillsDir — the harness-bridge install target, attested by ' +
+      'the gstack convention + plugin lane); project-scope ' +
+      '<workspace>/.claude/skills is provisional-from-docs.',
   },
   [CODEX_SPEC_ID]: {
     id: CODEX_SPEC_ID,
@@ -84,26 +88,35 @@ export const TARGETS: Record<string, HostSpecTarget> = {
       'docs/mcp/CODEX.md',
       'https://developers.openai.com/codex/mcp',
       'codex-cli 0.147.0 (binary serde field scan + live inline bearer_token wiring, issue #4043)',
+      'codex-cli 0.149.1 (reporter 3-variant probe in issue #4574: inline bearer_token is REJECTED ' +
+        'at config load for streamable_http; http_headers inline table loads on 0.147.x and 0.149.x)',
     ],
     note:
       'Local stdio MCP registration: `codex mcp add <name> [--env K=V]... -- ' +
       '<command> [args...]`, which writes [mcp_servers.<name>] into ' +
       '(CODEX_HOME || ~/.codex)/config.toml — codex resolves CODEX_HOME as ' +
       'the config dir itself. Streamable-HTTP servers are configured with ' +
-      '`url` plus `bearer_token` (inline) or `bearer_token_env_var`; the ' +
-      'config parser uses deny-unknown-fields, so writers must emit ONLY ' +
-      'verified keys and `KEY = "value"` spacing. The CX2-17 revisit trigger ' +
-      'FIRED (#4043): `codex mcp add` cannot express an inline bearer_token ' +
-      '(verified against codex-cli 0.147.0 --help), so the harness lane owns ' +
-      'a managed marker-delimited TOML block (codex-toml.ts) — the ONE ' +
-      'direct config.toml writer. One owner per server name: `codex mcp ' +
+      '`url` plus an inline `http_headers = { Authorization = "Bearer <t>" }` ' +
+      'table or `bearer_token_env_var` — inline `bearer_token` was accepted ' +
+      'by 0.147.x but is REJECTED AT CONFIG LOAD by >=0.149 (#4574, bricking ' +
+      'every codex session on the machine); the http_headers shape loads on ' +
+      'both. The config parser uses deny-unknown-fields, so writers must emit ' +
+      'ONLY verified keys and `KEY = "value"` spacing. The CX2-17 revisit ' +
+      'trigger FIRED (#4043): `codex mcp add` cannot express an inline ' +
+      'credential (verified against codex-cli 0.147.0 --help), so the harness ' +
+      'lane owns a managed marker-delimited TOML block (codex-toml.ts) — the ' +
+      'ONE direct config.toml writer. One owner per server name: `codex mcp ' +
       'remove` rewrites config.toml wholesale and drops comments, so the ' +
       'stdio lane (runHooks) must never manage a name the harness block ' +
       'owns, and vice versa. Codex 0.147.0 also ships a real hook system ' +
-      '(hooks.json; PreToolUse…SessionEnd) — CODEX_HAS_HOOKS=false means ' +
-      '"gbrain does not wire codex hooks yet" (follow-up filed), NOT "codex ' +
-      'has no hooks". Some codex builds gate HTTP MCP servers behind ' +
-      '`experimental_use_rmcp_client = true` — probe at wiring time.',
+      '(hooks.json; PreToolUse…SessionEnd) — gbrain wires SessionEnd only ' +
+      '(CODEX_HAS_HOOKS=true; codex-hooks.ts owns the two-file write incl. ' +
+      'the config.toml trust entry, see CODEX_HOOKS_SPEC_TARGET there). ' +
+      'Some codex builds gate HTTP MCP servers behind ' +
+      '`experimental_use_rmcp_client = true` — probe at wiring time. Skills: ' +
+      'no attested native skills DIR for direct file installs (the plugin ' +
+      'lane serves codex skills); a direct-copy target needs an observation ' +
+      'run before a default ships (harness-bridge requires an explicit dest).',
   },
   [OPENCODE_SPEC_ID]: {
     id: OPENCODE_SPEC_ID,
@@ -140,7 +153,10 @@ export const TARGETS: Record<string, HostSpecTarget> = {
       'double-loaded. opencode ships a JS plugin/event system — ' +
       'OPENCODE_HAS_HOOKS=false means "gbrain does not wire it yet" (follow-up ' +
       'filed), NOT "opencode has no hooks"; probes run with --pure + ' +
-      'OPENCODE_DISABLE_AUTOUPDATE=1 because mcp list autoloads plugins.',
+      'OPENCODE_DISABLE_AUTOUPDATE=1 because mcp list autoloads plugins. ' +
+      'Skills: no attested native skills DIR for direct file installs; a ' +
+      'direct-copy target needs an observation run before a default ships ' +
+      '(harness-bridge requires an explicit dest).',
   },
 };
 
@@ -231,11 +247,33 @@ export const GBRAIN_HARNESS_MARKER_VALUE = 'bootstrap-harness-v1';
  * HOME would otherwise write into the operator's REAL settings file (this
  * bit us; the write-ahead receipt's remove path self-healed it).
  */
-export function claudeUserSettingsPath(): string {
+/**
+ * The one CLAUDE_CONFIG_DIR-else-HOME-env-else-homedir() resolution (Bun's
+ * homedir() reads the password DB, not $HOME — the sandboxed-test hazard
+ * documented on claudeUserSettingsPath). Returns the directory that plays
+ * the role of `~/.claude` for paths that live INSIDE it (settings.json,
+ * skills/). NOT for claudeUserMcpConfigPath — its default lives at the HOME
+ * level (`~/.claude.json`), a genuinely different shape.
+ */
+function claudeConfigBase(): string {
   const configDir = process.env.CLAUDE_CONFIG_DIR?.trim();
-  if (configDir) return join(configDir, 'settings.json');
+  if (configDir) return configDir;
   const home = process.env.HOME?.trim();
-  return join(home || homedir(), '.claude', 'settings.json');
+  return join(home || homedir(), '.claude');
+}
+
+export function claudeUserSettingsPath(): string {
+  return join(claudeConfigBase(), 'settings.json');
+}
+
+/**
+ * #4325: the config-dir base itself, exported for detection — a machine with
+ * a `~/.claude` (or CLAUDE_CONFIG_DIR) directory has Claude Code configured
+ * even when the `claude` binary isn't on the probing process's PATH (CI
+ * runners, alias-only shells). Mirrors detectCodex's config-file fallback.
+ */
+export function claudeConfigDir(): string {
+  return claudeConfigBase();
 }
 
 /** permissions.allow entry that pre-approves an MCP server's tools for headless runs. */
@@ -256,9 +294,48 @@ export function claudeUserMcpConfigPath(): string {
   return join(home || homedir(), '.claude.json');
 }
 
-/** Where Claude Code stores session transcripts — the confinement root [S3#8]. */
+/**
+ * Where Claude Code stores session transcripts — the confinement root [S3#8].
+ * Uses the same config-dir base as settings/skills so custom config dirs keep
+ * legitimate transcript paths inside the allowed root.
+ */
 export function claudeProjectsDir(): string {
-  return join(homedir(), '.claude', 'projects');
+  return join(claudeConfigBase(), 'projects');
+}
+
+/**
+ * User-scope Claude Code skills dir (native SKILL.md discovery — the
+ * harness-bridge install target). Same CLAUDE_CONFIG_DIR-first then
+ * HOME-env-first discipline as claudeUserSettingsPath: Bun's homedir()
+ * reads the password database, not $HOME, so a sandboxed test that remaps
+ * HOME would otherwise write into the operator's REAL skills dir.
+ */
+export function claudeUserSkillsDir(): string {
+  return join(claudeConfigBase(), 'skills');
+}
+
+/**
+ * Project-scope Claude Code skills dir (`<workspace>/.claude/skills`).
+ * Provisional-from-docs: the user-scope dir is the attested location; the
+ * project-scope layout mirrors Claude Code's settings precedence.
+ */
+export function claudeProjectSkillsDir(workspaceDir: string): string {
+  return join(workspaceDir, '.claude', 'skills');
+}
+
+/**
+ * User-scope Claude Code memory file (`~/.claude/CLAUDE.md` — loaded into
+ * every session's context; the ambient-writeback managed block's install
+ * target). PROVISIONAL-from-docs (https://code.claude.com/docs/en/memory,
+ * noted 2026-09-01): the user-memory location is documented but has no
+ * in-repo live-binary attestation yet — treat a writer failure as
+ * "re-verify the spec" per the [ENG-7] discipline. Same
+ * CLAUDE_CONFIG_DIR-else-HOME-env-else-homedir() resolution as
+ * claudeUserSettingsPath (Bun's homedir() reads the password database, not
+ * $HOME — the sandboxed-test hazard documented there).
+ */
+export function claudeUserMemoryPath(): string {
+  return join(claudeConfigBase(), 'CLAUDE.md');
 }
 
 // ── Codex shapes ────────────────────────────────────────────────────────────
@@ -272,17 +349,89 @@ export function claudeProjectsDir(): string {
  * clobber the operator's real ~/.codex/config.toml.
  */
 export function codexConfigPath(): string {
-  const codexHome = process.env.CODEX_HOME?.trim();
-  return join(codexHome || join(homedir(), '.codex'), 'config.toml');
+  return join(codexHome(), 'config.toml');
+}
+
+/** THE one CODEX_HOME resolution (env override, else ~/.codex) — every codex
+ * path below joins onto it so the discipline can never drift per-path. */
+function codexHome(): string {
+  return process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
 }
 
 /**
- * Whether gbrain WIRES codex hooks. False = not yet: codex 0.147.0 ships a
- * real hook system (hooks.json; PreToolUse…SessionEnd — see the TARGETS
- * note), but gbrain's codex hook lane is a filed follow-up; per-turn context
- * on codex remains the pull-protocol AGENTS.md gates (plan D5).
+ * Codex rollout store — (CODEX_HOME || ~/.codex)/sessions/YYYY/MM/DD/
+ * rollout-*.jsonl (same CODEX_HOME resolution discipline as codexConfigPath;
+ * the spawner of a codex hook IS codex, which owns that env). This is the
+ * confinement root for the codex hook lane's transcript_path [S3#8] and the
+ * base of its discovery fallback — pinned here, never widenable by the
+ * process that spawned the hook.
  */
-export const CODEX_HAS_HOOKS = false;
+export function codexSessionsDir(): string {
+  return join(codexHome(), 'sessions');
+}
+
+/**
+ * Codex ARCHIVED rollout store — (CODEX_HOME || ~/.codex)/archived_sessions/
+ * rollout-*.jsonl. Codex moves a rollout here when a session is archived, and
+ * the store is FLAT: no YYYY/MM/DD nesting, unlike codexSessionsDir (verified
+ * on a live 0.147.0 host — 363 rollouts, zero subdirectories). It is the same
+ * codex-owned trust boundary as the live store, so the hook lane confines to
+ * BOTH; a moved rollout is otherwise refused as outside_projects_dir and is
+ * invisible to the discovery fallback.
+ */
+export function codexArchivedSessionsDir(): string {
+  return join(codexHome(), 'archived_sessions');
+}
+
+/**
+ * Codex hooks file — (CODEX_HOME || ~/.codex)/hooks.json, USER-GLOBAL (no
+ * per-project scope for the user layer gbrain writes). Written by
+ * codex-hooks.ts together with its config.toml trust-state entry; see
+ * CODEX_HOOKS_SPEC_TARGET there for the verified 0.147.0 facts.
+ */
+export function codexHooksPath(): string {
+  return join(codexHome(), 'hooks.json');
+}
+
+/**
+ * Codex user-global AGENTS.md — (CODEX_HOME || ~/.codex)/AGENTS.md, the
+ * instruction file codex merges into every session; the ambient-writeback
+ * managed block's install target. PROVISIONAL-from-docs
+ * (https://developers.openai.com/codex/guides/agents-md, noted 2026-09-01):
+ * no in-repo live-binary attestation for the user-global file yet — an
+ * observation run promotes it (follow-up filed in the ambient-writeback
+ * plan). The SAME doc pins an exclusivity rule: when AGENTS.override.md
+ * exists in CODEX_HOME, codex loads IT INSTEAD and ignores AGENTS.md
+ * entirely — writers must probe codexAgentsOverridePath() first or they
+ * install a dead integration [OV-A4].
+ */
+export function codexGlobalAgentsPath(): string {
+  return join(codexHome(), 'AGENTS.md');
+}
+
+/**
+ * The exclusivity file for codexGlobalAgentsPath() (same dated PROVISIONAL
+ * spec note, developers.openai.com/codex/guides/agents-md, 2026-09-01): its
+ * presence means codex IGNORES AGENTS.md — probe it before writing there,
+ * and report it in status so a dead integration never reads healthy.
+ */
+export function codexAgentsOverridePath(): string {
+  return join(codexHome(), 'AGENTS.override.md');
+}
+
+/** Codex hook events gbrain wires (v1: session-end capture only — a
+ * SessionStart greeting lane is a filed follow-up). */
+export const CODEX_HOOK_EVENTS = ['SessionEnd'] as const;
+
+/**
+ * Whether gbrain WIRES codex hooks. True as of the Memorable wave: bootstrap
+ * writes a SessionEnd entry into hooks.json plus its config.toml trust-state
+ * entry (codex-hooks.ts — the 0.147.0 trust gate makes an untrusted entry
+ * silently inert). SESSION-END CAPTURE ONLY: per-turn context on codex
+ * remains the pull-protocol AGENTS.md gates (plan D5); a SessionStart lane
+ * is a filed follow-up.
+ */
+export const CODEX_HAS_HOOKS = true;
 
 /**
  * Managed-block markers for the harness lane's direct config.toml writes

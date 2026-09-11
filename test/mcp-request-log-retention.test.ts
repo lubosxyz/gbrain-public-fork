@@ -52,7 +52,7 @@ async function executeMigrationStatements(engine: PGLiteEngine, sql: string): Pr
   }
 }
 
-describe('v131 — fork/upstream v128 reconciliation', () => {
+describe('v150 — fork/upstream v131+v132 reconciliation (fork v128+tenant lanes replayed)', () => {
   let engine: PGLiteEngine;
   beforeAll(async () => {
     engine = new PGLiteEngine();
@@ -63,15 +63,15 @@ describe('v131 — fork/upstream v128 reconciliation', () => {
     if (engine) await engine.disconnect();
   }, 60_000);
 
-  test('v131 entry exists, named + idempotent', () => {
-    const m = MIGRATIONS.find((x) => x.version === 131);
+  test('v150 entry exists, named + idempotent', () => {
+    const m = MIGRATIONS.find((x) => x.version === 150);
     expect(m).toBeDefined();
-    expect(m!.name).toBe('fork_upstream_v128_reconciliation');
+    expect(m!.name).toBe('fork_upstream_v131_v132_reconciliation');
     expect(m!.idempotent).toBe(true);
   });
 
-  test('LATEST_VERSION is at or above 131', () => {
-    expect(LATEST_VERSION).toBeGreaterThanOrEqual(131);
+  test('LATEST_VERSION is at or above 150', () => {
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(150);
   });
 
   test('table exists after initSchema with the documented columns', async () => {
@@ -100,7 +100,7 @@ describe('v131 — fork/upstream v128 reconciliation', () => {
   });
 
   test('re-running the migration SQL is a no-op (idempotent CREATE TABLE IF NOT EXISTS)', async () => {
-    const m = MIGRATIONS.find((x) => x.version === 131)!;
+    const m = MIGRATIONS.find((x) => x.version === 150)!;
     await expect(executeMigrationStatements(engine, m.sql)).resolves.toBeUndefined();
   });
 });
@@ -237,7 +237,7 @@ describe('purgeStaleMcpRequestLog', () => {
       expect(left.length).toBe(1);
     } finally {
       // Restore the table so later tests in this file aren't affected.
-      const m = MIGRATIONS.find((x) => x.version === 131)!;
+      const m = MIGRATIONS.find((x) => x.version === 150)!;
       await executeMigrationStatements(engine, m.sql);
     }
   });

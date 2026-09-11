@@ -7,7 +7,7 @@ import {
   decideLockAcquisition,
   isPidAlive,
 } from '../src/commands/autopilot.ts';
-import { looksLikeGbrainAutopilotCommand } from '../src/core/autopilot-lock.ts';
+import { looksLikeGbrainAutopilotCommand, readProcessCommand } from '../src/core/autopilot-lock.ts';
 
 let tmp: string;
 let lockPath: string;
@@ -54,6 +54,23 @@ describe('decideLockAcquisition', () => {
     })).toEqual({
       action: 'exit',
       holderPid: 1234,
+      holderState: 'alive-autopilot',
+    });
+  });
+
+  test('keeps a STALE lock whose holder is a live gbrain autopilot process', () => {
+    // The age gate applies only to non-autopilot holders: a genuine autopilot
+    // sibling is never stolen no matter how old the lockfile mtime is.
+    writeFileSync(lockPath, '1234');
+    const stale = new Date(Date.now() - AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS - 1000);
+    utimesSync(lockPath, stale, stale);
+    expect(decideLockAcquisition(lockPath, process.pid, {
+      isPidAlive: (pid) => pid === 1234,
+      readProcessCommand: () => 'gbrain autopilot --repo repo',
+    })).toEqual({
+      action: 'exit',
+      holderPid: 1234,
+      holderState: 'alive-autopilot',
     });
   });
 
@@ -65,6 +82,7 @@ describe('decideLockAcquisition', () => {
     })).toEqual({
       action: 'exit',
       holderPid: 1234,
+      holderState: 'alive-foreign',
     });
   });
 
@@ -81,7 +99,7 @@ describe('decideLockAcquisition', () => {
     });
   });
 
-  test('keeps a live lock when process identity cannot be inspected', () => {
+  test('keeps a FRESH lock when process identity cannot be inspected', () => {
     writeFileSync(lockPath, '1234');
     expect(decideLockAcquisition(lockPath, process.pid, {
       isPidAlive: (pid) => pid === 1234,
@@ -89,6 +107,23 @@ describe('decideLockAcquisition', () => {
     })).toEqual({
       action: 'exit',
       holderPid: 1234,
+      holderState: 'alive-unknown',
+    });
+  });
+
+  test('takes over a STALE lock when process identity cannot be inspected (#4300)', () => {
+    // Recycled PID after reboot on a host where the command probe fails:
+    // pre-fix this exited forever (bricked daemon). alive-unknown now shares
+    // the alive-foreign age gate.
+    writeFileSync(lockPath, '1234');
+    const stale = new Date(Date.now() - AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS - 1000);
+    utimesSync(lockPath, stale, stale);
+    expect(decideLockAcquisition(lockPath, process.pid, {
+      isPidAlive: (pid) => pid === 1234,
+      readProcessCommand: () => null,
+    })).toEqual({
+      action: 'takeover',
+      reason: 'unidentifiable pid 1234 with stale lock',
     });
   });
 
@@ -100,11 +135,90 @@ describe('decideLockAcquisition', () => {
   });
 });
 
+describe('readProcessCommand', () => {
+  test('prefers /proc/<pid>/cmdline when readable (#4300)', () => {
+    const seen: string[] = [];
+    const cmd = readProcessCommand(1234, {
+      readCmdlineFile: (path) => {
+        seen.push(path);
+        return Buffer.from('gbrain\0autopilot\0--repo\0repo\0');
+      },
+    });
+    expect(seen).toEqual(['/proc/1234/cmdline']);
+    expect(cmd).toBe('gbrain autopilot --repo repo');
+  });
+
+  test('falls back to ps when the cmdline probe throws', () => {
+    // The current process always exists; ps must resolve it on macOS/Linux.
+    const cmd = readProcessCommand(process.pid, {
+      readCmdlineFile: () => {
+        throw new Error('ENOENT');
+      },
+    });
+    expect(cmd).not.toBeNull();
+    expect((cmd ?? '').length).toBeGreaterThan(0);
+  });
+
+  test('falls back to ps when the cmdline file is empty (zombie)', () => {
+    const cmd = readProcessCommand(process.pid, {
+      readCmdlineFile: () => Buffer.from(''),
+    });
+    expect(cmd).not.toBeNull();
+  });
+
+  test('returns null for invalid pids without probing', () => {
+    expect(readProcessCommand(0)).toBeNull();
+    expect(readProcessCommand(-5)).toBeNull();
+    expect(readProcessCommand(Number.NaN)).toBeNull();
+  });
+
+  test('uses Get-CimInstance on win32 and never touches /proc or ps (#4563)', () => {
+    const calls: Array<[string, string[]]> = [];
+    const cmd = readProcessCommand(1234, {
+      platform: 'win32',
+      readCmdlineFile: () => {
+        throw new Error('should not read /proc on win32');
+      },
+      execFile: (file, args) => {
+        calls.push([file, args]);
+        return 'C:\\Users\\u\\.bun\\bin\\gbrain.exe autopilot --repo C:\\brain\r\n';
+      },
+    });
+    expect(cmd).toBe('C:\\Users\\u\\.bun\\bin\\gbrain.exe autopilot --repo C:\\brain');
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe('powershell.exe');
+    expect(calls[0][1].join(' ')).toContain('Get-CimInstance Win32_Process');
+    expect(calls[0][1].join(' ')).toContain('ProcessId=1234');
+    expect(looksLikeGbrainAutopilotCommand(cmd!)).toBe(true);
+  });
+
+  test('win32: returns null when powershell fails or the process is gone (#4563)', () => {
+    expect(readProcessCommand(1234, {
+      platform: 'win32',
+      execFile: () => {
+        throw new Error('no powershell');
+      },
+    })).toBeNull();
+    // Empty CIM output = process exited between kill-0 and the CIM query.
+    expect(readProcessCommand(1234, {
+      platform: 'win32',
+      readCmdlineFile: () => {
+        throw new Error('should not read /proc on win32');
+      },
+      execFile: () => '',
+    })).toBeNull();
+  });
+});
+
 describe('looksLikeGbrainAutopilotCommand', () => {
   test('matches packaged and source-tree autopilot invocations', () => {
     expect(looksLikeGbrainAutopilotCommand('gbrain autopilot --repo repo')).toBe(true);
     expect(looksLikeGbrainAutopilotCommand('./gbrain/src/cli.ts autopilot')).toBe(true);
     expect(looksLikeGbrainAutopilotCommand('bun src/cli.ts autopilot --repo repo')).toBe(true);
+  });
+
+  test('matches a Windows command line with the executable quoted under a path with spaces', () => {
+    expect(looksLikeGbrainAutopilotCommand('"C:\\Program Files\\gbrain\\gbrain.exe" autopilot --repo "C:\\my brain"')).toBe(true);
   });
 
   test('rejects unrelated live processes', () => {

@@ -1,3 +1,11 @@
+import { prepareRemoteJob, prepareRemoteAgent, assertRemoteJobControl } from '../minions/submission-authority.ts';
+import type { MinionJob } from '../minions/types.ts';
+
+function publicJob(job: MinionJob) {
+  const { submission_authority: _authority, ...visible } = job;
+  return { ...visible, private_queue_owner_token: job.private_queue_owner_token == null ? null : '[redacted]' };
+}
+
 /**
  * Jobs (Minions) operation cluster — pure move from operations.ts (v0.46.x
  * tranche 2). Op consts stay module-private; `jobsOperations` below lists
@@ -9,16 +17,72 @@
 
 import type { Operation, OperationContext } from './contract.ts';
 import { OperationError } from './contract.ts';
-import { normalizeSlugPrefix } from './context.ts';
+import { hasScope } from '../scope.ts';
+import {
+  assertEmbedBackfillQueueAdmission,
+  embedBackfillManualDrainCommand,
+  InvalidEmbedBackfillSourceIdError,
+  NoEmbedBackfillWorkerSurfaceError,
+} from '../minions/embed-backfill-admission.ts';
 
 // --- Jobs (Minions) ---
 
+/**
+ * #4098 — agent-lane ownership fence for the generic jobs ops.
+ *
+ * get_job / list_jobs / get_job_progress / cancel_job are `scope: 'admin'`
+ * ops that gained `agentCallable: true` so an agent-scoped OAuth client can
+ * monitor + cancel the jobs it submitted via submit_agent — WITHOUT admin.
+ * Returns the owner client id to fence on, or null when the caller is
+ * unfenced (full visibility):
+ *
+ *   - trusted local CLI (ctx.remote === false): unfenced (today's behavior)
+ *   - token with admin scope: unfenced (satisfied the op's declared scope)
+ *   - stdio MCP (remote, transport 'stdio', no per-token auth): unfenced —
+ *     the local-pipe surface ceiling governs there, same posture as today
+ *   - anything else (the agentCallable carve-out, i.e. agent scope without
+ *     admin): MUST carry ctx.auth.clientId; fenced on
+ *     `data->>'__owner_client_id'`. Missing identity → permission_denied
+ *     (fail closed, mirroring get_agent_job).
+ */
+function agentOwnerFence(ctx: OperationContext, opName: string): string | null {
+  if (ctx.remote === false) return null;
+  const scopes = ctx.auth?.scopes;
+  if (scopes && hasScope(scopes, 'admin')) return null;
+  if (!ctx.auth && ctx.transport === 'stdio') return null;
+  const clientId = ctx.auth?.clientId;
+  if (!clientId || typeof clientId !== 'string') {
+    throw new OperationError(
+      'permission_denied',
+      `${opName} without admin scope requires an authenticated OAuth client identity.`,
+      'Call over HTTP MCP with an `agent`-scoped token, or use an admin-scope token for unfenced access.',
+    );
+  }
+  return clientId;
+}
+
+/**
+ * #4098 — SQL-side ownership check (the get_agent_job predicate, uniform
+ * not-found). Foreign-owned and nonexistent ids are indistinguishable by
+ * design (anti-enumeration): both throw the SAME error the unfenced path
+ * throws for a missing id.
+ */
+async function assertJobOwned(ctx: OperationContext, id: number, owner: string): Promise<void> {
+  const rows = await ctx.engine.executeRaw<{ id: number }>(
+    `SELECT id FROM minion_jobs WHERE id = $1 AND data->>'__owner_client_id' = $2`,
+    [id, owner],
+  );
+  if (rows.length === 0) {
+    throw new OperationError('invalid_params', `Job not found: ${id}`);
+  }
+}
+
 const submit_job: Operation = {
   name: 'submit_job',
-  description: 'Submit a background job to the Minions queue. Built-in types are registered by registerBuiltinHandlers (src/commands/jobs.ts) — e.g. sync, embed, lint, import, extract, backlinks, autopilot-cycle, subagent, and more; submitting an unknown name with --follow prints the full list. The `shell` type is CLI-only and rejected over MCP.',
+  description: 'Submit a background job. Remote callers may submit sync, import, lint or lint-fix for their authenticated filesystem source. Other kinds require local CLI or a dedicated operation.',
   params: {
-    name: { type: 'string', required: true, description: 'Job type (e.g. sync, embed, lint, import, extract, backlinks, autopilot-cycle; shell is CLI-only). Full registry: registerBuiltinHandlers in src/commands/jobs.ts.' },
-    data: { type: 'object', description: 'Job payload (JSON)' },
+    name: { type: 'string', required: true, description: 'Remote job type: sync, import, lint, or lint-fix. Local CLI also supports other registered types.' },
+    data: { type: 'object', description: 'Remote sync accepts optional pull/noPull (one boolean); other remote jobs accept no parameters. Source and paths are derived from the grant.' },
     queue: { type: 'string', description: 'Queue name (default: "default")' },
     priority: { type: 'number', description: 'Priority (0 = highest, default: 0)' },
     max_attempts: { type: 'number', description: 'Max retry attempts (default: 3)' },
@@ -30,6 +94,30 @@ const submit_job: Operation = {
   scope: 'admin',
   handler: async (ctx, p) => {
     const name = typeof p.name === 'string' ? p.name.trim() : '';
+    let jobData = { ...((p.data as Record<string, unknown>) || {}) };
+    const remoteSubmission = ctx.remote !== false ? await prepareRemoteJob(ctx, name, p.data) : undefined;
+    if (remoteSubmission) jobData = remoteSubmission.data;
+    const translateAdmissionError = (e: unknown): never => {
+      if (e instanceof InvalidEmbedBackfillSourceIdError) {
+        throw new OperationError('invalid_params', e.message);
+      }
+      if (e instanceof NoEmbedBackfillWorkerSurfaceError) {
+        throw new OperationError(
+          'no_worker_surface',
+          e.message,
+          `Run \`${embedBackfillManualDrainCommand(e.sourceId)}\` to drain embeddings inline.`,
+        );
+      }
+      throw e;
+    };
+
+    // Dry-run is a feasibility preview, not an admission bypass. Evaluate the
+    // read-only worker-surface gate before returning so MCP and CLI agree.
+    try {
+      assertEmbedBackfillQueueAdmission(ctx.engine, name, jobData);
+    } catch (e) {
+      translateAdmissionError(e);
+    }
     if (ctx.dryRun) return { dry_run: true, action: 'submit_job', name };
 
     // Submit-side MCP guard: reject protected job names from untrusted callers
@@ -50,9 +138,9 @@ const submit_job: Operation = {
     const queue = new MinionQueue(ctx.engine);
     // Trusted flag fires ONLY for an explicit local CLI submission of a protected
     // name. Strict `=== false` so an untyped/cast context can't escalate.
-    const trusted = ctx.remote === false && isProtectedJobName(name) ? { allowProtectedSubmit: true } : undefined;
-
-    const jobData = (p.data as Record<string, unknown>) || {};
+    const trusted = remoteSubmission
+      ? { submissionAuthority: remoteSubmission.authority }
+      : ctx.remote === false && isProtectedJobName(name) ? { allowProtectedSubmit: true } : undefined;
 
     // v0.35.8.0: pre-enqueue shell-job validation, parity with the CLI submit
     // path. Closes the bug class where shell.ts handler-time validation ran
@@ -66,17 +154,23 @@ const submit_job: Operation = {
       validateShellJobParams(jobData);
     }
 
-    const job = await queue.add(name, jobData, {
-      queue: (p.queue as string) || 'default',
-      priority: (p.priority as number) || 0,
-      max_attempts: (p.max_attempts as number) || 3,
-      delay: (p.delay as number) || undefined,
-      timeout_ms: (p.timeout_ms as number) || undefined,
-      // #4145 [CEO-F7/R2-6]: range enforcement lives in queue.add's
-      // clampLockDurationMs (ParamDef has no min/max support; wrong TYPE is
-      // rejected by the shared number validation upstream of this handler).
-      lock_duration_ms: (p.lock_duration_ms as number) || undefined,
-    }, trusted);
+    const job = await (async () => {
+      try {
+        return await queue.add(name, jobData, {
+          queue: (p.queue as string) || 'default',
+          priority: (p.priority as number) || 0,
+          max_attempts: (p.max_attempts as number) || 3,
+          delay: (p.delay as number) || undefined,
+          timeout_ms: (p.timeout_ms as number) || undefined,
+          // #4145 [CEO-F7/R2-6]: range enforcement lives in queue.add's
+          // clampLockDurationMs (ParamDef has no min/max support; wrong TYPE is
+          // rejected by the shared number validation upstream of this handler).
+          lock_duration_ms: (p.lock_duration_ms as number) || undefined,
+        }, trusted);
+      } catch (e) {
+        return translateAdmissionError(e);
+      }
+    })();
 
     // v0.35.8.0: submit_job audit-log parity with the CLI path (codex F-CDX-4).
     // Pre-v0.35.8.0 the op handler bypassed the shell-audit JSONL writer
@@ -108,7 +202,7 @@ const submit_job: Operation = {
     // Amendments 24/25: post-enqueue queue-state probe (time-bounded,
     // fail-open). The job is already persisted; a probe failure degrades to
     // {probe_failed: true}, never an error on a successful submission.
-    return { ...job, queue_state: await probeQueueStateSafe(ctx, job.queue, [name]) };
+    return { ...publicJob(job), queue_state: await probeQueueStateSafe(ctx, job.queue, [name]) };
   },
 };
 
@@ -146,7 +240,7 @@ const submit_agent: Operation = {
     prompt: { type: 'string', required: true, description: 'User prompt for the agent' },
     model: { type: 'string', description: 'provider:model string (defaults to models.tier.subagent)' },
     allowed_tools: { type: 'array', description: 'Subset of bound_tools the agent may invoke', items: { type: 'string' } },
-    allowed_slug_prefixes: { type: 'array', description: 'Subset of bound_slug_prefixes for put_page writes', items: { type: 'string' } },
+    allowed_slug_prefixes: { type: 'array', description: 'Subset of delegated_slug_prefixes for writes; omit for a job-owned namespace', items: { type: 'string' } },
     max_turns: { type: 'number', description: 'Max LLM turns (default 20, hard cap 100)' },
     queue: { type: 'string', description: 'Queue name (default "default")' },
   },
@@ -166,185 +260,75 @@ const submit_agent: Operation = {
       throw new OperationError('permission_denied', 'submit_agent requires an OAuth client with the `agent` scope.');
     }
 
-    // Load the binding row.
-    const { sqlQueryForEngine } = await import('../sql-query.ts');
-    const sql = sqlQueryForEngine(ctx.engine);
-    let bindingRows: Array<Record<string, unknown>>;
+    const { currentDelegationGrant, submissionSnapshot, DelegationDeniedError } = await import('../minions/delegated-policy.ts');
+    const { hasScope } = await import('../scope.ts');
+    if (!hasScope(ctx.auth?.scopes ?? [], 'agent')) {
+      throw new OperationError('permission_denied', 'submit_agent requires the agent scope.');
+    }
+    if (typeof p.prompt !== 'string' || p.prompt.trim() === '') throw new OperationError('invalid_params', 'prompt must be nonempty');
+    const maxTurns = p.max_turns ?? 20;
+    if (!Number.isSafeInteger(maxTurns) || Number(maxTurns) < 1 || Number(maxTurns) > 100) {
+      throw new OperationError('invalid_params', 'max_turns must be an integer from 1 to 100');
+    }
+    if (p.model !== undefined && (typeof p.model !== 'string' || p.model.trim() === '')) {
+      throw new OperationError('invalid_params', 'model must name a supported agent tool-loop model');
+    }
+    if (p.queue !== undefined && (typeof p.queue !== 'string' || !p.queue.trim())) throw new OperationError('invalid_params', 'queue must be nonempty');
+    const { classifyCapabilities } = await import('../ai/capabilities.ts');
+    const { normalizeModelId, splitProviderModelId } = await import('../model-id.ts');
+    const { resolveModel, TIER_DEFAULTS, isAnthropicProvider, isOpenRouterSubagentFamily } = await import('../model-config.ts');
+    const { isConfigTruthy } = await import('../config.ts');
+    const resolvedModel = typeof p.model === 'string' ? p.model : await resolveModel(ctx.engine, { tier: 'subagent', configKey: 'models.subagent', fallback: TIER_DEFAULTS.subagent });
+    const modelForVerdict = splitProviderModelId(resolvedModel).provider === null && isAnthropicProvider(resolvedModel) ? normalizeModelId(resolvedModel) : resolvedModel;
+    if (['unknown', 'unusable:no_tools', 'unusable:no_subagent_loop'].includes(classifyCapabilities(modelForVerdict))) {
+      throw new OperationError('invalid_params', 'model must name a supported agent tool-loop model');
+    }
+    if (!isAnthropicProvider(resolvedModel) && !isOpenRouterSubagentFamily(resolvedModel)
+      && !isConfigTruthy(await ctx.engine.getConfig('agent.use_gateway_loop'))) {
+      throw new OperationError('invalid_params', 'This provider requires agent.use_gateway_loop=true before submitting an agent job.');
+    }
+    let snapshot;
     try {
-      bindingRows = await sql`
-        SELECT bound_tools, bound_source_id, bound_brain_id, bound_slug_prefixes,
-               bound_max_concurrent, budget_usd_per_day::text AS budget_cap
-          FROM oauth_clients
-         WHERE client_id = ${clientId}
-      `;
-    } catch (err) {
-      throw new OperationError(
-        'internal',
-        `submit_agent: could not load OAuth client binding: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      const grant = await currentDelegationGrant(ctx.engine, clientId, ctx.brainId);
+      snapshot = submissionSnapshot(grant, p, ctx.auth?.sourceId);
+    } catch (error) {
+      if (error instanceof DelegationDeniedError) throw new OperationError('permission_denied', error.message);
+      throw error;
     }
-    if (bindingRows.length === 0) {
-      throw new OperationError('permission_denied', `submit_agent: client_id ${clientId} not found.`);
-    }
-    const binding = bindingRows[0];
-    const boundTools = (binding.bound_tools as string[] | null) ?? null;
-    const boundSource = (binding.bound_source_id as string | null) ?? null;
-    const boundSlugPrefixes = (binding.bound_slug_prefixes as string[] | null) ?? null;
-    const boundMaxConcurrent = Number(binding.bound_max_concurrent ?? 1);
-    const budgetCapText = (binding.budget_cap as string | null) ?? null;
-
-    if (boundTools === null) {
-      throw new OperationError(
-        'permission_denied',
-        `submit_agent: client ${clientId} has the agent scope but no bindings. Re-register with --bound-tools, --bound-source, --bound-slug-prefixes, --bound-max-concurrent, --budget-usd-per-day.`,
-      );
-    }
-
-    // Validate each param against the binding.
-    //
-    // An EXPLICIT empty array is not "no restriction" here — downstream the
-    // subagent worker reads empty `allowed_tools` as "the full tool registry"
-    // and empty `allowed_slug_prefixes` as "fall back to the legacy
-    // wiki/agents/<job-id>/ namespace". Both subset loops below pass
-    // vacuously over an empty list, so `{allowed_tools: [], allowed_slug_prefixes: []}`
-    // from a client bound to `['search']` + `['emp-alice/']` would hand its
-    // subagent the whole registry (including put_page) writing outside the
-    // binding. `??` only substitutes null/undefined, so collapse the empty
-    // case to the binding explicitly.
-    const requestedToolsRaw = p.allowed_tools as string[] | undefined;
-    const requestedTools = requestedToolsRaw === undefined || requestedToolsRaw.length === 0
-      ? boundTools
-      : requestedToolsRaw;
-    for (const t of requestedTools) {
-      if (!boundTools.includes(t)) {
-        throw new OperationError(
-          'permission_denied',
-          `submit_agent: tool "${t}" is not in client ${clientId}'s bound_tools (${boundTools.join(', ')}).`,
-        );
-      }
-    }
-    const requestedSlugPrefixesRaw = p.allowed_slug_prefixes as string[] | undefined;
-    const requestedSlugPrefixes =
-      requestedSlugPrefixesRaw === undefined || requestedSlugPrefixesRaw.length === 0
-        ? (boundSlugPrefixes ?? [])
-        : requestedSlugPrefixesRaw;
-    // A bound client must end up with a non-empty delegated fence: an empty
-    // list reaches the subagent as "use the legacy wiki/agents/<id>/ namespace",
-    // which is outside every bound prefix.
-    if (boundSlugPrefixes !== null && requestedSlugPrefixes.length === 0) {
-      throw new OperationError(
-        'permission_denied',
-        `submit_agent: client ${clientId} is slug-bound but its binding resolved to an empty prefix list, which the subagent would read as the unfenced legacy namespace.`,
-        'Re-scope the client with a non-empty --bound-slug-prefixes.',
-      );
-    }
-    if (boundSlugPrefixes !== null) {
-      for (const sp of requestedSlugPrefixes) {
-        // Boundary-aware, same rule as the direct fence: a raw `startsWith`
-        // let a boundary-less binding (`emp-alice`) authorize a requested
-        // prefix in a SIBLING namespace (`emp-alice-2/`), which is then handed
-        // to the child as a full glob grant over another employee's pages.
-        if (!boundSlugPrefixes.some(bp => {
-          const base = normalizeSlugPrefix(bp);
-          const req = normalizeSlugPrefix(sp);
-          if (base === '') return false;
-          return base.endsWith('/')
-            ? req.startsWith(base)
-            : req === base || req.startsWith(`${base}/`);
-        })) {
-          throw new OperationError(
-            'permission_denied',
-            `submit_agent: slug_prefix "${sp}" is not under any of client ${clientId}'s bound_slug_prefixes.`,
-          );
-        }
-      }
-    }
-
-    // Concurrency cap: count active+waiting agent jobs for this client.
-    const inflight = await sql`
-      SELECT COUNT(*)::int AS n
-        FROM minion_jobs j
-       WHERE j.name = 'subagent'
-         AND j.status IN ('waiting', 'active', 'waiting-children')
-         AND j.data->>'__owner_client_id' = ${clientId}
-    `;
-    const inflightCount = Number((inflight[0]?.n as number | string | undefined) ?? 0);
-    if (inflightCount >= boundMaxConcurrent) {
-      throw new OperationError(
-        'rate_limited',
-        `submit_agent: client ${clientId} at concurrency cap (${inflightCount}/${boundMaxConcurrent}).`,
-      );
-    }
-
-    // Dry-run echo.
-    // The subagent fence uses `matchesSlugAllowList`, whose grammar makes a
-    // BARE entry match that one slug exactly — so a plain `emp-alice/` binding
-    // would let the delegated agent write nothing. Normalize the
-    // trailing-slash form into the glob the delegated matcher expects, so one
-    // stored column means the same span of slugs on both paths.
-    const delegatedSlugPrefixes = requestedSlugPrefixes.map(sp =>
-      sp.endsWith('/') ? `${sp}*` : sp);
-
+    const boundSource = snapshot.sourceId;
+    const boundMaxConcurrent = snapshot.maxConcurrent;
+    const budgetCapText = snapshot.budgetUsdPerDay;
+    const requestedTools = snapshot.tools;
+    const requestedSlugPrefixes = snapshot.slugPrefixes;
+    const jobData: Record<string, unknown> = {
+      prompt: p.prompt, max_turns: maxTurns, model: resolvedModel,
+      allowed_tools: requestedTools, allowed_slug_prefixes: requestedSlugPrefixes,
+      source_id: snapshot.sourceId, __owner_client_id: clientId,
+      __delegation_grant: snapshot,
+    };
+    const authority = await prepareRemoteAgent(ctx, jobData);
     if (ctx.dryRun) {
       return {
-        dry_run: true,
-        action: 'submit_agent',
-        client_id: clientId,
-        bound_tools: boundTools,
-        bound_source: boundSource,
+        dry_run: true, action: 'submit_agent', client_id: clientId,
+        bound_tools: requestedTools, bound_source: boundSource,
         bound_max_concurrent: boundMaxConcurrent,
-        // What the delegated job would ACTUALLY be granted, after the binding
-        // is applied — a preview that hides this can't show a widening bug.
-        resolved_tools: requestedTools,
-        resolved_slug_prefixes: delegatedSlugPrefixes,
+        resolved_tools: requestedTools, resolved_slug_prefixes: requestedSlugPrefixes,
+        resolved_model: resolvedModel,
+        spending: budgetCapText === null ? { mode: 'unlimited' } : { mode: 'capped', usd_per_day: budgetCapText },
       };
     }
-
-    // Submit via MinionQueue with allowProtectedSubmit (the agent op is
-    // remote-callable but the underlying job name 'subagent' is protected;
-    // the OAuth scope check above stands in for the protected-name guard).
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
-
-    const jobData: Record<string, unknown> = {
-      prompt: p.prompt as string,
-      max_turns: Math.min((p.max_turns as number) ?? 20, 100),
-      allowed_tools: requestedTools,
-      allowed_slug_prefixes: delegatedSlugPrefixes,
-      __owner_client_id: clientId,
-    };
-    if (typeof p.model === 'string') jobData.model = p.model;
-    // Write source for the delegated job comes from the AUTHENTICATED client
-    // whenever we have it. `bound_source_id` is an optional, separately-set
-    // column: unset it defaulted the child to 'default', and if it disagreed
-    // with the token's own source the child followed the column — either way
-    // a correctly slug-fenced client could act on the wrong source.
-    const delegatedSource = ctx.auth?.sourceId ?? boundSource;
-    if (boundSource && ctx.auth?.sourceId && boundSource !== ctx.auth.sourceId) {
-      throw new OperationError(
-        'permission_denied',
-        `submit_agent: client ${clientId}'s bound_source_id (${boundSource}) disagrees with its authenticated source (${ctx.auth.sourceId}); refusing to guess which one governs the delegated write.`,
-        'Re-scope the client so the two agree: `gbrain auth rescope-client <id> --source <source>`.',
-      );
-    }
-    if (delegatedSource) jobData.source_id = delegatedSource;
     let job;
     try {
-      job = await queue.add(
-        'subagent',
-        jobData,
+      job = await queue.add('subagent', jobData,
         { queue: (p.queue as string) || 'default' },
-        { allowProtectedSubmit: true },
-      );
-    } catch (e) {
-      // Admission quota (minions.quota_max_waiting.subagent, config-only):
-      // surface as a structured retryable error, not an opaque internal one.
-      // The quota message already omits live cross-tenant queue depth.
+        { allowProtectedSubmit: true, delegatedClientId: clientId, submissionAuthority: authority });
+    } catch (error) {
       const { isQueueQuotaExceededError } = await import('../minions/admission.ts');
-      if (isQueueQuotaExceededError(e)) {
-        throw new OperationError('rate_limited', e.message, 'Retry after the queue drains, or ask the operator to raise the quota.');
-      }
-      throw e;
+      if (isQueueQuotaExceededError(error)) throw new OperationError('rate_limited', error.message, 'Retry after existing work completes.');
+      if (error instanceof DelegationDeniedError) throw new OperationError('permission_denied', error.message);
+      throw error;
     }
 
     // Audit trail (D4) — best-effort JSONL.
@@ -355,7 +339,7 @@ const submit_agent: Operation = {
       logAgentSubmission({
         client_id: clientId,
         job_id: job.id,
-        model: typeof p.model === 'string' ? p.model : '<default>',
+        model: resolvedModel,
         bound_tools: requestedTools,
         bound_source: boundSource,
         slug_prefixes: requestedSlugPrefixes,
@@ -488,23 +472,28 @@ const get_agent_job: Operation = {
 
 const get_job: Operation = {
   name: 'get_job',
-  description: 'Get job status and details by ID',
+  description: 'Get job status and details by ID. Agent-scoped tokens (no admin) see only jobs they own.',
   params: {
     id: { type: 'number', required: true, description: 'Job ID' },
   },
   scope: 'admin',
+  agentCallable: true,
   handler: async (ctx, p) => {
+    const owner = agentOwnerFence(ctx, 'get_job');
+    if (owner !== null) await assertJobOwned(ctx, p.id as number, owner);
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
     const job = await queue.getJob(p.id as number);
     if (!job) throw new OperationError('invalid_params', `Job not found: ${p.id}`);
-    return job;
+    // private_queue_owner_token is a capability credential (lease renewal /
+    // attach), not job data — never expose it over MCP envelopes.
+    return publicJob(job);
   },
 };
 
 const list_jobs: Operation = {
   name: 'list_jobs',
-  description: 'List jobs with optional filters',
+  description: 'List jobs with optional filters. Agent-scoped tokens (no admin) see only jobs they own.',
   params: {
     status: { type: 'string', description: 'Filter by status (waiting, active, completed, failed, delayed, dead, cancelled)' },
     queue: { type: 'string', description: 'Filter by queue name' },
@@ -512,33 +501,47 @@ const list_jobs: Operation = {
     limit: { type: 'number', description: 'Max results (default: 50)' },
   },
   scope: 'admin',
+  agentCallable: true,
   handler: async (ctx, p) => {
+    const owner = agentOwnerFence(ctx, 'list_jobs');
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
-    return queue.getJobs({
+    const jobs = await queue.getJobs({
       status: p.status as string | undefined,
       queue: p.queue as string | undefined,
       name: p.name as string | undefined,
       limit: (p.limit as number) || 50,
+      // #4098: SQL-side ownership fence for agent-scoped callers.
+      ...(owner !== null ? { ownerClientId: owner } : {}),
     } as Parameters<typeof queue.getJobs>[0]);
+    // private_queue_owner_token is a capability credential (lease renewal /
+    // attach), not job data — never expose it over MCP envelopes.
+    return jobs.map(publicJob);
   },
 };
 
 const cancel_job: Operation = {
   name: 'cancel_job',
-  description: 'Cancel a waiting, active, or delayed job',
+  description: 'Cancel a waiting, active, or delayed job. Agent-scoped tokens (no admin) can cancel only jobs they own.',
   params: {
     id: { type: 'number', required: true, description: 'Job ID' },
   },
   mutating: true,
   scope: 'admin',
+  agentCallable: true,
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'cancel_job', id: p.id };
+    const owner = agentOwnerFence(ctx, 'cancel_job');
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
-    const cancelled = await queue.cancelJob(p.id as number);
+    // #4098: the owner predicate rides the recursive cancel's CTE seed — a
+    // fenced caller can cancel only roots it owns (descendants of an owned
+    // root cascade as usual). Foreign and missing ids share one envelope.
+    const cancelled = await queue.cancelJob(p.id as number, owner !== null ? { ownerClientId: owner } : undefined);
     if (!cancelled) throw new OperationError('invalid_params', `Cannot cancel job ${p.id} (may already be in terminal status)`);
-    return cancelled;
+    // private_queue_owner_token is a capability credential (lease renewal /
+    // attach), not job data — never expose it over MCP envelopes.
+    return publicJob(cancelled);
   },
 };
 
@@ -554,20 +557,28 @@ const retry_job: Operation = {
     if (ctx.dryRun) return { dry_run: true, action: 'retry_job', id: p.id };
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
+    const prior = await queue.getJob(p.id as number);
+    if (!prior) throw new OperationError('invalid_params', 'Job not found');
+    await assertRemoteJobControl(ctx, prior);
     const retried = await queue.retryJob(p.id as number);
     if (!retried) throw new OperationError('invalid_params', `Cannot retry job ${p.id} (must be failed or dead)`);
-    return retried;
+    // private_queue_owner_token is a capability credential (lease renewal /
+    // attach), not job data — never expose it over MCP envelopes.
+    return publicJob(retried);
   },
 };
 
 const get_job_progress: Operation = {
   name: 'get_job_progress',
-  description: 'Get structured progress for a running job',
+  description: 'Get structured progress for a running job. Agent-scoped tokens (no admin) see only jobs they own.',
   params: {
     id: { type: 'number', required: true, description: 'Job ID' },
   },
   scope: 'admin',
+  agentCallable: true,
   handler: async (ctx, p) => {
+    const owner = agentOwnerFence(ctx, 'get_job_progress');
+    if (owner !== null) await assertJobOwned(ctx, p.id as number, owner);
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
     const job = await queue.getJob(p.id as number);
@@ -582,8 +593,10 @@ const pause_job: Operation = {
   params: {
     id: { type: 'number', required: true, description: 'Job ID' },
   },
+  mutating: true,
   scope: 'admin',
   handler: async (ctx, p) => {
+    if (ctx.dryRun) return { dry_run: true, action: 'pause_job', id: p.id };
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
     const job = await queue.pauseJob(p.id as number);
@@ -598,10 +611,15 @@ const resume_job: Operation = {
   params: {
     id: { type: 'number', required: true, description: 'Job ID' },
   },
+  mutating: true,
   scope: 'admin',
   handler: async (ctx, p) => {
+    if (ctx.dryRun) return { dry_run: true, action: 'resume_job', id: p.id };
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
+    const prior = await queue.getJob(p.id as number);
+    if (!prior) throw new OperationError('invalid_params', 'Job not found');
+    await assertRemoteJobControl(ctx, prior);
     const job = await queue.resumeJob(p.id as number);
     if (!job) throw new OperationError('invalid_params', `Job not found or not paused: ${p.id}`);
     return { id: job.id, status: job.status };
@@ -616,10 +634,14 @@ const replay_job: Operation = {
     data_overrides: { type: 'object', required: false, description: 'Data fields to override (merged with original)' },
   },
   scope: 'admin',
+  mutating: true,
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'replay_job', id: p.id };
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
+    const prior = await queue.getJob(p.id as number);
+    if (!prior) throw new OperationError('invalid_params', 'Job not found');
+    await assertRemoteJobControl(ctx, prior, p.data_overrides);
     const job = await queue.replayJob(p.id as number, p.data_overrides as Record<string, unknown> | undefined);
     if (!job) throw new OperationError('invalid_params', `Job not found or not in terminal state: ${p.id}`);
     return { id: job.id, name: job.name, status: job.status, source_id: p.id };
@@ -632,13 +654,47 @@ const send_job_message: Operation = {
   params: {
     id: { type: 'number', required: true, description: 'Job ID to message' },
     payload: { type: 'object', required: true, description: 'Message payload (arbitrary JSON)' },
-    sender: { type: 'string', required: false, description: 'Sender identity (default: admin)' },
+    sender: { type: 'string', required: false, description: 'Sender identity — honored for trusted local callers only (default: admin). Remote callers always send as their authenticated identity (mcp:<clientId8>); the param is ignored.' },
   },
   scope: 'admin',
+  mutating: true,
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'send_job_message', id: p.id };
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
+
+    // Sidechannel sender fence (fail-closed, A9). A remote caller must NEVER
+    // pick its own sender (impersonation) nor inherit the trusted-local
+    // 'admin' default — the persisted sender is the AUTHENTICATED identity,
+    // derived exactly like the ops/schema-packs.ts audit actor
+    // (mcp:<clientId8>). No authenticated identity → refuse before any write.
+    if (ctx.remote !== false) {
+      const clientId = ctx.auth?.clientId;
+      if (!clientId) {
+        throw new OperationError(
+          'permission_denied',
+          'send_job_message requires an authenticated client identity when called remotely',
+        );
+      }
+      const sender = `mcp:${clientId.slice(0, 8)}`;
+      // The queue-level sender auth only admits in-band identities ('admin' /
+      // the parent job id) — see MinionQueue.sendMessage. The op layer has
+      // already authenticated this caller, so it validates job state the same
+      // way and persists the derived identity itself (same insert shape,
+      // raw payload object — never JSON.stringify into jsonb).
+      const job = await queue.getJob(p.id as number);
+      if (!job || ['completed', 'dead', 'cancelled', 'failed'].includes(job.status)) {
+        throw new OperationError('invalid_params', `Job not found or not messageable: ${p.id}`);
+      }
+      const rows = await ctx.engine.executeRaw<{ id: number }>(
+        `INSERT INTO minion_inbox (job_id, sender, payload)
+         VALUES ($1, $2, $3)
+         RETURNING id`,
+        [p.id, sender, p.payload],
+      );
+      return { sent: true, message_id: Number(rows[0].id), job_id: p.id };
+    }
+
     const msg = await queue.sendMessage(p.id as number, p.payload, (p.sender as string) ?? 'admin');
     if (!msg) throw new OperationError('invalid_params', `Job not found, not messageable, or sender unauthorized: ${p.id}`);
     return { sent: true, message_id: msg.id, job_id: p.id };
@@ -660,6 +716,9 @@ const get_job_stats: Operation = {
     '(unfiltered); by_type is windowed by since_hours; only the wedge block is scoped to ' +
     'the queue param. wedged: true is the silent-halt signal (a worker is alive but claiming ' +
     'nothing while work waits) — suggest restarting the jobs supervisor on the brain host. ' +
+    'private_queue: true means the queue is a parent-owned dream-inline queue: wedged is ' +
+    'NEVER true for it and a worker restart cannot help — recovery runs automatically at ' +
+    'worker spawn / dream-cycle start; suggest gbrain doctor for the per-queue verdict. ' +
     'Host-process diagnostics (renice, backpressure hints) stay on the gbrain jobs stats CLI.',
   params: {
     queue: { type: 'string', required: false, description: "Queue for the wedge signature (default 'default'). The other blocks stay global/windowed." },
@@ -678,8 +737,10 @@ const get_job_stats: Operation = {
         since: new Date(Date.now() - hours * 3_600_000),
         queue: typeof p.queue === 'string' && p.queue.length > 0 ? p.queue : 'default',
       });
-      const { wedged, wedge_threshold_minutes } = deriveWedgeSignal(stats.wedge);
-      return { schema_version: 1, window_hours: hours, ...stats, wedged, wedge_threshold_minutes };
+      const { wedged, wedge_threshold_minutes, private_queue } = deriveWedgeSignal(stats.wedge);
+      // private_queue tells the MCP consumer "restart the worker" is dead-end
+      // advice for this queue — it is parent-owned and needs reconciliation.
+      return { schema_version: 1, window_hours: hours, ...stats, wedged, wedge_threshold_minutes, private_queue };
     }, 'Job queue statistics (minions schema)');
   },
 };

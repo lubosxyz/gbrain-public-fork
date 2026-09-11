@@ -7,7 +7,8 @@
 
 import { OperationError, type Operation, type OperationContext } from './contract.ts';
 import {
-  sourceScopeOpts,
+  readPolicyOpts,
+  readHolders,
   thinkSourceScopeOpts,
   enforceClientSlugFence,
   validatePageSlug,
@@ -20,6 +21,8 @@ import {
   resolveTakesRepoDir,
   TakesWriteError,
 } from '../takes-write.ts';
+import { embedQuery } from '../embedding.ts';
+import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 
 // --- v0.28: Takes ---
 
@@ -40,7 +43,7 @@ const takes_list: Operation = {
   handler: async (ctx, p) => {
     return ctx.engine.listTakes({
       // #2200-class: honor federated/source scope (via the take's page.source_id).
-      ...sourceScopeOpts(ctx),
+      ...await readPolicyOpts(ctx),
       page_slug: p.page_slug as string | undefined,
       holder: p.holder as string | undefined,
       kind: p.kind as never,
@@ -51,7 +54,7 @@ const takes_list: Operation = {
       offset: p.offset as number | undefined,
       // Per-token allow-list — server-side filter for MCP-bound calls.
       // Local CLI callers leave takesHoldersAllowList unset and see all holders.
-      takesHoldersAllowList: ctx.takesHoldersAllowList,
+      takesHoldersAllowList: readHolders(ctx),
     });
   },
   cliHints: { name: 'takes-list' },
@@ -67,9 +70,9 @@ const takes_search: Operation = {
   },
   handler: async (ctx, p) => {
     return ctx.engine.searchTakes(p.query as string, {
-      ...sourceScopeOpts(ctx),
+      ...await readPolicyOpts(ctx),
       limit: p.limit as number | undefined,
-      takesHoldersAllowList: ctx.takesHoldersAllowList,
+      takesHoldersAllowList: readHolders(ctx),
     });
   },
   cliHints: { name: 'takes-search', positional: ['query'] },
@@ -96,13 +99,13 @@ const takes_scorecard: Operation = {
   handler: async (ctx, p) => {
     const card = await ctx.engine.getScorecard(
       {
-        ...sourceScopeOpts(ctx),
+        ...await readPolicyOpts(ctx),
         holder: p.holder as string | undefined,
         domainPrefix: p.domain_prefix as string | undefined,
         since: p.since as string | undefined,
         until: p.until as string | undefined,
       },
-      ctx.takesHoldersAllowList,
+      readHolders(ctx),
     );
     // [OV8/EV5] Resolver-provenance visibility: remote resolutions are
     // server-stamped resolved_by='mcp:<client>' (takes_resolve below), and
@@ -133,11 +136,11 @@ const takes_calibration: Operation = {
     // a breaking change; the scorecard is the segregation surface.)
     return ctx.engine.getCalibrationCurve(
       {
-        ...sourceScopeOpts(ctx),
+        ...await readPolicyOpts(ctx),
         holder: p.holder as string | undefined,
         bucketSize: p.bucket_size as number | undefined,
       },
-      ctx.takesHoldersAllowList,
+      readHolders(ctx),
     );
   },
   cliHints: { name: 'takes-calibration' },
@@ -150,8 +153,9 @@ const takes_calibration: Operation = {
  * signal, not a scorecard dimension).
  */
 async function countMcpResolved(ctx: OperationContext): Promise<number> {
-  const scope = sourceScopeOpts(ctx);
+  const scope = await readPolicyOpts(ctx);
   const where: string[] = [`t.resolved_at IS NOT NULL`, `t.resolved_by LIKE 'mcp:%'`];
+  if (scope.excludePrivate) where.push(privatePagesFilterFragment('p'));
   const params: unknown[] = [];
   if (scope.sourceIds && scope.sourceIds.length > 0) {
     params.push(scope.sourceIds);
@@ -160,8 +164,9 @@ async function countMcpResolved(ctx: OperationContext): Promise<number> {
     params.push(scope.sourceId);
     where.push(`p.source_id = $${params.length}`);
   }
-  if (ctx.takesHoldersAllowList) {
-    params.push(ctx.takesHoldersAllowList);
+  const holders = readHolders(ctx);
+  if (holders !== undefined) {
+    params.push(holders);
     where.push(`t.holder = ANY($${params.length}::text[])`);
   }
   try {
@@ -207,6 +212,8 @@ const think: Operation = {
     const { runThink, persistSynthesis } = await import('../think/index.ts');
     const result = await runThink(ctx.engine, {
       question: String(p.question),
+      // #3734: MCP think must populate the question vector for takes retrieval.
+      embedQuestion: (q) => embedQuery(q),
       anchor: p.anchor ? String(p.anchor) : undefined,
       rounds: typeof p.rounds === 'number' ? (p.rounds as number) : undefined,
       save: safeSave,
@@ -219,8 +226,9 @@ const think: Operation = {
       modelExplicit: !!p.model,
       since: p.since ? String(p.since) : undefined,
       until: p.until ? String(p.until) : undefined,
-      takesHoldersAllowList: ctx.takesHoldersAllowList,
+      takesHoldersAllowList: readHolders(ctx),
       ...thinkScope,
+      excludePrivate: (await readPolicyOpts(ctx)).excludePrivate,
       remote: ctx.remote !== false, // fail-closed: anything not strictly false is untrusted (CLAUDE.md invariant)
     });
 
@@ -234,12 +242,33 @@ const think: Operation = {
       for (const w of persisted.warnings) result.warnings.push(w);
     }
 
+    // #2556: `take` was gated (safeTake) but never EXECUTED — runThink ignores
+    // opts.take, so a local `take: true` silently persisted nothing. Persist
+    // md-first through the canonical takes write-through; refusals surface as
+    // loud machine-stable warnings + take_row:null. Remote stays blocked above.
+    let takeRow: number | null = null;
+    if (safeTake) {
+      if (!p.anchor) {
+        result.warnings.push('TAKE_REQUIRES_ANCHOR');
+      } else {
+        const { persistTakeFromSynthesis } = await import('../think/persist-take.ts');
+        const persisted = await persistTakeFromSynthesis(ctx.engine, result, {
+          anchor: String(p.anchor),
+          sourceId: ctx.sourceId,
+          lockTimeoutMs: 2000,
+        });
+        takeRow = persisted.take_row;
+        for (const w of persisted.warnings) result.warnings.push(w);
+      }
+    }
+
     return {
       ...result,
       // #1698 (#10): the persist-skip signal returns slug '' — map it (and any
       // falsy) to null so callers never see an empty-string "slug".
       saved_slug: savedSlug || null,
       evidence_inserted: evidenceInserted,
+      take_row: takeRow,
       remote_persisted_blocked: remote && (Boolean(p.save) || Boolean(p.take)),
     };
   },

@@ -11,7 +11,7 @@
 
 import type { Operation } from './contract.ts';
 import { OperationError } from './contract.ts';
-import { sourceScopeOpts } from './context.ts';
+import { sourceScopeOpts, readPolicyOpts } from './context.ts';
 import {
   FIND_EXPERTS_DESCRIPTION,
   FIND_CONTRADICTIONS_DESCRIPTION,
@@ -77,11 +77,16 @@ const volunteer_context: Operation = {
       );
     }
     const turns = parseWindow(p.window);
+    const { loadConfig: loadCfgForArms } = await import('../config.ts');
+    const { lexicalArmsEnabled } = await import('../context/reflex.ts');
     const pages = await volunteerContext(ctx.engine, turns, {
       sourceIds,
       priorContext: typeof p.prior_context === 'string' ? p.prior_context : undefined,
       maxPages: typeof p.max_pages === 'number' ? p.max_pages : undefined,
       minConfidence: typeof p.min_confidence === 'number' ? p.min_confidence : undefined,
+      // v0.46.15+ kill switch for the lexical recall arms (weak-alias +
+      // surname) — file-plane gate, threaded per ResolvePointersOpts.
+      lexicalArms: lexicalArmsEnabled(loadCfgForArms()),
     });
 
     // Feedback-loop logging: fire-and-forget batched INSERT through the
@@ -147,13 +152,15 @@ const find_experts: Operation = {
     const { loadActivePackBestEffort, expertTypesFromPack } = await import('../schema-pack/index.ts');
     const pack = await loadActivePackBestEffort(ctx);
     const types = pack ? expertTypesFromPack(pack.manifest) : [];
-    return findExperts(ctx.engine, {
+    const scope = await readPolicyOpts(ctx);
+    const experts = await findExperts(ctx.engine, {
       topic,
       limit: typeof p.limit === 'number' ? p.limit : undefined,
       explain: p.explain === true,
       types: types as never,
-      ...sourceScopeOpts(ctx),
+      ...scope,
     });
+    return experts;
   },
   // hidden: 'whoknows' is in CLI_ONLY (src/cli.ts) — runWhoknows owns the CLI
   // surface (ranked table + per-factor explain + thin-client routing) and was
@@ -187,6 +194,11 @@ const find_contradictions: Operation = {
     },
   },
   handler: async (ctx, p) => {
+    const scope = sourceScopeOpts(ctx);
+    if (ctx.remote !== false || scope.sourceId !== undefined || scope.sourceIds !== undefined) {
+      return { contradictions: [], note: 'Stored contradiction reports are temporarily available only to trusted local callers without a source filter.' };
+    }
+
     const limit = typeof p.limit === 'number' && p.limit > 0 ? Math.min(p.limit, 100) : 20;
     const slugFilter = typeof p.slug === 'string' ? p.slug.toLowerCase() : null;
     const sevFilter = (p.severity === 'low' || p.severity === 'medium' || p.severity === 'high')
@@ -210,8 +222,10 @@ const find_contradictions: Operation = {
         resolution_command: string;
       }>;
     }> | undefined) ?? [];
-    const findings = perQuery.flatMap((q) => q.contradictions);
-    const filtered = findings.filter((f) => {
+    const allFindings = perQuery.flatMap((q) => q.contradictions);
+    // This branch is trusted and unscoped. Apply the requested display
+    // filters before the limit; source-scoped reports are unavailable above.
+    const matching = allFindings.filter((f) => {
       if (sevFilter && f.severity !== sevFilter) return false;
       if (slugFilter) {
         const sA = f.a.slug.toLowerCase();
@@ -220,11 +234,13 @@ const find_contradictions: Operation = {
       }
       return true;
     });
+    const kept = matching.slice(0, limit);
     return {
       run_id: latest.run_id,
       ran_at: latest.ran_at,
-      contradictions: filtered.slice(0, limit),
-      total_in_run: findings.length,
+      contradictions: kept,
+      // Trusted unscoped callers retain the complete local run count.
+      total_in_run: allFindings.length,
     };
   },
   cliHints: { name: 'find-contradictions' },

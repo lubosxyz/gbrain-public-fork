@@ -1,25 +1,34 @@
+import type { PageReadScope } from '../core/types.ts';
+import { pageReadFilter } from '../core/search/read-policy-sql.ts';
 /**
- * gbrain orphans — Surface pages with no inbound wikilinks.
+ * gbrain orphans — Surface disconnected pages.
  *
- * Deterministic: zero LLM calls. Queries the links table for pages with
- * no entries where to_page_id = pages.id. By default filters out
- * auto-generated pages and pseudo-pages where no inbound links is expected.
+ * Deterministic: zero LLM calls. #4524: the DEFAULT definition is
+ * 'islanded' — no live inbound AND no live outbound link — matching
+ * get_health.orphan_pages so doctor and this command agree by construction.
+ * `--mode inbound` restores the legacy no-inbound-only view (pages that
+ * link out but are never linked TO). By default filters out auto-generated
+ * pages and pseudo-pages where being disconnected is expected.
  *
  * Usage:
- *   gbrain orphans                  # list orphans grouped by domain
+ *   gbrain orphans                  # list islanded pages grouped by domain
+ *   gbrain orphans --mode inbound   # legacy: pages with no inbound links
  *   gbrain orphans --json           # JSON output for agent consumption
  *   gbrain orphans --count          # just the number
  *   gbrain orphans --include-pseudo # include auto-generated/pseudo pages
  */
 
 import type { BrainEngine } from '../core/engine.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { createProgress, startHeartbeat } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import {
   shouldExcludeFromOrphanReporting,
   loadOrphanPolicyOverrides,
   type OrphanPolicyOverrides,
+  type OrphanPageMeta,
 } from '../core/orphan-policy.ts';
+import { quarantineFilterFragment } from '../core/quarantine.ts';
 
 // --- Types ---
 
@@ -43,8 +52,12 @@ export interface OrphanResult {
  * Returns true if a slug should be excluded from orphan reporting by default.
  * These are pages where having no inbound links is expected / not a content problem.
  */
-export function shouldExclude(slug: string, overrides?: OrphanPolicyOverrides): boolean {
-  return shouldExcludeFromOrphanReporting(slug, overrides);
+export function shouldExclude(
+  slug: string,
+  overrides?: OrphanPolicyOverrides,
+  meta?: OrphanPageMeta,
+): boolean {
+  return shouldExcludeFromOrphanReporting(slug, overrides, meta);
 }
 
 /**
@@ -69,7 +82,7 @@ export function deriveDomain(frontmatterDomain: string | null | undefined, slug:
  */
 export async function queryOrphanPages(
   engine: BrainEngine,
-): Promise<{ slug: string; title: string; domain: string | null }[]> {
+): Promise<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean }[]> {
   return engine.findOrphanPages();
 }
 
@@ -85,11 +98,15 @@ export async function queryOrphanPages(
  * consumer that needs the same exclusion logic (AUTO_SUFFIX_PATTERNS,
  * PSEUDO_SLUGS, RAW_SEGMENT, DENY_PREFIXES, FIRST_SEGMENT_EXCLUSIONS).
  * Two consumers sharing one definition = doctor and `gbrain orphans`
- * cannot disagree on the orphan count.
+ * cannot disagree on the orphan count. #4524 extended that guarantee to
+ * get_health.orphan_pages: `findOrphanPages` now DEFAULTS to health's
+ * 'islanded' definition (no live inbound AND no live outbound), so all
+ * three surfaces report the same number; pass `mode: 'inbound'` for the
+ * legacy no-inbound-only view.
  */
 export async function findOrphans(
   engine: BrainEngine,
-  opts: { includePseudo?: boolean; sourceId?: string; sourceIds?: string[] } = {},
+  opts: PageReadScope & { includePseudo?: boolean; mode?: 'inbound' | 'islanded' } = {},
 ): Promise<OrphanResult> {
   const includePseudo = !!opts.includePseudo;
   // v0.41.29.0: `sourceId` (scalar, from `--source` + single-source MCP
@@ -107,14 +124,16 @@ export async function findOrphans(
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
   progress.start('orphans.scan');
   const stopHb = startHeartbeat(progress, 'scanning pages for missing inbound links…');
-  let allOrphans: { slug: string; title: string; domain: string | null }[];
+  let allOrphans: { slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean }[];
   let total: number;
   let excludedAll: number;
   const overrides = includePseudo ? undefined : await loadOrphanPolicyOverrides(engine);
   try {
-    allOrphans = await engine.findOrphanPages(
-      sourceIds ? { sourceIds } : sourceId ? { sourceId } : undefined,
-    );
+    allOrphans = await engine.findOrphanPages({
+      excludePrivate: opts.excludePrivate,
+      ...(sourceIds ? { sourceIds } : sourceId ? { sourceId } : {}),
+      ...(opts.mode ? { mode: opts.mode } : {}),
+    });
     // v0.41.29.0 (Codex F6): correct the `total_linkable` denominator.
     // Enumerate ALL live pages (scoped) and count excluded-by-slug across
     // the WHOLE set — not just among orphans. The old
@@ -123,23 +142,19 @@ export async function findOrphans(
     // total_linkable and suppressing orphan warnings. `getAllSlugs` is NOT
     // used here because it does not filter soft-deleted rows; `total` must
     // match `findOrphanPages`'s `deleted_at IS NULL` candidate universe.
-    let scopeClause = '';
     const liveParams: unknown[] = [];
-    if (sourceIds) {
-      liveParams.push(sourceIds);
-      scopeClause = ` AND source_id = ANY($${liveParams.length}::text[])`;
-    } else if (sourceId) {
-      liveParams.push(sourceId);
-      scopeClause = ` AND source_id = $${liveParams.length}`;
-    }
-    const liveRows = await engine.executeRaw<{ slug: string }>(
-      `SELECT slug FROM pages WHERE deleted_at IS NULL${scopeClause}`,
+    const scopeClause = ` AND ${pageReadFilter('pages', opts, liveParams)}`;
+    // #4280: carry type + quarantine metadata so the denominator applies the
+    // same served-memory policy as the orphan list itself.
+    const liveRows = await engine.executeRaw<{ slug: string; type: string | null; quarantined: boolean }>(
+      `SELECT slug, type, (NOT ${quarantineFilterFragment('pages')}) AS quarantined
+         FROM pages WHERE deleted_at IS NULL${scopeClause}`,
       liveParams,
     );
     total = liveRows.length;
     excludedAll = includePseudo
       ? 0
-      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug, overrides) ? 1 : 0), 0);
+      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug, overrides, r) ? 1 : 0), 0);
   } finally {
     stopHb();
     progress.finish();
@@ -147,7 +162,7 @@ export async function findOrphans(
 
   const filtered = includePseudo
     ? allOrphans
-    : allOrphans.filter(row => !shouldExclude(row.slug, overrides));
+    : allOrphans.filter(row => !shouldExclude(row.slug, overrides, row));
 
   const orphans: OrphanPage[] = filtered.map(row => ({
     slug: row.slug,
@@ -226,21 +241,36 @@ export async function runOrphans(engine: BrainEngine, args: string[]) {
   // purpose — NOT resolveSourceWithTier, which would pick a default source
   // when the flag is absent and silently scope a bare `gbrain orphans`.
   let sourceId: string | undefined;
+  // #4524: --mode inbound|islanded picks the orphan definition. Default
+  // 'islanded' (health's definition) so doctor / get_health / orphans agree.
+  let mode: 'inbound' | 'islanded' | undefined;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--source' && i + 1 < args.length) {
       sourceId = args[++i] || undefined;
+    } else if (args[i] === '--mode' && i + 1 < args.length) {
+      const raw = args[++i];
+      if (raw !== 'inbound' && raw !== 'islanded') {
+        console.error(`Invalid --mode "${raw}". Use: inbound or islanded`);
+        setCliExitVerdict(1);
+        return;
+      }
+      mode = raw;
     }
   }
 
   if (args.includes('--help') || args.includes('-h')) {
     console.log(`Usage: gbrain orphans [options]
 
-Find pages with no inbound wikilinks.
+Find disconnected pages. Default definition is 'islanded' (no live inbound
+AND no live outbound link) — the same definition get_health.orphan_pages
+and doctor use, so all three surfaces agree by construction (#4524).
 
 Options:
   --json            Output as JSON (for agent consumption)
   --count           Output just the number of orphans
   --include-pseudo  Include auto-generated and pseudo pages in results
+  --mode <m>        Orphan definition: islanded (default) | inbound
+                    (legacy: pages with no inbound links, even if they link out)
   --source <id>     Scope the scan to one brain source (default: brain-wide)
   --help, -h        Show this help
 
@@ -250,7 +280,7 @@ Summary line: N orphans out of M linkable pages (K total; K-M excluded)
     return;
   }
 
-  const result = await findOrphans(engine, { includePseudo, sourceId });
+  const result = await findOrphans(engine, { includePseudo, sourceId, mode });
 
   if (count) {
     console.log(String(result.total_orphans));

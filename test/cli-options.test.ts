@@ -86,6 +86,115 @@ describe('parseGlobalFlags', () => {
     expect(r.cliOpts.explain).toBe(true);
     expect(r.rest).toEqual(['search', 'test query']);
   });
+
+  // #4541 — the global claim is scoped to the search/query formatter commands.
+  // Pre-fix, parseGlobalFlags claimed --explain for EVERY command, starving
+  // extract (`extract --explain timeline` fell through to the WRITE-pass
+  // extraction), whoknows, and onboard, which parse the flag themselves.
+  test('#4541: extract keeps its own --explain (handed back in place)', () => {
+    const r = parseGlobalFlags(['extract', '--explain', 'timeline']);
+    expect(r.cliOpts.explain).toBe(false);
+    expect(r.rest).toEqual(['extract', '--explain', 'timeline']);
+  });
+
+  test('#4541: whoknows keeps its own --explain', () => {
+    const r = parseGlobalFlags(['whoknows', 'fintech compliance', '--explain']);
+    expect(r.cliOpts.explain).toBe(false);
+    expect(r.rest).toEqual(['whoknows', 'fintech compliance', '--explain']);
+  });
+
+  test('#4541: onboard keeps its own --explain', () => {
+    const r = parseGlobalFlags(['onboard', '--check', '--explain']);
+    expect(r.cliOpts.explain).toBe(false);
+    expect(r.rest).toEqual(['onboard', '--check', '--explain']);
+  });
+
+  test('#4541: query still claims --explain globally', () => {
+    const r = parseGlobalFlags(['query', 'who is alice-example', '--explain']);
+    expect(r.cliOpts.explain).toBe(true);
+    expect(r.rest).toEqual(['query', 'who is alice-example']);
+  });
+
+  test('#4541: ask (query alias) still claims --explain globally', () => {
+    const r = parseGlobalFlags(['ask', 'who is alice-example', '--explain']);
+    expect(r.cliOpts.explain).toBe(true);
+    expect(r.rest).toEqual(['ask', 'who is alice-example']);
+  });
+
+  test('wave-g: call claims --explain — never handed into op positional args', () => {
+    // `gbrain call <op>` maps leftover argv into op params; a handed-back
+    // --explain would surface as an unknown-parameter error instead of
+    // being ignored (the pre-#4541 global behavior).
+    const r = parseGlobalFlags(['call', 'query', '--explain']);
+    expect(r.cliOpts.explain).toBe(true);
+    expect(r.rest).toEqual(['call', 'query']);
+  });
+
+  // #4557 — #4541 only fixed the case where --explain follows the command
+  // (`extract --explain timeline`). It missed the documented global-flag-
+  // FIRST invocation style (`gbrain --progress-json doctor` per this file's
+  // own header comment): a handed-back --explain landed at its ORIGINAL
+  // position, which for `--explain extract timeline` is rest[0] — and
+  // cli.ts dispatches on `args[0]` as the command, so the literal string
+  // '--explain' got treated as the command and dispatch broke for EVERY
+  // non-claiming command invoked this way.
+  test('#4557: --explain before a non-claiming command does not break dispatch', () => {
+    const r = parseGlobalFlags(['--explain', 'extract', 'timeline']);
+    expect(r.rest[0]).toBe('extract'); // the command, not '--explain'
+    expect(r.cliOpts.explain).toBe(false);
+    expect(r.rest).toEqual(['extract', '--explain', 'timeline']);
+  });
+
+  test('#4557: --explain-before-command keeps the exact shape --explain-after-command already had', () => {
+    // The fix must not touch the already-correct after-command case while
+    // fixing the before-command one — both invocation styles of the same
+    // command should hand the flag back in the identical spot relative to
+    // the command and any following positional value.
+    const before = parseGlobalFlags(['--explain', 'extract', 'timeline']);
+    const after = parseGlobalFlags(['extract', '--explain', 'timeline']);
+    expect(before.rest).toEqual(after.rest);
+  });
+
+  test('#4557: repeated --explain before the command matches the pre-existing repeated-flag shape after it (documented, not fixed here)', () => {
+    // Out of scope for this fix: extract-explain.ts resolves its <kind>
+    // argument via a naive `args.indexOf('--explain') + 1`, so a SECOND
+    // --explain shadows the first one's intended value regardless of
+    // where the pair sits relative to the command — this was already true
+    // pre-#4557 for `extract --explain --explain timeline` (unaffected by
+    // this change) and stays true post-#4557 for the previously-broken
+    // `--explain --explain extract timeline` too. This test pins parity
+    // between the two placements, not correctness of the double-flag case
+    // itself — a real fix belongs in extract-explain.ts's kind lookup.
+    const before = parseGlobalFlags(['--explain', '--explain', 'extract', 'timeline']);
+    const after = parseGlobalFlags(['extract', '--explain', '--explain', 'timeline']);
+    expect(before.rest).toEqual(after.rest);
+    expect(before.rest).toEqual(['extract', '--explain', '--explain', 'timeline']);
+  });
+
+  test('#4557: --quiet --explain <non-claiming command> preserves both flags and dispatch', () => {
+    const r = parseGlobalFlags(['--quiet', '--explain', 'extract', 'timeline']);
+    expect(r.cliOpts.quiet).toBe(true);
+    expect(r.rest[0]).toBe('extract');
+    expect(r.rest).toEqual(['extract', '--explain', 'timeline']);
+  });
+
+  test('#4557: --explain before an unrecognized command still dispatches on the command, not --explain', () => {
+    const r = parseGlobalFlags(['--explain', 'not-a-real-command']);
+    expect(r.rest[0]).toBe('not-a-real-command');
+    expect(r.rest).toEqual(['not-a-real-command', '--explain']);
+  });
+
+  test('#4557: --explain before query still claims globally (unaffected by the reorder fix)', () => {
+    const r = parseGlobalFlags(['--explain', 'query', 'who is alice-example']);
+    expect(r.cliOpts.explain).toBe(true);
+    expect(r.rest).toEqual(['query', 'who is alice-example']);
+  });
+
+  test('#4557: bare --explain with no command at all does not throw', () => {
+    const r = parseGlobalFlags(['--explain']);
+    expect(r.cliOpts.explain).toBe(false);
+    expect(r.rest).toEqual(['--explain']);
+  });
 });
 
 describe('getCliOptions / setCliOptions singleton', () => {
@@ -121,6 +230,23 @@ describe('cli.ts global-flag stripping (integration)', () => {
     });
     expect(res.status).toBe(0);
     expect(res.stdout).toContain('gbrain ');
+  });
+
+  // #4557 — end-to-end proof that the parseGlobalFlags fix actually reaches
+  // real command dispatch in cli.ts, not just the unit-tested return value.
+  // No DB/engine needed: an unrecognized command hits the dispatcher's
+  // `Unknown command: <command>` error (src/cli.ts) before any engine
+  // connect, so this differentiates "the real command was dispatched on"
+  // from "the literal '--explain' string was dispatched on" — the exact
+  // failure this fix corrects.
+  test('#4557: gbrain --explain <command> dispatches on the command, not on --explain', () => {
+    const res = spawnSync('bun', [CLI, '--explain', 'not-a-real-command-4557'], {
+      encoding: 'utf-8',
+      env: { ...process.env, NO_COLOR: '1' },
+    });
+    expect(res.status).toBe(1);
+    expect(res.stderr).toContain('Unknown command: not-a-real-command-4557');
+    expect(res.stderr).not.toContain('Unknown command: --explain');
   });
 });
 

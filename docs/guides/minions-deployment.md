@@ -189,7 +189,7 @@ command -v gbrain || { echo "gbrain not on PATH. Install, then retry."; exit 1; 
 #    (Supervisor is Postgres-only. PGLite's exclusive file lock blocks the
 #    separate worker process. If `config.engine === 'pglite'` the CLI rejects
 #    with a clear error.)
-gbrain doctor --fast --json | jq '.checks[] | select(.name=="db_connectivity")'
+gbrain doctor --fast --json | jq '.checks[] | select(.name=="connection")'
 
 # 3. Schema is up to date. If version=0 or status=="fail":
 #    gbrain apply-migrations --yes
@@ -308,11 +308,10 @@ use a dedicated queue name like `nightly-enrich` above.
 
 ### From `minion-watchdog.sh`
 
-Earlier versions of this guide shipped a 68-line bash watchdog
-(`minion-watchdog.sh`). It's been replaced by `gbrain jobs supervisor`
-which handles everything the script did, plus atomic PID locking,
-structured audit events, queue-scoped health checks, and graceful
-drain on SIGTERM.
+If a cron-driven bash watchdog (`minion-watchdog.sh`) is still keeping
+your worker alive, replace it with `gbrain jobs supervisor`, which covers
+the same job plus atomic PID locking, structured audit events,
+queue-scoped health checks, and graceful drain on SIGTERM.
 
 **Migration:**
 
@@ -325,7 +324,7 @@ crontab -e   # delete the "*/5 * * * * /usr/local/bin/minion-watchdog.sh" line
 
 # 2. Start the supervisor (systemd users: reinstall the unit from
 #    docs/guides/minions-deployment-snippets/systemd.service, which
-#    now calls `gbrain jobs supervisor`).
+#    calls `gbrain jobs supervisor`).
 gbrain jobs supervisor start --detach --json
 # Or: sudo systemctl restart gbrain-worker
 
@@ -357,7 +356,7 @@ Regardless of which deployment path you're upgrading from:
 ### Supabase connection drops
 
 If Supabase drops the worker's Postgres connection (maintenance,
-connection limits, network blip), this now self-heals under the
+connection limits, network blip), this self-heals under the
 supervisor: the worker's DB-liveness probe self-exits (`db_dead`) on a
 dead pool and the supervisor respawns it with a fresh pool, and the
 supervisor also restarts a worker that stops making progress while
@@ -365,7 +364,7 @@ claimable work waits. The escalation commands and thresholds live in the
 [queue operations runbook](queue-operations-runbook.md) — that's the
 canonical home for wedge recovery.
 
-What can still bite is now narrow. Lock renewal is verify-before-evict:
+What can still bite is narrow. Lock renewal is verify-before-evict:
 a thrown or timed-out renewal is never treated as loss — at the deadline
 the worker asks the database the authoritative question (one fenced
 re-check), so a starved-but-healthy job recovers its lease and keeps
@@ -379,11 +378,6 @@ The remaining exposure: a genuinely dead worker's long-lease job waits
 up to lease + grace + one sweep interval before requeue, and the stall
 detector still dead-letters after `max_stalled` genuine misses (schema
 column default 5).
-
-Mixed-version fleets degrade gracefully: an old worker ignores the
-`lock_duration_ms` column and runs the legacy 30 s behavior; new workers
-honor old rows via the claim-time default. No drain or ordered restart
-is required.
 
 **Tune per-job.** `gbrain jobs submit` accepts `--max-stalled N`,
 `--backoff-type fixed|exponential`, `--backoff-delay <ms>`,
@@ -423,8 +417,14 @@ gbrain jobs list --status active --limit 10
 # Dead-lettered jobs.
 gbrain jobs list --status dead --limit 10
 
-# Shell handler registered? (check supervisor audit log or worker stderr.)
-gbrain jobs supervisor status --json | jq '.worker_config.allow_shell_jobs'
+# Shell jobs enabled on the worker? There is no supervisor-status JSON field
+# for this — the gate is the GBRAIN_ALLOW_SHELL_JOBS=1 env var on the worker
+# process (the handler is always registered but guarded). Inspect the
+# supervisor's environment directly:
+ps eww -p "$(gbrain jobs supervisor status --json | jq -r '.supervisor_pid')" \
+  | grep -o 'GBRAIN_ALLOW_SHELL_JOBS=[^ ]*' || echo "flag not set"
+# An unflagged worker that claims a shell job dead-letters it instantly:
+gbrain jobs list --status dead --name shell --limit 3
 ```
 
 ## Uninstall

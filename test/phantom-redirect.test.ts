@@ -582,27 +582,38 @@ describe('runExtractFacts — phantom-redirect integration', () => {
 
   test('round 2 P1: legacy-row guard fires BEFORE phantom-redirect pass', async () => {
     await withTempDirs(async ({ brainDir }) => {
-      // Seed a legacy v0.31 fact row (row_num NULL, entity_slug NOT NULL).
-      // `source` is NOT NULL in the schema; the v0.31 path always set it.
-      // #2484: the guard only gates on rows whose entity_slug resolves to a
-      // LIVE page (genuine backfill candidates), so seed the backing page too.
-      await putPage('people/legacy', '# legacy\n', { type: 'person' });
-      writeMd(brainDir, 'people/legacy', '# legacy\n');
+      // #2763: the guard only gates on rows the v0_32_2 Phase B backfill
+      // could actually fence, which requires the source's local_path — set
+      // it (the migrated v0.31 brain shape) so the legacy row keeps gating.
       await engine.executeRaw(
-        `INSERT INTO facts (source_id, entity_slug, fact, kind, valid_from, source)
-         VALUES ('default', 'people/legacy', 'Legacy claim', 'fact', '2020-01-01'::date, 'legacy-import')`,
+        `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+        [brainDir],
       );
-      // Seed a phantom that SHOULD have been redirected if the guard didn't fire
-      await putPage('people/alice-example', '# alice-example\n', { type: 'person' });
-      writeMd(brainDir, 'people/alice-example', '# alice-example\n');
-      await putPage('alice', STUB_BODY);
-      writeMd(brainDir, 'alice', STUB_BODY);
+      try {
+        // Seed a legacy v0.31 fact row (row_num NULL, entity_slug NOT NULL).
+        // `source` is NOT NULL in the schema; the v0.31 path always set it.
+        // #2484: the guard only gates on rows whose entity_slug resolves to a
+        // LIVE page (genuine backfill candidates), so seed the backing page too.
+        await putPage('people/legacy', '# legacy\n', { type: 'person' });
+        writeMd(brainDir, 'people/legacy', '# legacy\n');
+        await engine.executeRaw(
+          `INSERT INTO facts (source_id, entity_slug, fact, kind, valid_from, source)
+           VALUES ('default', 'people/legacy', 'Legacy claim', 'fact', '2020-01-01'::date, 'legacy-import')`,
+        );
+        // Seed a phantom that SHOULD have been redirected if the guard didn't fire
+        await putPage('people/alice-example', '# alice-example\n', { type: 'person' });
+        writeMd(brainDir, 'people/alice-example', '# alice-example\n');
+        await putPage('alice', STUB_BODY);
+        writeMd(brainDir, 'alice', STUB_BODY);
 
-      const result = await runExtractFacts(engine, { sourceId: 'default', brainDir });
-      expect(result.guardTriggered).toBe(true);
-      expect(result.phantomsRedirected).toBe(0);
-      // Phantom .md still on disk (pass skipped)
-      expect(mdExists(brainDir, 'alice')).toBe(true);
+        const result = await runExtractFacts(engine, { sourceId: 'default', brainDir });
+        expect(result.guardTriggered).toBe(true);
+        expect(result.phantomsRedirected).toBe(0);
+        // Phantom .md still on disk (pass skipped)
+        expect(mdExists(brainDir, 'alice')).toBe(true);
+      } finally {
+        await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+      }
     });
   });
 
@@ -765,6 +776,43 @@ describe('phantom-audit module', () => {
       const { logPhantomEvent } = await import('../src/core/facts/phantom-audit.ts');
       // Should not throw — failure is logged to stderr
       expect(() => logPhantomEvent({ outcome: 'redirected', source_id: 'default' })).not.toThrow();
+    });
+  });
+});
+
+// ─── wave review: #4756 placement rule holds for the phantom-redirect writer ──
+describe('tryRedirectPhantom — fence placement above the timeline sentinel (#4756)', () => {
+  test('a canonical with a `---` + `## Timeline` sentinel and no fence gets `## Facts` ABOVE it, not at EOF', async () => {
+    await withTempDirs(async ({ brainDir }) => {
+      // The recommended page template: prose, then the legacy bare `---`
+      // sentinel followed by `## Timeline`. splitBody() files everything
+      // below the sentinel into page.timeline, where extract_facts refuses
+      // to reconcile a fence (FACTS_FENCE_BELOW_SENTINEL) — a blind EOF
+      // append froze the redirected rows permanently.
+      const canonicalBody = `# alice-example\n\nAlice runs acme-example.\n\n---\n\n## Timeline\n\n- 2026-01-01: Founded Acme\n`;
+      await putPage('people/alice-example', canonicalBody, { type: 'person' });
+      writeMd(brainDir, 'people/alice-example', canonicalBody);
+
+      const phantomBody = FACT_FENCE(
+        `| 1 | Founded Acme | fact | 1.0 | world | high | 2017-01-01 |  | linkedin |  |`,
+      );
+      await putPage('alice', phantomBody);
+      writeMd(brainDir, 'alice', phantomBody);
+
+      const phantom = await engine.getPage('alice', { sourceId: 'default' });
+      const result = await tryRedirectPhantom(engine, phantom!, 'default', brainDir, false);
+      expect(result.outcome).toBe('redirected');
+
+      const canonicalMd = readMd(brainDir, 'people/alice-example');
+      expect(canonicalMd).toContain('Founded Acme');
+      const factsAt = canonicalMd.indexOf('## Facts');
+      const sentinelAt = canonicalMd.indexOf('\n---\n');
+      expect(factsAt).toBeGreaterThan(-1);
+      expect(sentinelAt).toBeGreaterThan(-1);
+      expect(factsAt).toBeLessThan(sentinelAt);
+      // Prose above the fence survives; the timeline section is still last.
+      expect(canonicalMd.indexOf('Alice runs acme-example.')).toBeLessThan(factsAt);
+      expect(canonicalMd.indexOf('## Timeline')).toBeGreaterThan(canonicalMd.indexOf('gbrain:facts:end'));
     });
   });
 });

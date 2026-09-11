@@ -93,6 +93,23 @@ function parseBrainValue(val: string | undefined): string {
  */
 export const TIMEOUT_OWNING_COMMANDS = new Set(['sync', 'remote']);
 
+/**
+ * #4541: commands whose result formatter consumes the GLOBAL --explain (the
+ * v0.40.4 per-stage search attribution view in cli.ts's query/search
+ * formatter; `ask` is the query alias rewritten before dispatch). For every
+ * OTHER command the global parser hands the flag back IN PLACE — `extract
+ * --explain <kind>`, `whoknows --explain`, and `onboard --check --explain`
+ * parse it themselves, and the blanket claim starved them: `extract
+ * --explain timeline` fell through to the WRITE-pass extraction instead of
+ * the explain view.
+ *
+ * wave-g: `call` claims it too — `gbrain call <op>` maps leftover argv into
+ * op params, so a handed-back --explain would surface as an
+ * unknown-parameter error instead of being ignored (the pre-#4541 global
+ * behavior for `call query --explain`).
+ */
+export const EXPLAIN_CLAIMING_COMMANDS = new Set(['query', 'search', 'ask', 'call']);
+
 export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: string[] } {
   const cliOpts: CliOptions = { ...DEFAULT_CLI_OPTIONS };
   // #3013: --timeout can't be resolved inline — whether the GLOBAL parser
@@ -102,7 +119,8 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
   // a second pass below.
   type Slot =
     | { plain: string }
-    | { timeoutValue: string; equalsForm: boolean };
+    | { timeoutValue: string; equalsForm: boolean }
+    | { explainFlag: true };
   const slots: Slot[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -151,8 +169,10 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
       continue;
     }
     // v0.40.4 — --explain for `gbrain search/query` per-stage attribution.
+    // #4541: like --timeout, whether the global parser claims it depends on
+    // the command, which is only known after the full scan — slot it.
     if (a === '--explain') {
-      cliOpts.explain = true;
+      slots.push({ explainFlag: true });
       continue;
     }
     // --brain <id> / --brain=<id> — brain (database) axis. Exact-match only:
@@ -190,12 +210,50 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
   const commandSlot = slots.find((s): s is { plain: string } => 'plain' in s);
   const commandOwnsTimeout =
     commandSlot !== undefined && TIMEOUT_OWNING_COMMANDS.has(commandSlot.plain);
+  // #4541: only the search/query formatter commands claim --explain globally;
+  // everyone else gets it back in place (extract/whoknows/onboard own it).
+  const commandClaimsExplain =
+    commandSlot !== undefined && EXPLAIN_CLAIMING_COMMANDS.has(commandSlot.plain);
 
   const rest: string[] = [];
   const handback: string[] = [];
+  // #4557: a handed-back --explain that arrived BEFORE the command token
+  // (`gbrain --explain extract timeline`, the documented global-flag-first
+  // invocation style) must not be re-inserted at its original position —
+  // that puts it at rest[0], and cli.ts dispatches on `args[0]` as the
+  // command, so the literal string '--explain' gets treated as the command
+  // and dispatch breaks for every non-claiming command. Defer it until the
+  // command slot is emitted, then flush right after — this reproduces
+  // `<command> --explain ...` exactly as if the user had typed it there. An
+  // --explain that arrives AFTER the command (`extract --explain timeline`,
+  // already correct today) is left in its natural scanned position: moving
+  // it further (e.g. to the very end like the --timeout handback) would
+  // change its position relative to a following value token, and
+  // extract-explain.ts's kind lookup is positional
+  // (`args.indexOf('--explain') + 1`) — reordering it "just to be safe"
+  // would break the case that already works.
+  const deferredExplain: string[] = [];
+  let commandEmitted = false;
   for (const s of slots) {
     if ('plain' in s) {
       rest.push(s.plain);
+      if (s === commandSlot) {
+        commandEmitted = true;
+        if (deferredExplain.length > 0) {
+          rest.push(...deferredExplain);
+          deferredExplain.length = 0;
+        }
+      }
+      continue;
+    }
+    if ('explainFlag' in s) {
+      if (commandClaimsExplain) {
+        cliOpts.explain = true;
+      } else if (commandEmitted) {
+        rest.push('--explain');
+      } else {
+        deferredExplain.push('--explain');
+      }
       continue;
     }
     if (commandOwnsTimeout) {
@@ -211,6 +269,9 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
       rest.push('--timeout', s.timeoutValue);
     }
   }
+  // No plain (command) slot was ever found — nothing to flush against, so
+  // any deferred --explain(s) go at the end (there's no command to garble).
+  rest.push(...deferredExplain);
   rest.push(...handback);
 
   return { cliOpts, rest };

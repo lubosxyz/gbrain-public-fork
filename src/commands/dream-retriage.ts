@@ -13,7 +13,8 @@
  *      live backlog largely sits in dead per-run `dream-inline-*` queues no
  *      worker will ever drain), match (basename, hash16) to discovered
  *      transcripts, then:
- *        - matched below threshold      → cancel (frontier job not worth it)
+ *        - matched below the gate (threshold OR verified-segment rescue —
+ *          ONE predicate with the synthesize fan-out) → cancel
  *        - matched above, stale queue   → cancel as `converted_for_resubmit`
  *          (cancelled rows release their idempotency slot, so the next cycle
  *          re-adds them into ITS live private drain — this is what actually
@@ -50,6 +51,7 @@ import {
   type TriageFileReport,
 } from '../core/cycle/synthesize.ts';
 import { discoverTranscripts } from '../core/cycle/transcript-discovery.ts';
+import { passesTriageGate, rescueConfigOf } from '../core/cycle/triage-rescue.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { MinionQueue } from '../core/minions/queue.ts';
 import { canonicalLookup } from '../core/model-pricing.ts';
@@ -192,12 +194,13 @@ NOTES
   cancelled — they count as kept_live_queue. Running retriage while a cycle
   is active may double-judge some cache misses (benign: last write wins).
 
-RECONCILE SEMANTICS
-  matched + score <  threshold                  cancel
-  matched + score >= threshold, dead dream-inline-* queue (older than 1h)
+RECONCILE SEMANTICS (gate = threshold pass OR the verified-segment rescue —
+the same passesTriageGate the synthesize fan-out reads)
+  matched + below gate                          cancel
+  matched + passes gate, dead dream-inline-* queue (older than 1h)
                                                 cancel (converted_for_resubmit —
                                                 next cycle re-adds it into a live drain)
-  matched + score >= threshold, live queue      keep
+  matched + passes gate, live queue             keep
   matched, no reliable score                    keep
   unmatched / unparseable key                   keep (cancel with --cancel-unmatched)
   legacy dream:synth: (v1) keys                 never touched
@@ -218,6 +221,9 @@ interface ReconcileStats {
   candidates: number;
   cancelled: number;
   converted_for_resubmit: number;
+  /** Kept because the job PASSES THE GATE — score >= threshold OR the F2
+   * verified-segment rescue. The name predates the rescue; renaming would
+   * break --json consumers, so the widened semantics live here. */
   kept_above_threshold: number;
   kept_unscored: number;
   /** Rows in a dream-inline-* queue younger than the liveness grace — possibly a running cycle's; never cancelled (CX1). */
@@ -277,6 +283,10 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
     return;
   }
   const threshold = parsed.threshold ?? config.triage.threshold;
+  // F2: ONE gate everywhere — the same verified-segment rescue the synthesize
+  // fan-out applies. An operator sweep must never cancel queued jobs the
+  // rescue admitted (reconcile below), nor audit rescued files as "rejects".
+  const rescueCfg = rescueConfigOf(config.triage);
 
   let transcripts = discoverTranscripts({
     corpusDir: config.corpusDir,
@@ -305,9 +315,11 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
       if (cached && valid) {
         passStats.cacheHits++;
         byPath.set(t.filePath, cached);
+        const g = passesTriageGate(cached, t.content, threshold, rescueCfg);
         reports.push({
           filePath: t.filePath,
-          worth: cached.score !== null && cached.score >= threshold,
+          worth: g.pass,
+          ...(g.rescued ? { rescued: true, verified_segments: g.verified_segments } : {}),
           score: cached.score,
           content_type: cached.content_type,
           reasons: cached.reasons,
@@ -420,6 +432,7 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
       force: parsed.force,
       staleBefore: parsed.since ?? undefined,
       shouldStop,
+      rescue: rescueCfg,
     });
     reports = pass.reports;
     for (const [k, v] of pass.byPath) byPath.set(k, v);
@@ -436,8 +449,14 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
          FROM minion_jobs
         WHERE name = 'subagent'
           AND status IN ('waiting', 'delayed', 'paused')
-          AND idempotency_key LIKE 'dream:synth-v2:%'`,
+          AND (idempotency_key LIKE 'dream:synth-v2:%' OR queue LIKE 'dream-inline-%')`,
     );
+    // #4250: the queue-LIKE arm pulls in NON-synth children stranded in
+    // private per-run queues (patterns mints dream-inline-* queues too).
+    // Doctor's orphaned_private_queue check points operators HERE; a repair
+    // that can't even select the flagged rows is a dead end. Non-synth rows
+    // skip the verdict pipeline and are handled by the dead-inline
+    // conversion branch below.
     // Two lookups: membership in the discovered corpus (matched at all?) vs a
     // usable scored verdict. A discovered file with no reliable score is
     // "matched but unscored" — kept, never cancelled on missing data. The
@@ -445,9 +464,14 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
     // fixed-width hex after the final separator.
     const discoveredKeys = new Set<string>();
     const verdictByKey = new Map<string, DreamVerdict>();
+    // F2: transcript content by match key, for the rescue's mechanical
+    // segment verification in the cancel decision below (references only —
+    // the contents are already resident on the transcripts array).
+    const contentByKey = new Map<string, string>();
     for (const t of transcripts) {
       const k = `${basename(t.filePath)}|${t.contentHash.slice(0, 16)}`;
       discoveredKeys.add(k);
+      contentByKey.set(k, t.content);
       const v = byPath.get(t.filePath);
       if (v) verdictByKey.set(k, v);
     }
@@ -482,19 +506,53 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
     // with several slow sequential children can legitimately exceed the 1h
     // grace. Consult the REAL signal: a live (unexpired) cycle lock means a
     // cycle is running right now, so no dream-inline queue is provably dead.
-    const liveLocks = await engine.executeRaw<{ id: string }>(
-      `SELECT id FROM gbrain_cycle_locks WHERE ttl_expires_at > NOW() AND id LIKE 'gbrain-cycle%'`,
+    // Liveness matches db-lock's model: unexpired TTL OR refreshed within the
+    // steal grace (a starved-but-alive holder must keep suppressing repair).
+    const { resolveStealGraceSeconds } = await import('../core/db-lock.ts');
+    const { LOCK_TTL_MINUTES } = await import('../core/cycle.ts');
+    const stealGraceSecs = resolveStealGraceSeconds(LOCK_TTL_MINUTES);
+    const liveLocks = await engine.executeRaw<{ id: string; acquired_epoch_ms: string | number | null }>(
+      `SELECT id, EXTRACT(EPOCH FROM acquired_at) * 1000 AS acquired_epoch_ms
+         FROM gbrain_cycle_locks
+        WHERE (ttl_expires_at > NOW()
+               OR last_refreshed_at > NOW() - make_interval(secs => ${Number(stealGraceSecs)}))
+          AND id LIKE 'gbrain-cycle%'`,
     );
     // Structured-review round 2 P2: cycle locks are per-source
     // (`gbrain-cycle:<source>`) — a cycle running for source A must not
     // suppress conversions for source B indefinitely. Only the legacy bare
     // `gbrain-cycle` lock is global.
+    //
+    // #4250 ownership correlation (mirrors doctor's orphaned_private_queue):
+    // lock existence is NOT queue ownership. A dream-inline queue whose
+    // name-embedded birth PREDATES the live lock's acquired_at cannot belong
+    // to that holder — an older crashed cycle's queue stays repairable while
+    // a new cycle runs. Unknown birth or unparseable acquired_at stays
+    // fail-safe possibly-live.
+    const lockAcquiredMs = new Map<string, number>(
+      liveLocks.map(l => [l.id, Number(l.acquired_epoch_ms ?? Number.NaN)]),
+    );
     const globalLockLive = liveLocks.some(l => l.id === 'gbrain-cycle');
     const liveLockSources = new Set(
       liveLocks
         .map(l => (l.id.startsWith('gbrain-cycle:') ? l.id.slice('gbrain-cycle:'.length) : null))
         .filter((s): s is string => s !== null),
     );
+    const nowMsForBirth = Date.now();
+    /**
+     * A live lock suppresses a queue only if it could OWN it: queue born
+     * at/after acquisition (or birth/acquisition unknown — fail-safe). The
+     * 60s tolerance absorbs host-clock (queue-name Date.now) vs DB-clock
+     * (acquired_at NOW()) skew — the maintenance lane mints its queue
+     * seconds after acquiring the lock.
+     */
+    const OWNERSHIP_SKEW_TOLERANCE_MS = 60_000;
+    const lockCouldOwnQueue = (lockId: string, queueAgeMs: number | null): boolean => {
+      const acquired = lockAcquiredMs.get(lockId);
+      if (acquired === undefined) return false; // lock not live
+      if (queueAgeMs === null || !Number.isFinite(acquired)) return true; // fail-safe
+      return (nowMsForBirth - queueAgeMs) >= acquired - OWNERSHIP_SKEW_TOLERANCE_MS;
+    };
     if (liveLocks.length > 0) {
       process.stderr.write(
         `[retriage] live cycle lock(s) detected (${liveLocks.map(l => l.id).join(', ')}); ` +
@@ -526,7 +584,9 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
       // possibly-live regardless of age (structured-review P2: slow
       // sequential children can outlive the grace; round 2: per-source, so a
       // busy source A never suppresses source B's cleanup indefinitely).
-      const lockLiveForRow = globalLockLive || liveLockSources.has(row.source_id);
+      const lockLiveForRow =
+        (globalLockLive && lockCouldOwnQueue('gbrain-cycle', inlineQueueAge))
+        || (liveLockSources.has(row.source_id) && lockCouldOwnQueue(`gbrain-cycle:${row.source_id}`, inlineQueueAge));
       const possiblyLiveQueue = isInlineQueue
         && (lockLiveForRow || inlineQueueAge === null || inlineQueueAge <= DREAM_INLINE_LIVE_GRACE_MS);
       if (possiblyLiveQueue) {
@@ -540,7 +600,23 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
       }
       const key = parseSynthV2Key(row.idempotency_key);
       if (!key) {
-        reconcile.unmatched++;
+        // #4250: a NON-synth child (e.g. patterns) stranded in a provably-dead
+        // dream-inline queue has no verdict to consult and will never be
+        // claimed — convert it like the C1 branch below so doctor's
+        // orphaned_private_queue repair path actually repairs. The
+        // possibly-live filter above already kept anything a running cycle
+        // could own. Non-inline rows keep the unmatched bookkeeping.
+        if (isInlineQueue && (row.status === 'waiting' || row.status === 'delayed')) {
+          if (!parsed.dryRun) {
+            const outcome = await cancelRow(row.id);
+            if (outcome === 'cancelled') reconcile.converted_for_resubmit++;
+            else reconcile.already_terminal++;
+          } else {
+            reconcile.converted_for_resubmit++; // dry-run: would convert
+          }
+        } else {
+          reconcile.unmatched++;
+        }
         continue;
       }
       // C9 hardening: the key's encoded source must agree with the payload's
@@ -573,7 +649,10 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
         }
         continue;
       }
-      if (verdict.score < threshold) {
+      // F2: the cancel decision reads THE gate (threshold OR verified-segment
+      // rescue) — a below-threshold job the rescue admitted must survive the
+      // sweep, or reconcile cancels exactly what the last cycle fought to run.
+      if (!passesTriageGate(verdict, contentByKey.get(matchKey) ?? '', threshold, rescueCfg).pass) {
         if (!parsed.dryRun) {
           const outcome = await cancelRow(row.id);
           if (outcome === 'cancelled') reconcile.cancelled++;
@@ -583,7 +662,7 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
         }
         continue;
       }
-      // Above threshold. C1: a row stranded in a provably-dead per-run
+      // Above the gate. C1: a row stranded in a provably-dead per-run
       // dream-inline-* queue (older than the liveness grace, no live cycle
       // lock — the possibly-live case was already kept above) will never be
       // claimed — cancel it so the next cycle's queue.add re-creates it in a
@@ -611,7 +690,10 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
     process.stderr.write('[retriage] --audit-rejects skipped under --dry-run (the audit spends frontier-model calls)\n');
   }
   if (parsed.auditRejects !== null && !parsed.dryRun) {
-    const rejects = reports.filter(r => r.score !== null && r.score < threshold);
+    // F2: rescued band files are ACCEPTED, not rejects — auditing them as
+    // rejections would misreport the disagreement rate the threshold-tuning
+    // loop reads.
+    const rejects = reports.filter(r => r.score !== null && r.score < threshold && r.rescued !== true);
     // Deterministic stride-sample over the rejects in discovery order — no
     // randomness, so repeated audits compare like with like.
     const sample: TriageFileReport[] = [];

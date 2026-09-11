@@ -303,6 +303,9 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   model                 TEXT    NOT NULL DEFAULT 'text-embedding-3-large',
   token_count           INTEGER,
   embedded_at           TIMESTAMPTZ,
+  -- #4246 (v133): md5(chunk_text) at embed time. NULL = no embedding or
+  -- pre-v133 row (grandfathered by invalidateContentDriftEmbeddings).
+  embedded_text_hash    TEXT,
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- v0.19.0: code chunk metadata. Nullable — markdown chunks leave these NULL.
   -- Powers `query --lang`, `code-def <symbol>`, and `code-refs <symbol>`.
@@ -551,7 +554,10 @@ CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_entries(date);
 -- v0.41.18.0 (codex finding #11): widened from (page_id, date, summary) to
 -- include `source` so distinct meeting provenance survives. Legacy rows
 -- have source='' (schema default) so legacy dedup behavior is preserved.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_dedup ON timeline_entries(page_id, date, summary, source);
+-- #3737: keyed on md5(summary) — a raw long/incompressible summary overflowed
+-- the btree v4 row cap (~2704 bytes) and aborted the whole timeline insert.
+-- Both insert sites infer ON CONFLICT (page_id, date, md5(summary), source).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_dedup ON timeline_entries(page_id, date, md5(summary), source);
 -- v0.42.x (Life Chronicle): event-projection lookup + dedup. Partial
 -- (event_page_id IS NOT NULL) so ordinary timeline rows are unaffected.
 CREATE INDEX IF NOT EXISTS idx_timeline_event_page ON timeline_entries(event_page_id) WHERE event_page_id IS NOT NULL;
@@ -700,6 +706,12 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
   -- tier names into surface); NULL = server/config surface resolution.
   surface                 TEXT NULL,
   surface_set_by          TEXT NULL,
+  allowed_operations      TEXT[] NULL,
+  delegated_slug_prefixes TEXT[] NULL,
+  delegated_namespace    TEXT NOT NULL DEFAULT 'prefixes',
+  grant_profile           TEXT NULL,
+  grant_revision          INTEGER NOT NULL DEFAULT 0,
+  grant_repair_reasons    TEXT[] NOT NULL DEFAULT '{}',
   created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- v0.34.1 (#861, D13 + #876): source_id is the write-source scope;
@@ -709,6 +721,28 @@ CREATE INDEX IF NOT EXISTS idx_oauth_clients_source_id
   ON oauth_clients(source_id) WHERE source_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_oauth_clients_federated_read
   ON oauth_clients USING GIN (federated_read);
+
+
+CREATE TABLE IF NOT EXISTS oauth_grant_audit (
+  id BIGSERIAL PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  before_grant JSONB,
+  after_grant JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_oauth_grant_audit_client ON oauth_grant_audit(client_id, created_at);
+
+-- The facts index and withdrawal trigger are installed by migrations 60/148.
+CREATE TABLE IF NOT EXISTS fact_withdrawals (
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private','world')),
+  fact_hash TEXT NOT NULL,
+  withdrawn_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, visibility, fact_hash)
+);
 
 CREATE TABLE IF NOT EXISTS oauth_tokens (
   token_hash   TEXT PRIMARY KEY,
@@ -819,17 +853,130 @@ CREATE INDEX IF NOT EXISTS context_volunteer_events_src_slug_idx
 -- runtime. Key (source_id, client_id, session_id); client_id 'local' sentinel
 -- for CLI/hook, remote auth client id otherwise. jsonb DDL-literal defaults.
 CREATE TABLE IF NOT EXISTS session_context_state (
-  source_id         TEXT NOT NULL,
-  client_id         TEXT NOT NULL DEFAULT 'local',
-  session_id        TEXT NOT NULL,
-  standing_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
-  surfaced_slugs    JSONB NOT NULL DEFAULT '[]'::jsonb,
-  last_wake_at      TIMESTAMPTZ,
-  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  source_id           TEXT NOT NULL,
+  client_id           TEXT NOT NULL DEFAULT 'local',
+  session_id          TEXT NOT NULL,
+  standing_entities   JSONB NOT NULL DEFAULT '[]'::jsonb,
+  surfaced_slugs      JSONB NOT NULL DEFAULT '[]'::jsonb,
+  checkpoint_manifest JSONB NOT NULL DEFAULT '[]'::jsonb,
+  last_wake_at        TIMESTAMPTZ,
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (source_id, client_id, session_id)
 );
 CREATE INDEX IF NOT EXISTS session_context_state_updated_idx
   ON session_context_state (updated_at);
+
+-- extract_atoms_transcript_state (migration v146 — #4148 follow-on): failure
+-- streak + tombstone for TRANSCRIPT extraction items. Pages carry this in
+-- frontmatter (atoms_fail_count / atoms_fail_hash / atoms_scan_hash), but
+-- transcripts are files with no frontmatter, so pre-fix a transcript that
+-- deterministically produced malformed output — or that honestly yielded zero
+-- atoms — re-entered discovery and re-spent LLM budget on every cycle forever.
+--
+-- Why its own table. raw_data is page-scoped (page_id NOT NULL REFERENCES
+-- pages(id)) and transcripts aren't pages, exactly as dream_verdicts' own
+-- comment notes. And NOT columns on dream_verdicts: that cache is documented
+-- rebuildable via `gbrain dream retriage --force`, which clears it wholesale,
+-- so extraction state stored there would be swept away as collateral.
+--
+-- Why source_id is in the key, unlike dream_verdicts. That table caches a
+-- content-level judgment ("is this transcript worth processing"), which does
+-- not vary by source. A failure streak and a tombstone GATE EXTRACTION, and
+-- extraction is source-scoped throughout the phase — discovery SQL, the NOT
+-- EXISTS idempotency subquery, and every putPage take sourceId. An unscoped
+-- tombstone would let one source permanently suppress another source's
+-- extraction of the same file.
+--
+-- content_hash is the 16-char prefix, matching atoms.frontmatter->>'source_hash'
+-- and the page-side atoms_fail_hash. Having it in the PK is what makes "a
+-- content edit resets the streak" fall out for free: an edited transcript is a
+-- different row, mirroring the page-side hash-keyed reset.
+--
+-- RLS: covered by the v35 auto_rls_on_create_table event trigger, same posture
+-- as session_context_state (v126) and chat_usage_log (v140).
+CREATE TABLE IF NOT EXISTS extract_atoms_transcript_state (
+  source_id    TEXT        NOT NULL DEFAULT 'default',
+  file_path    TEXT        NOT NULL,
+  content_hash TEXT        NOT NULL,
+  fail_count   INTEGER     NOT NULL DEFAULT 0,
+  tombstoned   BOOLEAN     NOT NULL DEFAULT FALSE,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, file_path, content_hash)
+);
+CREATE INDEX IF NOT EXISTS extract_atoms_transcript_state_tombstoned_idx
+  ON extract_atoms_transcript_state (source_id, content_hash)
+  WHERE tombstoned;
+
+-- chat_usage_log (#4218 / migration v140): durable per-call chat usage
+-- ledger. One row per SUCCESSFUL gateway.chat() call, written fire-and-forget
+-- by the chat-usage sink (src/core/ai/chat-usage.ts). cost_usd is a
+-- canonical-table estimate; NULL when the model has no pricing (never a fake
+-- 0). Read back by the `get_usage` op with explicit coverage fields.
+CREATE TABLE IF NOT EXISTS chat_usage_log (
+  id                 BIGSERIAL PRIMARY KEY,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  model              TEXT NOT NULL,
+  provider           TEXT,
+  phase              TEXT,
+  input_tokens       INTEGER NOT NULL DEFAULT 0,
+  output_tokens      INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd           DOUBLE PRECISION
+);
+CREATE INDEX IF NOT EXISTS idx_chat_usage_log_created
+  ON chat_usage_log (created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_usage_log_model
+  ON chat_usage_log (model, created_at);
+
+-- open_loops (migration v144): the Gmail-first open-loop engine's structured
+-- record — "who is waiting on you, what you promised". Deduped per source on
+-- dedup_key; loops close by state transition, never delete. fact_id projects
+-- LLM-extracted commitments into the facts table so entity cards see them.
+CREATE TABLE IF NOT EXISTS open_loops (
+  id                 BIGSERIAL PRIMARY KEY,
+  source_id          TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  dedup_key          TEXT NOT NULL,
+  loop_type          TEXT NOT NULL CHECK (loop_type IN (
+                       'commitment_owed_by_me','commitment_owed_to_me',
+                       'unanswered_inbound','unanswered_outbound','decision_pending')),
+  counterparty_slug  TEXT,
+  counterparty_email TEXT,
+  summary            TEXT NOT NULL,
+  evidence           JSONB NOT NULL DEFAULT '[]'::jsonb,
+  thread_id          TEXT,
+  page_slug          TEXT,
+  due_at             TIMESTAMPTZ,
+  status             TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','done','dropped','stale')),
+  detector           TEXT NOT NULL CHECK (detector IN ('deterministic_thread','llm_extract','manual')),
+  confidence         REAL NOT NULL DEFAULT 1.0,
+  fact_id            BIGINT,
+  opened_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_activity_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed_at          TIMESTAMPTZ,
+  closed_by          TEXT,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT open_loops_dedup UNIQUE (source_id, dedup_key)
+);
+CREATE INDEX IF NOT EXISTS open_loops_status_idx
+  ON open_loops (source_id, status, last_activity_at DESC);
+CREATE INDEX IF NOT EXISTS open_loops_counterparty_idx
+  ON open_loops (source_id, counterparty_slug) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS open_loops_thread_idx
+  ON open_loops (source_id, thread_id) WHERE status = 'open';
+
+-- loop_suppressions (migration v144): `gbrain loops mute <sender|thread>` —
+-- the detector's user feedback loop. Suppressed senders/threads never open
+-- new loops (existing loops keep their state).
+CREATE TABLE IF NOT EXISTS loop_suppressions (
+  id         BIGSERIAL PRIMARY KEY,
+  source_id  TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  kind       TEXT NOT NULL CHECK (kind IN ('sender','thread')),
+  value      TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT loop_suppressions_uniq UNIQUE (source_id, kind, value)
+);
 
 -- migration_impact_log moved BELOW minion_jobs (was here, lines 645-676)
 -- because its `job_id BIGINT REFERENCES minion_jobs(id)` FK requires
@@ -946,6 +1093,8 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   queue            TEXT        NOT NULL DEFAULT 'default',
   status           TEXT        NOT NULL DEFAULT 'waiting',
   priority         INTEGER     NOT NULL DEFAULT 0,
+  submission_authority JSONB, -- NULL legacy rows require local authorization before workers start
+  claim_generation BIGINT NOT NULL DEFAULT 0, -- advanced atomically by protocol-aware claims
   data             JSONB       NOT NULL DEFAULT '{}',
   max_attempts     INTEGER     NOT NULL DEFAULT 3,
   attempts_made    INTEGER     NOT NULL DEFAULT 0,
@@ -975,6 +1124,9 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   remove_on_complete BOOLEAN   NOT NULL DEFAULT FALSE,
   remove_on_fail   BOOLEAN     NOT NULL DEFAULT FALSE,
   idempotency_key  TEXT,
+  private_queue_owner_job_id INTEGER REFERENCES minion_jobs(id) ON DELETE SET NULL,
+  private_queue_owner_token TEXT,
+  private_queue_lease_until TIMESTAMPTZ,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   started_at       TIMESTAMPTZ,
   finished_at      TIMESTAMPTZ,
@@ -1002,6 +1154,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_minion_jobs_idempotency ON minion_jobs (i
 -- WP4/WP5 (v127, ENG-10): wedge-signal index — covers the queue-health count
 -- FILTERs and max(updated_at) reads in queryWedgeSignals (supervisor.ts).
 CREATE INDEX IF NOT EXISTS idx_minion_jobs_queue_status_updated ON minion_jobs (queue, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_minion_jobs_private_queue_recovery
+  ON minion_jobs (queue, private_queue_lease_until)
+  WHERE queue LIKE 'dream-inline-%'
+    AND status IN ('waiting','active','delayed','waiting-children','paused');
+CREATE INDEX IF NOT EXISTS idx_minion_jobs_private_queue_owner
+  ON minion_jobs (private_queue_owner_job_id)
+  WHERE private_queue_owner_job_id IS NOT NULL;
 
 -- Inbox table for sidechannel messaging
 CREATE TABLE IF NOT EXISTS minion_inbox (
@@ -1110,6 +1269,14 @@ CREATE INDEX IF NOT EXISTS idx_subagent_messages_provider ON subagent_messages (
 -- Two-phase tool execution ledger. Before tool call: INSERT status='pending'.
 -- After success: UPDATE to 'complete' + output. On failure: 'failed' + error.
 -- Replay re-runs 'pending' rows only if the tool is idempotent.
+--
+-- tool_use_id holds the RAW provider id and is deliberately NOT unique per
+-- job (#4155): replay-style providers (claude-cli spawns a fresh subprocess
+-- per turn from an id-stripped transcript) reuse the same short id on every
+-- turn. Row identity is (job_id, message_idx, ordinal); readers that resolve
+-- a tool_use block to its execution row must key by (message_idx, tool_use_id),
+-- never by tool_use_id alone. The former job-wide unique constraint
+-- uniq_subagent_tools_use_id was dropped in migration v131.
 CREATE TABLE IF NOT EXISTS subagent_tool_executions (
   id                  BIGSERIAL PRIMARY KEY,
   job_id              BIGINT      NOT NULL REFERENCES minion_jobs(id) ON DELETE CASCADE,
@@ -1132,7 +1299,6 @@ CREATE TABLE IF NOT EXISTS subagent_tool_executions (
   gbrain_tool_use_id  UUID,
   started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   ended_at            TIMESTAMPTZ,
-  CONSTRAINT uniq_subagent_tools_use_id UNIQUE (job_id, tool_use_id),
   CONSTRAINT subagent_tool_executions_stable_id UNIQUE (job_id, message_idx, ordinal),
   CONSTRAINT chk_subagent_tools_status CHECK (status IN ('pending','complete','failed'))
 );
@@ -1173,8 +1339,12 @@ CREATE TABLE IF NOT EXISTS dream_verdicts (
   entities         JSONB,
   model            TEXT,
   triage_version   INT,
+  -- #4069 (migration v138): 30-day verdict TTL. Reads treat expired rows as
+  -- misses; the synthesize phase sweeps them best-effort.
+  expires_at       TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '30 days'),
   PRIMARY KEY (file_path, content_hash)
 );
+CREATE INDEX IF NOT EXISTS dream_verdicts_expires_idx ON dream_verdicts (expires_at);
 
 -- ============================================================
 -- Cycle coordination lock — v0.17 runCycle primitive
@@ -1435,8 +1605,8 @@ CREATE INDEX IF NOT EXISTS take_nudge_log_proposal_cooldown_idx
 CREATE INDEX IF NOT EXISTS take_nudge_log_wave_idx
   ON take_nudge_log (wave_version, fired_at DESC);
 
--- think_ab_results (v0.36.1.0 T18 / D19): A/B harness data for
--- `gbrain think --ab`. One row per side-by-side comparison.
+-- think_ab_results (v0.36.1.0 T18 / D19): A/B harness data for the think
+-- A/B harness (runAbTrial). One row per side-by-side comparison.
 CREATE TABLE IF NOT EXISTS think_ab_results (
   id              BIGSERIAL PRIMARY KEY,
   source_id       TEXT         NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -1451,6 +1621,28 @@ CREATE TABLE IF NOT EXISTS think_ab_results (
 );
 CREATE INDEX IF NOT EXISTS think_ab_results_recent_idx
   ON think_ab_results (source_id, ran_at DESC);
+
+-- Reject pre-upgrade producers/claims; old reapers must still be stopped during cutover.
+
+CREATE OR REPLACE FUNCTION enforce_minion_queue_protocol() RETURNS trigger SET search_path = pg_catalog, public AS $protocol$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.submission_authority IS NULL OR NEW.claim_generation <> 0 THEN
+      RAISE EXCEPTION 'Minion queue protocol 1 required: upgrade every producer and worker before restart';
+    END IF;
+  ELSIF NEW.status = 'active' AND (OLD.status <> 'active' OR NEW.lock_token IS DISTINCT FROM OLD.lock_token) THEN
+    IF NEW.submission_authority IS NULL OR NEW.claim_generation IS DISTINCT FROM OLD.claim_generation + 1 THEN
+      RAISE EXCEPTION 'Minion queue protocol 1 required: old workers cannot claim upgraded queue jobs';
+    END IF;
+  ELSIF NEW.claim_generation IS DISTINCT FROM OLD.claim_generation THEN
+    RAISE EXCEPTION 'Minion queue claim generation may advance only with a claim';
+  END IF;
+  RETURN NEW;
+END;
+$protocol$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS minion_queue_protocol ON minion_jobs;
+CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON minion_jobs
+  FOR EACH ROW EXECUTE FUNCTION enforce_minion_queue_protocol();
 
 -- NOTIFY trigger for real-time job events (Postgres only, not PGLite)
 CREATE OR REPLACE FUNCTION notify_minion_job_change() RETURNS trigger SET search_path = pg_catalog, public AS $$

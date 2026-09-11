@@ -148,7 +148,8 @@ export function isValidHolder(holder: string): boolean {
   return HOLDER_REGEX.test(holder);
 }
 
-const KIND_VALUES: ReadonlySet<string> = new Set(['fact', 'take', 'bet', 'hunch']);
+/** Canonical take kind vocabulary — the fence enum AND the extractor's accepted kinds. */
+export const TAKE_KIND_VALUES: ReadonlySet<string> = new Set(['fact', 'take', 'bet', 'hunch']);
 const QUALITY_VALUES: ReadonlySet<string> = new Set(['correct', 'incorrect', 'partial', 'unresolvable']);
 
 // v0.30.0: header tokens that mark a v0.30-shape fence. Presence of `quality`
@@ -241,7 +242,21 @@ export function parseTakesFence(body: string): ParseResult {
   const endIdx   = body.indexOf(TAKES_FENCE_END, beginIdx + TAKES_FENCE_BEGIN.length);
   const warnings: string[] = [];
 
-  if (beginIdx === -1 && endIdx === -1) return { takes: [], warnings };
+  if (beginIdx === -1 && endIdx === -1) {
+    // #3769: the canonical markers use the THREE-dash comment form
+    // (`<!--- gbrain:takes:begin -->`). A body that mentions the marker text
+    // without the exact form — most commonly the standard two-dash
+    // `<!-- gbrain:takes:begin -->` an author or agent writes from memory —
+    // is a fence the author MEANT to write. Flag it instead of silently
+    // parsing zero takes.
+    if (body.includes('gbrain:takes:begin')) {
+      warnings.push(
+        'TAKES_FENCE_NEAR_MISS: found "gbrain:takes:begin" but not the exact ' +
+        `marker "${TAKES_FENCE_BEGIN}" — use the three-dash comment form`,
+      );
+    }
+    return { takes: [], warnings };
+  }
   if (beginIdx === -1 || endIdx === -1) {
     warnings.push('TAKES_FENCE_UNBALANCED: missing begin or end marker');
     return { takes: [], warnings };
@@ -308,7 +323,7 @@ export function parseTakesFence(body: string): ParseResult {
     seenRowNums.add(rowNum);
 
     const kind = kindRaw.trim().toLowerCase();
-    if (!KIND_VALUES.has(kind)) {
+    if (!TAKE_KIND_VALUES.has(kind)) {
       warnings.push(`TAKES_TABLE_MALFORMED: unknown kind "${kindRaw}" (expected fact|take|bet|hunch)`);
       continue;
     }
@@ -436,7 +451,11 @@ export function renderTakesFence(takes: ParsedTake[]): string {
     const by         = t.resolvedBy       ? safe(t.resolvedBy)              : '';
     return `${baseCells} ${resolved} | ${quality} | ${evidence} | ${value} | ${unit} | ${by} |`;
   });
-  const inner = ['', header, separator, ...rows, ''].join('\n');
+  // #4615: the leading double-'' emits a BLANK LINE between the begin marker
+  // and the header — GFM parsers (Obsidian 1.3.2+, GitHub, VS Code) need it
+  // to render the fence as a table (same fix as renderFactsTable). The
+  // parser skips blank lines, so this is round-trip safe.
+  const inner = ['', '', header, separator, ...rows, ''].join('\n');
   return `${TAKES_FENCE_BEGIN}${inner}${TAKES_FENCE_END}`;
 }
 

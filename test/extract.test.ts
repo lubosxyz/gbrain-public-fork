@@ -30,6 +30,19 @@ describe('extractMarkdownLinks', () => {
     const content = '[A](a.md) and [B](b.md)';
     expect(extractMarkdownLinks(content)).toHaveLength(2);
   });
+
+  it('percent-decodes targets from Obsidian useMarkdownLinks mode', () => {
+    const content = '[Alice](People/Alice%20Chen.md)';
+    const links = extractMarkdownLinks(content);
+    expect(links).toHaveLength(1);
+    expect(links[0].relTarget).toBe('People/Alice Chen.md');
+  });
+
+  it('keeps a malformed percent-escape raw instead of throwing', () => {
+    const content = '[Bad](People/Alice%ZZ.md)';
+    expect(() => extractMarkdownLinks(content)).not.toThrow();
+    expect(extractMarkdownLinks(content)[0].relTarget).toBe('People/Alice%ZZ.md');
+  });
 });
 
 describe('extractLinksFromFile', () => {
@@ -49,6 +62,20 @@ describe('extractLinksFromFile', () => {
     expect(links).toHaveLength(0);
   });
 
+  it('resolves a percent-encoded Obsidian markdown-link target to its slugified page', async () => {
+    const content = 'See [Alice](People/Alice%20Chen.md).';
+    const allSlugs = new Set(['deals/test', 'people/alice-chen']);
+    const links = await extractLinksFromFile(content, 'deals/test.md', allSlugs);
+    expect(links.length).toBeGreaterThanOrEqual(1);
+    expect(links[0].to_slug).toBe('people/alice-chen');
+  });
+
+  it('does not throw and produces no edge for a malformed percent-escape', async () => {
+    const content = 'See [Alice](People/Alice%ZZ.md).';
+    const allSlugs = new Set(['deals/test', 'people/alice-chen']);
+    await expect(extractLinksFromFile(content, 'deals/test.md', allSlugs)).resolves.toHaveLength(0);
+  });
+
   it('extracts frontmatter company links (v0.13, includeFrontmatter opt-in)', async () => {
     const content = '---\ncompany: acme-example\ntype: person\n---\nContent.';
     // v0.13 canonical: person page with company: X → person → company works_at (outgoing).
@@ -59,6 +86,32 @@ describe('extractLinksFromFile', () => {
     expect(companyLinks.length).toBeGreaterThanOrEqual(1);
     expect(companyLinks[0].from_slug).toBe('people/test');
     expect(companyLinks[0].to_slug).toBe('companies/acme-example');
+  });
+
+  it('frontmatter attendees: a stroke-letter name resolves to the unfolded page slug sync mints (#4855)', async () => {
+    // The FS resolver has no fuzzy fallback, so it must try the sync slug
+    // grammar (which keeps đ) as well as the folded basename form.
+    const content = '---\nattendees: [Đức Example]\ntype: meeting\n---\nNotes.';
+    const allSlugs = new Set(['meetings/sync', 'people/đuc-example']);
+    const links = await extractLinksFromFile(content, 'meetings/sync.md', allSlugs, { includeFrontmatter: true });
+    const attended = links.filter(l => l.link_type === 'attended');
+    expect(attended).toHaveLength(1);
+    expect(attended[0].from_slug).toBe('people/đuc-example');
+    expect(attended[0].to_slug).toBe('meetings/sync');
+  });
+
+  it('frontmatter attendees: a stroke-letter name also resolves to the FOLDED ASCII page slug (#4855)', async () => {
+    // The other half of the dual-form lookup: the basename index keys through
+    // normalizeBasename, which folds đ → d, so a people page minted with an
+    // ASCII slug resolves too. Without the fold the key stays `đuc-example`
+    // and the lookup misses in silence.
+    const content = '---\nattendees: [Đức Example]\ntype: meeting\n---\nNotes.';
+    const allSlugs = new Set(['meetings/sync', 'people/duc-example']);
+    const links = await extractLinksFromFile(content, 'meetings/sync.md', allSlugs, { includeFrontmatter: true });
+    const attended = links.filter(l => l.link_type === 'attended');
+    expect(attended).toHaveLength(1);
+    expect(attended[0].from_slug).toBe('people/duc-example');
+    expect(attended[0].to_slug).toBe('meetings/sync');
   });
 
   it('extracts frontmatter investors array (v0.13: incoming direction)', async () => {
@@ -162,19 +215,34 @@ describe('extractTimelineFromContent', () => {
   });
 
   it('does not split on hyphens inside markdown link targets', () => {
-    const content = `- **2025-03-18** | Referenced in [Alice](../people/alice-example.md)`;
+    const content = `- **2025-03-18** | Mentioned in [Alice](../people/alice-example.md)`;
     const entries = extractTimelineFromContent(content, 'companies/acme-example');
     expect(entries).toHaveLength(1);
     expect(entries[0].source).toBe('markdown');
-    expect(entries[0].summary).toBe('Referenced in [Alice](../people/alice-example.md)');
+    expect(entries[0].summary).toBe('Mentioned in [Alice](../people/alice-example.md)');
   });
 
   it('does not split on spaced dashes inside link labels', () => {
-    const content = `- **2025-03-18** | Referenced in [Deals — Q1 Review](../deals/q1-review.md)`;
+    const content = `- **2025-03-18** | Mentioned in [Deals — Q1 Review](../deals/q1-review.md)`;
     const entries = extractTimelineFromContent(content, 'companies/acme-example');
     expect(entries).toHaveLength(1);
     expect(entries[0].source).toBe('markdown');
-    expect(entries[0].summary).toBe('Referenced in [Deals — Q1 Review](../deals/q1-review.md)');
+    expect(entries[0].summary).toBe('Mentioned in [Deals — Q1 Review](../deals/q1-review.md)');
+  });
+
+  it('skips generated backlink receipts because their dates are not entity events (#4277)', () => {
+    const content = `- **2025-03-18** | Referenced in [Alice](../people/alice-example.md)`;
+    expect(extractTimelineFromContent(content, 'companies/acme-example')).toHaveLength(0);
+  });
+
+  it('keeps a Source — Summary bullet whose summary merely mentions Referenced in', () => {
+    // The receipt guard fires only when the bullet's rest STARTS with the
+    // generated marker — a write-through rendered bullet (`source — summary`)
+    // must keep round-tripping even when its summary carries the phrase.
+    const content = `- **2025-03-18** | inbox — Referenced in [Alice](../people/alice-example.md) — follow up`;
+    const entries = extractTimelineFromContent(content, 'companies/acme-example');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].source).toBe('inbox');
   });
 
   it('splits on the first spaced dash outside links', () => {
@@ -210,6 +278,17 @@ describe('extractTimelineFromContent', () => {
     expect(entries[0].source).toBe('email from alice-example re: offer, signed');
   });
 
+  it('uses the full paragraph for a wrapped inline citation summary', () => {
+    const content = `The imported app showed product fit for commercial use
+after the prototype demo. [Source: user interview, 2026-07-30]`;
+    const entries = extractTimelineFromContent(content, 'projects/imported-app');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].date).toBe('2026-07-30');
+    expect(entries[0].summary).toBe(
+      'The imported app showed product fit for commercial use after the prototype demo.',
+    );
+  });
+
   it('extracts one entry per citation when a line carries several', () => {
     const content = `Both sides confirmed the partnership. [Source: call with widget-co, 2025-06-01] [Source: follow-up email, 2025-06-03]`;
     const entries = extractTimelineFromContent(content, 'companies/widget-co');
@@ -224,6 +303,31 @@ describe('extractTimelineFromContent', () => {
     const entries = extractTimelineFromContent(content, 'test');
     expect(entries).toHaveLength(1); // Format 1 only
     expect(entries[0].source).toBe('Meeting');
+  });
+
+  it('keeps a prose citation directly under a timeline bullet', () => {
+    const content = `- **2025-03-18** | Meeting notes
+Follow-up decision recorded. [Source: memo, 2025-03-20]`;
+    const entries = extractTimelineFromContent(content, 'test');
+    expect(entries).toHaveLength(2);
+    expect(entries[0].date).toBe('2025-03-18');
+    expect(entries[0].source).toBe('markdown');
+    expect(entries[0].summary).toBe('Meeting notes');
+    expect(entries[1].date).toBe('2025-03-20');
+    expect(entries[1].source).toBe('memo');
+    expect(entries[1].summary).toBe('Follow-up decision recorded.');
+  });
+
+  it('ignores dated citations inside fenced code blocks', () => {
+    const content = `\`\`\`
+Fake claim. [Source: generated fixture, 2025-01-01]
+\`\`\`
+Real claim. [Source: memo, 2025-01-02]`;
+    const entries = extractTimelineFromContent(content, 'test');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].date).toBe('2025-01-02');
+    expect(entries[0].source).toBe('memo');
+    expect(entries[0].summary).toBe('Real claim.');
   });
 
   it('skips a bare citation with no surrounding text', () => {

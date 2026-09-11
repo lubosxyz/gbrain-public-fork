@@ -1,6 +1,6 @@
 # Embedding providers
 
-GBrain ships with 16 embedding-provider recipes covering Voyage (the default), OpenAI, OpenRouter (single key, many hosted models), the major hosted alternatives, three local options, a universal escape hatch (LiteLLM proxy), and the deprecated ZeroEntropy recipe (hosted API shuts down 2026-09-04). Run `gbrain providers list` to see the live registry; `gbrain providers explain --json` emits a machine-readable matrix for agents.
+GBrain ships with 17 embedding-provider recipes covering Voyage (the default), OpenAI, OpenRouter (single key, many hosted models), the major hosted alternatives, four local options, a universal escape hatch (LiteLLM proxy), and the deprecated ZeroEntropy recipe (hosted API shuts down 2026-09-04). Run `gbrain providers list` to see the live registry; `gbrain providers explain --json` emits a machine-readable matrix for agents.
 
 This page is the human-readable counterpart: capability per provider, env-var setup, dimensions, cost, and known constraints.
 
@@ -15,7 +15,7 @@ gbrain init --pglite --model voyage            # use a non-default provider
 
 ## Init resolves your provider from your keys
 
-`gbrain init --pglite` auto-detects which provider to use from your provider keys — env vars or the file plane (`~/.gbrain/config.json` fields like `voyage_api_key`; env wins when both are set). With `VOYAGE_API_KEY` set, you get Voyage (`voyage:voyage-4` @ 1024d). With `OPENAI_API_KEY` set, you get OpenAI. Whenever a Voyage key is present — even if a different embedding provider is picked — init also writes `search.reranker.model voyage:rerank-2.5` as explicit config (one key covers both); keyed installs without a Voyage key get `search.reranker.enabled false` written instead. If multiple provider keys are set, init fires an interactive picker (non-TTY auto-picks the Voyage default when its key is present). ZeroEntropy is deprecated and excluded from both auto-pick and the picker — explicit `--embedding-model zeroentropyai:*` still works, with a loud warning. With no provider keys at all, init continues keyless (keyword-only search) with a loud notice; recover later with `gbrain init --force --embedding-model voyage:voyage-4`. Explicit flags (`--embedding-model`, `--no-embedding`) always win over key detection.
+`gbrain init --pglite` auto-detects which provider to use from your provider keys — env vars or the file plane (`~/.gbrain/config.json` fields like `voyage_api_key`; env wins when both are set). With `VOYAGE_API_KEY` set, you get Voyage (`voyage:voyage-4` @ 1024d). With `OPENAI_API_KEY` set, you get OpenAI. Whenever a Voyage key is present — even if a different embedding provider is picked — the mode-bundle reranker default (`voyage:rerank-2.5`) is already ready, so init writes no reranker row at all (one key covers both; it just prints `Reranker: voyage:rerank-2.5 (mode-bundle default)`); keyed installs without a Voyage key get `search.reranker.enabled false` written instead. If multiple provider keys are set, init fires an interactive picker (non-TTY auto-picks the Voyage default when its key is present). ZeroEntropy is deprecated and excluded from both auto-pick and the picker — explicit `--embedding-model zeroentropyai:*` still works, with a loud warning. With no provider keys at all, init continues keyless (keyword-only search) with a loud notice; recover later with `gbrain init --force --embedding-model voyage:voyage-4`. Explicit flags (`--embedding-model`, `--no-embedding`) always win over key detection.
 
 The resolved provider + dimensions get persisted to `~/.gbrain/config.json` atomically, so subsequent runs are deterministic across releases.
 
@@ -25,7 +25,7 @@ The resolved provider + dimensions get persisted to `~/.gbrain/config.json` atom
 |---|---|---|---|---|---|
 | `voyage` (**default** — `voyage-4` @ 1024d; `rerank-2.5` reranker on the same key) | `VOYAGE_API_KEY` | 1024 | 0.06 (`voyage-4`) | no | yes (`voyage-multimodal-3`) |
 | `openai` | `OPENAI_API_KEY` | 1536 | 0.13 | no | no |
-| `openrouter` | `OPENROUTER_API_KEY` | 1536 | 0.02 | no | model-dependent |
+| `openrouter` | `OPENROUTER_API_KEY` | per-model (1536 for the default `openai/text-embedding-3-small`; unlisted ids require explicit dims) | 0.02 | no | model-dependent |
 | `zeroentropyai` — **DEPRECATED** (hosted API **shuts down 2026-09-04**; replacement `voyage:voyage-4` — see note below) | `ZEROENTROPY_API_KEY` | 2560 (Matryoshka to 1280/640/320/...) | 0.05 | no | no |
 | `google` | `GOOGLE_GENERATIVE_AI_API_KEY` | 768 | 0.025 | no | no |
 | `azure-openai` | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT` | 1536 | 0.13 | no | no |
@@ -34,19 +34,20 @@ The resolved provider + dimensions get persisted to `~/.gbrain/config.json` atom
 | `zhipu` | `ZHIPUAI_API_KEY` | 1024 | varies | no | no |
 | `ollama` | (none — runs locally) | 768 | 0 | yes | no |
 | `llama-server` | (none — runs locally) | user-set | 0 | yes | no |
+| `lmstudio` | (none — runs locally) | user-set | 0 | yes | no |
 | `litellm` | `LITELLM_API_KEY` (optional) | user-set | varies | yes (proxy) | yes (backend permitting) |
 | `together` | `TOGETHER_API_KEY` | 768 | varies | no | no |
 | `anthropic` | (no embedding model — chat only) | — | — | — | — |
 | `deepseek` | (no embedding model — chat only) | — | — | — | — |
 | `groq` | (no embedding model — chat only) | — | — | — | — |
 
-**Note on local providers.** Ollama and llama-server have no required API key, so they don't show up in env-detection auto-pick. Pick them explicitly with `--embedding-model ollama:<model>` to avoid silently routing to a daemon that may not be running.
+**Note on local providers.** Ollama, llama-server and LM Studio have no required API key, so they don't show up in env-detection auto-pick. Pick them explicitly with `--embedding-model ollama:<model>` to avoid silently routing to a daemon that may not be running. Ollama can also run local chat/expansion models; set those routes explicitly with `gbrain config set models.chat ollama:<model>` and related per-task model keys.
 
 **Note on the ZeroEntropy hosted API.** ZeroEntropy announced (2026-07-24) that its hosted endpoints shut down on **2026-09-04**, and the recipe is deprecated: init auto-pick and the interactive picker exclude it (explicit `--embedding-model zeroentropyai:*` still works, with a loud warning), every ZE embed/rerank call prints a once-per-process deprecation warning, and `gbrain providers` annotates it DEPRECATED (`providers env zeroentropyai` prints the deprecation notice + migration command instead of the signup funnel, `providers explain` leads the row with ⚠ regardless of key readiness, and `gbrain doctor`'s ZE missing-key hint is migration-first). A brain still embedding through the hosted API loses semantic retrieval entirely on that date — query embedding uses the same endpoint, so existing vectors become unqueryable, not just new content. The off-ramp: `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024 --dry-run` (cost preview), then `--yes`. 1280 is not a valid Voyage width (valid: 256/512/1024/2048), so a 1280d brain gets a one-time schema/HNSW rebuild to 1024; the OpenAI alternative keeps the width (flexible dims): `--to openai:text-embedding-3-small --dim 1280`. See [the migration guide](../guides/embedding-migration.md). Self-hosting the Apache-2.0 zembed-1 weights keeps every existing vector with zero re-embed, but the endpoint must speak ZeroEntropy's wire dialect — a generic OpenAI-compatible llama-server/Ollama will NOT work without a compat proxy (details in [`docs/ai-providers/zeroentropy.md`](../ai-providers/zeroentropy.md)). `gbrain doctor` (check `provider_sunset`) flags affected brains — including ZE-backed custom embedding columns — and prints target-aware paste-ready commands (Voyage at 1024; OpenAI keep-width when the brain's actual width is valid there); accepted the risk? `gbrain config set doctor.suppress_provider_sunset true` silences it.
 
 ## If first import fails
 
-If `gbrain import` fails with `expected N dimensions, not M`, run `gbrain doctor`. The output will print the exact `gbrain config set ...` or `gbrain migrate embeddings` command to repair the mismatch. **You should not need to delete `~/.gbrain`.** The bug-class that historically forced `rm -rf` recoveries is closed as of v0.37.
+If `gbrain import` fails with `expected N dimensions, not M`, run `gbrain doctor`. The output will print the exact `gbrain config set ...` or `gbrain migrate embeddings` command to repair the mismatch. **You should not need to delete `~/.gbrain`.**
 
 The doctor distinguishes two repair paths:
 
@@ -67,13 +68,13 @@ The doctor distinguishes two repair paths:
 
 - **Cost-sensitive, English-only**: Ollama (free, local) or Voyage (paid, best quality per dollar).
 - **Quality-first**: Voyage `voyage-4-large` (1024-2048 dims, ~3-4× more dense tokens than OpenAI tiktoken).
-- **Code-heavy brain (gstack per-worktree, source repos)**: Voyage `voyage-code-3` (1024 default; supports 256/512/1024/2048), or the newer `voyage-code-4` (hosted, flexible dims, $0.12/M). Tuned on programming languages. Voyage publishes head-to-head numbers showing it outperforms their general flagships on code retrieval ([voyageai.com/blog](https://voyageai.com/blog)). For gstack's per-worktree pglite-backed code brain, this is the right default — see Topology 3 in `docs/architecture/topologies.md`.
-- **Reranking pair**: Voyage `rerank-2.5` ($0.05/M; `rerank-2.5-lite` at $0.02/M for cost-sensitive setups) is the new-install default and rides the same `VOYAGE_API_KEY` as embeddings. ZeroEntropy `zerank-2` remains the fallback only for brains that never set `search.reranker.model` — deprecated, hosted API ends 2026-09-04 (see [`docs/ai-providers/zeroentropy.md`](../ai-providers/zeroentropy.md)).
-- **Local reranking (no API spend)**: `llama-server-reranker` recipe (v0.40.6.1) — point gbrain at your own `llama-server --reranking` instance running Qwen3-Reranker or self-hosted ZeroEntropy weights. Same `gateway.rerank()` seam, $0 per call. Walkthrough in [`docs/ai-providers/llama-server-reranker.md`](../ai-providers/llama-server-reranker.md).
+- **Code-heavy brain (gstack per-worktree, source repos)**: Voyage `voyage-code-3` (1024 default; supports 256/512/1024/2048), or `voyage-code-4` (hosted, flexible dims, $0.12/M). Tuned on programming languages. Voyage publishes head-to-head numbers showing it outperforms their general flagships on code retrieval ([voyageai.com/blog](https://voyageai.com/blog)). For gstack's per-worktree pglite-backed code brain, this is the right default — see Topology 3 in `docs/architecture/topologies.md`.
+- **Reranking pair**: Voyage `rerank-2.5` ($0.05/M; `rerank-2.5-lite` at $0.02/M for cost-sensitive setups) is the mode-bundle default and rides the same `VOYAGE_API_KEY` as embeddings. Voyage's preview `rerank-3` / `rerank-3-lite` pair is also allowlisted — opt in with `gbrain config set search.reranker.model voyage:rerank-3` (the default stays on `rerank-2.5` so upgrades never move you); without the key search fails open in fusion order and `gbrain search modes` says so. ZeroEntropy `zerank-2` is deprecated (hosted API ends 2026-09-04); an explicitly configured `zeroentropyai:zerank-*` short-circuits past that date (see [`docs/ai-providers/zeroentropy.md`](../ai-providers/zeroentropy.md)).
+- **Local reranking (no API spend)**: `llama-server-reranker` recipe — point gbrain at your own `llama-server --reranking` instance running Qwen3-Reranker or self-hosted ZeroEntropy weights. Same `gateway.rerank()` seam, $0 per call. Walkthrough in [`docs/ai-providers/llama-server-reranker.md`](../ai-providers/llama-server-reranker.md).
 - **One key for many hosted models**: OpenRouter. Set `OPENROUTER_API_KEY` and use `openrouter:<provider>/<model>` for chat against GPT-5.2, Claude 4.x, Gemini 3, DeepSeek, and dozens more without juggling per-provider keys. Embedding catalog includes OpenAI, Google, Qwen, BGE-M3.
 - **Enterprise compliance**: Azure OpenAI (data residency + private endpoints) or self-hosted via llama-server / Ollama.
 - **China region**: DashScope (Alibaba) or Zhipu (BigModel). DashScope's international endpoint at `dashscope-intl.aliyuncs.com`; override `provider_base_urls.dashscope` for the China endpoint.
-- **OSS local, full control**: llama-server (`llama.cpp`) for any GGUF model; Ollama for the curated catalog.
+- **OSS local, full control**: llama-server (`llama.cpp`) for any GGUF model; Ollama for the curated catalog; LM Studio when you'd rather load the model from a GUI than a command line.
 - **Anything else**: LiteLLM proxy. Run LiteLLM in front of any provider (Bedrock, Vertex, Cohere, Jina, Fireworks, etc.) and point gbrain at it via `LITELLM_BASE_URL`.
 
 ## Per-provider details
@@ -82,7 +83,7 @@ The doctor distinguishes two repair paths:
 
 The main alternative to the Voyage default (its flexible-dim `text-embedding-3` models can keep an existing column width during a provider migration). Set `OPENAI_API_KEY`. Models: `text-embedding-3-large` (3072 max, 1536 default), `text-embedding-3-small` (1536). Matryoshka via the `dimensions` field — gbrain pins it from `embedding_dimensions` config so existing 1536-dim brains stay aligned across SDK upgrades.
 
-Optional `OPENAI_BASE_URL` — point the native OpenAI provider at an OpenAI-compatible gateway. A bare host is normalized to carry the `/v1` suffix automatically (so `https://gw.example.com` and `https://gw.example.com/v1` both work); when unset, the SDK's default endpoint is untouched. `ANTHROPIC_BASE_URL` gets the same normalization for Anthropic chat/expansion calls.
+Optional `OPENAI_BASE_URL` — point the native OpenAI provider at an OpenAI-compatible gateway. A bare host is normalized to carry the `/v1` suffix automatically (so `https://gw.example.com` and `https://gw.example.com/v1` both work); when unset, the SDK's default endpoint is untouched. With `OPENAI_BASE_URL` set, embedding does not require `OPENAI_API_KEY` — the override targets local OpenAI-compatible servers (LM Studio, vLLM) that ignore auth, so gbrain sends a placeholder key instead of refusing. `ANTHROPIC_BASE_URL` gets the same normalization for Anthropic chat/expansion calls.
 
 ### Voyage AI
 
@@ -90,7 +91,16 @@ Optional `OPENAI_BASE_URL` — point the native OpenAI provider at an OpenAI-com
 
 Voyage 4 family shares an embedding space across all variants, so you can index with `voyage-4` and later point the query model at `voyage-4-large` or `voyage-4-lite` without reindexing. Dims: 256, 512, 1024, 2048. **2048 exceeds pgvector's HNSW cap of 2000** — those brains fall back to exact vector scans (still correct, just slower).
 
-Voyage also serves the hosted rerankers `rerank-2.5` ($0.05/M) and `rerank-2.5-lite` ($0.02/M) at `POST /v1/rerank` (prices verified 2026-08-15) — the new-install reranker default, configured via `gbrain config set search.reranker.model voyage:rerank-2.5`.
+Voyage also serves four hosted rerankers at `POST /v1/rerank` — `rerank-2.5` ($0.05/M) and `rerank-2.5-lite` ($0.02/M), plus the preview `rerank-3` ($0.05/M) and `rerank-3-lite` ($0.02/M) (2.5 pair verified 2026-08-15, rerank-3 pair 2026-09-06). All four share one request/response wire, so switching is a config change and nothing else.
+
+`rerank-2.5` is the mode-bundle reranker default, so no config row is needed for it (an explicit `search.reranker.model` equal to it is exactly what `gbrain doctor`'s `search_mode` check calls redundant). Moving to the preview generation is one command:
+
+```bash
+gbrain config set search.reranker.model voyage:rerank-3
+gbrain models doctor          # green `reranker_config voyage:rerank-3` is the whole test
+```
+
+**Say to your agent:** *"switch my reranker to voyage rerank-3"* — *"check my model config"* (your agent runs `gbrain config set search.reranker.model voyage:rerank-3` then `gbrain models doctor`).
 
 **For brains that index source code** (gstack's per-worktree pglite-backed code brain — see Topology 3 in `docs/architecture/topologies.md`), prefer `voyage-code-3` over `voyage-4-large`. Voyage tunes it on programming languages and publishes head-to-head numbers vs their general flagships on code retrieval. Configure at install time:
 
@@ -104,15 +114,15 @@ To switch an existing brain, run `gbrain migrate embeddings --to voyage:voyage-c
 
 ### Google Gemini
 
-Set `GOOGLE_GENERATIVE_AI_API_KEY` (the AI Studio public API key). Model: `gemini-embedding-001`. Default 768 dims; Matryoshka up to 3072. Cheap.
+Set `GOOGLE_GENERATIVE_AI_API_KEY` (the AI Studio public API key). Models: `gemini-embedding-2` (current, GA 2026-04-22) and `gemini-embedding-001`. Default 768 dims; Matryoshka up to 3072 (`--embedding-dimensions 1536` / `3072`). Cheap. The two models' vector spaces are not interchangeable — to move an existing brain from `-001` to `-2`, use `gbrain migrate embeddings --to google:gemini-embedding-2 --dim <N>`, not `config set`.
 
-For GCP service-account / Vertex AI auth (production deployments), see the v0.32.x follow-up — Vertex ADC is on the roadmap.
+GCP service-account / Vertex AI auth (Vertex ADC) is not supported; only the AI Studio API key path is wired.
 
 ### OpenRouter
 
 Single OpenAI-compatible API for fan-out to OpenAI, Anthropic, Google, DeepSeek, Meta Llama, Qwen, and dozens of other hosted providers. One key, many models. Set `OPENROUTER_API_KEY` or `openrouter_api_key` in `~/.gbrain/config.json`, then use `openrouter:<provider>/<model>` (e.g. `openrouter:openai/gpt-5.2`, `openrouter:anthropic/claude-sonnet-4.6`).
 
-**Embedding**: `openai/text-embedding-3-small` (1536d default, Matryoshka shrink to 512/768/1024). OR's embedding catalog also includes `text-embedding-3-large`, `google/gemini-embedding-2-preview`, `qwen/qwen3-embedding-8b`, `bge-m3` — opt in via `--embedding-model openrouter:<id>`. Pricing matches the upstream provider (OR adds a small markup).
+**Embedding**: `openai/text-embedding-3-small` (1536d default, Matryoshka shrink to 512/768/1024). The recipe carries verified per-model native dims for its catalog — `openai/text-embedding-3-large` (3072), `qwen/qwen3-embedding-8b` (4096), `bge-m3` (1024) — so opting in via `--embedding-model openrouter:<id>` plans the right column width automatically. Any id NOT in that list (including `google/gemini-embedding-2-preview`, whose width is unverified) has no silent default: you must pass explicit dimensions (`--embedding-dimensions <N>` or `embedding_dimensions` config) or the command errors with the fix. Pricing matches the upstream provider (OR adds a small markup).
 
 **Chat**: every chat model OR proxies works through `/v1/chat/completions`. The recipe lists 8 curated entry points (GPT-5.2 family, Claude 4.5/4.6/4.7, Gemini 3 Flash Preview, DeepSeek); any other OR catalog ID also works. Tool-calling envelope is supported by the OR endpoint, but per-model capability varies — check https://openrouter.ai/models before counting on tools for a specific slug.
 
@@ -134,7 +144,7 @@ Models: `text-embedding-3-large`, `text-embedding-3-small`, `text-embedding-ada-
 
 Set `MINIMAX_API_KEY`. Optional `MINIMAX_GROUP_ID` for org-scoped accounts. Model: `embo-01` (1536 dims).
 
-MiniMax's API takes a `type: 'db' | 'query'` field for asymmetric retrieval. v0.32 routes everything as `type='db'` (symmetric retrieval — same vector space for indexing and queries). Asymmetric query support is a v0.32.x follow-up.
+MiniMax's API takes a `type: 'db' | 'query'` field for asymmetric retrieval. gbrain sends everything as `type='db'` (symmetric retrieval, same vector space for indexing and queries); asymmetric query encoding is not implemented for this recipe.
 
 ### DashScope (Alibaba)
 
@@ -144,21 +154,57 @@ CJK-dominant content tokenizes denser than OpenAI tiktoken; gbrain declares `cha
 
 ### Zhipu AI (BigModel)
 
-Set `ZHIPUAI_API_KEY`. Models: `embedding-3` (current; Matryoshka 256-2048 dims), `embedding-2`. v0.32 default is 1024 (HNSW-compatible). The 2048-dim option works but falls into the exact-scan branch (see Voyage 4 Large note above).
+Set `ZHIPUAI_API_KEY`. Models: `embedding-3` (current; Matryoshka 256-2048 dims), `embedding-2`. The default is 1024 (HNSW-compatible). The 2048-dim option works but falls into the exact-scan branch (see Voyage 4 Large note above).
 
 ### Ollama (local)
 
 No env required — Ollama runs unauthenticated locally. Optional `OLLAMA_BASE_URL` (default `http://localhost:11434/v1`) and `OLLAMA_API_KEY` (for auth-enabled deployments).
 
-Recipe ships with `nomic-embed-text` (768d, recommended), `mxbai-embed-large` (1024d), `all-minilm` (384d), plus the larger modern embedders `qwen3-embed-8b` (4096d) and `snowflake-arctic-embed-l-v2` (1024d). `gbrain providers test --model ollama:nomic-embed-text` smoke-tests the local install.
+Recipe ships with `nomic-embed-text` (768d, recommended), `mxbai-embed-large` (1024d), `all-minilm` (384d), plus the larger modern embedders `qwen3-embedding:8b` (4096d) and `snowflake-arctic-embed2` (1024d) — those are the pullable Ollama library tags. The spellings `qwen3-embed-8b` / `snowflake-arctic-embed-l-v2` are not pullable tags but are still accepted so brains initialized with them keep validating. `gbrain providers test --model ollama:nomic-embed-text` smoke-tests the local install.
 
 The recipe default is `nomic-embed-text`'s 768 dims. If you run one of the larger models, declare its native dimension with `--embedding-dimensions <N>` at init — gbrain trusts the value you declare for local recipes instead of rejecting a non-768 width.
+
+Ollama also exposes an OpenAI-compatible `/v1/chat/completions` endpoint, so gbrain can use local chat models for query expansion, `think`, facts extraction, and dream synthesis. A minimal local setup:
+
+```bash
+ollama pull nomic-embed-text
+ollama pull qwen2.5-coder:14b
+
+gbrain init --pglite --embedding-model ollama:nomic-embed-text --embedding-dimensions 768
+gbrain config set models.chat ollama:qwen2.5-coder:14b
+gbrain config set models.expansion ollama:qwen2.5-coder:14b
+gbrain config set models.think ollama:qwen2.5-coder:14b
+gbrain config set models.dream.synthesize ollama:qwen2.5-coder:14b
+gbrain config set models.dream.synthesize_verdict ollama:qwen2.5-coder:14b
+gbrain config set models.dream.patterns ollama:qwen2.5-coder:14b
+gbrain config set facts.extraction_model ollama:qwen2.5-coder:14b
+```
+
+The recipe marks Ollama chat as **not** tool-capable. That is enough for local reasoning flows, but not for gbrain's subagent/tool loop; keep `models.tier.subagent` on a provider with tool calling when you need that path.
 
 ### llama-server (local, llama.cpp)
 
 `llama.cpp`'s `llama-server --embeddings` endpoint. No env required. Optional `LLAMA_SERVER_BASE_URL` (default `http://localhost:8080/v1`) and `LLAMA_SERVER_API_KEY`.
 
 User-driven models: launch llama-server with `--model <gguf-path> --embeddings`, then run `gbrain init --embedding-model llama-server:<your-id> --embedding-dimensions <N>`. gbrain trusts the dimension you declare (you know the GGUF you launched); the recipe refuses the implicit shorthand `--model llama-server` because there's no canonical first model.
+
+### LM Studio (local)
+
+LM Studio's OpenAI-compatible local server, on default port 1234 (distinct from Ollama's 11434 and llama-server's 8080). No env required — the local server ignores auth. Optional `LMSTUDIO_BASE_URL` (default `http://localhost:1234/v1`) and `LMSTUDIO_API_KEY`.
+
+User-driven models, like llama-server: load an embedding model in the app and start the local server, then declare both the model id and its native width. The recipe ships no catalog and no default dimension, so `--embedding-dimensions <N>` is required — and trusted as declared, because only you know which model you loaded.
+
+```bash
+gbrain init --pglite --embedding-model lmstudio:<id-from-the-app> --embedding-dimensions <N>
+```
+
+The app's own `/v1/models` listing is the source for `<id-from-the-app>`, and `gbrain doctor` is the check afterwards. Note that `gbrain providers test` takes its probe width from the recipe's default dimension, so — as with llama-server and the LiteLLM proxy — it reports "not configured or not ready" here rather than smoke-testing the server.
+
+**Say to your agent:** *"Set up gbrain with LM Studio as my embedding provider"* — *"Initialize brain against my local LM Studio server"* — *"Is my brain set up right?"* Tell it the model id you loaded and the width that model emits; it runs the init above and reports what it picked.
+
+**Two ways to reach LM Studio.** The native `openai:` provider with `OPENAI_BASE_URL` set also reaches it, keylessly (see the OpenAI section above) — the shortest path when you are already configured for OpenAI and only want the embeddings served locally. Prefer the `lmstudio:` recipe when you want LM Studio as its own provider: `OPENAI_BASE_URL` redirects the whole native-OpenAI path (embedding, chat and expansion), while `lmstudio:` carries its own `LMSTUDIO_BASE_URL` and leaves `openai:` pointed at OpenAI. The recipe also prices local embedding at $0, so a `--max-cost`-bounded `gbrain embed` / `gbrain reindex` budgets it like Ollama and llama-server instead of refusing a model it cannot price.
+
+**If search stops returning semantic hits, reload the model.** A loaded LM Studio instance can drift into a state where embedding latency rises by orders of magnitude while the endpoint still answers — so it passes the reachability probe but misses the query-embed deadline (`GBRAIN_QUERY_EMBED_TIMEOUT_MS`, default 6s) on every query. The query still returns, keyword-only, stamped `embed_timeout` in the response's `degraded[]` with a once-per-process warning on stderr; recall drops until you reload the model in the app. Raise the timeout on slower hardware.
 
 ### LiteLLM proxy (universal escape hatch)
 
@@ -177,6 +223,15 @@ Three numbers matter:
 
 For most users: **stay at 1024 or 1536**. Bigger isn't better below the noise floor; smaller saves disk + RAM with marginal recall loss on Matryoshka providers.
 
+## Bulk-embed failure knobs
+
+Two env vars tune how bulk embeds (`gbrain embed --stale` and the autopilot/minion cycles that ride the same stale path) behave under sustained failures. Both matter most against local serial servers (Ollama at `-np 1`, llama-server), where re-sending doomed requests compounds into congestion collapse:
+
+| Env var | Default | What it does |
+|---|---|---|
+| `GBRAIN_EMBED_QUARANTINE_AFTER` | 3 | Consecutive zero-progress attempts (no chunk embedded) before a page is quarantined for the rest of the process. An attempt that embeds ANY chunk resets the page's counter — partial progress shrinks the stale set, so the next pass sends a smaller request, not the identical doomed one. Quarantine is keyed per page (`source_id::slug`) and announced once on stderr; later passes skip quarantined pages with a count. Process-lifetime by design: restarting retries deliberately, and `frontmatter.embed_skip` is the permanent block. Non-numeric or non-positive values fall back to 3. |
+| `GBRAIN_EMBED_MAX_BATCH_TOKENS` | (unset) | Token cap per embedding request for recipes that ship without one — ollama, llama-server, lmstudio, and litellm declare `no_batch_cap` because real capacity depends on the operator's server. When set, chunk texts are pre-split into sub-batches within `cap × safety_factor` (default 0.8) tokens, estimated via the recipe's `chars_per_token` (default 4). A recipe-declared cap always wins; invalid values are ignored. Read once from the environment at process start, never at call time. Without it, `no_batch_cap` recipes still get a conservative 16-item sub-batch cap so the per-call embed timeout bounds a fixed amount of work. |
+
 ## My provider isn't listed
 
 Four options:
@@ -188,7 +243,7 @@ Four options:
 
 ## Switching providers on an existing brain
 
-Embedding dimensions are baked into the schema at `gbrain init` time. As of v0.37.11.0, `gbrain config set embedding_model` and `gbrain config set embedding_dimensions` are refused — the schema column has to resize alongside the config, and `config set` only touches the config row.
+Embedding dimensions are baked into the schema at `gbrain init` time. `gbrain config set embedding_model` and `gbrain config set embedding_dimensions` are refused — the schema column has to resize alongside the config, and `config set` only touches the config row.
 
 The supported paths:
 

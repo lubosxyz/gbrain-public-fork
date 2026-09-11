@@ -20,6 +20,8 @@
  *   - P1-5: archive recheck happens in the handler (jobs.ts:1146), not
  *     here, so a source archived between fan-out and worker claim still
  *     skips cleanly.
+ *   - Missing checkout paths are skipped at dispatch time; sources.local_path
+ *     is machine-specific shared state and can legitimately point elsewhere.
  *
  * Phase-scope caveat (codex r1 P0-1): per-source cycle LOCKS let two cycles
  * RUN concurrently, but several phases (embed, orphans, purge,
@@ -30,10 +32,11 @@
  * row layer; cost duplication is the visible tradeoff).
  */
 
+import { existsSync } from 'fs';
 import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
-import { NON_GLOBAL_PHASES, GLOBAL_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
-import { sourceConfigHasRemoteUrl } from '../core/sources-load.ts';
+import { SOURCE_FRESHNESS_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
+import { sourceConfigHasRemoteUrl, sourceLocalPathSkipWarning } from '../core/sources-load.ts';
 import { AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES } from './autopilot-remediation-policy.ts';
 
 // #2194 fix #2: failure cooldown. A source whose autopilot-cycle keeps
@@ -66,6 +69,8 @@ export interface FanoutOpts {
   emit?: (line: string) => void;
   /** Sink for non-JSON human log lines; defaults to console.log. */
   log?: (line: string) => void;
+  /** Test seam for source checkout availability. */
+  pathExists?: (path: string) => boolean;
 }
 
 export interface FanoutResult {
@@ -82,11 +87,15 @@ export interface FanoutResult {
   skipped_cap: string[];
   /** Source ids skipped because they're in failure cooldown (#2194 fix #2). */
   skipped_cooldown: string[];
+  /** Source ids skipped because local_path is unavailable from this machine. */
+  skipped_unavailable_path: string[];
   /** True when this tick fell back to the legacy single-job path
    *  (no sources rows / engine empty). */
   legacy_fallback: boolean;
   /** True when every enumerated source is inside the freshness window. */
   all_sources_fresh: boolean;
+  /** True when every enumerated source is either fresh or skipped locally. */
+  all_sources_handled: boolean;
 }
 
 /**
@@ -341,11 +350,26 @@ export function selectSourcesForDispatch(
   floorMin = AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES,
   recentFailures: Map<string, SourceFailure> = new Map(),
   cooldownOpts: CooldownOpts = { baseMin: FAILURE_COOLDOWN_BASE_MIN, capMin: FAILURE_COOLDOWN_CAP_MIN },
-): { dispatch: SourceRow[]; skippedFresh: SourceRow[]; skippedCap: SourceRow[]; skippedCooldown: SourceRow[] } {
+  pathExists: (path: string) => boolean = () => true,
+): {
+  dispatch: SourceRow[];
+  skippedFresh: SourceRow[];
+  skippedCap: SourceRow[];
+  skippedCooldown: SourceRow[];
+  /** Each row carries the warning that excluded it, so the caller logs it
+   *  directly instead of recomputing (a second existsSync per row). */
+  skippedUnavailablePath: Array<SourceRow & { skip_warning: string }>;
+} {
   const stale: SourceRow[] = [];
   const fresh: SourceRow[] = [];
   const cooldown: SourceRow[] = [];
+  const unavailablePath: Array<SourceRow & { skip_warning: string }> = [];
   for (const s of sources) {
+    const skipWarning = s.local_path ? sourceLocalPathSkipWarning(s.id, s.local_path, pathExists, s.config) : null;
+    if (skipWarning) {
+      unavailablePath.push({ ...s, skip_warning: skipWarning });
+      continue;
+    }
     if (!isSourceStale(s, now, floorMin)) { fresh.push(s); continue; }
     // #2194 fix #2: a stale source that recently failed is held in cooldown so
     // it can't re-dispatch every tick (the storm). Success clears it.
@@ -364,7 +388,7 @@ export function selectSourcesForDispatch(
   });
   const dispatch = stale.slice(0, fanoutMax);
   const skippedCap = stale.slice(fanoutMax);
-  return { dispatch, skippedFresh: fresh, skippedCap, skippedCooldown: cooldown };
+  return { dispatch, skippedFresh: fresh, skippedCap, skippedCooldown: cooldown, skippedUnavailablePath: unavailablePath };
 }
 
 /**
@@ -434,8 +458,10 @@ export async function dispatchPerSource(
       skipped_fresh: [],
       skipped_cap: [],
       skipped_cooldown: [],
+      skipped_unavailable_path: [],
       legacy_fallback: true,
       all_sources_fresh: false,
+      all_sources_handled: false,
     };
   }
 
@@ -455,7 +481,8 @@ export async function dispatchPerSource(
     cooldownOpts = { baseMin: 0, capMin: FAILURE_COOLDOWN_CAP_MIN };
   }
 
-  const { dispatch, skippedFresh, skippedCap, skippedCooldown } =
+  const pathExists = opts.pathExists ?? existsSync;
+  const { dispatch, skippedFresh, skippedCap, skippedCooldown, skippedUnavailablePath } =
     selectSourcesForDispatch(
       sources,
       opts.fanoutMax,
@@ -463,7 +490,16 @@ export async function dispatchPerSource(
       AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES,
       recentFailures,
       cooldownOpts,
+      pathExists,
     );
+
+  for (const src of skippedUnavailablePath) {
+    if (opts.jsonMode) {
+      emit(JSON.stringify({ event: 'fanout_source_path_skipped', source_id: src.id, reason: src.skip_warning }));
+    } else {
+      log(src.skip_warning);
+    }
+  }
 
   const dispatched: string[] = [];
   const coalesced: string[] = [];
@@ -476,11 +512,10 @@ export async function dispatchPerSource(
           repoPath: opts.repoPath,
           source_id: src.id,
           pull: shouldPull,
-          // #2194 fix #3 (cycle split): per-source cycles run ONLY source-scoped
-          // (+ mixed) phases. The brain-wide global phases (embed, orphans,
-          // purge, …) run once in autopilot-global-maintenance, not N times
-          // concurrently here — the fix for the 4→10GB RSS blowout.
-          phases: NON_GLOBAL_PHASES,
+          // Freshness is stamped by bounded deterministic work only. LLM-backed
+          // source enrichment (atoms, takes, thin-page development, etc.) is
+          // explicit/background work and cannot hold source freshness hostage.
+          phases: SOURCE_FRESHNESS_PHASES,
         },
         {
           queue: 'default',
@@ -564,8 +599,10 @@ export async function dispatchPerSource(
     skipped_fresh: skippedFresh.map(s => s.id),
     skipped_cap: skippedCap.map(s => s.id),
     skipped_cooldown: skippedCooldown.map(s => s.id),
+    skipped_unavailable_path: skippedUnavailablePath.map(s => s.id),
     legacy_fallback: false,
     all_sources_fresh: skippedFresh.length === sources.length,
+    all_sources_handled: skippedFresh.length + skippedUnavailablePath.length === sources.length,
   };
 }
 
@@ -581,7 +618,7 @@ export function isGlobalMaintenanceStale(lastGlobalAtIso: string | null, now = D
 
 /**
  * #2194 fix #3 / #2227 bug #3 — dispatch the single brain-wide maintenance job
- * that runs the `global` cycle phases (embed, orphans, purge, …) ONCE per
+ * that runs the `mixed` + `global` cycle phases ONCE per
  * window, instead of N per-source cycles each running them concurrently (the
  * RSS blowout). Single-flight is structural: one `idempotency_key` per slot +
  * `maxPending:1` (an in-flight waiting/live-lock-active run suppresses
@@ -611,7 +648,7 @@ export async function dispatchGlobalMaintenance(
 
   const job = await queue.add(
     'autopilot-global-maintenance',
-    { repoPath: opts.repoPath, phases: GLOBAL_PHASES },
+    { repoPath: opts.repoPath, phases: MAINTENANCE_PHASES },
     {
       queue: 'default',
       // Structural single-flight: one global job per slot; maxPending:1
@@ -640,4 +677,80 @@ export async function dispatchGlobalMaintenance(
     log(`[dispatch] job #${job.id} autopilot-global-maintenance (brain-wide phases)`);
   }
   return { dispatched: true, reason: 'stale' };
+}
+
+/**
+ * Opt-in scheduled connector sync (OV#4: default OFF, daily cadence). For each
+ * provider that has a credential AND `connectors.<p>.auto_sync` truthy AND no
+ * `auth_error_at` newer than the credential's `savedAt` (a dead cookie must not
+ * burn job slots), submit a `connector-sync` job when the last sync is older
+ * than `connectors.sync_floor_min` (default 1440). Idempotency-keyed +
+ * maxPending:1 so a slow sync never stacks.
+ */
+export async function maybeDispatchConnectorSyncs(
+  engine: BrainEngine,
+  queue: MinionQueue,
+  opts: { slot: string; timeoutMs: number; jsonMode: boolean; nowMs?: number; emit?: (l: string) => void; log?: (l: string) => void },
+): Promise<{ dispatched: string[] }> {
+  const emit = opts.emit ?? ((line) => process.stderr.write(line + '\n'));
+  const log = opts.log ?? ((line) => console.log(line));
+  const nowMs = opts.nowMs ?? Date.now();
+
+  const { connectorProviderNames } = await import('../core/connectors/registry.ts');
+  const { loadCredential } = await import('../core/connectors/credentials.ts');
+  const {
+    autoSyncKey,
+    authErrorAtKey,
+    lastSyncAtKey,
+    syncFloorMinKey,
+    sourceIdKey,
+    isTruthy,
+    isConnectorSyncStale,
+    DEFAULT_SYNC_FLOOR_MIN,
+  } = await import('../core/connectors/config-keys.ts');
+
+  let floorMin = DEFAULT_SYNC_FLOOR_MIN;
+  const floorCfg = await engine.getConfig(syncFloorMinKey());
+  if (floorCfg) {
+    const n = parseInt(floorCfg, 10);
+    if (Number.isFinite(n) && n >= 1) floorMin = n;
+  }
+  const sourceId = (await engine.getConfig(sourceIdKey())) || 'default';
+  const dispatched: string[] = [];
+
+  for (const provider of connectorProviderNames()) {
+    const cred = loadCredential(provider);
+    if (!cred) continue; // no credential → nothing to sync
+    if (!isTruthy(await engine.getConfig(autoSyncKey(provider)))) continue; // opt-in only
+    // A dead cookie stamps auth_error_at; skip until the user re-auths (a fresh
+    // credential's savedAt will be newer than the stale error).
+    const authErrorAt = await engine.getConfig(authErrorAtKey(provider));
+    if (authErrorAt && cred.savedAt && authErrorAt > cred.savedAt) continue;
+
+    const lastSyncAt = await engine.getConfig(lastSyncAtKey(provider));
+    if (!isConnectorSyncStale(lastSyncAt, nowMs, floorMin)) continue;
+
+    const job = await queue.add(
+      'connector-sync',
+      { provider, sourceId },
+      {
+        queue: 'default',
+        idempotency_key: `connector-sync:${provider}:${opts.slot}`,
+        max_attempts: 2,
+        timeout_ms: opts.timeoutMs,
+        maxPending: 1,
+      },
+    );
+    if (job.coalesced) {
+      if (!opts.jsonMode) log(`[dispatch] coalesced connector-sync ${provider} (already in flight)`);
+      continue;
+    }
+    dispatched.push(provider);
+    if (opts.jsonMode) {
+      emit(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'connector_sync', provider, slot: opts.slot }));
+    } else {
+      log(`[dispatch] job #${job.id} connector-sync ${provider}`);
+    }
+  }
+  return { dispatched };
 }

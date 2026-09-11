@@ -16,25 +16,8 @@
 
 import type { BrainEngine } from '../core/engine.ts';
 import { errorFor, serializeError } from '../core/errors.ts';
-import { resolveScopedSourceOrThrow, SourceResolutionError } from '../core/sources-ops.ts';
-import { formatSoleNonDefaultNudge } from '../core/source-resolver.ts';
+import { resolveCliCodeScope, positionalArgs, parseFlag } from './code-scope.ts';
 import { resolveCodeReadiness, readinessHint } from '../core/code-graph-readiness.ts';
-
-/** A bad/invalid `.gbrain-source` pin or GBRAIN_SOURCE value surfaces from
- * `resolveSourceWithTier`'s `assertSourceExists` as a plain Error with one of
- * these message prefixes. Mirrors dream.ts:isResolverUserError. */
-function isResolverUserError(e: unknown): boolean {
-  if (!(e instanceof Error)) return false;
-  const m = e.message;
-  return (m.startsWith('Source "') && m.includes(' not found.'))
-    || m.startsWith('Invalid --source value')
-    || m.startsWith('Invalid GBRAIN_SOURCE value');
-}
-
-function parseFlag(args: string[], name: string): string | undefined {
-  const i = args.indexOf(name);
-  return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
-}
 
 function shouldEmitJson(args: string[]): boolean {
   if (args.includes('--json')) return true;
@@ -43,7 +26,7 @@ function shouldEmitJson(args: string[]): boolean {
 }
 
 export async function runCodeCallees(engine: BrainEngine, args: string[]): Promise<void> {
-  const positional = args.filter((a) => !a.startsWith('--'));
+  const positional = positionalArgs(args);
   const sym = positional[0];
   if (!sym) {
     const err = errorFor({
@@ -60,51 +43,12 @@ export async function runCodeCallees(engine: BrainEngine, args: string[]): Promi
     process.exit(2);
   }
   const limit = parseInt(parseFlag(args, '--limit') || '100', 10);
-  const allSources = args.includes('--all-sources');
-  let sourceId = parseFlag(args, '--source');
-
-  // Full source-resolution chain (honors .gbrain-source pin, env, local_path,
-  // brain_default, sole_non_default). Matches code-callers behavior.
-  if (!allSources && !sourceId) {
-    try {
-      const resolved = await resolveScopedSourceOrThrow(engine);
-      sourceId = resolved.source_id;
-      if (resolved.tier === 'sole_non_default') {
-        const nudge = formatSoleNonDefaultNudge(resolved.source_id);
-        if (nudge) console.error(nudge);
-      }
-    } catch (e: unknown) {
-      if (e instanceof SourceResolutionError) {
-        const env = errorFor({
-          class: 'UsageError',
-          code: e.code,
-          message: e.message,
-          hint: 'pass --source <id> for one source, or --all-sources to search every source',
-        }).envelope;
-        if (shouldEmitJson(args)) {
-          console.log(JSON.stringify({ error: env }));
-        } else {
-          console.error(e.message);
-        }
-        process.exit(2);
-      }
-      if (isResolverUserError(e)) {
-        const env = errorFor({
-          class: 'UsageError',
-          code: 'invalid_source_pin',
-          message: (e as Error).message,
-          hint: 'fix the .gbrain-source pin / GBRAIN_SOURCE value, or pass --source <id> / --all-sources',
-        }).envelope;
-        if (shouldEmitJson(args)) {
-          console.log(JSON.stringify({ error: env }));
-        } else {
-          console.error((e as Error).message);
-        }
-        process.exit(2);
-      }
-      throw e;
-    }
-  }
+  const { allSources, sourceId, scope, envelopeSourceId } = await resolveCliCodeScope(engine, {
+    sourceId: parseFlag(args, '--source'),
+    allSources: args.includes('--all-sources'),
+    jsonMode: shouldEmitJson(args),
+    command: 'code-callees',
+  });
 
   try {
     const edges = await engine.getCalleesOf(sym, {
@@ -113,13 +57,12 @@ export async function runCodeCallees(engine: BrainEngine, args: string[]): Promi
       sourceId: sourceId ?? undefined,
     });
 
-    const scope = allSources ? 'all' : 'single';
-    const envelopeSourceId = allSources ? null : (sourceId ?? null);
-
     // Call-graph readiness ('edge' grain): distinguishes "graph not built / still
     // indexing" from "genuinely no callees" when count === 0.
+    // remote: false — direct CLI invocation is the trusted local caller, so
+    // the #3707 out_of_scope brain-wide rerun stays available (#4352 gate).
     const readiness = await resolveCodeReadiness(engine, {
-      kind: 'edge', count: edges.length, sourceId: sourceId ?? undefined, allSources,
+      kind: 'edge', count: edges.length, sourceId: sourceId ?? undefined, allSources, remote: false,
     });
 
     if (shouldEmitJson(args)) {
@@ -127,8 +70,12 @@ export async function runCodeCallees(engine: BrainEngine, args: string[]): Promi
         symbol: sym, source_id: envelopeSourceId, scope, count: edges.length,
         status: readiness.status, ready: readiness.ready, callees: edges,
       };
+      // #3707: see code-callers.ts — scope problem vs never-built.
+      if (readiness.scoped_source_id) out.scoped_source_id = readiness.scoped_source_id;
       if (edges.length === 0 && !allSources && sourceId) {
-        out.hint = `No callees in source '${sourceId}'. Try --all-sources to search every source.`;
+        out.hint = readiness.status === 'out_of_scope'
+          ? (readinessHint(readiness) ?? `No callees in source '${sourceId}'.`)
+          : `No callees in source '${sourceId}'. Try --all-sources to search every source.`;
       }
       console.log(JSON.stringify(out, null, 2));
     } else if (edges.length === 0) {

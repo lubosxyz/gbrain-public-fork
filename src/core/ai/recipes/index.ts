@@ -18,6 +18,7 @@ import { deepseek } from './deepseek.ts';
 import { groq } from './groq.ts';
 import { together } from './together.ts';
 import { llamaServer } from './llama-server.ts';
+import { lmstudio } from './lmstudio.ts';
 import { minimax } from './minimax.ts';
 import { dashscope } from './dashscope.ts';
 import { dashscopeRerank } from './dashscope-rerank.ts';
@@ -25,6 +26,7 @@ import { zhipu } from './zhipu.ts';
 import { azureOpenAI } from './azure-openai.ts';
 import { zeroentropyai } from './zeroentropyai.ts';
 import { llamaServerReranker } from './llama-server-reranker.ts';
+import { nan } from './nan.ts';
 import { moonshot } from './moonshot.ts';
 import { mistral } from './mistral.ts';
 import { nvidia } from './nvidia.ts';
@@ -44,12 +46,14 @@ const ALL: Recipe[] = [
   together,
   llamaServer,
   llamaServerReranker,
+  lmstudio,
   minimax,
   dashscope,
   dashscopeRerank,
   zhipu,
   azureOpenAI,
   zeroentropyai,
+  nan,
   moonshot,
   mistral,
   nvidia,

@@ -14,16 +14,20 @@
 //      Haiku 3-check from extract_atoms decides "this atom is about
 //      concept X", it stamps the field).
 //   3. For each group with count ≥2: assign tier (T1/T2/T3/T4 by count).
-//   4. For T1/T2 groups: Sonnet call to produce a 1-paragraph narrative.
+//   4. Sort by tier, evidence count, and slug so the bounded LLM budget goes
+//      to the strongest groups deterministically.
+//   5. For T1/T2 groups: Sonnet call to produce a 1-paragraph narrative.
 //      For T3/T4: deterministic stub narrative.
-//   5. Write concept-typed pages.
+//   6. Write concept-typed pages with the synthesis mode made explicit.
 
-import type { BrainEngine } from '../engine.ts';
+import type { BrainEngine, LinkBatchInput } from '../engine.ts';
+import { resolveModel } from '../model-config.ts';
 import type { PhaseResult } from '../cycle.ts';
 import type { ProgressReporter } from '../progress.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
-import { chat as gatewayChat, isAvailable } from '../ai/gateway.ts';
+import { chat as gatewayChat, isAvailable, isThinkingModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../ai/gateway.ts';
+import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
 // #2163: concept pages route through importFromContent (the same
 // parse→chunk→embed pipeline put_page uses) instead of a bare engine.putPage,
 // so they land in the retrieval surface (content_chunks + embeddings) where
@@ -47,9 +51,44 @@ const FALLBACK_PRICING: ModelPricing = canonicalLookup('anthropic:claude-sonnet-
 const TIER_T1_MIN = 10;
 const TIER_T2_MIN = 5;
 const TIER_T3_MIN = 2;
+/**
+ * Output cap for the per-concept narrative. 500 sizes the *answer* (a
+ * 1-paragraph summary) and is ample for a non-reasoning model. It is NOT ample
+ * for a thinking-by-default model: reasoning bills as output and counts against
+ * max_tokens, so the budget is spent before any answer text is emitted — hosted
+ * DeepSeek returns empty content (→ `deterministicNarrative` ships a template
+ * stub as 'error_fallback'), while the native deepseek: recipe promotes the
+ * truncated reasoning_content into content (→ chain-of-thought persisted as
+ * the narrative with synthesis_mode 'llm'). This phase resolves at
+ * `tier: 'reasoning'`, so a thinking model here is the expected case.
+ */
+const DEFAULT_SYNTH_MAX_OUTPUT_TOKENS = 500;
+
+/**
+ * Narrative output cap for the resolved model. `isThinkingModel` is the
+ * gateway's shared predicate (name-matched Claude 5 OR recipe-declared
+ * `thinking_by_default`; unknown providers count as non-thinking), the same
+ * check think's maxOutputTokensFor and the subagent handler use. Thinking
+ * models get the gateway's verified THINKING_MODEL_MAX_OUTPUT_TOKENS rather
+ * than a phase-private number: a local 8000 contradicted it, and DeepSeek v4
+ * truncates at 8192-class caps — the reasoning budget was gone before any
+ * answer text.
+ */
+export function resolveSynthMaxOutputTokens(modelStr: string): number {
+  return isThinkingModel(modelStr) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_SYNTH_MAX_OUTPUT_TOKENS;
+}
 
 export interface SynthesizeConceptsOpts {
   brainDir?: string;
+  /**
+   * #4416: the cycle's resolved source scope (cycleSourceId in cycle.ts).
+   * Without it every write below falls through to the engine's `?? 'default'`
+   * literal, which misfiles (or, on the createVersion update path, kills the
+   * cycle) on any brain whose sole source is not named `default`: getPage's
+   * undefined-source path is source-agnostic, so the existence probe passes,
+   * then createVersion throws "page ... (source=default) not found".
+   */
+  sourceId?: string;
   dryRun?: boolean;
   yieldDuringPhase?: (() => Promise<void>) | undefined;
   /**
@@ -67,10 +106,18 @@ export interface SynthesizeConceptsOpts {
 
 interface AtomGroup {
   conceptSlug: string;
+  /** #4589: member atom slugs — the provenance edges are written from these. */
+  atomSlugs: string[];
   atomTitles: string[];
   atomBodies: string[];
   tier: 'T1' | 'T2' | 'T3' | 'T4';
 }
+
+type ConceptSynthesisMode =
+  | 'llm'
+  | 'deterministic_tier'
+  | 'budget_fallback'
+  | 'error_fallback';
 
 const SYNTH_PROMPT = `You write a 1-paragraph executive summary of a concept
 based on multiple atom-shaped insights that reference it.
@@ -95,11 +142,16 @@ export async function runPhaseSynthesizeConcepts(
         compiled_truth: string;
         frontmatter: { concepts?: string[]; imported_from?: string };
       }>(
+        // Codex P2: scoped to the cycle source — the provenance edges below
+        // are pinned to it, so a brain-global scan grouped same-slug atoms
+        // from OTHER sources into this source's concepts.
         `SELECT slug, title, compiled_truth, frontmatter
            FROM pages
           WHERE type = 'atom'
+            AND source_id = $1
             AND deleted_at IS NULL
             AND (frontmatter->>'imported_from') IS NULL`,
+        [opts.sourceId ?? 'default'],
       );
       atoms = rows
         .filter((r) => Array.isArray(r.frontmatter?.concepts) && r.frontmatter.concepts.length > 0)
@@ -125,10 +177,11 @@ export async function runPhaseSynthesizeConcepts(
   }
 
   // 2. Group atoms by concept slug
-  const groups = new Map<string, { titles: string[]; bodies: string[] }>();
+  const groups = new Map<string, { slugs: string[]; titles: string[]; bodies: string[] }>();
   for (const atom of atoms) {
     for (const conceptSlug of atom.concept_refs) {
-      const existing = groups.get(conceptSlug) ?? { titles: [], bodies: [] };
+      const existing = groups.get(conceptSlug) ?? { slugs: [], titles: [], bodies: [] };
+      existing.slugs.push(atom.slug);
       existing.titles.push(atom.title);
       existing.bodies.push(atom.body);
       groups.set(conceptSlug, existing);
@@ -144,6 +197,7 @@ export async function runPhaseSynthesizeConcepts(
       count >= TIER_T1_MIN ? 'T1' : count >= TIER_T2_MIN ? 'T2' : 'T3';
     atomGroups.push({
       conceptSlug,
+      atomSlugs: data.slugs,
       atomTitles: data.titles,
       atomBodies: data.bodies,
       tier,
@@ -160,12 +214,37 @@ export async function runPhaseSynthesizeConcepts(
     };
   }
 
+  // Spend the bounded LLM budget on the strongest concepts first, independent
+  // of Postgres/PGLite row encounter order. Stable slug ordering makes equal
+  // groups deterministic across engines and repeated runs.
+  const tierRank: Record<AtomGroup['tier'], number> = { T1: 0, T2: 1, T3: 2, T4: 3 };
+  atomGroups.sort((a, b) =>
+    tierRank[a.tier] - tierRank[b.tier] ||
+    b.atomTitles.length - a.atomTitles.length ||
+    a.conceptSlug.localeCompare(b.conceptSlug));
+
   // 4. Per group: synthesize narrative (LLM for T1/T2, deterministic for T3+)
   let conceptsWritten = 0;
   let estimatedSpendUsd = 0;
   const budgetCap = DEFAULT_BUDGET_USD;
   const failures: Array<{ concept: string; error: string }> = [];
+  // #4589 provenance-link problems. Kept OUT of `failures`: that list means
+  // "the LLM call failed → template fallback" downstream (summary wording,
+  // rollup halt_delta / round_completed_delta), which a missing edge is not —
+  // the narrative was synthesized and persisted as-is. Warn-only.
+  const linkWarnings: Array<{ concept: string; warning: string }> = [];
+  // #3044 adoption: shared halt policy — auth/billing halt on the first
+  // hit, a rate_limit streak halts after 3 consecutive failures, a
+  // successful chat call resets the streak.
+  const llmHalt = createGlobalLlmHaltTracker();
+  let abortedGlobalError: GlobalLlmErrorClass | null = null;
   const tierCounts = { T1: 0, T2: 0, T3: 0, T4: 0 };
+  const synthesisModeCounts: Record<ConceptSynthesisMode, number> = {
+    llm: 0,
+    deterministic_tier: 0,
+    budget_fallback: 0,
+    error_fallback: 0,
+  };
 
   // v0.41.19.0 (T3): throttled yield helper. Fires `opts.yieldDuringPhase`
   // every 30s — cycle.ts threads `buildYieldDuringPhase(lock, outer)` so
@@ -187,15 +266,27 @@ export async function runPhaseSynthesizeConcepts(
     }
   }
 
+  // Honour the documented per-task routing. Without an explicit model this
+  // call inherits models.chat, so models.dream.synthesize (advertised in the
+  // routing table as tier.reasoning) had no effect on this path.
+  const synthModel = await resolveModel(engine, {
+    configKey: 'models.dream.synthesize',
+    tier: 'reasoning',
+    fallback: 'sonnet',
+  });
+  const synthMaxOutputTokens = resolveSynthMaxOutputTokens(synthModel);
   for (const group of atomGroups) {
     tierCounts[group.tier]++;
     let narrative: string;
+    let synthesisMode: ConceptSynthesisMode;
     if (group.tier === 'T1' || group.tier === 'T2') {
       if (estimatedSpendUsd >= budgetCap) {
         narrative = deterministicNarrative(group);
+        synthesisMode = 'budget_fallback';
       } else {
         try {
           const result = await chat({
+            model: synthModel,
             system: SYNTH_PROMPT,
             messages: [
               {
@@ -210,12 +301,13 @@ export async function runPhaseSynthesizeConcepts(
                     .join('\n\n')}`,
               },
             ],
-            maxTokens: 500,
+            maxTokens: synthMaxOutputTokens,
           });
           // Post-await yield (T3): the LLM call is the main TTL hazard
           // codex flagged. Throttle inside maybeYield bounds the actual
           // refresh rate.
           await maybeYield();
+          llmHalt.reset();
           // Price from the model that actually answered, through the one
           // canonical chat-pricing table (CLAUDE.md invariant). Canonical
           // miss → Sonnet-tier FALLBACK_PRICING (see constant above).
@@ -224,18 +316,43 @@ export async function runPhaseSynthesizeConcepts(
             (result.usage.input_tokens * pricing.input +
               result.usage.output_tokens * pricing.output) /
             1_000_000;
-          narrative = result.text.trim() || deterministicNarrative(group);
+          const text = result.text.trim();
+          if (text) {
+            narrative = text;
+            synthesisMode = 'llm';
+          } else {
+            failures.push({ concept: group.conceptSlug, error: 'empty model response' });
+            narrative = deterministicNarrative(group);
+            synthesisMode = 'error_fallback';
+          }
         } catch (err) {
-          failures.push({
-            concept: group.conceptSlug,
-            error: err instanceof Error ? err.message : String(err),
-          });
+          const msg = err instanceof Error ? err.message : String(err);
+          // #3044 adoption: a whole-run LLM outage must not overwrite
+          // existing concept pages with error_fallback stub narratives.
+          // A halt decision stops the phase; a below-streak rate limit
+          // skips this group's write (the page stays intact for the next
+          // run); only non-global errors keep the per-item
+          // error_fallback behavior.
+          const decision = llmHalt.observe(err);
+          if (decision !== 'continue') {
+            abortedGlobalError = haltedClassOf(decision);
+            failures.push({
+              concept: group.conceptSlug,
+              error: `aborting phase: ${llmHalt.note()} (${msg})`,
+            });
+            break;
+          }
+          failures.push({ concept: group.conceptSlug, error: msg });
+          if (llmHalt.lastClass() === 'rate_limit') continue;
           narrative = deterministicNarrative(group);
+          synthesisMode = 'error_fallback';
         }
       }
     } else {
       narrative = deterministicNarrative(group);
+      synthesisMode = 'deterministic_tier';
     }
+    synthesisModeCounts[synthesisMode]++;
 
     if (!opts.dryRun) {
       const title = group.conceptSlug.split('/').pop() ?? group.conceptSlug;
@@ -247,6 +364,7 @@ export async function runPhaseSynthesizeConcepts(
           tier: group.tier,
           mention_count: group.atomTitles.length,
           composite_score: group.atomTitles.length,
+          synthesis_mode: synthesisMode,
           synthesized_at: new Date().toISOString(),
           synthesized_by: 'synthesize_concepts-v0.41',
         },
@@ -254,9 +372,43 @@ export async function runPhaseSynthesizeConcepts(
         '',
         { type: 'concept', title: title.replace(/-/g, ' '), tags: [] },
       );
-      await importFromContent(engine, `concepts/${title}`, md, {
+      const conceptSlug = `concepts/${title}`;
+      await importFromContent(engine, conceptSlug, md, {
         noEmbed: !isAvailable('embedding'),
+        // #4416: target the cycle's resolved source, not the 'default' literal.
+        sourceId: opts.sourceId,
       });
+      // #4589: bank concept<->member-atom provenance edges. The prompt forbids
+      // enumerating atoms in the body and no frontmatter field maps to a link
+      // verb, so without this every concept page lands with zero edges (graph
+      // orphan). Dedicated link_source keeps reconcile passes from pruning
+      // them; both endpoints sit in the cycle's source (an atom living in
+      // another source drops out of the batch JOIN — no cross-source edge).
+      // ON CONFLICT DO NOTHING makes re-runs idempotent, so a failure here is
+      // best-effort: recorded as a warn, the page write stands. Mirrors #3961.
+      const src = opts.sourceId ?? 'default';
+      const provenanceLinks: LinkBatchInput[] = [...new Set(group.atomSlugs)].flatMap((atomSlug) => [
+        { from_slug: conceptSlug, to_slug: atomSlug, link_type: 'synthesized_from', link_source: 'concept-provenance', context: 'member atom', from_source_id: src, to_source_id: src },
+        { from_slug: atomSlug, to_slug: conceptSlug, link_type: 'synthesizes', link_source: 'concept-provenance', context: 'concept synthesized from this atom', from_source_id: src, to_source_id: src },
+      ]);
+      try {
+        const inserted = await engine.addLinksBatch(provenanceLinks, { auditSite: 'cycle.synthesize_concepts.provenance' }); // gbrain-allow-direct-insert: concept-provenance edges derived from the synthesis itself (no markdown body to reconcile from)
+        // Zero rows back with edges requested means every member atom fell
+        // out of the batch JOIN (not in this source) — unless a prior run
+        // already banked them (ON CONFLICT DO NOTHING also returns 0). A
+        // silent 'ok' here is a graph orphan with a clean receipt.
+        if (inserted === 0 && provenanceLinks.length > 0) {
+          const banked = (await engine.getLinks(conceptSlug, { sourceId: src }))
+            .some((l) => l.link_source === 'concept-provenance');
+          if (!banked) {
+            linkWarnings.push({ concept: group.conceptSlug, warning: `provenance links: 0 of ${provenanceLinks.length} edges landed (member atoms not in source '${src}'?)` });
+          }
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        linkWarnings.push({ concept: group.conceptSlug, warning: `provenance links failed: ${msg}` });
+        console.error(`[synthesize_concepts] provenance links failed for ${conceptSlug} (non-fatal): ${msg}`);
+      }
     }
     conceptsWritten++;
     // v0.41.19.0 (T4): one tick per concept group with running count.
@@ -268,16 +420,17 @@ export async function runPhaseSynthesizeConcepts(
     await maybeYield();
   }
 
-  // v0.42 Wave B3: receipt + rollup for synthesize_concepts. Brain-global
-  // phase — uses 'default' source_id because concepts span sources. Receipt
-  // only fires when concepts were actually written; rollup always fires so
-  // doctor sees the phase ran.
+  // v0.42 Wave B3: receipt + rollup for synthesize_concepts. Receipt/rollup
+  // carry the cycle's resolved source (#4416, opts.sourceId); 'default'
+  // survives only as the fallback for legacy unscoped callers. Receipt only
+  // fires when concepts were actually written; rollup always fires so doctor
+  // sees the phase ran.
   if (!opts.dryRun && conceptsWritten > 0) {
     const runId = `concepts-${Date.now().toString(36)}`;
     try {
       await writeReceipt(engine, {
         kind: 'concepts',
-        source_id: 'default',
+        source_id: opts.sourceId ?? 'default',
         run_id: runId,
         round: 'single',
         extracted_at: new Date().toISOString(),
@@ -286,6 +439,8 @@ export async function runPhaseSynthesizeConcepts(
         summary:
           `Synthesized ${conceptsWritten} concepts ` +
           `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3}) ` +
+          `(llm=${synthesisModeCounts.llm} deterministic=${synthesisModeCounts.deterministic_tier} ` +
+          `budget_fallback=${synthesisModeCounts.budget_fallback} error_fallback=${synthesisModeCounts.error_fallback}) ` +
           `from ${atomGroups.length} groups across ${atoms.length} atoms.`,
       });
     } catch (err) {
@@ -295,7 +450,7 @@ export async function runPhaseSynthesizeConcepts(
   if (!opts.dryRun) {
     await upsertExtractRollup(engine, {
       kind: 'concepts',
-      source_id: 'default',
+      source_id: opts.sourceId ?? 'default',
       cost_delta: estimatedSpendUsd,
       round_completed_delta: failures.length === 0 ? 1 : 0,
       halt_delta: failures.length > 0 ? 1 : 0,
@@ -304,18 +459,22 @@ export async function runPhaseSynthesizeConcepts(
 
   return {
     phase: 'synthesize_concepts',
-    status: failures.length > 0 ? 'warn' : 'ok',
+    status: failures.length > 0 || linkWarnings.length > 0 ? 'warn' : 'ok',
     duration_ms: 0,
     summary:
       `synthesize_concepts: ${conceptsWritten} concepts ` +
       `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3})` +
-      (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : ''),
+      (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : '') +
+      (linkWarnings.length > 0 ? ` (${linkWarnings.length} provenance-link warning(s))` : ''),
     details: {
       concepts_written: conceptsWritten,
       tier_counts: tierCounts,
+      synthesis_mode_counts: synthesisModeCounts,
       groups_found: atomGroups.length,
       atoms_seen: atoms.length,
       failures,
+      link_warnings: linkWarnings,
+      ...(abortedGlobalError ? { aborted_global_error: abortedGlobalError } : {}),
       estimated_spend_usd: estimatedSpendUsd,
       budget_usd: budgetCap,
       dry_run: opts.dryRun ?? false,

@@ -28,7 +28,7 @@ import { importCodeFile } from '../core/import-file.ts';
 import { estimateTokens } from '../core/chunkers/code.ts';
 import { getEmbeddingModelName, estimateEmbeddingCostUsd } from '../core/embedding.ts';
 import { errorFor, serializeError } from '../core/errors.ts';
-import { createInterface } from 'readline';
+import { promptYesNo } from '../core/confirm-prompt.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { BudgetTracker, BudgetExhausted } from '../core/budget/budget-tracker.ts';
@@ -186,18 +186,6 @@ async function estimateReindexCost(
   return { totalTokens, totalPages };
 }
 
-async function promptYesNo(question: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(question, (answer) => {
-      rl.close();
-      const a = answer.trim().toLowerCase();
-      resolve(a === 'y' || a === 'yes');
-    });
-    rl.on('close', () => resolve(false));
-  });
-}
-
 export async function runReindexCode(
   engine: BrainEngine,
   opts: ReindexCodeOpts = {},
@@ -295,7 +283,10 @@ export async function runReindexCode(
               reporter.tick();
               return;
             }
-            if (!row.compiled_truth) {
+            // `compiled_truth` is NOT NULL DEFAULT '': an empty file is legitimately '' (every
+            // `__init__.py`). Only a null row is missing; the falsy check counted every empty
+            // file as a failure (#4902).
+            if (row.compiled_truth == null) {
               failed++;
               failures.push({ slug: row.slug, error: 'missing compiled_truth' });
               reporter.tick();
@@ -422,6 +413,26 @@ export function buildCostRefusal(opts: {
       'Refusing to re-embed non-interactively without confirmation. ' +
       'Pass --yes to proceed, or --dry-run for the preview (exit 0).',
   };
+}
+
+/**
+ * issue #3970 — recovery hint for the "0 reindexed, N skipped" wall. Without
+ * --force, importCodeFile's content_hash short-circuit skips every unchanged
+ * page, so a user trying to backfill symbol metadata (or re-embed) sees an
+ * all-skipped pass with no pointer at the cure. Pure + exported for tests.
+ * Returns null when the hint doesn't apply (something reindexed, nothing
+ * skipped, or --force already passed).
+ */
+export function reindexForceHint(
+  result: Pick<ReindexCodeResult, 'reindexed' | 'skipped'>,
+  force: boolean | undefined,
+): string | null {
+  if (force || result.reindexed > 0 || result.skipped === 0) return null;
+  return (
+    `All ${result.skipped} page(s) were skipped by the content_hash short-circuit ` +
+    `(content unchanged since last index). To force a full re-chunk + re-embed pass ` +
+    `(e.g. to backfill symbol metadata), re-run with --force.`
+  );
 }
 
 /**
@@ -555,6 +566,10 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
         `(${result.codePages} total code pages, ~${result.totalTokens.toLocaleString()} tokens, ` +
         `est. $${result.costUsd.toFixed(2)}).`,
     );
+    // #3970: an all-skipped pass without --force is usually someone trying to
+    // heal missing chunk metadata — point at the flag that actually does it.
+    const hint = reindexForceHint(result, force);
+    if (hint) console.log(hint);
     if (result.failures && result.failures.length > 0) {
       console.log(`\n${result.failures.length} failure(s):`);
       for (const f of result.failures.slice(0, 10)) {

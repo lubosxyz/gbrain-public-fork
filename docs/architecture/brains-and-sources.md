@@ -209,6 +209,15 @@ ARRAY of readable sources that takes precedence over the scalar
 operations layer). Local CLI callers never set it; the scalar chain above
 is the whole story for them.
 
+One guard on tier 2 for the MCP stdio lane: a harness-launched `gbrain serve`
+checks a well-formed `GBRAIN_SOURCE` against the `sources` table at startup
+and exits with the offending value and the fix when it names no active
+(non-archived) source, instead of serving a scope that holds zero pages while
+every health check stays green. Unset, `__all__`, and malformed values keep
+their normal handling, and a transient database error never blocks startup.
+The CLI env tier fails the same way (`assertSourceExists` in
+`src/core/source-resolver.ts`).
+
 ---
 
 ## For agents reading this
@@ -240,6 +249,86 @@ is the whole story for them.
   dotfile picks the brain, inside a subdirectory the dotfile picks the
   source. The flags are for when you want to query across the boundary
   deliberately.
+
+## Entity identity across sources
+
+**The identity key for a page is `(source_id, slug)`.** Slugs are only
+unique per source, so `people/alice` in your `wiki` source and
+`people/alice-chen` in a mounted team source are, by default, two unrelated
+pages — even when they describe the same person. Nothing merges them
+automatically.
+
+When they ARE the same entity, say so explicitly with the manual-only
+identity ops (no auto-matching, no name-similarity heuristics):
+
+```
+gbrain entity-identity-link   --entity-id alice-chen --slug people/alice --source-id wiki
+gbrain entity-identity-link   --entity-id alice-chen --slug people/alice-chen --source-id team-brain --canonical
+gbrain entity-identity-list   --entity-id alice-chen
+gbrain entity-identity-unlink --entity-id alice-chen --slug people/alice --source-id wiki
+```
+
+Members live in the `entity_identities` table (one identity per page;
+re-linking moves the page; at most one canonical member per group). The
+write ops are local-only. Retrieval-side union — `get_links` /
+`get_backlinks` merging edges from a page's identity co-members — is gated
+by the `entity_identity.union` config key (default off) and never widens a
+federated caller's source grant.
+
+## Cross-source link edges
+
+Wikilink and markdown-link edges stay inside one source by default. When a
+page in source A links a target that exists only in source B (typically via
+`link_resolution.global_basename`), the edge is NOT written; instead the drop
+is counted so graph sparsity is observable — `gbrain extract links --source db`
+and `gbrain extract --stale` print `Skipped N cross-source candidate(s)` (JSON:
+`skipped_cross_source`), and the serve sweep records it as `cross_source_link`
+in its skip ledger.
+
+To write those edges, opt in:
+
+```
+gbrain config set link_resolution.cross_source true   # or env GBRAIN_LINK_RESOLUTION_CROSS_SOURCE=1
+gbrain extract links --source db                      # re-extract once; --stale will not revisit stamped pages
+```
+
+Without the flag, an isolated (`federated=false`) source only writes edges
+whose both endpoints live in that source; a federated source may also link
+into the configured default source (`sources.default`). With the flag on, a
+target that exists only in other sources resolves to the lexicographically
+smallest source id, so repeated extracts converge on the same row. The read
+side is unchanged: a federated caller's source grant still scopes every link
+read.
+
+## What confines remote callers (and what does not)
+
+When a brain is served to remote agents (HTTP MCP, stdio MCP treated as
+remote), these are the enforcement surfaces — everything on this list is
+fail-closed and tested:
+
+- **Source isolation** — every read resolves through the source-scope ladder
+  (federated grant array > scalar source floor > nothing). A caller without a
+  grant for a source cannot read its pages, chunks, or edges.
+- **Facts visibility** — facts carry `private`/`world` visibility; remote
+  callers see `world` only.
+- **Takes holders** — per-token allow-lists (`gbrain auth permissions <token>
+  set-takes-holders ...`) scope which held takes a remote caller sees.
+- **Write-side slug fences** — a client bound to slug prefixes can only write
+  under them, and only a small fenced allow-list of write operations
+  (`put_page`, `add_link`, `add_timeline_entry`, …) is available to
+  slug-bound clients; every other non-read operation is refused (fail-closed:
+  a write op added later is denied until it is fenced and allow-listed).
+
+Backlink-count ranking applies the caller's read policy to the result page,
+each contributing referrer, and any independent edge-origin page before
+counting. Graph enrichment uses the same source and page-visibility policy.
+
+**Page-level `visibility: private` is enforced for remote callers by default.**
+The exact frontmatter value `private` hides that concrete page row;
+`visibility: local`, absent visibility, and other values do not. Trusted local
+CLI callers retain access. Operator settings can opt out of private-page
+filtering, so source grants remain an independent boundary: keep content in an
+ungranted source when remote callers must have no access to that source.
 
 ## Further reading
 

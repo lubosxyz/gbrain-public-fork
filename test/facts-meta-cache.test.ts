@@ -20,7 +20,7 @@ import {
   __hotMemoryCacheForTests,
   HOT_MEMORY_CACHE_MAX_ENTRIES,
 } from '../src/core/facts/meta-hook.ts';
-import type { BrainEngine } from '../src/core/engine.ts';
+import type { BrainEngine, FactRow } from '../src/core/engine.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 
@@ -210,12 +210,96 @@ describe('meta-hook cache hygiene (bounded, expired-entry eviction)', () => {
 
     // Rebuild path throws (dispatch absorbs this in production). The expired
     // entry must NOT survive the failed rebuild — delete happens on read-miss.
-    const boomEngine = {
-      listFactsBySession: async () => { throw new Error('boom'); },
-      listFactsSince: async () => { throw new Error('boom'); },
-    } as unknown as BrainEngine;
-    await expect(getBrainHotMemoryMeta('get_stats', ctx({ engine: boomEngine }))).rejects.toThrow('boom');
-    expect(cache.size).toBe(0);
+    // Same ENGINE as the warm call: the cache key folds engine identity (a
+    // different engine is a different key and never touches this entry; its
+    // expired corpse is reaped by the overflow eviction, which picks
+    // oldest-expiry first).
+    // Instance-property shadows over the prototype methods; deleted in
+    // finally so the shared engine is intact for later tests.
+    const mutable = engine as unknown as Record<string, unknown>;
+    mutable.listFactsBySession = async () => { throw new Error('boom'); };
+    mutable.listFactsSince = async () => { throw new Error('boom'); };
+    try {
+      await expect(getBrainHotMemoryMeta('get_stats', ctx())).rejects.toThrow('boom');
+      expect(cache.size).toBe(0);
+    } finally {
+      delete mutable.listFactsBySession;
+      delete mutable.listFactsSince;
+    }
+  });
+
+  test('cache never serves one engine\'s payload to another engine (cross-brain isolation)', async () => {
+    // One process, two brains, identical source/tier/session: the hot-memory
+    // cache key folds ENGINE identity, so brain B is never served brain A's
+    // facts inside the TTL. This is the CI shard-7 leak (a conformance
+    // suite's fact surfacing in the privacy sweep's _meta) and the hosted
+    // multi-tenant cross-brain leak, pinned.
+    await engine.insertFact(
+      { fact: 'engine-A hot fact', kind: 'fact', entity_slug: 'engine-a-iso', visibility: 'world', source: 'test' },
+      { source_id: 'default' },
+    );
+    const a = await getBrainHotMemoryMeta('get_stats', ctx());
+    expect(JSON.stringify(a ?? {})).toContain('engine-A hot fact');
+    const engineB = emptyEngine();
+    const b = await getBrainHotMemoryMeta('get_stats', ctx({ engine: engineB }));
+    expect(JSON.stringify(b ?? {})).not.toContain('engine-A hot fact');
+  });
+
+  test('cache expiry clamps to the earliest retained valid_until (read-time TTL honesty)', async () => {
+    const factRow = (validUntil: Date): FactRow => ({
+      id: 1,
+      source_id: 'default',
+      entity_slug: 'ttl-clamp',
+      fact: 'ttl-clamp fact',
+      kind: 'fact',
+      visibility: 'world',
+      notability: 'medium',
+      context: null,
+      valid_from: new Date(),
+      valid_until: validUntil,
+      expired_at: null,
+      superseded_by: null,
+      consolidated_at: null,
+      consolidated_into: null,
+      source: 'test',
+      source_session: null,
+      confidence: 0.9,
+      embedding: null,
+      embedded_at: null,
+      created_at: new Date(),
+    });
+    /** Engine stub returning one row; counts listFactsSince queries. */
+    function countingEngine(validUntil: Date): { engine: BrainEngine; calls: () => number } {
+      let n = 0;
+      const engine = {
+        listFactsBySession: async () => [],
+        listFactsSince: async () => { n++; return [factRow(validUntil)]; },
+      } as unknown as BrainEngine;
+      return { engine, calls: () => n };
+    }
+
+    // A fact expiring ~50ms out clamps the entry's expiry to valid_until —
+    // NOT now+ttl — so the payload can't ride the ambient channel for up to
+    // 30s past the row's own expiry.
+    const soon = countingEngine(new Date(Date.now() + 50));
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: soon.engine }), { ttlMs: 30_000 });
+    expect(soon.calls()).toBe(1);
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: soon.engine }), { ttlMs: 30_000 });
+    expect(soon.calls()).toBe(1); // inside the clamped window: cache hit
+    await new Promise((r) => setTimeout(r, 80));
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: soon.engine }), { ttlMs: 30_000 });
+    expect(soon.calls()).toBe(2); // clamp expired the entry at valid_until, not +30s
+
+    // Control: a far-future valid_until (+1h) never tightens the window —
+    // the third call after the same 80ms wait is still a cache hit.
+    const far = countingEngine(new Date(Date.now() + 60 * 60 * 1000));
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: far.engine }), { ttlMs: 30_000 });
+    expect(far.calls()).toBe(1);
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: far.engine }), { ttlMs: 30_000 });
+    expect(far.calls()).toBe(1);
+    await new Promise((r) => setTimeout(r, 80));
+    await getBrainHotMemoryMeta('get_stats', ctx({ engine: far.engine }), { ttlMs: 30_000 });
+    expect(far.calls()).toBe(1); // ttl still governs: 80ms << 30s
   });
 
   test('max-entries bound holds under many distinct (caller-controlled) session ids', async () => {

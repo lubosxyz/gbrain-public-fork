@@ -78,15 +78,23 @@ export function hasCJK(s: string): boolean {
  */
 export function countCJKAwareWords(s: string): number {
   if (s.length === 0) return 0;
+  return isCJKDominant(s)
+    ? s.replace(/\s/g, '').length
+    : (s.match(/\S+/g) || []).length;
+}
+
+/**
+ * The ONE density test behind countCJKAwareWords: true when CJK chars make
+ * up at least CJK_DENSITY_THRESHOLD of the non-whitespace chars. Callers
+ * that need to branch on "would countCJKAwareWords count chars here?" (the
+ * chunker's overlap extractor) route through this so the two cannot drift.
+ */
+export function isCJKDominant(s: string): boolean {
+  const nonWhitespace = s.replace(/\s/g, '').length;
+  if (nonWhitespace === 0) return false;
   const cjkMatches = s.match(new RegExp(`[${CJK_SLUG_CHARS}]`, 'g'));
   const cjkCount = cjkMatches ? cjkMatches.length : 0;
-  const nonWhitespace = s.replace(/\s/g, '').length;
-  if (nonWhitespace === 0) return 0;
-  const density = cjkCount / nonWhitespace;
-  if (density >= CJK_DENSITY_THRESHOLD) {
-    return nonWhitespace;
-  }
-  return (s.match(/\S+/g) || []).length;
+  return cjkCount / nonWhitespace >= CJK_DENSITY_THRESHOLD;
 }
 
 /**
@@ -96,3 +104,19 @@ export function countCJKAwareWords(s: string): number {
 export function escapeLikePattern(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 }
+
+/**
+ * Splits a CJK query into distinct, non-empty whitespace-delimited terms.
+ *
+ * In Korean and Japanese, word order is flexible and particles attach to nouns,
+ * so the same fact or search intent frequently appears in varying token sequences
+ * (e.g. "김대리 미팅" vs "미팅 김대리"). Splitting into individual terms allows
+ * multi-term conjunction (AND matching) across chunk text regardless of word order.
+ *
+ * Returns deduplicated terms preserving the original order of appearance.
+ */
+export function splitCJKQueryTerms(query: string): string[] {
+  const terms = query.split(/\s+/).filter(t => t.length > 0);
+  return Array.from(new Set(terms));
+}
+

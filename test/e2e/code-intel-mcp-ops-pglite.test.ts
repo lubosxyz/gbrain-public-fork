@@ -50,25 +50,25 @@ describe('v0.34 W3 — code-intel MCP ops registered', () => {
   test('code_callers exists with scope:read and v0.34 description', () => {
     expect(operationsByName.code_callers).toBeDefined();
     expect(operationsByName.code_callers!.scope).toBe('read');
-    expect(operationsByName.code_callers!.description).toBe(CODE_CALLERS_DESCRIPTION);
+    expect(operationsByName.code_callers!.description).toStartWith(CODE_CALLERS_DESCRIPTION);
   });
 
   test('code_callees exists with scope:read and v0.34 description', () => {
     expect(operationsByName.code_callees).toBeDefined();
     expect(operationsByName.code_callees!.scope).toBe('read');
-    expect(operationsByName.code_callees!.description).toBe(CODE_CALLEES_DESCRIPTION);
+    expect(operationsByName.code_callees!.description).toStartWith(CODE_CALLEES_DESCRIPTION);
   });
 
   test('code_def exists with scope:read and v0.34 description', () => {
     expect(operationsByName.code_def).toBeDefined();
     expect(operationsByName.code_def!.scope).toBe('read');
-    expect(operationsByName.code_def!.description).toBe(CODE_DEF_DESCRIPTION);
+    expect(operationsByName.code_def!.description).toStartWith(CODE_DEF_DESCRIPTION);
   });
 
   test('code_refs exists with scope:read and v0.34 description', () => {
     expect(operationsByName.code_refs).toBeDefined();
     expect(operationsByName.code_refs!.scope).toBe('read');
-    expect(operationsByName.code_refs!.description).toBe(CODE_REFS_DESCRIPTION);
+    expect(operationsByName.code_refs!.description).toStartWith(CODE_REFS_DESCRIPTION);
   });
 
   test('all four code_* ops have a symbol param marked required', () => {
@@ -150,6 +150,30 @@ describe('v0.34 W3 — code_callers source scoping', () => {
     const sources = new Set(result.callers.map((c) => c.source_id));
     expect(sources.has('source-a')).toBe(true);
     expect(sources.has('source-b')).toBe(true);
+  });
+});
+
+describe('#4011 — graph ops re-route to the code-bearing federated source', () => {
+  test('remote code_callers is temporarily suspended before federated rerouting', async () => {
+    // Vault+code brain: the caller's scalar scope ('default') holds no code;
+    // the graph lives entirely in 'code-src'. Pre-#4011 the traversal stayed
+    // on 'default' and readiness honestly reported not_built — masking a
+    // fully built graph that code_def / code_refs could already see.
+    await registerSource(engine, 'default');
+    await registerSource(engine, 'code-src');
+    const defPage = await insertCodePage(engine, 'code-src', 'src/foo.ts');
+    const callerPage = await insertCodePage(engine, 'code-src', 'src/caller.ts');
+    await insertChunk(engine, defPage, 0, 'parseMarkdown', 'function');
+    const callerChunk = await insertChunk(engine, callerPage, 0, 'callerInCode', 'function');
+    await insertUnresolvedEdge(engine, callerChunk, 'callerInCode', 'parseMarkdown', 'code-src');
+    const ctx = {
+      ...makeCtx(engine, 'default'),
+      remote: true,
+      localFederatedSourceIds: ['default', 'code-src'],
+    };
+    await expect(operationsByName.code_callers!.handler(ctx, { symbol: 'parseMarkdown' })).rejects.toMatchObject({
+      code: 'permission_denied', message: expect.stringContaining('temporarily unavailable'),
+    });
   });
 });
 

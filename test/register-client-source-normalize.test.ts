@@ -58,7 +58,17 @@ describe('register-client route wiring (structural)', () => {
     const src = readFileSync(new URL('../src/commands/serve-http.ts', import.meta.url), 'utf-8');
     expect(src).toContain('sourceId = normalizeSourceInput(source)');
     expect(src).toContain('federatedReadIds = normalizeFederatedReadInput(federatedRead)');
-    expect(src).toMatch(/registerClientManual\(\s*name,\s*grants,\s*scopeString,\s*uris,\s*sourceId,\s*federatedReadIds,\s*validatedAuthMethod/);
+    // cathedral-6: the route composes registerScopedClient (the CLI's core)
+    // instead of calling registerClientManual directly — now on the
+    // tx-scoped sql handle (dup-check + INSERT are one transaction). The
+    // transposition hazard this pin exists for is now a NAMED-FIELD hazard —
+    // pin that the normalized values land on the right keys of the
+    // parsed-args object.
+    // Profile requests pass through the validated preview before registration;
+    // the explicit sources must survive both named-field boundaries.
+    expect(src).toContain('previewNewAdminGrant(engine, name, grantRequest.patch, { sourceId, federatedRead: federatedReadIds, scopes: scopeString })');
+    expect(src).toMatch(/registerScopedClient\(txSql,\s*name,\s*\{[\s\S]*?scopes:\s*preview.scopes.join\(' '\),[\s\S]*?sourceId:\s*preview.sourceId!,[\s\S]*?federatedRead:\s*preview.federatedRead,[\s\S]*?tokenEndpointAuthMethod:\s*validatedAuthMethod[\s\S]*?\}/);
+    expect(src).toContain('grant: grantRequest.patch');
   });
 });
 

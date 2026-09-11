@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, spyOn } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -52,6 +52,29 @@ created: 2026-05-24
 ---
 
 `;
+
+describe('#4702 importFromContent — content_sanity.disabled_patterns (DB plane end-to-end)', () => {
+  test('gbrain config set content_sanity.disabled_patterns actually reaches the import gate', async () => {
+    await withIsolatedHome(async () => {
+      // Line-anchored access_denied body match: quarantined by default…
+      const content = FRONTMATTER + 'Access Denied when I open the staging dashboard.\n\nDiscussion of the error follows.';
+      const before = await importFromContent(engine, 'test/ad-default', content, { noEmbed: true });
+      expect(before.quarantined).toBe(true);
+      // …but a DB-plane opt-out (what `gbrain config set` writes) lets the
+      // page land normally. Pre-fix the key was written but never read.
+      await engine.setConfig('content_sanity.disabled_patterns', 'access_denied');
+      try {
+        const after = await importFromContent(engine, 'test/ad-disabled', content, { noEmbed: true });
+        expect(after.quarantined ?? false).toBe(false);
+        const page = await engine.getPage('test/ad-disabled');
+        expect(page).not.toBeNull();
+        expect(isQuarantined(page!.frontmatter as Record<string, unknown>)).toBe(false);
+      } finally {
+        await engine.unsetConfig('content_sanity.disabled_patterns');
+      }
+    });
+  });
+});
 
 describe('importFromContent — junk quarantine (v0.42 default disposition)', () => {
   test('Cloudflare junk title → page LANDS quarantined (hidden), does NOT throw', async () => {
@@ -250,6 +273,26 @@ describe('importFromContent — soft-block (D9 transition + embed_skip)', () => 
       await importFromContent(engine, 'test/big2', content, { noEmbed: true });
       const chunks = await engine.getChunks('test/big2');
       expect(chunks.length).toBe(0);
+    });
+  });
+
+  test('soft-block notice fires through console.warn, not bare stderr (#3893)', async () => {
+    await withIsolatedHome(async () => {
+      // #3893 (reimplemented from @y2688): a bare process.stderr.write is
+      // invisible to console-level operator hooks and log collectors — the
+      // oversized soft_block silently drops embedding, so its notice must
+      // go through console.warn.
+      const warnSpy = spyOn(console, 'warn');
+      try {
+        const content = FRONTMATTER + 'a'.repeat(600_000);
+        await importFromContent(engine, 'test/warn-visibility', content, { noEmbed: true });
+        const messages = warnSpy.mock.calls.map(args => args.map(String).join(' '));
+        expect(messages.some(m =>
+          m.includes('content-sanity flag (oversized)') && m.includes('test/warn-visibility'),
+        )).toBe(true);
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
   });
 });

@@ -18,10 +18,11 @@
  */
 import { describe, test, expect } from 'bun:test';
 import {
-  existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+import { PassThrough } from 'node:stream';
 
 import { runPgliteRepair } from '../src/commands/pglite-repair.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -38,6 +39,31 @@ function makeFakeLayout(dir: string): void {
   mkdirSync(join(dir, 'pg_wal'), { recursive: true });
   writeFileSync(join(dir, 'PG_VERSION'), '17\n');
   writeFileSync(join(dir, 'global', 'pg_control'), Buffer.alloc(8192));
+}
+
+/**
+ * Swap the global `process.stdin` for a fake TTY-flagged PassThrough for the
+ * duration of `fn`, writing `answer` to it shortly after `fn` starts (so the
+ * interactive `rl.question` inside `promptYesNo` has already attached its
+ * listener). Restores the real `process.stdin` in `finally` regardless of
+ * outcome. Confirmed to work under both node and bun (readline reads
+ * `process.stdin` at call time, not import time).
+ */
+async function withInteractiveAnswer<T>(answer: string, fn: () => Promise<T>): Promise<T> {
+  // Restore the ORIGINAL property descriptor, not just the original value:
+  // on Node this is a getter, and on Bun a plain data property whose
+  // writable/enumerable flags must match what we found.
+  const realStdinDescriptor = Object.getOwnPropertyDescriptor(process, 'stdin')!;
+  const fake = new PassThrough() as unknown as NodeJS.ReadStream;
+  (fake as unknown as { isTTY: boolean }).isTTY = true;
+  Object.defineProperty(process, 'stdin', { value: fake, configurable: true });
+  try {
+    const resultPromise = fn();
+    setTimeout(() => (fake as unknown as PassThrough).write(`${answer}\n`), 20);
+    return await resultPromise;
+  } finally {
+    Object.defineProperty(process, 'stdin', realStdinDescriptor);
+  }
 }
 
 function writeLockFile(dir: string, lock: Record<string, unknown>): string {
@@ -293,7 +319,34 @@ describe('gbrain pglite-repair — TTY + config gates', () => {
     expect(existsSync(`${dir}.wal-repair-attempt.json`)).toBe(false);
   });
 
-  test('9. no --path with a non-pglite configured engine: exit 1, not_pglite', async () => {
+  test('9. interactive "y" answer proceeds with repair (#4318 close-before-resolve race)', async () => {
+    // Regression for #4318: the old inline promptYesNo in this file called
+    // rl.close() BEFORE resolving the answer, and its unguarded
+    // rl.on('close', () => resolve(false)) fired synchronously during that
+    // close — so a typed "y" still resolved false and the command took the
+    // "Aborted" branch. This pins that a "y" answer is honored end-to-end
+    // through the actual interactive confirm gate (not just via the shared
+    // helper's own unit tests in test/confirm-prompt.test.ts).
+    const dir = join(tmp('gbrain-repair-interactive-'), 'brain.pglite');
+    makeFakeLayout(dir);
+
+    const cap = captureConsole();
+    try {
+      await withInteractiveAnswer('y', () => runPgliteRepair(['--path', dir, '--json']));
+    } finally {
+      cap.restore();
+    }
+
+    const out = parseJsonLine(cap.logs);
+    // The race resolved the confirm to `false` even for a typed "y" — the
+    // broken behavior always produced this exact receipt. Assert its absence
+    // rather than a specific return code, since what happens AFTER a
+    // correctly-honored "y" (repair attempted on this fake layout) is
+    // covered by other tests in this file.
+    expect(out).not.toEqual({ status: 'aborted', reason: 'user_declined' });
+  }, 30_000);
+
+  test('10. no --path with a non-pglite configured engine: exit 1, not_pglite', async () => {
     // Hermetic GBRAIN_HOME (same convention as apply-migrations-pglite-spawn):
     // configDir() appends '.gbrain', so the config lands at <home>/.gbrain/.
     const home = tmp('gbrain-repair-home-');
@@ -414,5 +467,32 @@ describe('gbrain pglite-repair — argument + quarantine hardening (adversarial 
     expect(parseJsonLine(cap.logs).code).toBe('refused_reap_quarantine');
     // No surgery: no backup dir created.
     expect(readdirSync(join(dir, '..')).some((f) => f.includes('.wal-repair-backup-'))).toBe(false);
+  });
+});
+
+describe('gbrain pglite-repair — interactive confirm wiring (#4318 residual)', () => {
+  test('uses the shared confirm-prompt helper, not a local reimplementation', () => {
+    // This file's own inline `promptYesNo` had the same close-before-resolve
+    // race that #4318 fixed in sync-cost-gate.ts/reindex-code.ts: `rl.close()`
+    // fired inside the answer callback synchronously triggered an unguarded
+    // `rl.on('close', () => resolve(false))`, so a typed "y" was silently
+    // read as decline. This pins the fix at the source level — a future
+    // change that reintroduces a local `promptYesNo`/`createInterface` here
+    // (rather than importing the shared, race-free helper) fails this test,
+    // even though `test/confirm-prompt.test.ts` cannot see this file at all.
+    // test-reads-source-ok: pins that the local reimplementation stays gone
+    // and the shared helper is wired with the exact stderr-preserving args —
+    // there's no exported/injectable seam to assert this behaviorally.
+    const src = readFileSync(join(import.meta.dir, '../src/commands/pglite-repair.ts'), 'utf8');
+    expect(src).toContain("import { promptYesNo } from '../core/confirm-prompt.ts';");
+    expect(src).not.toMatch(/\bfunction promptYesNo\b/);
+    expect(src).not.toContain("from 'readline'");
+    // The call site itself must keep the prompt on stderr — confirm-prompt's
+    // default `output` is stdout, and `--json` callers depend on stdout
+    // staying machine-readable-only. Checking the import above isn't enough:
+    // dropping `{ output: process.stderr }` from this call would still pass
+    // that assertion while leaking the prompt into --json output.
+    expect(src).toContain("await promptYesNo('Repair now? [y/N] ', { output: process.stderr });");
+    expect(src).not.toContain("from 'node:readline'");
   });
 });

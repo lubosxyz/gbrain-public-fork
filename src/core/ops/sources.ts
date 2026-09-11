@@ -8,6 +8,8 @@
 
 import type { Operation } from './contract.ts';
 import { OperationError } from './contract.ts';
+import { sourceScopeOpts } from './context.ts';
+import { resolveAuthCapabilities } from '../harness/capabilities.ts';
 
 // --- v0.28: whoami + sources management ---
 
@@ -85,12 +87,7 @@ const whoami: Operation = {
         transport: 'oauth',
         client_id: ctx.auth.clientId,
         client_name: ctx.auth.clientName ?? ctx.auth.clientId,
-        scopes: ctx.auth.scopes,
-        expires_at: ctx.auth.expiresAt ?? null,
-        // Read-only self-introspection of the token's source grants —
-        // widens nothing; absent grants serialize fail-closed (null / []).
-        source_id: ctx.auth.sourceId ?? null,
-        federated_read: ctx.auth.allowedSources ?? [],
+        ...await resolveAuthCapabilities(ctx.auth, ctx.engine, ctx.config),
       };
     }
     return {
@@ -186,16 +183,34 @@ const sources_list: Operation = {
   description:
     'List registered sources with page counts and remote_url. v0.28 surfaces ' +
     'the new remote_url field so a remote MCP caller can confirm a source is ' +
-    'managed by clone+pull rather than user-supplied path.',
+    'managed by clone+pull rather than user-supplied path. Results are ' +
+    "confined to the caller's resolved source scope (federated read grant > " +
+    'bound source; #4433) and carry no marker when rows were withheld, so a ' +
+    'listing may be incomplete. Only the trusted local CLI (`gbrain sources ' +
+    'list`) sees the full registry.',
   params: {
     include_archived: { type: 'boolean', description: 'Include soft-deleted sources.' },
   },
   scope: 'read',
   handler: async (ctx, p) => {
     const { listSources } = await import('../sources-ops.ts');
+    // #4433: row-filter the listing to the caller's source scope — a client
+    // whose scope excludes a source must not learn that source's id, name,
+    // or page_count. Wave-L posture (maintainer decision, supersedes the
+    // wave-g "scalar callers keep the full listing" carve-out): EVERY
+    // untrusted caller (anything not strictly remote === false) is confined
+    // through the canonical sourceScopeOpts ladder, matching the rest of
+    // the read-op surface — federated grant > scalar bound source >
+    // fail-closed '__all__' (the sentinel passes through as a literal that
+    // matches no real source id, so it yields an empty listing rather than
+    // the whole registry). Trusted local CLI keeps the full operator view.
+    const scope = ctx.remote === false ? {} : sourceScopeOpts(ctx);
+    const allowedSourceIds =
+      scope.sourceIds ?? (scope.sourceId !== undefined ? [scope.sourceId] : undefined);
     return {
       sources: await listSources(ctx.engine, {
         includeArchived: (p.include_archived as boolean) === true,
+        ...(allowedSourceIds !== undefined ? { allowedSourceIds } : {}),
       }),
     };
   },
@@ -242,12 +257,27 @@ const sources_status: Operation = {
     'Per-source diagnostic. Returns clone_state ("healthy" | "missing" | ' +
     '"not-a-dir" | "no-git" | "url-drift" | "corrupted" | "not-applicable") ' +
     'so a remote MCP caller can diagnose whether the on-disk clone is ' +
-    'syncable without SSH access to the brain host.',
+    "syncable without SSH access to the brain host. Confined to the caller's " +
+    'resolved source scope (#4433); an out-of-scope id answers not_found, ' +
+    'indistinguishable from a nonexistent source.',
   params: {
     id: { type: 'string', required: true, description: "Source id to diagnose, as listed by sources_list (e.g. 'wiki'). A source id, not a page slug." },
   },
   scope: 'read',
   handler: async (ctx, p) => {
+    // Source isolation, mirroring sources_list's #4433 wave-L posture
+    // exactly (the maintainer decision that superseded the wave-g "scalar
+    // callers keep the full listing" carve-out): EVERY untrusted caller
+    // (anything not strictly remote === false) is confined through the
+    // canonical sourceScopeOpts ladder — federated grant > scalar bound
+    // source. Trusted local CLI keeps the full operator view. Out-of-scope
+    // ids answer not_found, indistinguishable from a nonexistent source
+    // (anti-enumeration), matching get_agent_job's shape.
+    const scope = ctx.remote === false ? {} : sourceScopeOpts(ctx);
+    const allowed = scope.sourceIds ?? (scope.sourceId !== undefined ? [scope.sourceId] : null);
+    if (allowed && !allowed.includes(p.id as string)) {
+      throw new OperationError('not_found', `Unknown source: ${p.id}`);
+    }
     const { getSourceStatus } = await import('../sources-ops.ts');
     return getSourceStatus(ctx.engine, p.id as string);
   },

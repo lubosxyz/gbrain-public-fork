@@ -1,5 +1,7 @@
 # Connect GBrain to Claude Code
 
+For an existing agent, start with the [memory-only walkthrough](../tutorials/connect-coding-agent.md); a personal-agent identity and private repository are optional. For an existing hosted brain, use [private handoff and profiles](../guides/hosted-harness-access.md).
+
 > New to this? The [Give your coding agent a memory](../tutorials/connect-coding-agent.md)
 > tutorial walks both paths (local-from-nothing and connect-to-an-existing-brain)
 > end to end, plus the brain-first protocol that makes it worth it. This page is
@@ -21,6 +23,22 @@ brain-first skill set:
 /plugin install gbrain@gbrain
 ```
 
+Two **persona variants** ship from the same marketplace — curated subsets
+for sessions that don't want all 67 skills in the native manifest:
+
+```
+/plugin install gbrain-coding@gbrain    # brain-first coding persona
+/plugin install gbrain-daily@gbrain     # daily personal-brain persona
+```
+
+Install exactly ONE gbrain plugin per machine — every variant serves the same
+`gbrain` MCP server name, so two installed variants would double-serve.
+Curation lives in `skills/plugin-lanes.json#personas` (one recorded reason
+per skill). Alternative without a marketplace round-trip:
+`gbrain skillpack scaffold --harness claude-code` copies the same persona set
+into your user-scope skills dir with a local-edit-respecting update lens
+(see docs/guides/skillpacks-as-scaffolding.md).
+
 (CLI form: `claude plugin marketplace add garrytan/gbrain` +
 `claude plugin install gbrain@gbrain`.) Prerequisites and behavior match the
 [Codex plugin](CODEX.md#install-as-a-codex-plugin-recommended): the gbrain CLI
@@ -41,6 +59,18 @@ claude mcp add gbrain -- gbrain serve --surface verbs
 
 That's it. Claude Code spawns `gbrain serve` as a stdio subprocess. No server, no
 tunnel, no token needed. Works with both PGLite and Supabase engines.
+
+> **PGLite brains are single-process.** PGLite is a single-writer embedded
+> Postgres: the first running `gbrain serve` owns the brain's data directory
+> via the data-dir lock, for its whole lifetime. A second `serve` (e.g. a
+> second harness or session registering the same stdio command) — or any CLI
+> command that opens the DB — fails on the lock while that serve is live
+> (`gbrain sync` is the one exception: it delegates to the live serve). If
+> more than one process needs the brain at once, run ONE shared
+> `gbrain serve --http` and point every client at it (Options 2/3 below), or
+> migrate to the Postgres/Supabase engine, which tolerates concurrent
+> connections. Details:
+> [serve ↔ sync concurrency](../architecture/serve-sync-concurrency.md).
 
 `--surface verbs` exposes the seven-verb memory protocol (`recall`, `remember`,
 `entity`, `synthesize`, `forget`, `context_pack`, `delta` —
@@ -113,8 +143,8 @@ search for [any topic in your brain]
 You should see results from your GBrain knowledge base.
 
 > **`list_skills` returns nothing?** Skill discovery is gated by `mcp.publish_skills`
-> on the host. New brains from `gbrain init` default it ON; brains upgraded from an
-> older release stay OFF until you opt in. Enable it on the host with
+> on the host. `gbrain init` sets it ON for new brains; a brain whose config never
+> set the key stays OFF until you opt in. Enable it on the host with
 > `gbrain config set mcp.publish_skills true`. Skill discovery and the core tools
 > named here (search, query, get_page, put_page, think, find_experts) are
 > full-surface — on `--surface verbs` the agent sees only the seven memory verbs,
@@ -124,7 +154,7 @@ You should see results from your GBrain knowledge base.
 > `remember` on the verbs surface.
 > Why brains differ on the default: [tutorial A1](../tutorials/connect-coding-agent.md#a1-on-the-host-serve-over-http).
 
-## Ambient recall at session boundaries (v0.45.7)
+## Ambient recall at session boundaries
 
 Two frozen verbs close the "no question fired" gap for long-lived sessions:
 `context_pack` (session-start warm-up + post-compaction rehydration) and

@@ -46,8 +46,8 @@ beforeAll(async () => {
     ON CONFLICT (id) DO NOTHING;
   `);
   await db.exec(`
-    INSERT INTO minion_jobs (id, queue, name, data, status)
-    VALUES (2001, 'default', 'subagent', '{}'::jsonb, 'completed')
+    INSERT INTO minion_jobs (submission_authority, id, queue, name, data, status)
+    VALUES ('{"version":1,"kind":"application"}'::jsonb, 2001, 'default', 'subagent', '{}'::jsonb, 'completed')
     ON CONFLICT (id) DO NOTHING;
   `);
   await db.query(
@@ -109,6 +109,46 @@ describe('#1586: the patterns phase scopes its writes to the cycle source', () =
       expect(existsSync(join(foreignDir, `${SLUG}.md`))).toBe(false);
     } finally {
       rmSync(foreignDir, { recursive: true, force: true });
+    }
+  });
+
+  test('#4077: abort during reverse-write stops the current and all remaining file writes', async () => {
+    const abortDir = mkdtempSync(join(tmpdir(), 'gbrain-patterns-abort-'));
+    const controller = new AbortController();
+    const refs = [
+      { slug: 'wiki/personal/patterns/abort-first', source_id: SOURCE_ID },
+      { slug: 'wiki/personal/patterns/abort-second', source_id: SOURCE_ID },
+    ];
+    // Fake engine: the abort fires DURING the first ref's row reads, so the
+    // post-read signal check — not just the loop-top one — must stop the
+    // first file write too.
+    const fakeEngine = {
+      getPage: async (slug: string) => ({
+        slug,
+        type: 'note',
+        title: slug,
+        compiled_truth: slug,
+        frontmatter: {},
+        timeline: '',
+      }),
+      getTags: async () => {
+        controller.abort(new Error('patterns-reverse-write-cancelled'));
+        return [];
+      },
+    };
+
+    try {
+      await expect(reverseWriteRefs(
+        fakeEngine as any,
+        abortDir,
+        refs,
+        SOURCE_ID,
+        controller.signal,
+      )).rejects.toThrow('patterns-reverse-write-cancelled');
+      expect(existsSync(join(abortDir, `${refs[0]!.slug}.md`))).toBe(false);
+      expect(existsSync(join(abortDir, `${refs[1]!.slug}.md`))).toBe(false);
+    } finally {
+      rmSync(abortDir, { recursive: true, force: true });
     }
   });
 });

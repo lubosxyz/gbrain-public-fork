@@ -34,22 +34,22 @@ export const METRIC_GLOSSARY: Readonly<Record<string, Readonly<MetricGlossEntry>
   // ────────────────────────────────────────────────────────────────────────
   'precision@k': Object.freeze({
     industry_term: 'Precision at k (P@k)',
-    eli10: 'Of the top k results the engine returned, what fraction were actually relevant? High precision means few junk results in the top of the list.',
-    range: '0..1, higher is better. P@10 = 0.7 means 7 of the top 10 results were on-topic.',
+    eli10: 'Of the top k unique pages the engine returned, what fraction were actually relevant? Multiple chunks from one page count once. High precision means few junk pages in the top of the list.',
+    range: '0..1, higher is better. The denominator stays k even when fewer than k unique pages are returned; P@10 = 0.7 means 7 relevant pages in the top 10 slots.',
   }),
   'recall@k': Object.freeze({
     industry_term: 'Recall at k (R@k)',
-    eli10: 'Of all the relevant results that exist in the brain, what fraction did the engine find in its top k? High recall means few missed answers.',
-    range: '0..1, higher is better. R@10 = 0.81 means out of every 100 questions, the right answer was in the top 10 for 81 of them.',
+    eli10: 'Of all the relevant pages that exist in the brain, what fraction did the engine find in its first k unique pages? Multiple chunks from one page count once. High recall means few missed answers.',
+    range: '0..1, higher is better. R@10 = 0.81 means 81% of all labeled relevant pages appeared in the first 10 unique results.',
   }),
   'mrr': Object.freeze({
     industry_term: 'Mean Reciprocal Rank (MRR)',
-    eli10: 'On average, how far down the list is the FIRST relevant result? An MRR of 1.0 means the first hit is always right; an MRR of 0.5 means it\'s typically at rank 2.',
+    eli10: 'On average, how far down the unique-page list is the FIRST relevant result? Repeated chunks do not consume ranks. An MRR of 1.0 means the first page is always right; an MRR of 0.5 means it\'s typically at rank 2.',
     range: '0..1, higher is better. Computed as the average of 1/rank-of-first-relevant-result across all test queries.',
   }),
   'ndcg@k': Object.freeze({
     industry_term: 'Normalized Discounted Cumulative Gain at k (nDCG@k)',
-    eli10: 'Like precision@k, but the engine gets MORE credit for putting good results near the top than near rank k. A perfect ordering scores 1.0; a totally random ordering scores near 0.',
+    eli10: 'Like precision@k, but the engine gets MORE credit for putting good pages near the top than near rank k. Each page earns gain once even if several chunks matched. A perfect ordering scores 1.0; a totally random ordering scores near 0.',
     range: '0..1, higher is better. nDCG@10 above 0.65 is the common "ship it" threshold for hybrid retrieval on technical corpora.',
   }),
 
@@ -207,6 +207,36 @@ export const METRIC_GLOSSARY: Readonly<Record<string, Readonly<MetricGlossEntry>
     eli10: 'Of everything the real LLM extractor persisted, what fraction matches a gold fact? Low precision means the extractor invents or over-extracts — junk memory that pollutes future recall.',
     range: '0..1, higher is better. Absent in deterministic runs.',
   }),
+
+  // ────────────────────────────────────────────────────────────────────────
+  // LongMemEval — long-term conversational memory benchmark
+  // (`gbrain eval longmemeval`; docs/eval-bench.md)
+  // ────────────────────────────────────────────────────────────────────────
+  'recall_all@k': Object.freeze({
+    industry_term: 'Strict session recall at k (recall_all@k, LongMemEval)',
+    eli10: 'Did EVERY gold session for the question land among the distinct sessions in the top k retrieved chunks? A multi-session question with two gold sessions only counts when both are there — this is the evidence-complete rate the answer model actually needs. Abstention (_abs) questions stay out of the denominator unless --include-abstention.',
+    range: '0..1 per question type and aggregate, higher is better. Strict by construction: recall_all@k <= recall_any@k always.',
+  }),
+  'recall_any@k': Object.freeze({
+    industry_term: 'Lenient session recall at k (recall_any@k, LongMemEval)',
+    eli10: 'Did AT LEAST ONE gold session land among the distinct sessions in the top k retrieved chunks? The lenient companion to recall_all@k — a partial-evidence hit still counts. Per-row `recall_hit` is a deprecated alias of this metric.',
+    range: '0..1, higher is better. Reported alongside recall_all@k; the gap between them is the partial-evidence rate.',
+  }),
+  'qa_accuracy': Object.freeze({
+    industry_term: 'Judged QA accuracy (LongMemEval, LLM-as-judge)',
+    eli10: 'Of all questions in the run, what fraction did the judge model mark correct against the gold answer (official LongMemEval prompts)? The headline scores every question the judge could not grade (timeouts, refusals, malformed verdicts, budget skips) as INCORRECT, so it is never more lenient than the official scorer; the companion accuracy_excluding_errors drops those rows from the denominator and the judge_errors count says how many there were.',
+    range: '0..1, higher is better. Only comparable across runs with the same reader model, judge model, prompt version and dataset revision.',
+  }),
+  'mean_returned_results': Object.freeze({
+    industry_term: 'Mean returned results per question (autocut benefit, LongMemEval replay)',
+    eli10: 'Across the questions in an autocut floor replay, the mean number of chunk rows in the returned window (the first k rows autocut kept). This is the benefit side of the autocut trade: fewer rows per question means less context the answer model has to read. Compare it against recall_all@k, the guardrail, at each floor.',
+    range: '0..k, lower is better ONLY while recall_all@k holds. Equals k whenever autocut never trims inside the window (e.g. floor `off`).',
+  }),
+  'mean_returned_est_tokens': Object.freeze({
+    industry_term: 'Mean estimated tokens returned per question (autocut benefit, LongMemEval replay)',
+    eli10: 'Across the questions in an autocut floor replay, the mean of the summed estimated tokens (chars / 4) of the returned window. The token-denominated twin of mean_returned_results: the direct measure of how much conversational memory each question pushes into the answer model at a given floor.',
+    range: '0..unbounded, lower is better ONLY while recall_all@k holds. Approximates OpenAI tiktoken counts for English; off by ~5-10% for other tokenizers.',
+  }),
 });
 
 /**
@@ -291,6 +321,7 @@ export function renderMetricGlossaryMarkdown(): string {
       'source_isolation_violations', 'avg_injected_tokens',
       'extraction_recall', 'extraction_precision',
     ]],
+    ['LongMemEval — Long-Term Conversational Memory', ['recall_all@k', 'recall_any@k', 'qa_accuracy', 'mean_returned_results', 'mean_returned_est_tokens']],
   ];
 
   for (const [groupTitle, metrics] of groups) {

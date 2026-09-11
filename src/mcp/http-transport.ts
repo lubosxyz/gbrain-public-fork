@@ -26,9 +26,12 @@
  */
 
 import { createHash } from 'crypto';
+import { hasScope } from '../core/scope.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { buildToolDefs } from './tool-defs.ts';
-import { operations } from '../core/operations.ts';
+import { resolveMcpInstructions } from './instructions.ts';
+import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
+import { operations, operationsByName } from '../core/operations.ts';
 import type { AuthInfo } from '../core/operations.ts';
 import { gateRemoteToolCall } from '../core/auth-gate.ts';
 import { writeAuthAudit } from '../core/auth-audit.ts';
@@ -41,7 +44,11 @@ import { disabledOpsForPublishGates } from './publish-gates.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
-import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions, normalizeTokenScopes } from '../core/legacy-token-scope.ts';
+import { degradedLastError, isEngineDegraded } from '../core/degraded-marker.ts';
+import { classifyPgAccessError } from '../core/pg-access-classify.ts';
+import { redactConnectionInfo } from '../core/audit/redact-connection-info.ts';
+import { redactUrlsInText } from '../core/url-redact.ts';
+import { normalizeTokenScopes, parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions } from '../core/legacy-token-scope.ts';
 export { parseLegacyTokenScope };
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
@@ -177,6 +184,18 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
   // (pglite-schema.ts:478,495 and schema.sql), so the legacy bearer-auth
   // path works on either engine without a postgres.js singleton.
   const sql = sqlQueryForEngine(engine);
+
+  // Classified reason for the /health degraded payload — read-only on the
+  // stored startup error, wrapped so a classifier bug degrades to a generic
+  // token rather than failing the health endpoint.
+  const degradedHealthReason = (): string => {
+    try {
+      const err = degradedLastError(engine);
+      return err === undefined ? 'startup_connect_failed' : classifyPgAccessError(err, {}).reason;
+    } catch {
+      return 'startup_connect_failed';
+    }
+  };
 
   const limiters = opts.limiters || buildDefaultLimiters();
   const bodyCap = envInt('GBRAIN_HTTP_MAX_BODY_BYTES', DEFAULT_BODY_CAP);
@@ -337,14 +356,17 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       const auth: AuthInfo = {
         token,
         clientId: rowId,
+        principal: { kind: 'legacy_token', id: rowId },
         clientName: rowName,
         // v132: server-derived token kind (this transport only verifies
         // access_tokens rows).
         tokenKind: 'legacy',
         // v132: tenant-scoped tokens thread their REAL stored grant (the
-        // gate requires exactly ['read']); grandfathered tokens keep this
-        // transport's historical empty-scopes behavior byte-identical.
-        scopes: tenantScoped ? (normalizeTokenScopes(row.scopes) ?? []) : [],
+        // gate requires exactly ['read']). Non-tenant tokens honor a stored
+        // scopes grant; grandfathered (NULL-scopes) rows keep full access (#4043).
+        scopes: tenantScoped
+          ? (normalizeTokenScopes(row.scopes) ?? [])
+          : (normalizeTokenScopes(row.scopes) ?? ['read', 'write', 'admin']),
         sourceId,
         ...(allowedSources ? { allowedSources } : {}),
         // v132: tenant threading — whoami reports company_slug from HERE
@@ -397,6 +419,15 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       // Health check — no auth, no rate limit. Probes the DB so orchestration
       // doesn't see "ok" while clients are getting misleading 401s during a DB outage.
       if (path === '/health') {
+        // Startup-degraded serve (db-availability 4c): report the classified
+        // state WITHOUT touching the engine — a health poller must never
+        // consume (or storm) the one lazy reconnect attempt.
+        if (isEngineDegraded(engine)) {
+          return Response.json(
+            { status: 'degraded', version: VERSION, transport: 'http', db: 'unreachable', reason: degradedHealthReason() },
+            { status: 503, headers: corsHeaders(origin) },
+          );
+        }
         try {
           await sql`SELECT 1`;
           return Response.json(
@@ -404,8 +435,11 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
             { headers: corsHeaders(origin) },
           );
         } catch (e: any) {
+          // Redacted: a driver message can embed the full DSN, and /health is
+          // unauthenticated by design.
+          const safe = redactUrlsInText(redactConnectionInfo(e?.message ?? 'unknown'));
           return Response.json(
-            { status: 'unhealthy', version: VERSION, transport: 'http', db: 'unreachable', error: e?.message ?? 'unknown' },
+            { status: 'unhealthy', version: VERSION, transport: 'http', db: 'unreachable', error: safe },
             { status: 503, headers: corsHeaders(origin) },
           );
         }
@@ -507,12 +541,27 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       // initialize
       if (method === 'initialize') {
         logRequest(auth.tokenName!, 'initialize', 'success', Date.now() - startedMs);
+        // Ambient writeback (opt-in, default off): resolved per initialize —
+        // fail-closed with a per-engine last-known-good bundle, so a config
+        // read failure serves the previous bundle (or the base string), never
+        // a wrong posture. The advertised writeback also respects token scopes —
+        // extract_facts is advertised only when the resolved surface can
+        // actually call it (OV2-14; a verbs/starter-pinned serve must not
+        // order agents to call a tool dispatch will deny).
+        const writeback = await resolveWritebackConfig(engine, fileConfig);
         return Response.json(
           {
             result: {
               protocolVersion: '2025-03-26',
               serverInfo: { name: 'gbrain', version: VERSION },
               capabilities: { tools: {} },
+              // #4748: contract (+ opt-in writeback section) + deployment identity.
+              instructions: resolveMcpInstructions(fileConfig, process.env, {
+                writeback: ambientOptsFrom(writeback, {
+                  remember: hasScope(auth.auth!.scopes, 'write') && (!surfaceAllowedOps || surfaceAllowedOps.has('remember')),
+                  extractFacts: hasScope(auth.auth!.scopes, 'write') && (!surfaceAllowedOps || surfaceAllowedOps.has('extract_facts')),
+                }),
+              }),
             },
             jsonrpc: '2.0',
             id,
@@ -539,9 +588,11 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         // unconditionally, so gates-off served the exact listed-but-denied
         // catalog lie E5 (test/truthful-catalog.e2e-lite.test.ts) pins out.
         const gateDisabled = await disabledOpsForPublishGates(engine, fileConfig);
-        const visibleTools = gateDisabled.size === 0
-          ? tools
-          : tools.filter(t => !gateDisabled.has(t.name));
+        const visibleTools = tools.filter(t => {
+          const op = operationsByName[t.name];
+          return op && !gateDisabled.has(t.name) && (hasScope(auth.auth!.scopes, op.scope ?? 'read')
+            || (op.agentCallable === true && hasScope(auth.auth!.scopes, 'agent')));
+        });
         logRequest(auth.tokenName!, 'tools/list', 'success', Date.now() - startedMs);
         return Response.json(
           { result: { tools: visibleTools }, jsonrpc: '2.0', id },
@@ -587,6 +638,14 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
             },
             { headers: corsHeaders(origin) },
           );
+        }
+        const op = operationsByName[toolName];
+        if (op && !op.localOnly && !hasScope(auth.auth!.scopes, op.scope ?? 'read') &&
+            !(op.agentCallable === true && hasScope(auth.auth!.scopes, 'agent'))) {
+          logRequest(auth.tokenName!, `tools/call:${toolName}`, 'denied_after_list', Date.now() - startedMs);
+          return Response.json({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text',
+            text: JSON.stringify({ error: 'permission_denied', message: `Tool requires ${op.scope ?? 'read'} scope` }) }] } },
+            { headers: corsHeaders(origin) });
         }
         // v0.28: thread per-token takes-holder allow-list so takes_list /
         // takes_search / query (when it returns takes) can server-side filter.

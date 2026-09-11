@@ -17,6 +17,8 @@ import {
   renderSessionParts,
 } from '../src/core/transcripts/render.ts';
 import { parseConversation } from '../src/core/conversation-parser/parse.ts';
+import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, stripFactsFence } from '../src/core/facts-fence.ts';
+import { TAKES_FENCE_BEGIN, parseTakesFence } from '../src/core/takes-fence.ts';
 import type { ParsedSession } from '../src/core/transcripts/types.ts';
 
 function session(messages: ParsedSession['messages'], meta: Partial<ParsedSession['meta']> = {}): ParsedSession {
@@ -60,6 +62,25 @@ describe('render round-trip through the SHARED imessage-slack pattern', () => {
     expect(parsed.messages[1].text).toContain('fund-b participated.');
     // PM rendering (21:30 UTC → 9:30 PM).
     expect(body).toContain('(2026-08-02 9:30 PM)');
+  });
+
+  test('multi-line coding turns remain parseable below the ordinary density floor', () => {
+    const longUserTurn = Array.from({ length: 40 }, (_, i) => `user line ${i}`).join('\n');
+    const longAssistantTurn = Array.from({ length: 40 }, (_, i) => `assistant line ${i}`).join('\n');
+    const sparse = session([
+      { role: 'user', timestamp: '2026-08-02T09:00:03.000Z', text: longUserTurn },
+      { role: 'assistant', timestamp: '2026-08-02T09:00:04.000Z', text: longAssistantTurn },
+    ]);
+
+    const rendered = renderSessionParts(
+      redactSession(sparse, { userPatternsPath: '/nonexistent' }),
+    );
+    const parsed = parseConversation(splitBody(rendered.parts[0].content));
+
+    expect(parsed.matched_pattern_id).toBe('imessage-slack');
+    expect(parsed.messages).toHaveLength(2);
+    expect(parsed.messages[0].text).toContain('user line 39');
+    expect(parsed.messages[1].text).toContain('assistant line 39');
   });
 
   test('frontmatter is mandatory-complete: type, date, unique per-part id, marker', () => {
@@ -118,6 +139,49 @@ describe('anchor-escape [P0: hostile BODIES cannot forge messages]', () => {
     // parses under the cleaned speaker, never as a forged boundary.
     expect(parsed.messages[0].speaker).not.toContain('*');
     expect(parsed.messages[0].text).toBe('hello there');
+  });
+
+  // #4821: a session that quoted another page's facts/takes fence (context
+  // pack, get_page) must not carry a LIVE fence marker into the transcript
+  // page — the 4000-char message cap routinely keeps the begin marker and
+  // drops the end, manufacturing FACTS_FENCE_UNBALANCED on every dream cycle.
+  test('a quoted facts:begin marker (end truncated away) does not become a live, unbalanced fence', () => {
+    const quoted = session([
+      { role: 'user', timestamp: '2026-08-02T09:00:03.000Z', text: `Page body:\n${FACTS_FENCE_BEGIN}\n| # | claim | kind |` },
+      { role: 'assistant', timestamp: '2026-08-02T09:00:04.000Z', text: 'Noted.' },
+    ]);
+    const body = splitBody(renderSessionParts(redactSession(quoted, { userPatternsPath: '/nonexistent' })).parts[0].content);
+    expect(parseFactsFence(body).warnings).toEqual([]);
+    expect(body.includes(FACTS_FENCE_BEGIN)).toBe(false);
+    // Still readable/greppable: the marker text survives, only the token is neutralized.
+    expect(body).toContain('facts:begin');
+    expect(parseConversation(body).messages).toHaveLength(2);
+  });
+
+  test('a fully quoted facts fence is not indexed as the TRANSCRIPT page\'s facts, nor stripped from its chunk text', () => {
+    const fence = [
+      FACTS_FENCE_BEGIN,
+      '',
+      '| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |',
+      '|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|',
+      '| 1 | acme-example raised a seed round | event | 0.9 | public | notable |  |  |  |  |',
+      '',
+      FACTS_FENCE_END,
+    ].join('\n');
+    const quoted = session([
+      { role: 'user', timestamp: '2026-08-02T09:00:03.000Z', text: `Here is the page:\n${fence}\nthoughts?` },
+    ]);
+    const body = splitBody(renderSessionParts(redactSession(quoted, { userPatternsPath: '/nonexistent' })).parts[0].content);
+    expect(parseFactsFence(body).facts).toHaveLength(0);
+    expect(stripFactsFence(body)).toBe(body);
+  });
+
+  test('a quoted takes:begin marker does not raise a takes-fence warning', () => {
+    const quoted = session([
+      { role: 'user', timestamp: '2026-08-02T09:00:03.000Z', text: `Quoting:\n${TAKES_FENCE_BEGIN}\n| # | take |` },
+    ]);
+    const body = splitBody(renderSessionParts(redactSession(quoted, { userPatternsPath: '/nonexistent' })).parts[0].content);
+    expect(parseTakesFence(body).warnings.filter((w) => w.startsWith('TAKES_FENCE_'))).toEqual([]);
   });
 
   test('YAML-hostile titles serialize safely; issue refs are NOT over-redacted', () => {

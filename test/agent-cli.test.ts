@@ -229,10 +229,11 @@ describe('queue.add trusted-submit gate for subagent', () => {
     expect(ok.name).toBe('subagent_aggregator');
   });
 
-  test('v0.38 S1.7: subagent with any tool-supporting provider passes the queue gate', async () => {
+  test('v0.38 S1.7: subagent with a loop-capable provider passes the queue gate', async () => {
     // v0.38 D6/D7 — the Anthropic pin is removed. The gateway tool loop
-    // routes any provider with native tool calling. Submit-time guard now
-    // refuses ONLY on unusable:no_tools or unknown verdicts.
+    // routes any provider whose recipe declares tool calling AND
+    // supports_subagent_loop: true. Submit-time guard refuses on the
+    // unusable:no_tools / unusable:no_subagent_loop / unknown verdicts.
     const openaiJob = await queue.add(
       'subagent',
       { prompt: 'hi', model: 'openai:gpt-5.2' },
@@ -275,6 +276,24 @@ describe('queue.add trusted-submit gate for subagent', () => {
     await expect(
       queue.add('subagent', { prompt: 'hi', model: 'voyage:voyage-3-large' }, {}, { allowProtectedSubmit: true }),
     ).rejects.toThrow(/unknown provider/i);
+  });
+
+  test('subagent with a loop-incapable provider (supports_subagent_loop: false) is rejected at submit time', async () => {
+    // moonshot supports tools but declares the loop unsupported.
+    // Non-Anthropic OpenRouter families stay refused; Anthropic-via-OR is allowed.
+    await expect(
+      queue.add('subagent', { prompt: 'hi', model: 'moonshot:kimi-k2.5' }, {}, { allowProtectedSubmit: true }),
+    ).rejects.toThrow(/supports_subagent_loop/);
+    await expect(
+      queue.add('subagent', { prompt: 'hi', model: 'openrouter:openai/gpt-5.2' }, {}, { allowProtectedSubmit: true }),
+    ).rejects.toThrow(/supports_subagent_loop/);
+    const job = await queue.add(
+      'subagent',
+      { prompt: 'hi', model: 'openrouter:anthropic/claude-haiku-4.5' },
+      {},
+      { allowProtectedSubmit: true },
+    );
+    expect(job.id).toBeGreaterThan(0);
   });
 });
 
@@ -416,13 +435,19 @@ describe('#2922: submit-time source resolution', () => {
       await withEnv({ GBRAIN_SOURCE: undefined }, async () => {
         try {
           await runAgentRun(engine, ['--detach', '--source', 'does-not-exist', 'write', 'a', 'page']);
-          throw new Error('expected runAgentRun to exit');
+          throw new Error('expected runAgentRun to reject');
         } catch (e: any) {
+          // The resolver's `not found or is archived.` wording is a USER error
+          // (mirrors dream.ts): the handler classifies it via the shared
+          // isResolverUserError predicate, prints one stderr line, exits 1 —
+          // never propagates as a stack trace.
           expect(e.message).toBe('EXIT');
         }
       });
       expect(spy).toHaveBeenCalledWith(1);
-      expect(errSpy.mock.calls.some(call => String(call[0]).includes('not found'))).toBe(true);
+      const errOut = errSpy.mock.calls.flat().join(' ');
+      expect(errOut).toMatch(/gbrain agent run: Source "does-not-exist" not found or is archived/);
+      expect(errOut).toMatch(/gbrain sources list/);
       const rows = await engine.executeRaw<{ id: number }>(
         `SELECT id FROM minion_jobs WHERE name = 'subagent'`,
       );
@@ -441,13 +466,15 @@ describe('#2922: submit-time source resolution', () => {
       await withEnv({ GBRAIN_SOURCE: undefined }, async () => {
         try {
           await runAgentRun(engine, ['--detach', '--source', 'corporate', 'write', 'a', 'page']);
-          throw new Error('expected runAgentRun to exit');
+          throw new Error('expected runAgentRun to reject');
         } catch (e: any) {
           expect(e.message).toBe('EXIT');
         }
       });
       expect(spy).toHaveBeenCalledWith(1);
-      expect(errSpy.mock.calls.some(call => String(call[0]).includes('archived'))).toBe(true);
+      const errOut = errSpy.mock.calls.flat().join(' ');
+      expect(errOut).toMatch(/gbrain agent run: Source "corporate" not found or is archived/);
+      expect(errOut).toMatch(/restore|sources list/);
       const rows = await engine.executeRaw<{ id: number }>(
         `SELECT id FROM minion_jobs WHERE name = 'subagent'`,
       );
@@ -518,5 +545,58 @@ describe('fan-out manifest shape (integration)', () => {
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+describe('dispatcher routes register (cathedral-6)', () => {
+  test('runAgent dispatches register and its --help never touches the engine', async () => {
+    const { runAgent } = await import('../src/commands/agent.ts');
+    // engine=null: the SELF_HELP_WITHOUT_ENGINE lane. Help must print and return.
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => { logs.push(a.join(' ')); };
+    try {
+      await runAgent(null, ['register', '--help']);
+    } finally {
+      console.log = orig;
+    }
+    const out = logs.join('\n');
+    expect(out).toContain('gbrain agent register');
+    expect(out).toContain('--preset daily-driver|coding-agent');
+  });
+
+  test('top-level help mentions register', async () => {
+    const { runAgent } = await import('../src/commands/agent.ts');
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => { logs.push(a.join(' ')); };
+    try {
+      await runAgent(null, ['--help']);
+    } finally {
+      console.log = orig;
+    }
+    expect(logs.join('\n')).toContain('agent register');
+  });
+
+  test('`agent run -- --help` is NOT a help request (-- terminator honored)', async () => {
+    const { runAgent } = await import('../src/commands/agent.ts');
+    // With a null engine and a post-`--` --help, the dispatcher must treat it
+    // as a REAL run (and refuse on the missing engine) — never print help.
+    const errs: string[] = [];
+    const origErr = console.error;
+    const origExit = process.exit;
+    let exitCode: number | undefined;
+    console.error = (...a: unknown[]) => { errs.push(a.join(' ')); };
+    (process as any).exit = (code?: number) => { exitCode = code; throw new Error('__exit__'); };
+    try {
+      await runAgent(null, ['run', '--', '--help']).catch((e) => {
+        if (!/__exit__/.test(String(e?.message))) throw e;
+      });
+    } finally {
+      console.error = origErr;
+      (process as any).exit = origExit;
+    }
+    expect(exitCode).toBe(1);
+    expect(errs.join('\n')).toContain('needs a configured brain');
   });
 });

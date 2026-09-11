@@ -57,7 +57,7 @@ export const FACTS_FENCE_END   = '<!--- gbrain:facts:end -->';
 // the fence parser has zero engine dependencies — it must run in pure-
 // markdown contexts (the chunker strip, the CI invariant check) where
 // importing engine.ts pulls a large DB-shaped transitive graph.
-export type FactKind = 'event' | 'preference' | 'commitment' | 'belief' | 'fact';
+export type FactKind = 'event' | 'preference' | 'commitment' | 'belief' | 'fact' | 'idea';
 
 // Mirror src/core/engine.ts FactVisibility ('private' | 'world'). Binary
 // gate per the existing takes D21 contract — drives the chunker strip
@@ -67,7 +67,7 @@ export type FactVisibility = 'private' | 'world';
 export type FactNotability = 'high' | 'medium' | 'low';
 
 const KIND_VALUES: ReadonlySet<string> = new Set([
-  'event', 'preference', 'commitment', 'belief', 'fact',
+  'event', 'preference', 'commitment', 'belief', 'fact', 'idea',
 ]);
 const VISIBILITY_VALUES: ReadonlySet<string> = new Set(['private', 'world']);
 const NOTABILITY_VALUES: ReadonlySet<string> = new Set(['high', 'medium', 'low']);
@@ -244,7 +244,7 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
 
     const kind = kindRaw.trim().toLowerCase();
     if (!KIND_VALUES.has(kind)) {
-      warnings.push(`FACTS_TABLE_MALFORMED: unknown kind "${kindRaw}" (expected event|preference|commitment|belief|fact)`);
+      warnings.push(`FACTS_TABLE_MALFORMED: unknown kind "${kindRaw}" (expected event|preference|commitment|belief|fact|idea)`);
       continue;
     }
 
@@ -340,8 +340,125 @@ export function renderFactsTable(facts: ParsedFact[]): string {
     const valueCell = f.claimValue === undefined ? '' : String(f.claimValue);
     return `${base} ${escapeFenceCell(f.claimMetric ?? '')} | ${escapeFenceCell(valueCell)} | ${escapeFenceCell(f.claimUnit ?? '')} | ${escapeFenceCell(f.claimPeriod ?? '')} |`;
   });
-  const inner = ['', header, separator, ...rows, ''].join('\n');
+  // #4615: the leading double-'' emits a BLANK LINE between the begin marker
+  // and the header. The marker is an HTML block; with only one newline after
+  // it, GFM parsers (Obsidian 1.3.2+, GitHub, VS Code) treat the pipe rows as
+  // a paragraph continuation and show raw pipes instead of a table. The
+  // parser skips blank lines, so this is round-trip safe.
+  const inner = ['', '', header, separator, ...rows, ''].join('\n');
   return `${FACTS_FENCE_BEGIN}${inner}${FACTS_FENCE_END}`;
+}
+
+/**
+ * #2044 / #4548 row-level, visibility-aware restoration merge for the
+ * remote write-back boundary (import-file.ts), replacing the original
+ * whole-block swap (which only fired when the incoming fence went to
+ * exactly zero facts).
+ *
+ * `get_page`/`fetch` strip non-'world' rows before an untrusted
+ * (`ctx.remote !== false`) caller ever sees them, so a documented
+ * get_page -> edit -> put_page round-trip arrives MISSING rows the caller
+ * structurally could not have seen — their absence is not an intentional
+ * delete. Conversely, 'world'-visible rows WERE fully visible, so an
+ * edit/deletion of one is the caller's and must be honored (#4554).
+ *
+ * Rules:
+ *   - Only non-'world' rows of the existing fence are restoration
+ *     candidates. World rows are NEVER restored — a legitimate deletion
+ *     stays deleted.
+ *   - A hidden row whose rowNum is absent from the incoming fence is
+ *     restored at its stable rowNum (cross-page `#F<N>` refs survive).
+ *   - A hidden row whose rowNum APPEARS in the incoming fence with a
+ *     DIFFERENT claim is a rowNum collision: the caller never saw that
+ *     number, so the incoming row is a caller-authored addition that
+ *     landed on a hidden number. The hidden row keeps its stable number;
+ *     the caller's row is renumbered onto fresh appended numbers
+ *     (max rowNum across both sets + 1), matching upsertFactRow's
+ *     append-only contract.
+ *   - Same rowNum + same claim: the caller already carries the row (e.g.
+ *     a full-content write-through) — the incoming version wins, nothing
+ *     restored, so the merge is idempotent.
+ *   - Either side parsing with warnings returns null: re-rendering a
+ *     fence we could not fully parse would drop the caller's unparsed
+ *     rows. The residual data loss is surfaced by factsGapWarning below.
+ *
+ * Returns null when there is nothing to restore (pure-world fence, no
+ * hidden rows missing, or a non-authoritative parse) — the caller writes
+ * the incoming fence as-is. Pure and side-effect-free.
+ */
+export function restoreHiddenFactRows(
+  incoming: { facts: ParsedFact[]; warnings: string[] },
+  existing: { facts: ParsedFact[]; warnings: string[] },
+): { merged: ParsedFact[]; restored: ParsedFact[]; renumbered: Array<{ from: number; to: number }> } | null {
+  if (incoming.warnings.length > 0 || existing.warnings.length > 0) return null;
+  const hidden = existing.facts.filter((f) => f.visibility !== 'world');
+  if (hidden.length === 0) return null;
+
+  const incomingByRowNum = new Map(incoming.facts.map((f) => [f.rowNum, f]));
+  const restored: ParsedFact[] = [];
+  const collidingRowNums = new Set<number>();
+  for (const h of hidden) {
+    const inc = incomingByRowNum.get(h.rowNum);
+    if (!inc) {
+      restored.push(h);
+    } else if (inc.claim !== h.claim) {
+      collidingRowNums.add(h.rowNum);
+      restored.push(h);
+    }
+    // claim-equal: incoming already carries the row; keep the incoming version.
+  }
+  if (restored.length === 0) return null;
+
+  let next = Math.max(
+    0,
+    ...incoming.facts.map((f) => f.rowNum),
+    ...existing.facts.map((f) => f.rowNum),
+  ) + 1;
+  const renumbered: Array<{ from: number; to: number }> = [];
+  const kept = incoming.facts.map((f) => {
+    if (!collidingRowNums.has(f.rowNum)) return f;
+    const to = next++;
+    renumbered.push({ from: f.rowNum, to });
+    return { ...f, rowNum: to };
+  });
+  const merged = [...kept, ...restored].sort((a, b) => a.rowNum - b.rowNum);
+  return { merged, restored, renumbered };
+}
+
+/**
+ * Surfacing-only diagnostic for the residual data-loss case the #4548
+ * row-level merge (restoreHiddenFactRows above) deliberately does not
+ * cover: when either fence parses with warnings, the merge refuses to
+ * re-render it (that would drop the caller's unparsed rows), so non-'world'
+ * rows present before the remote write and missing from the incoming write
+ * are still dropped. This warning surfaces exactly that.
+ *
+ * With clean parses the merge always restores hidden rows, so `restored`
+ * is true and this returns null — the pre-#4548 gap (a mixed fence's
+ * hidden row silently dropped) no longer occurs.
+ *
+ * Returns a warning string, or null if nothing to flag. Pure and
+ * side-effect-free — the caller decides how to surface it (console.warn
+ * today).
+ */
+export function factsGapWarning(
+  slug: string,
+  incoming: { facts: ParsedFact[]; warnings: string[] },
+  existing: { facts: ParsedFact[]; warnings: string[] },
+  restored: boolean,
+): string | null {
+  if (restored) return null;
+  if (existing.facts.length === 0) return null;
+
+  const incomingRowNums = new Set(incoming.facts.map((f) => f.rowNum));
+  const dropped = existing.facts.filter(
+    (f) => f.visibility !== 'world' && !incomingRowNums.has(f.rowNum),
+  ).length;
+  if (dropped === 0) return null;
+  return `[gbrain] #2044 gap on ${slug}: ${dropped} non-'world' fact row(s) present before this ` +
+    `remote write are missing from the incoming write and were NOT restored (the fence parsed ` +
+    `with warnings, so the row-level merge could not rewrite it safely). If these rows were ` +
+    `dropped by a caller who never saw them, they are now lost.`;
 }
 
 /**
@@ -388,18 +505,82 @@ export function upsertFactRow(
     },
   ];
 
-  const newFence = renderFactsTable(allRows);
+  return { body: replaceOrInsertFactsFence(body, renderFactsTable(allRows)), rowNum: nextRowNum };
+}
 
+/**
+ * The ONE fence-placement rule, shared by every writer that materializes a
+ * fence into a page body (upsertFactRow, the phantom-redirect canonical
+ * append, the importer's hidden-row merge). Replaces an existing fence in
+ * place; otherwise inserts a fresh `## Facts` section carrying `fenceBlock`.
+ *
+ * #4756: the FIRST fence must land in compiled_truth — ABOVE the timeline
+ * sentinel. splitBody() files everything below the sentinel into
+ * page.timeline, where extract_facts refuses to reconcile it
+ * (FACTS_FENCE_BELOW_SENTINEL) — a blind EOF append on any page that already
+ * had a timeline froze the fence permanently. No sentinel → EOF append.
+ */
+export function replaceOrInsertFactsFence(body: string, fenceBlock: string): string {
   const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
   const endIdx   = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
-  let out: string;
   if (beginIdx !== -1 && endIdx !== -1) {
-    out = body.slice(0, beginIdx) + newFence + body.slice(endIdx + FACTS_FENCE_END.length);
-  } else {
-    const sep = body.endsWith('\n') ? '\n' : '\n\n';
-    out = `${body}${sep}## Facts\n\n${newFence}\n`;
+    return body.slice(0, beginIdx) + fenceBlock + body.slice(endIdx + FACTS_FENCE_END.length);
   }
-  return { body: out, rowNum: nextRowNum };
+  const section = `## Facts\n\n${fenceBlock}\n`;
+  const sentinelAt = timelineSentinelOffset(body);
+  if (sentinelAt !== -1) {
+    const head = body.slice(0, sentinelAt);
+    const sep = head === '' ? '' : head.endsWith('\n\n') ? '' : head.endsWith('\n') ? '\n' : '\n\n';
+    return `${head}${sep}${section}\n${body.slice(sentinelAt)}`;
+  }
+  const sep = body.endsWith('\n') ? '\n' : '\n\n';
+  return `${body}${sep}${section}`;
+}
+
+/**
+ * Char offset of the line start of the first timeline sentinel in `body`,
+ * or -1 when none is present. Mirrors every sentinel form
+ * `markdown.ts:findTimelineSplitIndex` honours (#4756): `<!-- timeline -->` /
+ * `<!--timeline-->` (what serializeMarkdown emits), the decorated
+ * `--- timeline ---`, and the legacy bare `---` whose next non-empty line is
+ * `## Timeline` / `## History` — the shape the recommended page templates
+ * emit. upsertFactRow receives RAW on-disk text, so a leading YAML
+ * frontmatter block is skipped first (same skip as
+ * timeline-write-through.ts) and its `---` delimiters can't false-positive
+ * the bare-`---` rule. Local rather than imported because this module must
+ * stay free of markdown.ts's transitive dependency graph (see the FactKind
+ * comment at the top of the file).
+ */
+function timelineSentinelOffset(body: string): number {
+  const lines = body.split('\n');
+  let start = 0;
+  if (lines[0]?.trim() === '---') {
+    for (let i = 1; i < lines.length; i++) {
+      if (lines[i].trim() === '---') { start = i + 1; break; }
+    }
+  }
+  let offset = 0;
+  for (let i = 0; i < start; i++) offset += lines[i].length + 1;
+  for (let i = start; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (
+      trimmed === '<!-- timeline -->' ||
+      trimmed === '<!--timeline-->' ||
+      /^---\s+timeline\s+---$/i.test(trimmed)
+    ) {
+      return offset;
+    }
+    if (trimmed === '---' && lines.slice(start, i).join('\n').trim().length > 0) {
+      for (let j = i + 1; j < lines.length; j++) {
+        const next = lines[j].trim();
+        if (next.length === 0) continue;
+        if (/^##\s+(timeline|history)\s*$/i.test(next)) return offset;
+        break;
+      }
+    }
+    offset += lines[i].length + 1;
+  }
+  return -1;
 }
 
 export interface StripFactsFenceOpts {

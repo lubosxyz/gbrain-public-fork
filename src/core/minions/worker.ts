@@ -1,3 +1,4 @@
+import { assertNoUnreviewedJobs, authorizeJobExecution, withSubmissionAuthority } from './submission-authority.ts';
 /**
  * MinionWorker — Concurrent in-process job worker with BullMQ-inspired patterns.
  *
@@ -25,8 +26,10 @@ import {
 } from './types.ts';
 import { MinionQueue } from './queue.ts';
 import { runWaitingTtlTick, ttlNoticeGraceMs } from './admission.ts';
+import { withChatPhase } from '../ai/chat-usage.ts';
 import { calculateBackoff } from './backoff.ts';
 import { RateLeaseUnavailableError } from './handlers/subagent.ts';
+import { leaseFullBackoffMs } from './rate-leases.ts';
 import { logLeasePressure } from './lease-pressure-audit.ts';
 import {
   runLockRenewalTick,
@@ -379,6 +382,7 @@ export class MinionWorker extends EventEmitter {
     }
 
     await this.queue.ensureSchema();
+    await assertNoUnreviewedJobs(this.engine);
     this.running = true;
     // R2-9 lifecycle: (re-)enable the event-loop-delay histogram for this
     // run; stop() disables it so embedding hosts / test suites that cycle
@@ -1302,6 +1306,7 @@ export class MinionWorker extends EventEmitter {
         );
 
     try {
+      const authority = await authorizeJobExecution(this.engine, job);
       const result = isolated
         ? await runJobInChild({
             jobId: job.id,
@@ -1312,7 +1317,9 @@ export class MinionWorker extends EventEmitter {
             invocation: this.opts.childCliInvocation as { cmd: string; argsPrefix: string[] },
             tiniPath: this.opts.childTiniPath,
           })
-        : await handler(context as MinionJobContext);
+        // #4218: attribute every gateway.chat() the handler makes to this
+        // job so chat_usage_log rows carry `phase = 'job:<name>'`.
+        : await withSubmissionAuthority(authority, () => withChatPhase(`job:${job.name}`, () => handler(context as MinionJobContext)), abort.signal);
 
       // The child spawned and ran — the spawn path is healthy again.
       this._consecutiveChildSpawnFailures = 0;
@@ -1438,9 +1445,12 @@ export class MinionWorker extends EventEmitter {
       const isLeaseFull = err instanceof RateLeaseUnavailableError;
       if (isLeaseFull) {
         const leaseErr = err as RateLeaseUnavailableError;
-        // 1-3s jittered backoff. Not the exponential curve — this is "yield
-        // the slot, try again soon", not "give up after a few tries."
-        const leaseBackoffMs = 1000 + Math.floor(Math.random() * 2000);
+        // 1-3s jittered backoff (shared with the inline drain — one curve,
+        // no silent desync). Not the exponential curve — this is "yield the
+        // slot, try again soon", not "give up after a few tries."
+        // #4310: a caller-suggested delay (the global-LLM-halt cooldown's
+        // remaining window) wins over the short lease bounce.
+        const leaseBackoffMs = leaseErr.retryInMs ?? leaseFullBackoffMs();
         const released = await this.queue.releaseLeaseFullJob(
           job.id, lockToken, errorText, leaseBackoffMs,
         );

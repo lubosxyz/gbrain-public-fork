@@ -25,17 +25,28 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-import type { SearchResult, PageType, RelationalFanoutRow } from '../types.ts';
+import type { SearchResult, PageType, RelationalFanoutRow, PageReadPolicy } from '../types.ts';
 import { createAuditWriter } from '../audit/audit-writer.ts';
 import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
+import { buildVisibilityClause } from './sql-ranking.ts';
+import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
+import { sanitizeRemoteBody } from '../remote-body.ts';
 import { parseRelationalQuery, type RelationalQuery, type RelationVocab } from './relational-intent.ts';
+import { stampEvidence, type EvidenceOpts } from './evidence.ts';
 
-export interface RelationalArmOpts {
+export interface RelationalArmOpts extends PageReadPolicy {
   sourceId?: string;
   sourceIds?: string[];
   depth?: number;
   limit?: number;
   vocab?: RelationVocab;
+  /**
+   * #4352 remediation — hide `visibility: private` pages from the arm's
+   * hydrated candidates. hybridSearch threads the caller's resolved gate
+   * (resolveExcludePrivatePages) here, same as the keyword/vector arms;
+   * without it a remote relational query leaked private titles + snippets.
+   */
+  excludePrivate?: boolean;
   onMeta?: (meta: RelationalArmMeta) => void;
 }
 
@@ -84,6 +95,7 @@ async function resolveSeedScoped(
   engine: BrainEngine,
   sources: string[],
   phrase: string,
+  policy: PageReadPolicy,
 ): Promise<Array<{ source_id: string; slug: string }>> {
   const out: Array<{ source_id: string; slug: string }> = [];
   const seen = new Set<string>();
@@ -95,25 +107,43 @@ async function resolveSeedScoped(
     seen.add(key);
     out.push({ source_id: sid, slug: r.slug });
   }
-  return out;
+  if (!out.length || !hasReadPolicy(policy)) return out;
+  const params: unknown[] = [out.map(ref => ref.source_id), out.map(ref => ref.slug)];
+  const filter = pageReadFilter('p', policy, params, true);
+  const admitted = await engine.executeRaw<{ source_id: string; slug: string }>(
+    `SELECT p.source_id, p.slug FROM pages p
+     JOIN unnest($1::text[], $2::text[]) AS refs(source_id, slug)
+       ON p.source_id = refs.source_id AND p.slug = refs.slug WHERE ${filter}`, params,
+  );
+  const allowed = new Set(admitted.map(ref => `${ref.source_id}:${ref.slug}`));
+  return out.filter(ref => allowed.has(`${ref.source_id}:${ref.slug}`));
 }
 
-/** Batch-hydrate fanout rows into SearchResult rows in fanout (ranked) order. */
+/** Batch-hydrate fanout rows into SearchResult rows in fanout (ranked) order.
+ *  #4352 remediation: the SELECT surfaces titles + compiled_truth snippets, so
+ *  it applies the full shared visibility clause (deleted + archived-source +
+ *  quarantine, plus the private predicate when excludePrivate) — pre-fix it
+ *  filtered on deleted_at alone and leaked private/archived pages. */
 async function hydrate(
   engine: BrainEngine,
   rows: RelationalFanoutRow[],
   seedSlug: string,
+  policy: PageReadPolicy,
 ): Promise<SearchResult[]> {
   if (rows.length === 0) return [];
-  const slugs = Array.from(new Set(rows.map(r => r.slug)));
+  const params: unknown[] = [rows.map(r => r.source_id), rows.map(r => r.slug)];
+  const filter = pageReadFilter('p', policy, params);
   const pageRows = await engine.executeRaw<{
     page_id: number; slug: string; source_id: string; title: string; type: string; synopsis: string | null;
   }>(
     `SELECT p.id AS page_id, p.slug, p.source_id, p.title, p.type,
-            LEFT(p.compiled_truth, 240) AS synopsis
+            p.compiled_truth AS synopsis
      FROM pages p
-     WHERE p.slug = ANY($1::text[]) AND p.deleted_at IS NULL`,
-    [slugs],
+     JOIN sources s ON s.id = p.source_id
+     JOIN unnest($1::text[], $2::text[]) AS refs(source_id, slug)
+       ON p.source_id = refs.source_id AND p.slug = refs.slug
+     WHERE ${filter} ${buildVisibilityClause('p', 's', { excludePrivate: policy.excludePrivate, requireSafeChunks: false })}`,
+    params,
   );
   const byKey = new Map<string, typeof pageRows[number]>();
   for (const pr of pageRows) byKey.set(`${pr.source_id}:${pr.slug}`, pr);
@@ -127,7 +157,7 @@ async function hydrate(
       page_id: pr.page_id,
       title: pr.title,
       type: pr.type as PageType,
-      chunk_text: pr.synopsis ?? r.slug,
+      chunk_text: sanitizeRemoteBody(pr.synopsis ?? r.slug).slice(0, 240),
       chunk_source: 'compiled_truth',
       // E1: reinforce the page's REAL canonical chunk; F3: chunkless entity
       // pages key page-level (chunk_id 0 → rrfKey `source:slug:0`, stable and
@@ -144,6 +174,91 @@ async function hydrate(
     });
   }
   return out;
+}
+
+/**
+ * #3995 — decision stamp for the guaranteed page-1 relational evidence slot.
+ * Surfaced through HybridSearchMeta.relational_evidence_slot so `--explain`
+ * consumers can audit why a low-fused-score row appears on the first page.
+ */
+export interface RelationalEvidenceSlotDecision {
+  action: 'promoted' | 'injected';
+  slug: string;
+  source_id: string;
+  /** promoted only: the 0-based fused rank the row was lifted from. */
+  from_rank?: number;
+}
+
+/**
+ * #3995 — guarantee page-1 evidence for a FIRED relational arm.
+ *
+ * A relational answer is often lexically unrecoverable (unverified entity
+ * stub, single-arm RRF score), so the fused row can land beyond the `limit`
+ * slice (fusion overflow) or be dropped entirely by autocut (which only
+ * preserves alias hits). When the arm fired, at least one of its pages must
+ * survive to the first page or the feature silently no-ops.
+ *
+ * Pure (returns a new array; never mutates inputs). Page-level check on
+ * `(source_id, slug)`:
+ *   - some relational page already in the top-`limit` window → no-op;
+ *   - best-ranked fused relational row sits beyond the window → PROMOTE it
+ *     into slot `limit-1` (keeps its real fused score);
+ *   - no relational page in the pool at all (autocut/trim dropped it) →
+ *     INJECT `relationalList[0]` at slot `limit-1` (score clamped just below
+ *     its new predecessor so ordering stays monotone).
+ *
+ * First page only: `offset > 0` is a pure no-op (paginating a guaranteed
+ * slot is incoherent — the row would repeat on every page).
+ */
+export function ensureRelationalEvidenceSlot(
+  pool: SearchResult[],
+  relationalList: SearchResult[],
+  limit: number,
+  offset: number,
+  evidenceOpts?: EvidenceOpts,
+): { pool: SearchResult[]; decision?: RelationalEvidenceSlotDecision } {
+  if (offset > 0 || limit <= 0 || relationalList.length === 0) return { pool };
+  const pageKey = (r: SearchResult) => `${r.source_id ?? 'default'}:${r.slug}`;
+  const relKeys = new Set(relationalList.map(pageKey));
+
+  const window = Math.min(limit, pool.length);
+  for (let i = 0; i < window; i++) {
+    if (relKeys.has(pageKey(pool[i]))) return { pool }; // evidence already on page 1
+  }
+
+  // Fusion overflow: the arm's best fused row survived ranking but sits past
+  // the slice boundary — promote it into the last page-1 slot.
+  for (let i = limit; i < pool.length; i++) {
+    if (!relKeys.has(pageKey(pool[i]))) continue;
+    const out = pool.slice();
+    const [row] = out.splice(i, 1);
+    out.splice(limit - 1, 0, row);
+    return {
+      pool: out,
+      decision: { action: 'promoted', slug: row.slug, source_id: row.source_id ?? 'default', from_rank: i },
+    };
+  }
+
+  // Dropped entirely (autocut / trim): re-inject the arm's top candidate.
+  const out = pool.slice();
+  const insertAt = Math.min(limit - 1, out.length);
+  const prev = insertAt > 0 ? out[insertAt - 1] : undefined;
+  const top = relationalList[0];
+  // Clamp just below the predecessor when the raw arm score is non-positive
+  // OR would exceed it — the returned page must stay monotone.
+  const row =
+    prev && (!(top.score > 0) || top.score > prev.score)
+      ? { ...top, score: Math.max(0, prev.score * 0.999) }
+      : { ...top };
+  // The injected row is a raw arm row that never saw the pipeline's
+  // stampEvidence pass (which runs before this slot) — stamp it here so every
+  // page-1 row carries the evidence/create_safety contract.
+  stampEvidence([row], evidenceOpts);
+  out.splice(insertAt, 0, row);
+  return {
+    pool: out,
+    decision: { action: 'injected', slug: row.slug, source_id: row.source_id ?? 'default' },
+  };
 }
 
 /**
@@ -173,6 +288,11 @@ export async function buildRelationalArm(
   try {
     const sources = scopeSources(opts);
     const fanoutOpts = {
+      sourceId: opts.sourceId,
+      sourceIds: opts.sourceIds,
+      excludePrivate: opts.excludePrivate,
+      requireSafeChunks: opts.requireSafeChunks,
+      takesHoldersAllowList: opts.takesHoldersAllowList,
       linkTypes: parsed.linkTypes,
       direction: parsed.direction,
       depth: opts.depth,
@@ -181,20 +301,15 @@ export async function buildRelationalArm(
 
     if (parsed.kind === 'connects' && parsed.seeds.length === 2) {
       // Resolve both endpoints; both must resolve or the arm no-ops.
-      const resA = await resolveSeedScoped(engine, sources, parsed.seeds[0]);
-      const resB = await resolveSeedScoped(engine, sources, parsed.seeds[1]);
+      const resA = await resolveSeedScoped(engine, sources, parsed.seeds[0], opts);
+      const resB = await resolveSeedScoped(engine, sources, parsed.seeds[1], opts);
       if (resA.length === 0 || resB.length === 0) return finish([]);
       meta.seeds_resolved = resA.length + resB.length;
 
-      const perSource = (rs: typeof resA) => ({
-        sourceId: rs.length === 1 ? rs[0].source_id : undefined,
-        sourceIds: rs.length > 1 ? Array.from(new Set(rs.map(x => x.source_id))) : undefined,
-        slugs: Array.from(new Set(rs.map(x => x.slug))),
-      });
-      const a = perSource(resA);
-      const b = perSource(resB);
-      const fanA = await engine.relationalFanout(a.slugs, { ...fanoutOpts, sourceId: a.sourceId, sourceIds: a.sourceIds });
-      const fanB = await engine.relationalFanout(b.slugs, { ...fanoutOpts, sourceId: b.sourceId, sourceIds: b.sourceIds });
+      const a = { slugs: [...new Set(resA.map(ref => ref.slug))], seedRefs: resA };
+      const b = { slugs: [...new Set(resB.map(ref => ref.slug))], seedRefs: resB };
+      const fanA = await engine.relationalFanout(a.slugs, { ...fanoutOpts, seedRefs: a.seedRefs });
+      const fanB = await engine.relationalFanout(b.slugs, { ...fanoutOpts, seedRefs: b.seedRefs });
       // Shared midpoints: nodes reachable from BOTH endpoints (exclude the
       // endpoints themselves). Ordered by combined hop.
       const bByKey = new Map(fanB.map(r => [`${r.source_id}:${r.slug}`, r] as const));
@@ -204,23 +319,21 @@ export async function buildRelationalArm(
         .map(r => ({ row: r, combined: r.hop + bByKey.get(`${r.source_id}:${r.slug}`)!.hop }))
         .sort((x, y) => x.combined - y.combined || x.row.slug.localeCompare(y.row.slug))
         .map(x => x.row);
-      const list = await hydrate(engine, shared, parsed.seeds.join(' ↔ '));
+      const list = await hydrate(engine, shared, parsed.seeds.join(' ↔ '), opts);
       meta.fired = list.length > 0;
       return finish(list);
     }
 
     // who_rel / who_at / intro: single logical seed (may resolve in N sources).
-    const resolved = await resolveSeedScoped(engine, sources, parsed.seeds[0]);
+    const resolved = await resolveSeedScoped(engine, sources, parsed.seeds[0], opts);
     if (resolved.length === 0) return finish([]);
     meta.seeds_resolved = resolved.length;
     const slugs = Array.from(new Set(resolved.map(r => r.slug)));
-    const srcIds = Array.from(new Set(resolved.map(r => r.source_id)));
     const rows = await engine.relationalFanout(slugs, {
       ...fanoutOpts,
-      sourceId: srcIds.length === 1 ? srcIds[0] : undefined,
-      sourceIds: srcIds.length > 1 ? srcIds : undefined,
+      seedRefs: resolved,
     });
-    const list = await hydrate(engine, rows, resolved[0].slug);
+    const list = await hydrate(engine, rows, resolved[0].slug, opts);
     meta.fired = list.length > 0;
     return finish(list);
   } catch (err) {

@@ -1,6 +1,6 @@
 ---
 name: brain-ops
-version: 1.1.0
+version: 1.2.0
 upstream: brain-ops@fc834ee
 description: |
   Brain knowledge base operations. The core read/write cycle: brain-first lookup,
@@ -29,28 +29,45 @@ writes_to:
 
 # Brain Operations — The Ambient Context Layer
 
-The brain is not an archive. It is a live context membrane that every interaction
-flows through in both directions.
+Recall relevant context before responding. Save explicit requests with
+provenance; automatic capture is off until the user opts in. Reading this skill
+does not enable capture, delegation, or paid enrichment. A chat-only instruction
+suppresses writes for that turn, including when standing capture is enabled.
 
 > **Convention:** See `skills/conventions/brain-first.md` for the 5-step lookup protocol.
 > **Convention:** See `skills/conventions/quality.md` for citation and back-link rules.
 
 > **Memory verbs (MEMORY_VERBS v1, gbrain ≥ 0.43).** Over MCP, prefer the five
-> frozen memory verbs for the read/write cycle: **`remember(fact, provenance,
+> core memory verbs for the read/write cycle: **`remember(fact, provenance,
 > ttl?)`** to save a single durable fact (mandatory provenance; dedupes +
 > supersedes), **`recall(query | entity, budget_tokens)`** to read it back
 > budget-packed, **`entity(name)`** for a zero-LLM card, **`synthesize(question)`**
-> for the expensive cross-page answer, **`forget(id)`** to expire a fact. Use
+> for the expensive cross-page answer, **`forget(id)`** to withdraw active memory
+> (history, source material, and backups may remain). `context_pack` and `delta`
+> complete the seven-verb surface. Use
 > `remember` instead of `extract_facts` when you already have ONE formed fact;
 > `put_page` / `add_link` / `add_timeline_entry` stay the page/graph write path.
 > Fall back to the classic ops when the verbs aren't on the surface. Contract:
 > `docs/protocol/MEMORY_VERBS_v1.md`.
+>
+> **Keyless brains:** when `extract_facts` returns `skipped:
+> extraction_unavailable`, YOU are the extractor — pull the facts from the turn
+> yourself and write each one via `remember` with `kind` set (event | preference
+> | commitment | belief | fact — those five are the frozen protocol enum; the
+> `idea` kind the extractor and DB carry is NOT one of them) and the
+> visibility the envelope's `agent_action` names
+> (default private — pin it; `remember` defaults to world), or author a
+> `## Facts` fence on the entity page. A `skipped: extraction_failed` envelope
+> (server-side extractor errored on this turn; `reason` names why) invites the
+> same manual `remember` fallback for that turn — automatic extraction stays
+> on for future writes.
 
 ## Contract
 
 This skill guarantees:
 - Brain is checked BEFORE any external API call (brain-first lookup)
-- Every inbound signal triggers the READ → ENRICH → WRITE loop
+- Explicit save requests and opted-in inbound signals trigger the READ → WRITE
+  loop; enrichment requires its separately configured authority
 - Every outbound response checks brain for relevant context
 - Source attribution on every fact written (inline `[Source: ...]` citations)
 - User's direct statements are highest-authority data
@@ -98,18 +115,21 @@ not just "find the page" but "answer the question":
 4. Cost: LLM calls per question — this is the expensive path. Use `query` for
    simple page lookups where you just need the slug or a quick context check.
 
-### Phase 2: On Every Inbound Signal (READ → ENRICH → WRITE)
+### Phase 2: Authorized Capture (READ → WRITE)
 
-Every message, meeting, email, or conversation that references a person or company:
+For an explicit save request, or a message within the user's opted-in capture
+scope that has no chat-only restriction:
 
 1. **Detect entities** — people, companies, deals mentioned
 2. **Load brain pages** — read existing pages for context before responding
 3. **Identify new information** — what does this signal tell us that the page doesn't know?
 4. **Write it back** — update the brain page with new info + timeline entry + source citation
-5. **Create if missing** — if notable and no page exists, create via enrich skill
+5. **Create if missing** — if notable, save supplied information with provenance;
+   invoke enrichment only when separately authorized
 
-**User's direct statements are the highest-value data source.** Write them to brain
-pages immediately with attribution `[Source: User, YYYY-MM-DD]`.
+Attribute the user's direct statements with `[Source: User, YYYY-MM-DD]`.
+Without capture authorization, use the information in the current conversation
+without persisting it. Explicit remembering does not enable ongoing capture.
 
 ### Phase 2.5: Structured Graph Updates (automatic)
 
@@ -137,25 +157,22 @@ Before answering any question about a person, company, or topic:
 
 Don't answer from general knowledge when a brain page exists.
 
-### Phase 4: Ambient Enrichment
+### Phase 4: Optional Enrichment
 
-This is not a special mode. This is the default. Everything the user says is an
-ingest event.
+Enrichment is an additional user choice. Neither a mentioned entity, a shared
+link, nor capture opt-in authorizes external research, paid calls, or delegation
+by itself. Follow an explicit ingestion/enrichment request or the user's stored
+scope and spending policy. Without that authority, recall existing context and
+save only the supplied information that the user authorized retaining.
 
-- Person mentioned → check brain, create/enrich if needed (spawn background)
-- Company mentioned → same
-- Link shared → ingest it (delegate to idea-ingest)
-- Data shared → delegate to appropriate skill
-
-**Rules:**
-- Never interrupt the conversation to do enrichment
-- Spawn sub-agents for anything that would slow down the response
-- Never announce "I'm enriching the brain" — just do it silently
+Use background agents only when delegation is authorized and supported by the
+harness. Report observed results without claiming a generated routine ran.
 
 ## Output Format
 
-No separate output. Brain-ops is an always-on behavior layer, not a report generator.
-The output is updated brain pages and enriched responses.
+Use retrieved context in the response and cite it. Confirm authorized writes
+only after readback; if no write was requested or opted in, do not persist the
+conversation merely to produce a memory update.
 
 ## Cross-source citation format (v0.18.0+)
 

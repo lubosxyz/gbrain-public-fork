@@ -1,3 +1,5 @@
+import { readPolicyOpts } from './context.ts';
+import { sanitizeRemoteBody } from '../remote-body.ts';
 /**
  * Admin operation cluster — pure move from operations.ts (v0.46.x tranche 2).
  * Op consts stay module-private; `adminOperations` below lists them in
@@ -8,19 +10,30 @@
  * Never import from '../operations.ts' here (cycle).
  */
 
-import type { Operation } from './contract.ts';
+import type { Operation, OperationContext } from './contract.ts';
 import { enforceClientSlugFence, sourceScopeOpts } from './context.ts';
-import { stripTakesFence } from '../takes-fence.ts';
 import { VERSION } from '../../version.ts';
 
 // --- Admin ---
 
+/**
+ * #4592: the #4433 ladder, shared by the three diagnostic aggregates
+ * (get_stats / get_health / get_brain_identity). Trusted local CLI keeps the
+ * brain-wide view; every remote caller is confined to sourceScopeOpts(ctx)
+ * (federated array > scalar > the unmatchable __all__ sentinel, which
+ * fail-closes to zeros). Aggregates leak by subtraction, so they scope like
+ * reads.
+ */
+function diagnosticScope(ctx: OperationContext): { sourceId?: string; sourceIds?: string[] } {
+  return ctx.remote === false ? {} : sourceScopeOpts(ctx);
+}
+
 const get_stats: Operation = {
   name: 'get_stats',
-  description: 'Brain statistics (page count, chunk count, etc.)',
+  description: 'Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant.',
   params: {},
   handler: async (ctx) => {
-    return ctx.engine.getStats();
+    return ctx.engine.getStats(diagnosticScope(ctx));
   },
   scope: 'admin',
   cliHints: { name: 'stats' },
@@ -28,10 +41,14 @@ const get_stats: Operation = {
 
 const get_health: Operation = {
   name: 'get_health',
-  description: 'Brain health dashboard (embed coverage, stale pages, orphans). Includes a `migrations {pending, partial, wedged, skipped_future}` block from the host migration ledger so remote agents can detect wedged/outstanding host migrations without shelling into the brain host.',
+  description: 'Brain health dashboard (embed coverage, stale pages, orphans) — remote callers see counters confined to their source grant. Includes a `migrations {pending, partial, wedged, skipped_future}` block from the host migration ledger so remote agents can detect wedged/outstanding host migrations without shelling into the brain host.',
   params: {},
   handler: async (ctx) => {
-    const health = await ctx.engine.getHealth();
+    // The `migrations` block below stays GLOBAL for scoped callers by
+    // decision: it is a host filesystem ledger with no per-source semantics,
+    // and a wedged host migration is exactly what a remote agent needs to
+    // see to explain degraded behavior.
+    const health = await ctx.engine.getHealth(diagnosticScope(ctx));
     // TODOS:4063 — composed at the OP layer (not BrainEngine.getHealth):
     // the ledger is a filesystem JSONL, engine-agnostic; growing the engine
     // interface would force both engines to duplicate a file read.
@@ -66,10 +83,12 @@ const get_health: Operation = {
  */
 const get_brain_identity: Operation = {
   name: 'get_brain_identity',
-  description: 'Brain identity + counters for thin-client banner. Returns version, engine kind, and page/chunk counts. Read-scope.',
+  description: 'Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. Returns version, engine kind, and page/chunk counts. Read-scope.',
   params: {},
   handler: async (ctx) => {
-    const stats = await ctx.engine.getStats();
+    // #4592: read-scope + unscoped counters made this op the quiet third
+    // aggregate leak (the issue named only stats/health). Same ladder.
+    const stats = await ctx.engine.getStats(diagnosticScope(ctx));
     // v0.42 self-upgrade: surface a pending update on the thin-client banner
     // (bonus channel; the CLI stderr marker + `gbrain self-upgrade` are the
     // load-bearing surface). Cache-read-only, no network, fail-open.
@@ -125,8 +144,10 @@ const run_doctor: Operation = {
   handler: async (ctx) => {
     const { doctorReportRemote } = await import('../../commands/doctor.ts');
     // Source isolation (cross-model P1): a source-bound caller's report must
-    // not aggregate other sources' activity. Scope-aware checks (currently
-    // volunteer_channels) filter on these ids; unscoped ctx = brain-wide.
+    // not aggregate other sources' activity. Scope-aware checks (connection,
+    // brain_score, chronicle_projection_health, multi_source_drift,
+    // volunteer_channels, extract_atoms_backlog) filter on these ids;
+    // unscoped ctx = brain-wide.
     const scope = sourceScopeOpts(ctx);
     const sourceIds = scope.sourceIds ?? (scope.sourceId ? [scope.sourceId] : undefined);
     return doctorReportRemote(ctx.engine, { sourceIds });
@@ -142,13 +163,9 @@ const get_versions: Operation = {
     slug: { type: 'string', required: true, description: 'Slug of the page whose version history to list.' },
   },
   handler: async (ctx, p) => {
-    const versions = await ctx.engine.getVersions(p.slug as string, sourceScopeOpts(ctx));
-    // Same takes-allow-list privacy boundary as get_page. Snapshots persist
-    // historical compiled_truth verbatim, including the takes fence, so
-    // a remote token bypassing get_page via /history would re-introduce
-    // the same leak across every prior version.
-    if (!ctx.takesHoldersAllowList) return versions;
-    return versions.map(v => ({ ...v, compiled_truth: stripTakesFence(v.compiled_truth) }));
+    const versions = await ctx.engine.getVersions(p.slug as string, await readPolicyOpts(ctx));
+    if (ctx.remote === false) return versions;
+    return versions.map(v => ({ ...v, compiled_truth: sanitizeRemoteBody(v.compiled_truth) }));
   },
   scope: 'read',
   cliHints: { name: 'history', positional: ['slug'] },

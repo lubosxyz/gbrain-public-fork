@@ -44,10 +44,18 @@ import { resolveSourceWithTier } from '../core/source-resolver.ts';
 import {
   defaultSlug,
   detectBinaryNullByte,
+  detectBinarySignature,
   normalizeForHash,
   deriveTitle,
+  explicitCaptureType,
   mergeCaptureFrontmatter,
 } from '../core/capture-content.ts';
+import {
+  loadActivePackForWriteVocabulary,
+  packDeclaresPageType,
+  undeclaredPageTypeMessage,
+  undeclaredPageTypeSuggestion,
+} from '../core/schema-pack/write-vocabulary.ts';
 
 export { detectBinaryNullByte, normalizeForHash, mergeCaptureFrontmatter } from '../core/capture-content.ts';
 
@@ -285,6 +293,23 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
     process.exit(1);
   }
 
+  // #4022 magic-byte guard runs FIRST: it names the actual format, and it
+  // catches the containers the NUL scan structurally cannot (an ASCII-armored
+  // PDF has no NUL in its head, so pre-fix it was decoded to mojibake and
+  // stored as a page body with its real text silently dropped).
+  const binaryFormat = detectBinarySignature(rawBuffer!);
+  if (binaryFormat !== null) {
+    console.error(
+      `gbrain capture: refusing to capture ${binaryFormat} content from ${inputLabel}\n` +
+      `  Detected by magic bytes. Storing it would write UTF-8 replacement characters as the\n` +
+      `  page body — for container formats the real text is compressed, so it would be lost\n` +
+      `  entirely while the command reported success.\n` +
+      `  Extract the text first, then capture that. For a PDF:\n` +
+      `    pdftotext ${inputLabel === 'stdin' ? 'input.pdf' : inputLabel} - | gbrain capture --stdin --slug <slug>`,
+    );
+    process.exit(1);
+  }
+
   // CV10 binary guard. Scans the first 8KB for NUL bytes; rejects with a
   // friendly message before UTF-8 decode mangles arbitrary bytes.
   const nullByteOffset = detectBinaryNullByte(rawBuffer!);
@@ -328,6 +353,27 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
       // assertSourceExists throws "Source 'X' not found. Available sources: ..."
       console.error(`gbrain capture: ${e instanceof Error ? e.message : String(e)}`);
       process.exit(1);
+    }
+  }
+
+  // #4655: fail-loud vocabulary check for an EXPLICIT page type (--type flag
+  // or a frontmatter `type:` in the input) against the active schema pack.
+  // Best-effort pack load — no resolvable pack means no check. The
+  // default-'note' path is never checked, so bare `gbrain capture` keeps
+  // working even under packs that don't declare 'note'.
+  if (!isThinClient(cfg) && engine) {
+    const explicitType = explicitCaptureType(rawBody, parsed.type);
+    if (explicitType) {
+      const activePack = await loadActivePackForWriteVocabulary({
+        engine,
+        remote: false,
+        sourceId: resolvedSourceId,
+      });
+      if (activePack && !packDeclaresPageType(activePack, explicitType)) {
+        console.error(`gbrain capture: ${undeclaredPageTypeMessage(explicitType, activePack, 'capture')}`);
+        console.error(`  ${undeclaredPageTypeSuggestion(activePack)}`);
+        process.exit(1);
+      }
     }
   }
 
@@ -484,8 +530,10 @@ export const __testing = {
   buildContent,
   mergeCaptureFrontmatter,
   deriveTitle,
+  explicitCaptureType,
   parseArgs,
   detectBinaryNullByte,
+  detectBinarySignature,
   normalizeForHash,
   maybeRewriteSourceFkError,
 };

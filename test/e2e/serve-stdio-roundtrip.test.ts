@@ -26,21 +26,38 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { execFileSync } from 'child_process';
+import { spawnSync } from 'child_process';
+import { keylessBrainEnv } from '../helpers/provider-env.ts';
+import { cliDiagnostic, toolDiagnostic } from '../helpers/fixture-diagnostics.ts';
+
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { VERB_NAMES } from '../../src/core/verbs.ts';
+import { GBRAIN_MCP_INSTRUCTIONS } from '../../src/mcp/instructions.ts';
+
+function execFixture(args: string[], env: Record<string, string>): void {
+  const result = spawnSync('bun', ['--no-env-file', ...args], { cwd: process.cwd(), env, encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(cliDiagnostic(args[2] ?? 'stdio fixture', {
+    exitCode: result.status ?? -1, stdout: result.stdout ?? '', stderr: result.stderr ?? '',
+  }));
+}
 
 // Distinctive token so keyword search can't accidentally match anything else.
 const MARKER = 'qantani-marker-9f3z';
+const FEDERATED_MARKER = 'umbriel-federated-marker-71c4';
 
 function textOf(result: unknown): string {
   const content = (result as { content?: Array<{ type?: string; text?: string }> })?.content;
   if (!Array.isArray(content)) return '';
   return content.map((c) => (typeof c?.text === 'string' ? c.text : '')).join('\n');
+}
+
+function resultSourceIds(text: string): string[] {
+  const result = JSON.parse(text) as Array<{ source_id?: unknown }>;
+  return result.flatMap((row) => (typeof row.source_id === 'string' ? [row.source_id] : []));
 }
 
 describe('serve stdio round-trip E2E (local PGLite → real MCP tool calls)', () => {
@@ -57,16 +74,13 @@ describe('serve stdio round-trip E2E (local PGLite → real MCP tool calls)', ()
     // assertion fails).
     // Build a concrete Record<string,string> (StdioClientTransport.env rejects
     // undefined values), dropping the ambient DB URLs so the subprocess is PGLite.
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
-    env.GBRAIN_HOME = home;
-    delete env.DATABASE_URL;
-    delete env.GBRAIN_DATABASE_URL;
+    const env = keylessBrainEnv(process.env, home, {
+      DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined, GBRAIN_REMOTE_CLIENT_SECRET: undefined,
+    });
+    delete env.GBRAIN_SOURCE;
 
     // 1. Init a local PGLite brain (the "from nothing" step).
-    execFileSync('bun', ['run', 'src/cli.ts', 'init', '--pglite', '--no-embedding', '--non-interactive'], {
-      cwd: process.cwd(), env, stdio: 'ignore',
-    });
+    execFixture(['run', 'src/cli.ts', 'init', '--pglite', '--no-embedding', '--non-interactive'], env);
 
     // 2. Seed one page so page_count > 0 and search has something to find.
     //    --no-embed keeps it hermetic (no embedding provider configured); the
@@ -77,15 +91,27 @@ describe('serve stdio round-trip E2E (local PGLite → real MCP tool calls)', ()
       join(notes, 'marker.md'),
       `---\ntitle: ${MARKER} note\n---\n\n# ${MARKER}\n\nThis page exists to prove ${MARKER} is retrievable over stdio MCP.\n`,
     );
-    execFileSync('bun', ['run', 'src/cli.ts', 'import', notes, '--no-embed'], {
-      cwd: process.cwd(), env, stdio: 'ignore',
-    });
+    execFixture(['run', 'src/cli.ts', 'import', notes, '--no-embed'], env);
+
+    // Seed a second source that participates in unqualified federated reads.
+    // Import through the CLI so this uses the ordinary source registration
+    // and page-routing path.
+    const federatedNotes = join(home, 'federated-notes');
+    mkdirSync(federatedNotes, { recursive: true });
+    writeFileSync(
+      join(federatedNotes, 'marker.md'),
+      `---\ntitle: ${FEDERATED_MARKER} note\n---\n\n# ${FEDERATED_MARKER}\n\nThis page exists only in the federated source.\n`,
+    );
+    execFixture(['run', 'src/cli.ts', 'sources', 'add', 'federated-source', '--path', federatedNotes, '--federated', '--force'], env);
+    execFixture(['run', 'src/cli.ts', 'import', federatedNotes, '--no-embed', '--source-id', 'federated-source'], env);
 
     // 3. Let the MCP SDK spawn `gbrain serve` (stdio) and run the initialize
-    //    handshake — exactly what `claude mcp add gbrain -- gbrain serve` does.
+    //    handshake with the opt-in idle timeout enabled. This pins the
+    //    production wrapper shape that previously let the timeout's activity
+    //    listener consume initialize before the SDK transport attached.
     transport = new StdioClientTransport({
       command: 'bun',
-      args: ['run', 'src/cli.ts', 'serve'],
+      args: ['--no-env-file', 'run', 'src/cli.ts', 'serve', '--stdio-idle-timeout', '14400'],
       cwd: process.cwd(),
       env, // includes PATH (to find `bun`) + GBRAIN_HOME
     });
@@ -102,6 +128,7 @@ describe('serve stdio round-trip E2E (local PGLite → real MCP tool calls)', ()
 
   test('initialize handshake + tools/list exposes the core retrieval tools', async () => {
     expect(connected).toBe(true);
+    expect(client!.getInstructions()).toBe(GBRAIN_MCP_INSTRUCTIONS);
     const { tools } = await client!.listTools();
     const names = new Set(tools.map((t) => t.name));
     // The core MCP tools the connect LEARN_INSTRUCTION promises always work.
@@ -131,6 +158,28 @@ describe('serve stdio round-trip E2E (local PGLite → real MCP tool calls)', ()
     // The result payload (slug / title / snippet) must mention the marker.
     expect(text).toContain(MARKER);
   }, 30_000);
+
+  test('query treats an explicit __all__ like an omitted source in federated stdio', async () => {
+    expect(connected).toBe(true);
+    const args = { query: FEDERATED_MARKER, expand: false, limit: 5 };
+
+    const omitted = textOf(await client!.callTool({ name: 'query', arguments: args }));
+    const explicitAll = textOf(await client!.callTool({
+      name: 'query',
+      arguments: { ...args, source_id: '__all__' },
+    }));
+    const explicitDefault = textOf(await client!.callTool({
+      name: 'query',
+      arguments: { ...args, source_id: 'default' },
+    }));
+
+    expect(omitted).toContain(FEDERATED_MARKER);
+    expect(explicitAll).toContain(FEDERATED_MARKER);
+    expect(explicitDefault).not.toContain(FEDERATED_MARKER);
+    expect(resultSourceIds(omitted)).toContain('federated-source');
+    expect(resultSourceIds(explicitAll)).toContain('federated-source');
+    expect(resultSourceIds(explicitDefault)).not.toContain('federated-source');
+  }, 30_000);
 });
 
 // Distinct marker for the verbs-surface session (own temp brain, own token).
@@ -145,11 +194,9 @@ describe('serve --surface verbs stdio E2E (the 7 frozen memory verbs over a real
   beforeAll(async () => {
     home = mkdtempSync(join(tmpdir(), 'gbrain-stdio-verbs-e2e-'));
     // Same hermetic-PGLite env dance as the full-surface session above.
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
-    env.GBRAIN_HOME = home;
-    delete env.DATABASE_URL;
-    delete env.GBRAIN_DATABASE_URL;
+    const env = keylessBrainEnv(process.env, home, {
+      DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined, GBRAIN_REMOTE_CLIENT_SECRET: undefined,
+    });
     // Quiescent brain: the startup sweep could touch pages BETWEEN the two
     // delta wakes and legitimately re-surface them (a changed page is SUPPOSED
     // to re-appear), turning the cursor-advance assertion flaky. Kill switch
@@ -157,9 +204,7 @@ describe('serve --surface verbs stdio E2E (the 7 frozen memory verbs over a real
     env.GBRAIN_SWEEP = '0';
 
     // 1. Init a local PGLite brain.
-    execFileSync('bun', ['run', 'src/cli.ts', 'init', '--pglite', '--no-embedding', '--non-interactive'], {
-      cwd: process.cwd(), env, stdio: 'ignore',
-    });
+    execFixture(['run', 'src/cli.ts', 'init', '--pglite', '--no-embedding', '--non-interactive'], env);
 
     // 2. Seed two pages BEFORE serve spawns so the first delta wake has pages
     //    to deliver (the cursor-advance assertion needs a non-empty delivery).
@@ -173,14 +218,12 @@ describe('serve --surface verbs stdio E2E (the 7 frozen memory verbs over a real
       join(notes, 'pack-b.md'),
       `---\ntitle: ${VERBS_MARKER} beta\n---\n\n# ${VERBS_MARKER} beta\n\nSeed page B for the verbs-surface delta cursor.\n`,
     );
-    execFileSync('bun', ['run', 'src/cli.ts', 'import', notes, '--no-embed'], {
-      cwd: process.cwd(), env, stdio: 'ignore',
-    });
+    execFixture(['run', 'src/cli.ts', 'import', notes, '--no-embed'], env);
 
     // 3. Spawn the QUICKSTART surface — exactly the 7 protocol verbs.
     transport = new StdioClientTransport({
       command: 'bun',
-      args: ['run', 'src/cli.ts', 'serve', '--surface', 'verbs'],
+      args: ['--no-env-file', 'run', 'src/cli.ts', 'serve', '--surface', 'verbs'],
       cwd: process.cwd(),
       env,
     });
@@ -205,7 +248,7 @@ describe('serve --surface verbs stdio E2E (the 7 frozen memory verbs over a real
   test('tools/call context_pack on an unknown entity → schema-valid empty pack, protocol_version 1', async () => {
     expect(connected).toBe(true);
     const res = await client!.callTool({ name: 'context_pack', arguments: { entities: 'nonexistent-entity' } });
-    expect((res as { isError?: boolean }).isError).not.toBe(true);
+    expect((res as { isError?: boolean }).isError, toolDiagnostic("verbs roundtrip", res)).not.toBe(true);
     const pack = JSON.parse(textOf(res)) as {
       protocol_version: number;
       entities: string[];
@@ -227,7 +270,7 @@ describe('serve --surface verbs stdio E2E (the 7 frozen memory verbs over a real
   test('tools/call delta with an explicit epoch cursor → protocol_version 1 + has_more + next_cursor', async () => {
     expect(connected).toBe(true);
     const res = await client!.callTool({ name: 'delta', arguments: { since: '1970-01-01T00:00:00Z' } });
-    expect((res as { isError?: boolean }).isError).not.toBe(true);
+    expect((res as { isError?: boolean }).isError, toolDiagnostic("verbs roundtrip", res)).not.toBe(true);
     const d = JSON.parse(textOf(res)) as {
       protocol_version: number;
       since: string;
@@ -274,7 +317,7 @@ describe('serve --surface verbs stdio E2E (the 7 frozen memory verbs over a real
         provenance: 'e2e: serve-stdio-roundtrip',
       },
     });
-    expect((remembered as { isError?: boolean }).isError).not.toBe(true);
+    expect((remembered as { isError?: boolean }).isError, toolDiagnostic("remember roundtrip", remembered)).not.toBe(true);
     const rem = JSON.parse(textOf(remembered)) as { id: string; status: string; protocol_version: number };
     expect(rem.protocol_version).toBe(1);
     expect(['inserted', 'duplicate', 'superseded']).toContain(rem.status);

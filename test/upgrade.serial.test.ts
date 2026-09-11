@@ -1,8 +1,12 @@
 import { describe, test, expect } from 'bun:test';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
+import * as upgradeModule from '../src/commands/upgrade.ts';
 import { resolveBunGlobalRoot } from '../src/commands/upgrade.ts';
+import { formatMarker } from '../src/core/self-upgrade.ts';
+import type { BinarySelfUpdateResult } from '../src/core/binary-self-update.ts';
+import { VERSION } from '../src/version.ts';
 
 // We can't easily mock process.execPath in bun, so we test the upgrade
 // command's --help output and the detection logic via subprocess
@@ -214,4 +218,187 @@ describe('post-upgrade behavior (post v0.12.0 merge)', () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain('Usage: gbrain post-upgrade');
   });
+});
+
+describe('assessUpgradeOutcome (#4366)', () => {
+  test('mismatch when still running an older version than the target', () => {
+    expect(upgradeModule.assessUpgradeOutcome('0.46.25.0', '0.46.21.0')).toBe('mismatch');
+  });
+
+  test('ok when the observed version reaches or passes the target', () => {
+    expect(upgradeModule.assessUpgradeOutcome('0.46.25.0', '0.46.25.0')).toBe('ok');
+    expect(upgradeModule.assessUpgradeOutcome('0.46.25.0', '0.47.0.0')).toBe('ok');
+  });
+
+  test('ok when no target is known (legacy callers keep current behavior)', () => {
+    expect(upgradeModule.assessUpgradeOutcome(undefined, '0.40.0.0')).toBe('ok');
+  });
+
+  test('unverified when the observed version is missing or unparseable', () => {
+    expect(upgradeModule.assessUpgradeOutcome('0.46.25.0', '')).toBe('unverified');
+    expect(upgradeModule.assessUpgradeOutcome('0.46.25.0', 'not-a-version')).toBe('unverified');
+  });
+
+  test('accepts a v-prefixed target tag', () => {
+    expect(upgradeModule.assessUpgradeOutcome('v0.46.25.0', '0.46.21.0')).toBe('mismatch');
+  });
+});
+
+describe('runUpgrade target verification (#4366)', () => {
+  const TARGET = '99.99.99.0';
+  const OLD = '0.40.0.0';
+  const repoRoot = new URL('..', import.meta.url).pathname;
+
+  /**
+   * Build a hermetic fake install under a temp HOME and run runUpgrade in a
+   * subprocess (Bun snapshots environ at birth, so PATH shims cannot be
+   * injected in-process):
+   *   - a PATH-first `clawhub` shim exiting 0 without changing anything —
+   *     the same successful-no-op shape as `bun update` on an exact-tag Git
+   *     pin (the issue's install);
+   *   - a PATH-first `gbrain` shim that keeps reporting `observedVersion`;
+   *   - a pre-seeded upgrade-available marker so cache retention is observable;
+   *   - with `binaryResult`, the driver runs under a copy of bun named `gbrain`
+   *     (detectInstallMethod keys on execPath's basename) and the driver mocks
+   *     runBinarySelfUpdate to return that result, reaching the binary branch.
+   */
+  async function runUpgradeAgainstFakeInstall(opts: {
+    observedVersion: string;
+    targetVersion?: string;
+    binaryResult?: BinarySelfUpdateResult;
+  }): Promise<{ home: string; exitCode: number; stderr: string }> {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-upgrade-target-'));
+    const bin = join(home, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'clawhub'), '#!/bin/sh\nexit 0\n');
+    writeFileSync(join(bin, 'gbrain'), `#!/bin/sh\necho "gbrain ${opts.observedVersion}"\n`);
+    chmodSync(join(bin, 'clawhub'), 0o755);
+    chmodSync(join(bin, 'gbrain'), 0o755);
+
+    mkdirSync(join(home, '.gbrain'), { recursive: true });
+    writeFileSync(
+      join(home, '.gbrain', 'last-update-check'),
+      formatMarker({ kind: 'upgrade_available', current: OLD, latest: TARGET }) + '\n',
+    );
+
+    // The driver lives OUTSIDE the repo so detectInstallMethod() cannot see a
+    // node_modules/.git ancestor and falls through to the clawhub shim.
+    const driverPath = join(home, 'driver.ts');
+    const mockPrelude = opts.binaryResult
+      ? `import { mock } from 'bun:test';\n` +
+        `mock.module('${repoRoot}src/core/binary-self-update.ts', () => ({\n` +
+        `  runBinarySelfUpdate: async () => (${JSON.stringify(opts.binaryResult)}),\n` +
+        `}));\n`
+      : '';
+    writeFileSync(
+      driverPath,
+      mockPrelude +
+        `import { runUpgrade } from '${repoRoot}src/commands/upgrade.ts';\n` +
+        `const t = process.env.TEST_TARGET_VERSION;\n` +
+        `await runUpgrade(['--swap-only'], t ? { targetVersion: t } : {});\n`,
+    );
+    let bunExec = 'bun';
+    if (opts.binaryResult) {
+      bunExec = join(home, 'exec', 'gbrain');
+      mkdirSync(dirname(bunExec));
+      copyFileSync(process.execPath, bunExec);
+      chmodSync(bunExec, 0o755);
+    }
+
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      HOME: home,
+      GBRAIN_HOME: home,
+      PATH: `${bin}:${process.env.PATH}`,
+    };
+    delete env.TEST_TARGET_VERSION;
+    if (opts.targetVersion) env.TEST_TARGET_VERSION = opts.targetVersion;
+
+    const proc = Bun.spawn([bunExec, 'run', driverPath], {
+      cwd: repoRoot,
+      env,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    return { home, exitCode, stderr };
+  }
+
+  test('mismatch exits nonzero, keeps the pending-upgrade cache, and records verify-target', async () => {
+    const { home, exitCode, stderr } = await runUpgradeAgainstFakeInstall({
+      observedVersion: OLD,
+      targetVersion: TARGET,
+    });
+    try {
+      expect(exitCode).toBe(1);
+      // The upgrade-available marker must survive so future nags still fire.
+      expect(existsSync(join(home, '.gbrain', 'last-update-check'))).toBe(true);
+      // No false JUST_UPGRADED breadcrumb for an upgrade that never happened.
+      expect(existsSync(join(home, '.gbrain', 'just-upgraded-from'))).toBe(false);
+      // The operator gets the exact-tag reinstall remediation.
+      expect(stderr).toContain(`github:garrytan/gbrain#v${TARGET}`);
+
+      const errPath = join(home, '.gbrain', 'upgrade-errors.jsonl');
+      const records = existsSync(errPath)
+        ? readFileSync(errPath, 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+        : [];
+      expect(records.some((r) => r.phase === 'verify-target')).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('reaching the target keeps the success path: cache cleared, breadcrumb written, exit 0', async () => {
+    const { home, exitCode } = await runUpgradeAgainstFakeInstall({
+      observedVersion: TARGET,
+      targetVersion: TARGET,
+    });
+    try {
+      expect(exitCode).toBe(0);
+      expect(existsSync(join(home, '.gbrain', 'last-update-check'))).toBe(false);
+      expect(readFileSync(join(home, '.gbrain', 'just-upgraded-from'), 'utf-8').trim()).toBe(VERSION);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('no target (legacy caller) preserves prior behavior even when the version is stale', async () => {
+    const { home, exitCode } = await runUpgradeAgainstFakeInstall({
+      observedVersion: OLD,
+    });
+    try {
+      expect(exitCode).toBe(0);
+      expect(existsSync(join(home, '.gbrain', 'last-update-check'))).toBe(false);
+      expect(existsSync(join(home, '.gbrain', 'just-upgraded-from'))).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // A failed binary swap must still name the release it attempted. With no
+  // caller target (plain `gbrain upgrade`), to_version comes from the release
+  // tag runBinarySelfUpdate resolved — never '' — so doctor can say which
+  // version failed to install.
+  for (const [reason, error] of [
+    ['smoke_failed', undefined],
+    ['version_mismatch', undefined],
+    ['replace_failed', 'EACCES: permission denied'],
+  ] as const) {
+    test(`binary self-update ${reason} records to_version = attempted release`, async () => {
+      const { home } = await runUpgradeAgainstFakeInstall({
+        observedVersion: OLD,
+        binaryResult: { ok: false, reason, targetVersion: TARGET, error },
+      });
+      try {
+        const errPath = join(home, '.gbrain', 'upgrade-errors.jsonl');
+        const records = readFileSync(errPath, 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
+        const rec = records.find((r) => r.phase === 'binary-self-update');
+        expect(rec?.to_version).toBe(TARGET);
+        expect(rec?.error).toBe(error ? `${reason}: ${error}` : reason);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  }
 });

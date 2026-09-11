@@ -4,12 +4,13 @@ This is your install + operating protocol. Claude Code reads `./CLAUDE.md` autom
 Everyone else (Codex, Cursor, OpenClaw, Aider, Continue, or an LLM fetching via URL):
 start here.
 
-> **Becoming someone's persistent personal agent** (identity + memory + private repo)?
-> Follow [`BOOTSTRAP_FOR_AGENTS.md`](./BOOTSTRAP_FOR_AGENTS.md) — the `gbrain bootstrap`
-> flow — instead of the plain install below, then come back here for the operating
-> protocol. Connecting to an EXISTING remote brain from a laptop agent?
-> `gbrain connect https://your-host/mcp --token gbrain_xxx --install` (see the MCP
-> table in [`README.md`](./README.md)).
+> **Default: add memory to the existing agent.** Preserve its identity and unrelated instructions. Start keyless; automatic capture and paid enrichment are opt-in. No bootstrap interview or private repository is required.
+>
+> **Inside Grok Bot or Muse:** follow [Grok Bot](docs/guides/grok-bot.md) or [Muse](docs/guides/muse.md), using the isolated [in-agent setup](docs/guides/in-agent-setup.md) entry point. Use the absolute recorded launcher on every call. Sources organize local memory; they do not isolate agents that share files or credentials. Do not mark generated skills or routines as activated without native-harness evidence.
+>
+> **Existing hosted brain:** follow [hosted harness access](docs/guides/hosted-harness-access.md). Provision on the host; install the private handoff inside the intended harness. A URL or ordinary OAuth token is not administration authority.
+>
+> **Creating a new personal agent, explicitly requested by the user:** follow [BOOTSTRAP_FOR_AGENTS.md](BOOTSTRAP_FOR_AGENTS.md), then return here for the operating protocol.
 
 ## Install (5 min)
 
@@ -35,7 +36,11 @@ start here.
    exact ask-the-user protocol. Same banner fires on `gbrain post-upgrade`
    for existing users (search modes were added in v0.32.3).
 4. Read [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) for the full step-by-step
-   flow (API keys, identity, cron, verification).
+   flow (keyless memory, optional API capabilities, maintenance, verification).
+
+## Memory operating protocol
+
+Recall relevant saved context before answering. Save explicit requests to remember with provenance; confirm corrections against the stored record. Automatic capture requires opt-in. Withdrawal (`forget`) removes a fact from active memory; history, source material, and private backups may remain. Never promise physical erasure. Verify changes with actual GBrain calls and distinguish a local test from a new-conversation test in the harness.
 
 ## Read this order
 
@@ -67,8 +72,19 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
 - **Configure:** [`docs/ENGINES.md`](./docs/ENGINES.md),
   [`docs/guides/live-sync.md`](./docs/guides/live-sync.md),
   [`docs/mcp/DEPLOY.md`](./docs/mcp/DEPLOY.md).
+- **Bring in your chat history:** `gbrain transcripts ingest` imports a
+  downloaded ChatGPT / Claude export (or agent session logs); `gbrain connectors`
+  connects the account and syncs new conversations live, incrementally and on an
+  opt-in schedule (cookie/OAuth credentials stay on your machine, 0600). Full
+  guide: [`docs/guides/chat-connectors.md`](./docs/guides/chat-connectors.md).
 - **Debug:** [`docs/GBRAIN_VERIFY.md`](./docs/GBRAIN_VERIFY.md),
   [`docs/guides/minions-fix.md`](./docs/guides/minions-fix.md), `gbrain doctor --fix`.
+  Database unreachable — or any `GBRAIN_DB_ACCESS <reason>` marker in gbrain
+  output: `gbrain engine status --probe` (which engine, where its URL comes from,
+  classified reachability), then `gbrain db-repair` to diagnose and
+  `gbrain db-repair --yes` to apply safe fixes. All three are engine-free — they
+  work while the database is down. Full loop:
+  [`docs/ENGINES.md`](./docs/ENGINES.md#engine-detection-and-access-repair).
 - **Migrate / upgrade:** `gbrain upgrade` (binary self-update + schema migrations + post-upgrade prompts),
   [`docs/UPGRADING_DOWNSTREAM_AGENTS.md`](./docs/UPGRADING_DOWNSTREAM_AGENTS.md),
   [`skills/migrations/`](./skills/migrations/), `gbrain apply-migrations --yes` (manual schema-only).
@@ -103,6 +119,17 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   to opt out). Non-metric event rows (`meeting`, `job_change`,
   `location_change`) ride through the same pipeline via `facts.event_type`;
   pass `kind: 'event'` or `'all'` to `find_trajectory` to query them.
+- **Answer "who is waiting on me?":** connect the user's Google account once
+  (`gbrain google setup` — two user interactions; relay the `[SHOW USER]`
+  blocks verbatim), then `gbrain waiting --json` returns the ranked people
+  waiting on the user, what they promised, evidence quotes, and Gmail deep
+  links. Manage loops with `gbrain loops done|drop|mute`. It refuses on
+  stale data and names the exact sync command to run first. Guides:
+  [`docs/guides/google-connect.md`](./docs/guides/google-connect.md) (setup +
+  every error and its fix),
+  [`docs/guides/open-loops.md`](./docs/guides/open-loops.md) (how detection
+  works); the harness protocol lives in
+  [`skills/google-loops/SKILL.md`](./skills/google-loops/SKILL.md).
 - **Everything else:** [`./llms.txt`](./llms.txt) is the full documentation map.
   [`./llms-full.txt`](./llms-full.txt) is the same map with core docs inlined for
   single-fetch ingestion.

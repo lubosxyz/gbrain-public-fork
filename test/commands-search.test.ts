@@ -8,6 +8,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runSearch } from '../src/commands/search.ts';
+import { MODES_REPORT_PER_CALL_NOTE } from '../src/core/search/modes-report.ts';
 import { recordSearchTelemetry, _resetTelemetryWriterForTest, getTelemetryWriter, TELEMETRY_COVERAGE_CAVEAT } from '../src/core/search/telemetry.ts';
 import type { HybridSearchMeta } from '../src/core/types.ts';
 
@@ -75,13 +76,22 @@ describe('gbrain search modes (read-only dashboard)', () => {
 
   test('per-key override shows up with source=override', async () => {
     await engine.setConfig('search.mode', 'conservative');
-    await engine.setConfig('search.cache.enabled', 'false');
+    await engine.setConfig('search.title_boost', '2');
     const out = await captureRun(() => runSearch(engine, ['modes', '--json']));
     const report = JSON.parse(out);
-    expect(report.resolved.cache_enabled.value).toBe(false);
-    expect(report.resolved.cache_enabled.source).toBe('override');
+    expect(report.resolved.title_boost.value).toBe(2);
+    expect(report.resolved.title_boost.source).toBe('override');
     // Other knobs still come from the mode bundle.
     expect(report.resolved.searchLimit.source).toBe('mode');
+  });
+
+  test.each(['false', 'true'])('cache availability overrides configured %s without erasing it', async (configured) => {
+    await engine.setConfig('search.cache.enabled', configured);
+    const report = JSON.parse(await captureRun(() => runSearch(engine, ['modes', '--json'])));
+    expect(report.resolved.cache_enabled.value).toBe(false);
+    expect(report.resolved.cache_enabled.source).toBe('availability');
+    expect(report.resolved.cache_enabled.source_detail).toContain('temporarily disabled');
+    expect(await engine.getConfig('search.cache.enabled')).toBe(configured);
   });
 
   test('default text output names the active mode', async () => {
@@ -90,6 +100,19 @@ describe('gbrain search modes (read-only dashboard)', () => {
     expect(out).toContain('tokenmax');
     expect(out).toContain('conservative');
     expect(out).toContain('balanced');
+  });
+
+  test('#4604: text output carries the per-call caveat verbatim under a Note: label', async () => {
+    // The dashboard resolves config overrides + the mode bundle; per-call
+    // SearchOpts overrides on individual searches are invisible to it. The
+    // text renderer must say so with the SAME string the JSON report exposes
+    // as `per_call_note`, so the two surfaces can't drift.
+    await engine.setConfig('search.mode', 'balanced');
+    const out = await captureRun(() => runSearch(engine, ['modes']));
+    expect(out).toContain('Note:');
+    expect(out).toContain(MODES_REPORT_PER_CALL_NOTE);
+    const json = JSON.parse(await captureRun(() => runSearch(engine, ['modes', '--json'])));
+    expect(json.per_call_note).toBe(MODES_REPORT_PER_CALL_NOTE);
   });
 });
 
@@ -173,11 +196,13 @@ describe('gbrain search stats', () => {
     const out = await captureRun(() => runSearch(engine, ['stats', '--json']));
     const stats = JSON.parse(out);
     expect(stats.coverage).toBeDefined();
-    expect(stats.coverage.cli_invocations).toBe('typically_not_recorded');
+    expect(stats.coverage.cli_invocations).toBe('recorded_on_clean_exit');
     // Pin the substance, not just presence — an inaccurate reason string
-    // (e.g. "long-lived processes only") must fail this test.
+    // (e.g. "long-lived processes only") must fail this test. Post-#4143 the
+    // contract is: clean exits flush; unclean deaths still drop.
     expect(stats.coverage.reason).toMatch(/short-lived CLI/i);
-    expect(stats.coverage.reason).toMatch(/typically.*not recorded|not.*typically recorded/i);
+    expect(stats.coverage.reason).toMatch(/clean exit/i);
+    expect(stats.coverage.reason).toMatch(/hard kill/i);
   });
 
   test('--json includes a coverage disclosure (non-empty table)', async () => {
@@ -188,7 +213,7 @@ describe('gbrain search stats', () => {
 
     const out = await captureRun(() => runSearch(engine, ['stats', '--json']));
     const stats = JSON.parse(out);
-    expect(stats.coverage.cli_invocations).toBe('typically_not_recorded');
+    expect(stats.coverage.cli_invocations).toBe('recorded_on_clean_exit');
   });
 
   // Wording-accuracy pin, independent of the TELEMETRY_COVERAGE_NOTE import:
@@ -197,20 +222,22 @@ describe('gbrain search stats', () => {
   // (round-1 review caught exactly this class of bug — "long-lived
   // processes only" overclaimed and dropped `jobs work`). Hardcode the
   // substance here instead of comparing production output to itself.
-  test('--json coverage.reason names all three long-lived process kinds + the threshold exception', async () => {
+  test('--json coverage.reason names all three long-lived process kinds + the residual-loss cases', async () => {
     const out = await captureRun(() => runSearch(engine, ['stats', '--json']));
     const reason: string = JSON.parse(out).coverage.reason;
     expect(reason).toMatch(/gbrain serve/i);
     expect(reason).toMatch(/mcp/i);
     expect(reason).toMatch(/jobs work/i);
     expect(reason).toMatch(/short-lived CLI/i);
-    // Must not claim CLI calls are NEVER recorded — a bulk CLI run that
-    // itself crosses the 100-call flush threshold before exiting IS
-    // captured, so the wording must hedge ("typically"/"usually"), not
-    // assert absolute exclusivity ("only"/"never").
-    expect(reason).toMatch(/typically|usually/i);
+    // Post-#4143: must not claim CLI calls are unconditionally recorded —
+    // the teardown drain only covers CLEAN exits; the wording must name what
+    // still drops (hard kills / over-bound drains / disconnect mid-buffer)
+    // and must not assert absolutes in either direction.
+    expect(reason).toMatch(/clean exit/i);
+    expect(reason).toMatch(/hard kill|drops/i);
     expect(reason).not.toMatch(/\bonly\b/i);
     expect(reason).not.toMatch(/\bnever\b/i);
+    expect(reason).not.toMatch(/\balways\b/i);
   });
 
   test('human output surfaces the exact coverage caveat (empty table)', async () => {
@@ -223,11 +250,12 @@ describe('gbrain search stats', () => {
 
   // Same independent-wording-pin rationale as the --json test above,
   // applied to the short human caveat.
-  test('human coverage caveat names long-lived processes + jobs work + the hedge word, independent of the import', async () => {
+  test('human coverage caveat names long-lived processes + jobs work + the residual-loss hedge, independent of the import', async () => {
     const out = await captureRun(() => runSearch(engine, ['stats']));
     expect(out).toMatch(/favors long-lived processes/i);
     expect(out).toMatch(/jobs work/i);
-    expect(out).toMatch(/typically not recorded/i);
+    expect(out).toMatch(/clean exit/i);
+    expect(out).toMatch(/hard kills/i);
     expect(out).not.toMatch(/only long-lived processes/i);
   });
 
@@ -256,7 +284,7 @@ describe('gbrain search tune (recommendations)', () => {
     const out = await captureRun(() => runSearch(engine, ['tune', '--json']));
     const r = JSON.parse(out);
     expect(r.coverage).toBeDefined();
-    expect(r.coverage.cli_invocations).toBe('typically_not_recorded');
+    expect(r.coverage.cli_invocations).toBe('recorded_on_clean_exit');
     expect(r.coverage.reason).toMatch(/short-lived CLI/i);
   });
 
@@ -291,7 +319,7 @@ describe('gbrain search tune (recommendations)', () => {
     expect(modeRec.suggested).toBe('balanced');
     // Coverage disclosure travels with real recommendations too, not just
     // the insufficient-data early-return path.
-    expect(r.coverage.cli_invocations).toBe('typically_not_recorded');
+    expect(r.coverage.cli_invocations).toBe('recorded_on_clean_exit');
   });
 
   test('has_recommendations → human output notes the exact coverage caveat', async () => {

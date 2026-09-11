@@ -20,7 +20,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
-import { execFileSync, spawnSync } from 'child_process';
+import { execFileSync, spawn, spawnSync } from 'child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join, resolve } from 'path';
@@ -173,6 +173,80 @@ describe('run-unit-parallel.sh timeout escalation contract', () => {
     const source = readFileSync(PARALLEL_SH_SRC, 'utf-8');
     expect(source).toContain('[ "$rc" = "124" ] || [ "$rc" = "137" ]');
   });
+});
+
+describe('run-unit-parallel.sh operator-interrupt cleanup', () => {
+  it('kills an interrupt-resistant shard when its terminal group receives SIGINT', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-parallel-interrupt-'));
+    let child: ReturnType<typeof spawn> | undefined;
+    let bunPid = 0;
+    try {
+      mkdirSync(join(root, 'scripts', 'lib'), { recursive: true });
+      mkdirSync(join(root, 'test'), { recursive: true });
+      mkdirSync(join(root, 'bin'), { recursive: true });
+      for (const s of ['run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh']) {
+        copyFileSync(resolve(REPO_ROOT, 'scripts', s), join(root, 'scripts', s));
+        chmodSync(join(root, 'scripts', s), 0o755);
+      }
+      copyFileSync(TESTENV_SH_SRC, join(root, 'scripts', 'lib', 'test-env.sh'));
+      writeFileSync(join(root, 'test', 'hang.test.ts'), '// discovered by the shard wrapper\n');
+
+      const fakeBun = join(root, 'bin', 'bun');
+      writeFileSync(fakeBun, `#!/usr/bin/env bash
+[ "${'$'}{1:-}" = "test" ] || exit 0
+echo "$$" > "${join(root, 'bun.pid')}"
+trap '' INT TERM
+while true; do sleep 1; done
+`);
+      chmodSync(fakeBun, 0o755);
+
+      child = spawn('bash', [join(root, 'scripts', 'run-unit-parallel.sh'), '--shards', '1'], {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: `${join(root, 'bin')}:${process.env.PATH ?? ''}`,
+          GBRAIN_TEST_NO_MEM_ADAPT: '1',
+          GBRAIN_TEST_SHARD_TIMEOUT: '300',
+        },
+        detached: true,
+        stdio: 'ignore',
+      });
+
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(join(root, 'bun.pid')) && Date.now() < deadline) {
+        await Bun.sleep(25);
+      }
+      expect(existsSync(join(root, 'bun.pid'))).toBe(true);
+      bunPid = Number(readFileSync(join(root, 'bun.pid'), 'utf8').trim());
+
+      const proc = child;
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
+        proc.once('exit', (code, signal) => resolveExit({ code, signal }));
+        process.kill(-proc.pid!, 'SIGINT');
+      });
+      // handle_interrupt runs cleanup_children then `exit 130` — a raw SIGINT
+      // death would mean the trap never ran (cleanup skipped).
+      expect(exit.code).toBe(130);
+
+      const goneDeadline = Date.now() + 2_000;
+      let liveState = '';
+      do {
+        const probe = spawnSync('ps', ['-o', 'stat=', '-p', String(bunPid)], { encoding: 'utf8' });
+        liveState = (probe.stdout || '').trim();
+        if (!liveState || liveState.startsWith('Z')) break;
+        await Bun.sleep(25);
+      } while (Date.now() < goneDeadline);
+      // A zombie owns no memory and only awaits launchd reaping; any other
+      // state means the cancelled suite is still doing or retaining work.
+      expect(!liveState || liveState.startsWith('Z')).toBe(true);
+    } finally {
+      // Reap the detached tree BEFORE the fixture dir goes: a failed assertion
+      // above must not leave the fake-bun loop (its own process group) alive.
+      if (child?.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } }
+      if (bunPid) { try { process.kill(bunPid, 'SIGKILL'); } catch { /* already gone */ } }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 describe('run-unit-parallel.sh no-timeout-binary fallback (rc from shard wait, not watchdog teardown)', () => {
@@ -405,4 +479,106 @@ describe('run-unit-parallel.sh external-kill rescue contract', () => {
     expect(source).toContain('date +%s > "$LOG_DIR/shard-$i.start"');
     expect(source).toContain('date +%s > "$LOG_DIR/shard-$i.end"');
   });
+});
+
+describe('run-unit-parallel.sh mem-adapt shed order (intra before shards)', () => {
+  // `bun test --max-concurrency` only bounds test.concurrent tests (1 file in
+  // the corpus), so intra-shard width is nearly free to shed while every
+  // dropped SHARD removes a whole bun process of real fan-out. The old order
+  // (shards first) collapsed a 16GB box to 1x4 — a serial run behind a 12000s
+  // watchdog, measured 3.25x slower than 4 shards on the same machine.
+  it('sheds intra-shard concurrency to 1 before dropping any shard', () => {
+    // Stub detect_available_mem_mb by appending a redefinition to the
+    // sandbox's test-env.sh copy (last definition wins in bash). --dry-run
+    // prints the banner and exits before spawning anything.
+    const stubEnv = join(TMPROOT, 'scripts', 'lib', 'test-env.sh');
+    const orig = readFileSync(stubEnv, 'utf-8');
+    writeFileSync(stubEnv, orig + '\ndetect_available_mem_mb() { echo "${FAKE_AVAIL_MB:-0}"; }\n');
+    try {
+      const r = spawnSync(
+        'bash',
+        [join(TMPROOT, 'scripts', 'run-unit-parallel.sh'), '--shards', '4', '--dry-run'],
+        {
+          cwd: TMPROOT,
+          encoding: 'utf-8',
+          // budget = 8704 - 4096 = 4608MB → MAX_TOTAL 3 at 1536MB/file.
+          // Old policy landed at 1x3; the fix must land at 3x1.
+          env: {
+            ...process.env,
+            GBRAIN_TEST_NO_MEM_ADAPT: '0',
+            GBRAIN_TEST_MAX_CONCURRENCY: '4',
+            FAKE_AVAIL_MB: '8704',
+          },
+        },
+      );
+      expect(r.stderr).toContain('mem-adapted 4x4→3x1');
+      expect(r.stderr).not.toContain('→1x');
+    } finally {
+      writeFileSync(stubEnv, orig);
+    }
+  });
+});
+
+describe('run-unit-parallel.sh no-timeout-binary wedge sentinel (rc 143 at cap → WEDGED)', () => {
+  // Regression pin: the fallback watchdog TERMs a hung shard (rc 143), which
+  // the pinned 124/137 wedge line cannot see. Before the .watchdog sentinel,
+  // that run died as a bare NON_OOM_FAIL with an rc=143 summary — the
+  // EXIT-HANG/WEDGED classifier was unreachable on machines without coreutils
+  // timeout, turning the known exit-hang leak into a false hard-red there.
+  let WROOT: string;
+
+  beforeAll(() => {
+    WROOT = mkdtempSync(join(tmpdir(), 'gbrain-parallel-wedge-'));
+    mkdirSync(join(WROOT, 'scripts'), { recursive: true });
+    mkdirSync(join(WROOT, 'test'), { recursive: true });
+    for (const s of ['run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh', 'lib/test-env.sh']) {
+      mkdirSync(dirname(join(WROOT, 'scripts', s)), { recursive: true });
+      copyFileSync(resolve(REPO_ROOT, 'scripts', s), join(WROOT, 'scripts', s));
+      chmodSync(join(WROOT, 'scripts', s), 0o755);
+    }
+    // A test still mid-sleep at the shard cap — the fallback watchdog TERMs
+    // the bun process (rc 143). What this pins is the CLASSIFICATION of that
+    // kill (sentinel → WEDGED), not bun's exit-hang leak itself: a plain
+    // module-level ref'd timer no longer holds bun 1.3 open after the run,
+    // so a sleeping test is the reliable way to be alive at the cap.
+    const hanging = `import { describe, it } from 'bun:test';
+describe('hanging', () => { it('sleeps past the shard cap', async () => { await Bun.sleep(30_000); }, 55_000); });`;
+    writeFileSync(join(WROOT, 'test', 'a-hang-at-exit.test.ts'), hanging);
+
+    // Curated PATH with every tool the scripts call EXCEPT timeout binaries,
+    // so the fallback branch executes even on hosts with coreutils.
+    const bin = join(WROOT, 'bin');
+    mkdirSync(bin);
+    for (const tool of ['bash', 'sh', 'env', 'dirname', 'basename', 'mktemp', 'date', 'sleep', 'cat', 'tail', 'head', 'rm', 'mkdir', 'pkill', 'grep', 'sed', 'awk', 'wc', 'tr', 'seq', 'find', 'sort', 'touch', 'stat', 'bun']) {
+      const p = Bun.which(tool);
+      if (p) symlinkSync(p, join(bin, tool));
+    }
+  });
+
+  afterAll(() => {
+    if (WROOT) rmSync(WROOT, { recursive: true, force: true });
+  });
+
+  it('classifies a watchdog-TERMed shard as WEDGED via the sentinel, not a bare rc=143 fail', () => {
+    const r = spawnSync(
+      'bash',
+      [join(WROOT, 'scripts', 'run-unit-parallel.sh'), '--shards', '1'],
+      {
+        cwd: WROOT,
+        encoding: 'utf-8',
+        env: {
+          PATH: join(WROOT, 'bin'),
+          HOME: process.env.HOME ?? WROOT,
+          TMPDIR: process.env.TMPDIR ?? '/tmp',
+          GBRAIN_TEST_SHARD_TIMEOUT: '6',
+          GBRAIN_TEST_SHARD_KILL_AFTER: '2',
+          GBRAIN_TEST_NO_MEM_ADAPT: '1',
+        },
+      },
+    );
+    expect(r.status).not.toBe(0);
+    expect(existsSync(join(WROOT, '.context', 'test-shards', 'shard-1.watchdog'))).toBe(true);
+    const summary = readFileSync(join(WROOT, '.context', 'test-summary.txt'), 'utf-8');
+    expect(summary).toContain('WEDGED');
+  }, 120_000);
 });

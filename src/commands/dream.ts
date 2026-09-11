@@ -31,7 +31,7 @@ import {
   type CyclePhase,
   type CycleReport,
 } from '../core/cycle.ts';
-import { resolveSourceId } from '../core/source-resolver.ts';
+import { ALL_SOURCES, isResolverUserError, resolveImplicitDefaultSourceId, resolveSourceId } from '../core/source-resolver.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { fetchSource } from '../core/sources-load.ts';
 import { existsSync } from 'fs';
@@ -41,7 +41,13 @@ interface DreamArgs {
   json: boolean;
   dryRun: boolean;
   pull: boolean;
-  phase: CyclePhase | null;
+  /**
+   * #4493: every explicitly-named (or --input/--drain-implied) phase, order
+   * preserved, deduped. Empty = full/default cycle. Previously a single
+   * `phase` scalar read from the FIRST --phase flag, so repeats were
+   * silently dropped.
+   */
+  phases: CyclePhase[];
   dir: string | null;
   help: boolean;
   /** v0.21: ad-hoc transcript file path; implies --phase synthesize. */
@@ -118,22 +124,31 @@ function collectFlagValues(args: string[], flag: string): string[] | null {
 }
 
 function parseArgs(args: string[]): DreamArgs {
-  const phaseIdx = args.indexOf('--phase');
+  // #4493: collect EVERY --phase occurrence. `args.indexOf('--phase')` used
+  // to read only the FIRST flag, so `--phase a --phase b --phase c` silently
+  // ran phase a alone and exited 0 with a report covering one phase. Each
+  // value is validated, order is preserved, repeats of the same value
+  // collapse (same contract as the repeated --source handling below).
+  const phaseValues = collectFlagValues(args, '--phase');
+  if (phaseValues === null) {
+    console.error('--phase <name>: missing value. Usage: gbrain dream --phase <name>');
+    process.exit(2);
+  }
   // issue #2860 (Codex P3): captured BEFORE --input/--drain get a chance to
-  // implicitly default `phase` below, so --once's validation can require
+  // implicitly default `phases` below, so --once's validation can require
   // the user actually TYPED --phase, not merely that some phase ended up
   // resolved. Without this, `--input <f> --once` and `--drain --once`
   // slip past the "explicit --phase required" contract (the derived
-  // `phase` value is already non-null by the time that check runs) and
+  // phase value is already non-null by the time that check runs) and
   // --once becomes silently ineffective for both.
-  const phaseWasExplicit = phaseIdx !== -1;
-  const rawPhase = phaseIdx !== -1 ? args[phaseIdx + 1] : null;
-  let phase = rawPhase && (ALL_PHASES as string[]).includes(rawPhase)
-    ? (rawPhase as CyclePhase)
-    : null;
-  if (rawPhase && !phase) {
-    console.error(`Unknown phase "${rawPhase}". Valid: ${ALL_PHASES.join(', ')}`);
-    process.exit(1);
+  const phaseWasExplicit = phaseValues.length > 0;
+  let phases: CyclePhase[] = [];
+  for (const rawPhase of phaseValues) {
+    if (!(ALL_PHASES as string[]).includes(rawPhase)) {
+      console.error(`Unknown phase "${rawPhase}". Valid: ${ALL_PHASES.join(', ')}`);
+      process.exit(1);
+    }
+    if (!phases.includes(rawPhase as CyclePhase)) phases.push(rawPhase as CyclePhase);
   }
 
   const dirIdx = args.indexOf('--dir');
@@ -175,7 +190,7 @@ function parseArgs(args: string[]): DreamArgs {
   }
 
   // --input implies --phase synthesize.
-  if (inputFile && !phase) phase = 'synthesize';
+  if (inputFile && phases.length === 0) phases = ['synthesize'];
 
   // v0.41.13: --source <id> (and the --source-id alias) drives per-source
   // cycle scoping. Resolution rules:
@@ -229,9 +244,9 @@ function parseArgs(args: string[]): DreamArgs {
     windowSeconds = parseInt(raw, 10);
   }
   if (drain) {
-    if (!phase) phase = 'extract_atoms';
-    else if (phase !== 'extract_atoms') {
-      console.error(`--drain currently supports only --phase extract_atoms (got "${phase}")`);
+    if (phases.length === 0) phases = ['extract_atoms'];
+    else if (phases.length > 1 || phases[0] !== 'extract_atoms') {
+      console.error(`--drain currently supports only --phase extract_atoms (got "${phases.join(', ')}")`);
       process.exit(2);
     }
   }
@@ -264,12 +279,22 @@ function parseArgs(args: string[]): DreamArgs {
     );
     process.exit(2);
   }
+  // #4493 corollary: --once bypasses ONE phase's enabled gate; with several
+  // named phases there is no single target, and force-enabling them all at
+  // once is the surprise-spend risk #2860 exists to prevent.
+  if (once && phases.length > 1 && !wantsHelp) {
+    console.error(
+      `--once supports a single --phase target; got [${phases.join(', ')}]. ` +
+      'Run each phase in its own --phase <name> --once invocation.',
+    );
+    process.exit(2);
+  }
 
   return {
     json: args.includes('--json'),
     dryRun: args.includes('--dry-run'),
     pull: args.includes('--pull'),
-    phase,
+    phases,
     dir,
     help: args.includes('--help') || args.includes('-h'),
     inputFile,
@@ -369,7 +394,9 @@ Options:
                       but skips the synthesis subagents.
                       "--dry-run" does NOT mean "zero LLM calls."
   --json              Emit the CycleReport as JSON (agent-readable)
-  --phase <name>      Run a single phase: ${ALL_PHASES.join(' | ')}
+  --phase <name>      Run only the named phase(s). Repeatable — every named
+                      phase runs, in canonical cycle order (#4493).
+                      Valid: ${ALL_PHASES.join(' | ')}
   --once              With --phase <name>: run that phase once even if its
                       own dream.<phase>.enabled / cycle.<phase>.enabled
                       config gate is false. Never reads or writes config —
@@ -392,7 +419,16 @@ Options:
                       cycle_freshness check sees a fresh stamp on
                       completion. When omitted, gbrain derives the
                       source from --dir / the configured checkout
-                      when it matches a source's local_path (#1869).
+                      when it matches a source's local_path (#1869),
+                      or from the default-like source selected by
+                      sources.default / sole-non-default routing.
+                      A named non-default source runs the deterministic
+                      freshness phases unless --phase is given
+                      (explicit phases are honored verbatim). A bare
+                      no --source dream against the default-like source,
+                      and --source default, still run the full cycle.
+                      GBRAIN_SOURCE=<id> is equivalent when --source is
+                      omitted.
   --source-id <id>    Alias for --source. Matches the v0.37.7.0+
                       naming used by import/extract/graph-query.
 
@@ -431,7 +467,7 @@ Examples:
 
 Configure synthesize:
   gbrain config set dream.synthesize.session_corpus_dir /path/to/transcripts
-  gbrain config set dream.synthesize.session_corpus_dir /path/to/transcripts
+  gbrain config set cycle.timezone Asia/Kolkata  # optional; defaults to host timezone
 
 Related:
   gbrain autopilot --install            # continuous maintenance as a daemon
@@ -454,9 +490,29 @@ function printHuman(report: CycleReport) {
   }
 
   if (report.status === 'clean') {
+    // A 'clean' cycle can still carry a skip reason worth surfacing — e.g.
+    // synthesize's D8 legacy-key / D5 oversize-chunk skips leave
+    // transcripts_processed/synth_pages_written at 0 (so deriveStatus sees
+    // no activity) while `details.skips` names exactly why each transcript
+    // was passed over. Without this, `--input <already-handled-file>`
+    // prints only "Brain is healthy" with no indication anything was
+    // examined and skipped.
+    const skipLines: string[] = [];
+    for (const p of report.phases) {
+      const skips = (p.details as { skips?: Array<{ filePath: string; reason: string }> } | undefined)?.skips;
+      if (Array.isArray(skips)) {
+        for (const s of skips) {
+          skipLines.push(`  - ${p.phase}: ${s.filePath} (${s.reason})`);
+        }
+      }
+    }
     console.log(
       `Brain is healthy. ${report.phases.length} phase(s) checked in ${(report.duration_ms / 1000).toFixed(1)}s.`,
     );
+    if (skipLines.length > 0) {
+      console.log('Skipped:');
+      for (const line of skipLines) console.log(line);
+    }
     return;
   }
 
@@ -468,6 +524,17 @@ function printHuman(report: CycleReport) {
       p.status === 'skipped' ? '-' : '✗';
     const line = `  ${icon} ${p.phase.padEnd(10)}  ${p.summary}`;
     console.log(line);
+    const details = p.details as Record<string, unknown> | undefined;
+    const failures = Array.isArray(details?.failures) ? details.failures : [];
+    if (failures.length > 0) {
+      for (const f of failures) {
+        // sync failures carry `source`; synthesize_concepts failures carry
+        // `concept` — name whichever is present so a concept-synthesis
+        // failure isn't printed as an anonymous '?'.
+        const { source, concept, error } = f as { source?: string; concept?: string; error?: string };
+        console.log(`      ✗ ${source ?? concept ?? '?'}: ${error ?? 'unknown error'}`);
+      }
+    }
     if (p.error) {
       const hint = p.error.hint ? ` (${p.error.hint})` : '';
       console.log(`      [${p.error.class}/${p.error.code}] ${p.error.message}${hint}`);
@@ -489,27 +556,22 @@ function printHuman(report: CycleReport) {
   }
 }
 
+// ── Test-only export ───────────────────────────────────────
+// `__testing` re-exports otherwise-private helpers so unit tests can pin
+// CLI output behavior without spawning a subprocess. Not part of the
+// runtime contract.
+export const __testing = {
+  printHuman,
+};
+
 // ─── CLI entry ─────────────────────────────────────────────────────
 
-/**
- * Predicate: is this error one of the resolver's user-facing throws
- * we want to surface as a clean stderr line + exit 1?
- *
- * Matches the message prefixes thrown from
- * `src/core/source-resolver.ts:resolveSourceId` and
- * `assertSourceExists`. Anything else (TypeError / ReferenceError /
- * postgres connection failures / unexpected bugs) is intentionally
- * NOT caught — those propagate to Bun's default unhandled handler
- * with a stack trace so genuine programmer bugs aren't hidden as
- * if they were operator errors. (Plan D-T3, codex C-7.)
- */
-function isResolverUserError(e: unknown): boolean {
-  if (!(e instanceof Error)) return false;
-  const m = e.message;
-  return (m.startsWith('Source "') && m.includes(' not found.'))
-      || m.startsWith('Invalid --source value')
-      || m.startsWith('Invalid GBRAIN_SOURCE value');
-}
+// The resolver's user-facing throws (unknown/archived source, invalid --source
+// / GBRAIN_SOURCE value) surface as a clean stderr line + exit 1 via the shared
+// `isResolverUserError` predicate (source-resolver.ts, next to the messages it
+// matches). Anything else — TypeError / connection failures / genuine bugs —
+// is intentionally NOT caught and propagates with a stack trace so programmer
+// bugs are never hidden as operator errors. (Plan D-T3, codex C-7.)
 
 /**
  * issue #1678 — bounded single-hold extract_atoms drain (see DreamArgs.drain).
@@ -533,7 +595,7 @@ async function runDrain(
   if (opts.dryRun) {
     const remaining = await countExtractAtomsBacklog(engine, extractionSourceId);
     if (opts.json) {
-      console.log(JSON.stringify({ phase: 'extract_atoms', status: 'ok', dry_run: true, extracted: 0, skipped: 0, remaining, batches: 0, stopped: 'window' }, null, 2));
+      console.log(JSON.stringify({ phase: 'extract_atoms', status: 'ok', dry_run: true, extracted: 0, skipped: 0, remaining, batches: 0, stopped: 'window', failure_count: 0, failures: [], omitted_failure_count: 0, last_error: null }, null, 2));
     } else {
       console.log(`[drain] dry-run: ${remaining ?? '?'} page(s) eligible for atom extraction (no work done)`);
     }
@@ -568,6 +630,22 @@ async function runDrain(
     throw e;
   }
 
+  // #4539: surface WHY the drain underperformed. Pre-fix the phase's
+  // failures[] was collapsed to bare counts inside the drain adapter, so a
+  // run that failed on every item printed only `stopped: no_progress` and the
+  // operator had to re-run the phase by hand to see the provider/parse error.
+  // Stderr (not stdout): progress/diagnostics never pollute the data stream.
+  if (result.failure_count > 0) {
+    // #4730: the bounded per-item records ride the --json payload; the human
+    // stderr line reports the totals (and any cap overflow) so nothing is
+    // silently dropped in either mode.
+    const omitted = result.omitted_failure_count > 0
+      ? ` (${result.failures.length} detailed, ${result.omitted_failure_count} beyond the record cap)`
+      : '';
+    process.stderr.write(
+      `[drain] ${result.failure_count} item failure(s)${omitted}${result.last_error ? `; last error: ${result.last_error}` : ''}\n`,
+    );
+  }
   if (opts.json) {
     console.log(JSON.stringify(result, null, 2));
   } else {
@@ -626,15 +704,49 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
   //      last_full_cycle_at to an archived source would mask data
   //      staleness when the source is later restored)
   let resolvedSourceId: string | undefined;
-  if (opts.source !== null) {
+  // #4700: a bare `gbrain dream` whose brain routes bare commands to a
+  // non-default source (sources.default config, or sole-non-default routing)
+  // IS the canonical default cycle for that brain — run the full implicit
+  // phase set instead of the freshness-only source cycle. Explicit
+  // `--source <id>` and the autopilot fanout keep the freshness boundary.
+  let implicitDefaultSourceId: string | null = null;
+  let fullImplicitSourceCycle = false;
+  // #4778: GBRAIN_SOURCE is tier 2 of the shared resolver, but dream only
+  // entered the resolver behind the --source gate, so an env-scoped bare run
+  // cycled the unscoped brain and never stamped the intended source. The
+  // __all__ sentinel is excluded: unscoped dream already spans every source,
+  // and a '__all__' scope has no local_path (every filesystem phase would be
+  // skipped as no_brain_dir).
+  const envSource = process.env.GBRAIN_SOURCE ?? '';
+  const envScoped = envSource !== '' && envSource !== ALL_SOURCES;
+  if (opts.source === null && engine !== null) {
+    try {
+      implicitDefaultSourceId = await resolveImplicitDefaultSourceId(engine);
+    } catch (e) {
+      if (isResolverUserError(e)) {
+        console.error((e as Error).message);
+        process.exit(1);
+      }
+      throw e;
+    }
+    // Gated on an EMPTY env, not on !envScoped: an explicit GBRAIN_SOURCE=__all__
+    // asks for the whole brain and must not be narrowed to the implicit default.
+    if (opts.dir === null && envSource === '' && implicitDefaultSourceId && implicitDefaultSourceId !== 'default') {
+      resolvedSourceId = implicitDefaultSourceId;
+      fullImplicitSourceCycle = true;
+    }
+  }
+  if (opts.source !== null || envScoped) {
     if (engine === null) {
       console.error(
-        'gbrain dream --source <id> requires a connected brain ' +
-        '(no engine available); omit --source or run `gbrain init` first',
+        'gbrain dream --source <id> / GBRAIN_SOURCE=<id> requires a connected brain ' +
+        '(no engine available); omit the source scope or run `gbrain init` first',
       );
       process.exit(1);
     }
     try {
+      // A null explicit falls through to tier 2 (GBRAIN_SOURCE: validate +
+      // assertSourceExists) — the recall.ts pattern.
       resolvedSourceId = await resolveSourceId(engine, opts.source);
     } catch (e) {
       if (isResolverUserError(e)) {
@@ -643,6 +755,12 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
       }
       throw e; // genuine bugs propagate with stack trace
     }
+    // #4700 mirror of the path-derived branch below: an env scope naming the
+    // brain's default-like source is still the canonical default cycle, not
+    // a freshness-only --source cycle.
+    fullImplicitSourceCycle = opts.source === null
+      && implicitDefaultSourceId === resolvedSourceId
+      && resolvedSourceId !== 'default';
     // Archived-source guard via fetchSource from sources-load.ts
     // (single-row SELECT that projects `archived` and falls back to
     // pre-v0.26.5 schemas via isUndefinedColumnError catch — same
@@ -687,7 +805,15 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     const derived = await resolveSourceForDir(engine, brainDir);
     if (derived !== undefined) {
       const src = await fetchSource(engine, derived);
-      if (src?.archived !== true) resolvedSourceId = derived;
+      if (src?.archived !== true) {
+        resolvedSourceId = derived;
+        // #4700: a path-derived run that lands on the brain's default-like
+        // source is still the canonical default cycle — keep the full
+        // implicit phase set rather than downgrading to freshness-only.
+        fullImplicitSourceCycle = opts.source === null
+          && implicitDefaultSourceId === derived
+          && derived !== 'default';
+      }
     }
   }
   // ─── issue #1678: bounded single-hold extract_atoms drain ──────────
@@ -699,22 +825,27 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     return runDrain(engine, opts, resolvedSourceId, brainDir);
   }
 
-  const phases: CyclePhase[] | undefined = opts.phase ? [opts.phase] : undefined;
+  // #4493: pass EVERY named phase through (runCycle already accepts the
+  // array); empty means the full/default cycle.
+  const phases: CyclePhase[] | undefined = opts.phases.length > 0 ? opts.phases : undefined;
 
   const report = await runCycle(engine, {
     brainDir,
     dryRun: opts.dryRun,
     pull: opts.pull,
     phases,
-    sourceId: resolvedSourceId, // undefined when --source not set → legacy back-compat
+    // Undefined for legacy unscoped runs; set for explicit source cycles,
+    // path-derived cycles, and bare default-like non-default source cycles.
+    sourceId: resolvedSourceId,
+    fullImplicitSourceCycle,
     synthInputFile: opts.inputFile ?? undefined,
     synthDate: opts.date ?? undefined,
     synthFrom: opts.from ?? undefined,
     synthTo: opts.to ?? undefined,
     synthBypassDreamGuard: opts.bypassDreamGuard,
-    // issue #2860: opts.phase is guaranteed non-null here when opts.once is
-    // set (parseArgs enforces --once requires --phase).
-    onceForPhase: opts.once ? opts.phase! : undefined,
+    // issue #2860: exactly one phase is guaranteed here when opts.once is
+    // set (parseArgs enforces --once requires a single explicit --phase).
+    onceForPhase: opts.once ? opts.phases[0]! : undefined,
   });
 
   if (opts.json) {

@@ -37,6 +37,17 @@ export const PROJECT = {
 
 export const SECTIONS: DocSection[] = [
   {
+    heading: "Choose your agent setup",
+    entries: [
+      { title: "Grok Bot", path: "docs/guides/grok-bot.md", description: "Add repairable local memory inside Grok Bot, enable its native skill, or connect a hosted brain. Shared-computer trust and dated evidence." },
+      { title: "Muse personal agent", path: "docs/guides/muse.md", description: "Verify durable storage and add explicit memory with provenance alongside Muse's native memory; distinguish Muse Code and unverified native MCP." },
+      { title: "Inside an existing agent", path: "docs/guides/in-agent-setup.md", description: "Isolated setup, absolute launcher, receipts, keyless maintenance, complete private backup and safe restoration." },
+      { title: "Connect a hosted brain", path: "docs/guides/hosted-harness-access.md", description: "Host-side grants, private credential handoff, harness installation, profile repair, delegation limits and honest verification." },
+      { title: "Harness adapter reference", path: "docs/guides/harness-adapters.md", description: "Registry-generated transport, authentication lifetime and configuration facts.", includeInFull: false },
+      { title: "Harness validation evidence", path: "docs/guides/harness-validation.md", description: "Local lifecycle and HTTP/worker proof, reproducible tests, and the remaining actual-harness acceptance checks.", includeInFull: false },
+    ],
+  },
+  {
     heading: "Core entry points",
     entries: [
       {
@@ -158,6 +169,12 @@ export const SECTIONS: DocSection[] = [
         path: "docs/guides/push-context.md",
       },
       {
+        title: "docs/guides/github-source.md",
+        description:
+          "Mirror GitHub issues, PRs, comments, reviews and CI checks as brain pages. One key + one registration command to a searchable mirror; webhook-driven instant refresh, poll-sweep fallback, daily reconcile, App-credential option.",
+        path: "docs/guides/github-source.md",
+      },
+      {
         title: "docs/mcp/DEPLOY.md",
         description: "MCP server deployment.",
         path: "docs/mcp/DEPLOY.md",
@@ -230,7 +247,7 @@ export const SECTIONS: DocSection[] = [
       {
         title: "skills/migrations/",
         description:
-          "Per-version agent-executable migration instructions (latest: v0.46.3.0 — the ZeroEntropy-sunset embedding + reranker switch playbook).",
+          "Per-version agent-executable migration instructions (latest: v0.49.0.0 — isolated agent setup, hosted grant migration, and verification).",
         path: "skills/migrations/",
       },
       {
@@ -294,6 +311,13 @@ export const SECTIONS: DocSection[] = [
         title: "docs/architecture/infra-layer.md",
         description: "Shared infra patterns.",
         path: "docs/architecture/infra-layer.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/memorable-agents.md",
+        description:
+          "Optional Memorable procedural-memory integration: the session-end receipt, the config gate and kill switch, the consent model, and exactly what leaves the machine.",
+        path: "docs/memorable-agents.md",
         includeInFull: false,
       },
     ],

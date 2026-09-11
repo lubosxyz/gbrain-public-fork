@@ -1,5 +1,7 @@
 # Connect GBrain to Codex
 
+Adding memory to an existing Codex agent preserves its identity and needs no private repository. Use the [memory-only walkthrough](../tutorials/connect-coding-agent.md). Connecting an existing hosted brain? Use [private handoff and profiles](../guides/hosted-harness-access.md), including configuration that survives a new shell.
+
 > New to this? The [Give your coding agent a memory](../tutorials/connect-coding-agent.md)
 > tutorial walks both paths (local-from-nothing and connect-to-an-existing-brain)
 > end to end, plus the brain-first protocol that makes it worth it. This page is
@@ -25,6 +27,13 @@ works but downloads the full development repo and tracks master tip — use it
 only for from-source installs. Refresh a snapshot with
 `codex plugin marketplace upgrade`; remove with `codex plugin remove
 gbrain@gbrain` + `codex plugin marketplace remove gbrain`.
+
+**Persona variants (Claude-lane only, for now).** The `gbrain-coding` /
+`gbrain-daily` curated variants ship in the Claude Code marketplace; the
+codex marketplace deliberately stays at the single full plugin until codex's
+handling of multi-entry marketplaces gets its observation run (the dist
+branch carries the variant trees already, so enabling is a two-line
+marketplace edit once verified — TODOS.md follow-up).
 
 **Prerequisites.** The plugin cannot ship the gbrain binary; install it once
 (`bun install -g github:garrytan/gbrain#latest-stable` — the npm package
@@ -55,7 +64,9 @@ Codex; route the brain axis with `GBRAIN_BRAIN_ID` (env only — there is no
 config default for the brain axis). `--source-guard` makes this fail-closed:
 when a brain has more than one source to choose from and no binding, write
 and admin operations error with an actionable message until a source is bound
-(the user-global stdio serve binds the source from `GBRAIN_SOURCE`, not a flag); a sole
+(the user-global stdio serve binds the source from `GBRAIN_SOURCE`, not a flag,
+and exits at startup when that value names a source that is missing or
+archived); a sole
 real source is unambiguous and unaffected, and reads always pass. (Edge case:
 a `.gbrain-source` dotfile placed at `$HOME` is an ancestor of the plugin
 snapshot dir and would bind every plugin-lane write to it — put source pins
@@ -149,6 +160,17 @@ codex mcp remove gbrain
   `codex mcp add gbrain -- gbrain serve --surface verbs` — the memory-verb
   protocol ([MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)); drop the flag
   for the full operation catalog.
+- **PGLite brains are single-process.** PGLite is a single-writer embedded
+  Postgres: the first running `gbrain serve` (the plugin's, or a stdio
+  registration) owns the brain's data directory via the data-dir lock. A
+  second `serve` — say, gbrain registered in a second harness on the same
+  machine — or any CLI command that opens the DB fails on the lock while
+  that serve is live (`gbrain sync` is the one exception: it delegates to
+  the live serve). If multiple processes need the brain at once, run ONE
+  shared `gbrain serve --http` and point every client at it (the remote
+  paths above), or migrate to the Postgres/Supabase engine, which tolerates
+  concurrent connections. Details:
+  [serve ↔ sync concurrency](../architecture/serve-sync-concurrency.md).
 - **Ambient recall (Codex has no lifecycle hooks — use the pull path).** At the
   start of a topical thread and after a compaction, call
   `context_pack(entities, budget_tokens)` to warm the standing entities; on a

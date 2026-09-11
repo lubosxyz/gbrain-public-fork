@@ -104,6 +104,38 @@ describe('makeJudgeClient — construction-time provider probe', () => {
 });
 
 describe('JudgeClient.create — gateway routing + shape adapter', () => {
+  test('A2b (#4077): forwards a caller AbortSignal to gateway.chat', async () => {
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test-A2b' }, async () => {
+      const judge = makeJudgeClient('claude-haiku-4-5-20251001');
+      expect(judge).not.toBeNull();
+      const abort = new AbortController();
+      let receivedSignal: AbortSignal | undefined;
+      __setChatTransportForTests(async (opts): Promise<ChatResult> => {
+        receivedSignal = opts.abortSignal;
+        return {
+          text: WORTH_PROCESSING_JSON,
+          blocks: [],
+          stopReason: 'end',
+          usage: { input_tokens: 10, output_tokens: 20, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'test:stub',
+          providerId: 'test',
+        };
+      });
+
+      await judge!.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 200,
+        system: 'judge system prompt',
+        messages: [{ role: 'user', content: 'judge this' }],
+      }, { signal: abort.signal });
+
+      // The exact caller signal must reach the transport — a cancelled cycle
+      // has to be able to tear down an in-flight judge call, not just skip
+      // the next one.
+      expect(receivedSignal).toBe(abort.signal);
+    });
+  });
+
   test('A3: routes through gateway.chat (verified via __setChatTransportForTests stub)', async () => {
     await withEnv({ ANTHROPIC_API_KEY: 'sk-test-A3' }, async () => {
       const judge = makeJudgeClient('claude-haiku-4-5-20251001');
@@ -112,10 +144,12 @@ describe('JudgeClient.create — gateway routing + shape adapter', () => {
       let transportCalled = false;
       let receivedSystem: string | undefined;
       let receivedModel: string | undefined;
+      let receivedProviderOptions: Record<string, Record<string, unknown>> | undefined;
       __setChatTransportForTests(async (opts): Promise<ChatResult> => {
         transportCalled = true;
         receivedSystem = opts.system;
         receivedModel = opts.model;
+        receivedProviderOptions = opts.providerOptions;
         return {
           text: WORTH_PROCESSING_JSON,
           blocks: [],
@@ -137,10 +171,111 @@ describe('JudgeClient.create — gateway routing + shape adapter', () => {
       expect(receivedSystem).toBe('judge system prompt');
       // Gateway model gets the anthropic: prefix normalized
       expect(receivedModel).toBe('anthropic:claude-haiku-4-5-20251001');
+      // The thinking-disable pin is DeepSeek-only; other providers must not
+      // receive call-scoped provider options from the judge.
+      expect(receivedProviderOptions).toBeUndefined();
       // Anthropic.Message shape returned
       expect(result.content?.[0]?.type).toBe('text');
       expect((result.content?.[0] as { type: string; text: string }).text).toBe(WORTH_PROCESSING_JSON);
     });
+  });
+
+  test('A3b: DeepSeek verdict judge disables thinking for its own call only', async () => {
+    // DeepSeek v4 models think by default and bill reasoning as OUTPUT tokens
+    // against max_tokens (recipe thinking_by_default, gbrain#4172). The triage
+    // judge wants the plain JSON verdict, so it pins thinking off per-call via
+    // ChatOpts.providerOptions instead of burning budget on reasoning.
+    // No DEEPSEEK_API_KEY needed: non-anthropic construction skips the key
+    // probe (A9) and the transport is stubbed.
+    const judge = makeJudgeClient('deepseek:deepseek-v4-flash');
+    expect(judge).not.toBeNull();
+
+    let receivedProviderOptions: Record<string, Record<string, unknown>> | undefined;
+    __setChatTransportForTests(async (opts): Promise<ChatResult> => {
+      receivedProviderOptions = opts.providerOptions;
+      return {
+        text: WORTH_PROCESSING_JSON,
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 10, output_tokens: 20, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'deepseek:deepseek-v4-flash',
+        providerId: 'deepseek',
+      };
+    });
+
+    await judge!.create({
+      model: 'deepseek:deepseek-v4-flash',
+      max_tokens: 1024,
+      system: 'judge system prompt',
+      messages: [{ role: 'user', content: 'judge this' }],
+    });
+
+    expect(receivedProviderOptions).toEqual({
+      deepseek: { thinking: { type: 'disabled' } },
+    });
+  });
+
+  test('A3c: OpenRouter DeepSeek verdict judge disables thinking for its own call only', async () => {
+    // Same contract as A3b for the OpenRouter-hosted DeepSeek routes (#4758):
+    // the recipe declares thinking_by_default for `deepseek/…`, so the judge
+    // pins thinking off per-call under the openrouter providerOptions
+    // namespace (the openai-compatible adapter spreads
+    // providerOptions[recipe.id] into the wire body).
+    const judge = makeJudgeClient('openrouter:deepseek/deepseek-v4-flash-0731');
+    expect(judge).not.toBeNull();
+
+    let receivedProviderOptions: Record<string, Record<string, unknown>> | undefined;
+    __setChatTransportForTests(async (opts): Promise<ChatResult> => {
+      receivedProviderOptions = opts.providerOptions;
+      return {
+        text: WORTH_PROCESSING_JSON,
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 10, output_tokens: 20, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'openrouter:deepseek/deepseek-v4-flash-0731',
+        providerId: 'openrouter',
+      };
+    });
+
+    await judge!.create({
+      model: 'openrouter:deepseek/deepseek-v4-flash-0731',
+      max_tokens: 1024,
+      system: 'judge system prompt',
+      messages: [{ role: 'user', content: 'judge this' }],
+    });
+
+    expect(receivedProviderOptions).toEqual({
+      openrouter: { thinking: { type: 'disabled' } },
+    });
+  });
+
+  test('A3d: OpenRouter non-DeepSeek routes receive no thinking pin', async () => {
+    // The pin is family-scoped: an anthropic/ route via OR must not get a
+    // DeepSeek-shaped `thinking` knob sprayed into its wire body.
+    const judge = makeJudgeClient('openrouter:anthropic/claude-haiku-4.5');
+    expect(judge).not.toBeNull();
+
+    let receivedProviderOptions: Record<string, Record<string, unknown>> | undefined;
+    __setChatTransportForTests(async (opts): Promise<ChatResult> => {
+      receivedProviderOptions = opts.providerOptions;
+      return {
+        text: WORTH_PROCESSING_JSON,
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 10, output_tokens: 20, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'openrouter:anthropic/claude-haiku-4.5',
+        providerId: 'openrouter',
+      };
+    });
+
+    await judge!.create({
+      model: 'openrouter:anthropic/claude-haiku-4.5',
+      max_tokens: 1024,
+      system: 'judge system prompt',
+      messages: [{ role: 'user', content: 'judge this' }],
+    });
+
+    expect(receivedProviderOptions).toBeUndefined();
   });
 
   test('A4: ChatResult.text → Anthropic.Message.content[0].text mapping', async () => {
