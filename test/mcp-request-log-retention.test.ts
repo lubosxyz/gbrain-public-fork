@@ -52,7 +52,7 @@ async function executeMigrationStatements(engine: PGLiteEngine, sql: string): Pr
   }
 }
 
-describe('v150 — fork/upstream v131+v132 reconciliation (fork v128+tenant lanes replayed)', () => {
+describe('v160 — fork/upstream v131+v132 reconciliation (fork v128+tenant lanes replayed; moved from v150 in the 0.51.6.0 merge)', () => {
   let engine: PGLiteEngine;
   beforeAll(async () => {
     engine = new PGLiteEngine();
@@ -63,15 +63,15 @@ describe('v150 — fork/upstream v131+v132 reconciliation (fork v128+tenant lane
     if (engine) await engine.disconnect();
   }, 60_000);
 
-  test('v150 entry exists, named + idempotent', () => {
-    const m = MIGRATIONS.find((x) => x.version === 150);
+  test('v160 entry exists, named + idempotent', () => {
+    const m = MIGRATIONS.find((x) => x.version === 160);
     expect(m).toBeDefined();
-    expect(m!.name).toBe('fork_upstream_v131_v132_reconciliation');
+    expect(m!.name).toBe('fork_upstream_v150_reconciliation');
     expect(m!.idempotent).toBe(true);
   });
 
-  test('LATEST_VERSION is at or above 150', () => {
-    expect(LATEST_VERSION).toBeGreaterThanOrEqual(150);
+  test('LATEST_VERSION is at or above 161', () => {
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(161);
   });
 
   test('table exists after initSchema with the documented columns', async () => {
@@ -99,8 +99,15 @@ describe('v150 — fork/upstream v131+v132 reconciliation (fork v128+tenant lane
     expect(rows.length).toBe(1);
   });
 
+  test('v161 replays upstream v150 (canonical page revisions) for fork brains that skipped it', () => {
+    const replay = MIGRATIONS.find((x) => x.version === 161);
+    expect(replay?.name).toBe('fork_replay_upstream_v150_canonical_page_revisions');
+    expect(replay?.idempotent).toBe(true);
+    expect(replay?.sql).toBe(MIGRATIONS.find((x) => x.version === 150)!.sql);
+  });
+
   test('re-running the migration SQL is a no-op (idempotent CREATE TABLE IF NOT EXISTS)', async () => {
-    const m = MIGRATIONS.find((x) => x.version === 150)!;
+    const m = MIGRATIONS.find((x) => x.version === 160)!;
     await expect(executeMigrationStatements(engine, m.sql)).resolves.toBeUndefined();
   });
 });
@@ -237,7 +244,7 @@ describe('purgeStaleMcpRequestLog', () => {
       expect(left.length).toBe(1);
     } finally {
       // Restore the table so later tests in this file aren't affected.
-      const m = MIGRATIONS.find((x) => x.version === 150)!;
+      const m = MIGRATIONS.find((x) => x.version === 160)!;
       await executeMigrationStatements(engine, m.sql);
     }
   });

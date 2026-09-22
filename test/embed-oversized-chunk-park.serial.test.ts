@@ -37,6 +37,37 @@ mock.module('../src/core/embedding.ts', () => ({
 }));
 
 // Import AFTER mocking.
+// 0.51.6.0 merge: the embed path now reads a guarded projection snapshot and
+// installs vectors through `installPageEmbeddings` inside `engine.transaction`
+// (upstream #5149). This suite pins the PARKING contract, not the guard, so
+// the projection layer is stubbed onto the same tracked mock engine: the
+// snapshot is whatever `getChunks` returns and installation is the old
+// `upsertChunks` call the assertions below already inspect.
+mock.module('../src/core/page-state/projections.ts', () => ({
+  readProjectionSnapshot: async (engine: any, slug: string, sourceId: string) => {
+    const chunks = await engine.getChunks(slug, { sourceId, includeUnsealed: true });
+    if (!chunks) return null;
+    const page = (await engine.getPage(slug, { sourceId })) ?? {};
+    return {
+      snapshot: {
+        page: { slug, source_id: sourceId, id: 1, contextual_retrieval_mode: null, ...page },
+        revision: 'r1', sourceIncarnation: '1', tags: [], withdrawals: [],
+      },
+      chunks, indexingContext: 'test-ctx', embeddingModel: 'test:model', maxChunkTokens: 2000,
+    };
+  },
+  installPageEmbeddings: async (engine: any, prepared: any, chunks: any[], signature?: string) => {
+    const { slug, source_id: sourceId } = prepared.snapshot.page;
+    await engine.upsertChunks(slug, chunks, { sourceId });
+    if (signature) await engine.setPageEmbeddingSignature(slug, { sourceId, signature });
+    return true;
+  },
+  installPageProjection: async () => {},
+  sealPageTextProjection: async () => {},
+  queuePageProjection: async () => {},
+  rebuildPendingPageProjections: async () => ({ rebuilt: 0, superseded: 0 }),
+}));
+
 const { runEmbedCore } = await import('../src/commands/embed.ts');
 
 // Preflight seam: let diagnoseEmbedding's fast path pass without real env.
@@ -50,13 +81,17 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
     if (overrides[method]) return overrides[method](...args);
     return Promise.resolve(null);
   };
-  return new Proxy({} as any, {
+  const proxy: any = new Proxy({} as any, {
     get(_, prop: string) {
       if (prop === '_calls') return calls;
       if (overrides[prop]) return overrides[prop];
+      // Guarded installs run inside engine.transaction(fn); the mock has no
+      // isolation to offer, so the callback simply sees the same engine.
+      if (prop === 'transaction') return (fn: (tx: any) => Promise<any>) => fn(proxy);
       return track(prop);
     },
   });
+  return proxy;
 }
 
 /** The exact wording Ollama returned on the failing runs. */
