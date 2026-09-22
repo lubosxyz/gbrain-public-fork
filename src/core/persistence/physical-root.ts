@@ -2,12 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { SqlEngine } from './model.ts';
-import { coordinationLockPath, reservationRepairLockPath } from './coordination-lock.ts';
+import { coordinationLockPath } from './coordination-lock.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
 import { adoptTransferredRootStamp, assertNoPhysicalRootOverlap, assertPhysicalRoot, assertPhysicalRootStamp, PHYSICAL_ROOT_MARKER, physicalRootError,
   readPhysicalRootReservation, repairReservationCoordinationPath, reservePhysicalRootRecord, writePhysicalRootStamp, type PhysicalRootReservation } from './physical-root-record.ts';
 
-export { assertPhysicalRoot, coordinationLockIsInsideRoot, isPhysicalRootMetadata, readPhysicalRootReservation, repairReservationCoordinationPath } from './physical-root-record.ts';
+export { assertPhysicalRoot, coordinationLockIsInsideRoot, isPhysicalRootMetadata, readPhysicalRootReservation, repairReservationCoordinationPath, reservationRepairGuardPath } from './physical-root-record.ts';
 export interface PhysicalRootClaim { hostId: string; worktreeId?: string; coordinationPath?: string; }
 async function brainIdentity(tx: SqlEngine): Promise<string> {
   const [brain] = await tx.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
@@ -24,7 +24,7 @@ export async function reservePhysicalRoot(tx: SqlEngine, path: string, opts: Phy
   // Shared boundary for every claim, managed lifecycle included: a reservation wedged inside its
   // own checkout by a refused v0.51 claim is moved out before the strict read rejects it.
   await repairReservationCoordinationPath(root, worktreeId => coordinationLockPath(root, worktreeId),
-    brainId, opts.hostId, reservationRepairLockPath);
+    brainId, opts.hostId);
   const previous = readPhysicalRootReservation(root);
   const worktreeId = opts.worktreeId ?? previous?.worktreeId ?? randomUUID();
   const coordinationPath = opts.coordinationPath ?? previous?.coordinationPath ?? coordinationLockPath(root, worktreeId);

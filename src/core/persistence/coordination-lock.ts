@@ -42,12 +42,6 @@ export function coordinationNamespace(canonicalRoot: string): string {
   return sha256(`${canonicalRoot}\0${localHostId()}`).slice(0, 32);
 }
 
-/** Serializes repairers of one reservation; lives beside the locks, never inside the checkout. */
-export function reservationRepairLockPath(root: string): string {
-  const canonicalRoot = canonicalFilesystemPath(root);
-  return join(userCoordinationLocks(), coordinationNamespace(canonicalRoot), 'reservation-repair.lock');
-}
-
 export function coordinationLockPath(root: string, worktreeId: string): string {
   const canonicalRoot = canonicalFilesystemPath(root);
   // The shared fallback is namespaced by the canonical root, not just by worktree id: two brains
@@ -61,4 +55,20 @@ export function coordinationLockPath(root: string, worktreeId: string): string {
   }
   throw new OperationError('storage_error', 'No coordination lock directory lives outside this canonical checkout.',
     'Point GBRAIN_COORDINATION_HOME at a directory outside the source root.');
+}
+
+/**
+ * Which lock a successor coordinates on after a verified transfer.
+ *
+ * The successor's own reservation is the physical identity of that checkout, so it wins: preferring
+ * a historical binding over it makes the physical-root check reject the mismatch and leaves the
+ * worktree draining. A recorded binding path is the fallback that keeps one stable lock when the
+ * successor has no reservation yet, and it is ignored when it points inside the successor root.
+ * Only a worktree with neither mints a fresh path.
+ */
+export function successorCoordinationPath(root: string, reserved: string | null, recorded: string | null,
+  worktreeId: string): string {
+  if (reserved) return reserved;
+  if (recorded && isOutsideRoot(canonicalFilesystemPath(root), canonicalFilesystemPath(recorded))) return recorded;
+  return coordinationLockPath(root, worktreeId);
 }

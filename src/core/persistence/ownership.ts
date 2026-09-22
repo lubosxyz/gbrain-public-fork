@@ -5,7 +5,7 @@ import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
 import { discoverGitRoot } from '../sync-git.ts';
 import { digest, sha256 } from './digest.ts';
-import { coordinationLockPath, reservationRepairLockPath } from './coordination-lock.ts';
+import { coordinationLockPath, successorCoordinationPath } from './coordination-lock.ts';
 import { localHostId } from './identity.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
@@ -52,7 +52,7 @@ export async function repairWedgedReservation(engine: SqlEngine, path: string, h
   const [localBrain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
   if (!localBrain) return;
   await repairReservationCoordinationPath(root, worktreeId => coordinationLockPath(root, worktreeId),
-    localBrain.brain_id, hostId, reservationRepairLockPath);
+    localBrain.brain_id, hostId);
 }
 export async function claimWorktree(engine: BrainEngine, sourceId: string, path: string, hostId = localHostId()): Promise<WorktreeBinding> {
   // Repair first, before either path reads the reservation strictly: a record wedged by a refused
@@ -191,9 +191,8 @@ export async function acceptWriterTransfer(engine: BrainEngine, sourceId: string
   // recorded binding path is the fallback that keeps the lock stable when the successor has no
   // reservation yet, and only a worktree with neither mints a fresh one.
   await repairWedgedReservation(engine, root, hostId);
-  const reserved = readPhysicalRootReservation(root)?.coordinationPath ?? null;
-  const recorded = binding.coordination_path && !containsPath(root, binding.coordination_path) ? binding.coordination_path : null;
-  const coordination = reserved ?? recorded ?? coordinationLockPath(root, binding.worktree_id);
+  const coordination = successorCoordinationPath(root, readPhysicalRootReservation(root)?.coordinationPath ?? null,
+    binding.coordination_path, binding.worktree_id);
   const lock = await acquireNativeLock(coordination, { timeoutMs: 5000 });
   if (!lock) throw new OperationError('write_pending', 'Successor worktree is busy.');
   try {

@@ -83,16 +83,25 @@ export function readPhysicalRootReservation(path: string): PhysicalRootReservati
  * token, brain, worktree, host, inode stamps) and only ever moves the lock OUT of the root, so it
  * cannot adopt another owner's root or invent a new worktree.
  */
+/**
+ * Guard for repairing ONE reservation. It is derived from the reservation file, which is fixed by
+ * the root alone, so every repairer serializes on the same inode no matter how its coordination
+ * home is configured. It lives beside the reservation — outside the checkout — and never becomes a
+ * coordination lock itself.
+ */
+export function reservationRepairGuardPath(root: string): string {
+  return `${physicalRootReservationPath(canonicalFilesystemPath(root))}.repair.lock`;
+}
 export async function repairReservationCoordinationPath(path: string, compliant: (worktreeId: string) => string,
-  localBrainId: string, localHostId: string, repairLock: (root: string) => string): Promise<PhysicalRootReservation | null> {
+  localBrainId: string, localHostId: string): Promise<PhysicalRootReservation | null> {
   const root = canonicalFilesystemPath(path);
-  if (!coordinationLockIsInsideRoot(root, readReservationIdentity(root)?.coordinationPath ?? root)) {
+  // No record, or a record whose lock is already outside: nothing to repair and no guard to take,
+  // so a fresh claim never waits on an unrelated repair while it holds a database transaction.
+  const current = readReservationIdentity(root);
+  if (current === null || !coordinationLockIsInsideRoot(root, current.coordinationPath)) {
     return readPhysicalRootReservation(root);
   }
-  // Serialize repairers of THIS reservation: two of them (different GBRAIN_COORDINATION_HOME, say)
-  // could otherwise each read the same wedged record and the slower rename would replace a path a
-  // binding already committed to, leaving database and reservation disagreeing forever.
-  const guard = await acquireNativeLock(repairLock(root), { timeoutMs: 2000 });
+  const guard = await acquireNativeLock(reservationRepairGuardPath(root), { timeoutMs: 2000 });
   if (!guard) throw new OperationError('writer_lock_unavailable', 'Another process is repairing this reservation.');
   try {
     const value = readReservationIdentity(root);
