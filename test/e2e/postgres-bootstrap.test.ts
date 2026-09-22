@@ -152,14 +152,14 @@ describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => 
     expect(srcCheck).toHaveLength(1);
   });
 
-  test('PostgresEngine.initSchema survives pre-v121 timeline_entries missing event_page_id (KOM-250)', async () => {
+  test('PostgresEngine.initSchema survives pre-v121 timeline_entries missing event_page_id (migration-failure reporting)', async () => {
     // v121 forward-reference incident: SCHEMA_SQL's partial indexes
     // idx_timeline_event_page + idx_timeline_event_dedup reference
     // timeline_entries.event_page_id, which pre-v121 brains lack (CREATE
     // TABLE IF NOT EXISTS is a no-op on the existing table). Without the
     // bootstrap case, initSchema crashes with `column "event_page_id" does
     // not exist` before migration v121 can run — wedging every orchestrator
-    // migration whose phase A runs initSchema (KOM-250, personal brain).
+    // migration whose phase A runs initSchema (migration-failure reporting, personal brain).
     await engine.initSchema();
     const conn = (engine as any).sql;
 

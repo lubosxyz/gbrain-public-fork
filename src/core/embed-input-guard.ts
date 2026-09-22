@@ -1,7 +1,7 @@
 /**
  * Pre-embed input ceiling — the last gate before a text reaches an embedder.
  *
- * Why this exists (KOM-287): stored chunks are not guaranteed to respect the
+ * Why this exists (parked-chunk accounting): stored chunks are not guaranteed to respect the
  * chunker's cap. `content_chunks` rows written by an older chunker version
  * outlive the upgrade that introduced `DEFAULT_MAX_CHUNK_TOKENS`, and several
  * paths (`embed-stale`, `migrate-engine`, the re-embed sweeps) recycle

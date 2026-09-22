@@ -1487,7 +1487,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     try {
       // Unified view: OAuth clients + legacy API keys.
       //
-      // KOM-277: total_requests/last_used_at are otherwise computed LIVE over
+      // request-log retention: total_requests/last_used_at are otherwise computed LIVE over
       // mcp_request_log, which the cycle purge phase now prunes on a TTL
       // (purgeStaleMcpRequestLog, src/core/mcp-request-log-retention.ts). Each
       // purged batch folds its per-token count + max(created_at) into

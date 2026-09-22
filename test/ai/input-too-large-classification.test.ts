@@ -1,5 +1,5 @@
 /**
- * KOM-287 — telling a PERMANENT over-context input apart from a transient
+ * parked-chunk accounting — telling a PERMANENT over-context input apart from a transient
  * provider problem.
  *
  * The bug: Ollama answers "the input length exceeds the context length" with a

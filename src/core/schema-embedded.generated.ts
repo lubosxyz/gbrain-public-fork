@@ -781,7 +781,7 @@ CREATE INDEX IF NOT EXISTS idx_mcp_log_time_agent ON mcp_request_log(created_at,
 CREATE INDEX IF NOT EXISTS idx_mcp_log_agent_time ON mcp_request_log(agent_name, created_at DESC);
 
 -- ============================================================
--- mcp_request_log_purged: running per-token counters (KOM-277 retention)
+-- mcp_request_log_purged: running per-token counters (request-log retention retention)
 -- ============================================================
 -- The purge phase (src/core/mcp-request-log-retention.ts) deletes stale
 -- mcp_request_log rows on a TTL and folds their per-token count/max(created_at)

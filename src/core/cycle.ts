@@ -1765,7 +1765,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     } catch {
       // Non-fatal.
     }
-    // KOM-277 — TTL-based GC of mcp_request_log (append-only MCP usage log,
+    // request-log retention — TTL-based GC of mcp_request_log (append-only MCP usage log,
     // no FK either direction, unbounded growth otherwise: ~57MB/month on a
     // representative brain). Best-effort: purgeStaleMcpRequestLog itself
     // fail-closes to 0 when mcp_request_log_purged doesn't exist yet

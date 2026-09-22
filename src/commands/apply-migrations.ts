@@ -509,7 +509,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
       if (result.status === 'failed') {
         console.error(`Migration v${m.version} reported status=failed.`);
         // Surface each failed phase's detail — the ledger records it, but
-        // the operator needs it on stderr to act (#921 / KOM-250).
+        // the operator needs it on stderr to act (#921 / migration-failure reporting).
         for (const line of failedPhaseLines(result.phases)) console.error(line);
         // Record the attempt as 'partial' (not 'complete') so the cap counts
         // it. Don't let a failed orchestrator look like it never ran.

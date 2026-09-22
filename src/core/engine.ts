@@ -1190,7 +1190,7 @@ export interface BrainEngine {
    */
   setPageEmbeddingSignature(slug: string, opts: { sourceId?: string; signature: string }): Promise<void>;
   /**
-   * Merge an embed-skip marker into one page's `frontmatter` (KOM-287).
+   * Merge an embed-skip marker into one page's `frontmatter` (parked-chunk accounting).
    * Called by the embed path when a chunk is rejected as over-context, so the
    * page stops being selected for embedding instead of failing on every run
    * forever. Merges rather than replaces — the rest of the frontmatter is

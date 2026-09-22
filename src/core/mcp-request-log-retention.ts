@@ -1,8 +1,8 @@
 /**
- * KOM-277 — mcp_request_log retention.
+ * request-log retention — mcp_request_log retention.
  *
  * mcp_request_log is a pure append-only MCP usage log (no FK in or out).
- * A representative brain (gbrain_komfi) carries 246k rows / 88MB, growing
+ * A representative brain (a company brain) carries 246k rows / 88MB, growing
  * ~57MB/month — left unbounded it grows forever. This module prunes rows
  * past a TTL (default 30 days, configurable via the DB-plane config key
  * `cycle.purge.mcp_request_log_retention_days`) while preserving the

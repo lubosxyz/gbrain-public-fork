@@ -260,7 +260,7 @@ export async function embedBatchWithBackoff(
  * providers whose wrappers strip `cause.status`.
  */
 export function isEmbedRetriableError(e: unknown): boolean {
-  // KOM-287: a permanent over-context rejection is never retriable, even when
+  // parked-chunk accounting: a permanent over-context rejection is never retriable, even when
   // the provider wrapped it with a gateway-ish status (cause.status 502/503/504
   // survives normalizeAIError) — retrying identical oversized bytes only delays
   // the parking path. Permanent classification wins over gateway detection.

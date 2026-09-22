@@ -1,8 +1,8 @@
 /**
- * KOM-287 — a chunk the embedder can never accept must be parked, not retried
+ * parked-chunk accounting — a chunk the embedder can never accept must be parked, not retried
  * forever.
  *
- * Production shape this reproduces (rejstrik/komfi/masiruyou replicas,
+ * Production shape this reproduces (three company replicas,
  * 2026-08-15 12:00:34 in ~/.gbrain/replica-refresh.log): three code pages each
  * held exactly one chunk longer than `ollama:bge-m3` will accept. The sync
  * pass isolated it and embedded the siblings, which left the page with ONE

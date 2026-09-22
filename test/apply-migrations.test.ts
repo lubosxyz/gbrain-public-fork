@@ -167,7 +167,7 @@ describe('buildPlan — diff against completed + installed VERSION', () => {
   });
 });
 
-// KOM-250 follow-up: a failed/partial orchestrator must print WHY (the
+// migration-failure reporting follow-up: a failed/partial orchestrator must print WHY (the
 // phases[].detail that lands in the ledger), not just "reported
 // status=failed" — the v0.13.0 wedge hid `column "event_page_id" does not
 // exist` from the operator for three runs.

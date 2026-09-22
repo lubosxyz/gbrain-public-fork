@@ -1,5 +1,5 @@
 /**
- * KOM-287 — the pre-embed input ceiling.
+ * parked-chunk accounting — the pre-embed input ceiling.
  *
  * The embed path must not spend a provider call on a text that already
  * breaches gbrain's own chunk budget. Stored chunks carry no such guarantee:

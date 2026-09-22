@@ -81,7 +81,7 @@ export interface EmbedSkipMarker {
    *                          block threshold at import (see content-sanity.ts).
    *  `'chunk_token_limit'` — a CHUNK of the page is longer than the
    *                          embedder's context window, so the page can never
-   *                          finish embedding as chunked (KOM-287). Written by
+   *                          finish embedding as chunked (parked-chunk accounting). Written by
    *                          the embed path, not by import, because only the
    *                          provider can settle whether a given chunk fits. */
   reason: 'oversized' | 'chunk_token_limit';
@@ -110,7 +110,7 @@ export function buildEmbedSkipMarker(bytes: number, now: Date = new Date()): Emb
 }
 
 /** Marker for a page holding a chunk the embedder rejected as over-context
- *  (KOM-287). Written after the fact by the embed path; `bytes` is the
+ *  (parked-chunk accounting). Written after the fact by the embed path; `bytes` is the
  *  offending chunk's length, which is what an operator needs to decide
  *  whether to re-chunk the page or leave it parked.
  *

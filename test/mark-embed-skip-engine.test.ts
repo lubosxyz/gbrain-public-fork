@@ -1,5 +1,5 @@
 /**
- * KOM-287 — `engine.markEmbedSkip` against a real engine.
+ * parked-chunk accounting — `engine.markEmbedSkip` against a real engine.
  *
  * The embed path calls this to park a page holding a chunk the embedder
  * rejected as over-context. It is a jsonb MERGE, which is the part worth
@@ -10,7 +10,7 @@
  *
  * Runs against PGLite, which is real PostgreSQL — the same jsonb semantics
  * the Postgres engine relies on. The Postgres half of the pair is exercised
- * end-to-end by `gbrain embed --stale` in the KOM-287 verification.
+ * end-to-end by `gbrain embed --stale` in the parked-chunk accounting verification.
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';

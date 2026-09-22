@@ -271,7 +271,7 @@ export interface EmbedResult {
    */
   failure_samples: string[];
   /**
-   * KOM-287: chunks this run refused to keep retrying because they exceed the
+   * parked-chunk accounting: chunks this run refused to keep retrying because they exceed the
    * embedder's context window. Deliberately NOT counted on `failures`: a
    * failure means "try again", and these can never succeed as chunked, so
    * folding them in would hold the run's exit code red forever and drown the
@@ -959,7 +959,7 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
     if (result.failures > 0) {
       serr(`[embed] ${result.failures} chunk(s) failed to embed. First error: ${result.failure_samples[0] ?? 'unknown'}`);
     }
-    // KOM-287: stated once, on its own line, and pointedly NOT as a failure —
+    // parked-chunk accounting: stated once, on its own line, and pointedly NOT as a failure —
     // the operator's next move is to re-chunk those pages, not to re-run embed.
     if (result.parked > 0) {
       serr(
@@ -1130,7 +1130,7 @@ async function embedPage(
 
   // v0.41.31: stamp provenance so a later model/dims swap is detectable as
   // stale. Guard: only stamp when EVERY chunk was (re)embedded this pass
-  // (#3037: failed chunks stay NULL). KOM-287: a parked chunk leaves the page
+  // (#3037: failed chunks stay NULL). parked-chunk accounting: a parked chunk leaves the page
   // as incompletely embedded as a failed one does, so it blocks the stamp too.
   const fullyEmbedded = failed === 0 && outcome.parked === 0 && toEmbed.length === chunks.length;
   // Vectors and their completion stamps share the page guard. A later
@@ -1320,7 +1320,7 @@ async function embedAll(
       }));
       // Partial failures retain their old context; a full completion stamps
       // its vectors and title-tier convention in the same guarded transaction.
-      // KOM-287: `parked` blocks the stamp for the same reason `failed` does —
+      // parked-chunk accounting: `parked` blocks the stamp for the same reason `failed` does —
       // the page was not fully re-embedded.
       const fullyEmbedded = failed === 0 && outcome.parked === 0;
       if (!await observed(pacer, () => engine.transaction(async tx => {
@@ -1964,7 +1964,7 @@ async function embedAllStale(
           if (!stale.length) return;
           const pageRow = prepared.snapshot.page;
           // #3037: per-chunk failure isolation — one bad chunk costs one
-          // chunk, not the whole page's siblings. KOM-287: the outcome also
+          // chunk, not the whole page's siblings. parked-chunk accounting: the outcome also
           // carries parked chunks (provider can never accept them).
           const outcome = await embedPageTexts(
             wrapChunkTextsForStoredMode(pageRow, stale), { abortSignal: effectiveSignal });
@@ -1987,7 +1987,7 @@ async function embedAllStale(
           // The last batch stamps from complete DB provenance (#4825).
           // Keep both stamps with vector installation so later contextual
           // work cannot commit between installation and title-tier demotion.
-          // KOM-287: `parked` blocks both stamps for the same reason `failed`
+          // parked-chunk accounting: `parked` blocks both stamps for the same reason `failed`
           // does — the page was not fully re-embedded this pass.
           const cleanPass = failed === 0 && outcome.parked === 0;
           if (!await observed(pacer, () => engine.transaction(async tx => {
@@ -2159,7 +2159,7 @@ interface PageEmbedOutcome {
   /** Chunks that failed for a reason a later run could still resolve. */
   failed: number;
   /**
-   * KOM-287: chunks that exceed the embedder's context window. Kept apart
+   * parked-chunk accounting: chunks that exceed the embedder's context window. Kept apart
    * from `failed` because the caller's response differs — a failure is
    * retried, a parked chunk is recorded and the page taken out of the embed
    * rotation. Both leave the chunk's embedding NULL.
@@ -2194,7 +2194,7 @@ async function embedPageTexts(
     parkedIndexes.push(index);
   };
 
-  // KOM-287, first line: never spend a provider call on a text that already
+  // parked-chunk accounting, first line: never spend a provider call on a text that already
   // breaches gbrain's own chunk budget. Catches chunks left behind by an
   // older chunker version, which no re-chunk sweep has reached yet.
   const { sendable, sendableIndexes, oversized } = partitionEmbedInputs(texts);
@@ -2213,7 +2213,7 @@ async function embedPageTexts(
     return { embeddings, failed: 0, parked, parkedBytes, firstParkedDetail, parkedIndexes };
   } catch (e: unknown) {
     if (opts.abortSignal?.aborted) throw e; // shutdown, not a chunk problem
-    // KOM-287, second line: an over-context rejection is about ONE input, so
+    // parked-chunk accounting, second line: an over-context rejection is about ONE input, so
     // isolation is the only way to learn which. It fires even for a
     // single-text batch — the catch-up pass reaches a poisoned page with just
     // that one chunk left, and the pre-fix `texts.length <= 1` bail was what
@@ -2255,7 +2255,7 @@ async function embedPageTexts(
 }
 
 /**
- * KOM-287: record a page's parked chunks once and take the page out of the
+ * parked-chunk accounting: record a page's parked chunks once and take the page out of the
  * embed rotation, so "this chunk cannot be embedded" is stated a single time
  * instead of re-discovered on every run forever.
  *

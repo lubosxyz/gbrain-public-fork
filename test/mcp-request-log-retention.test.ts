@@ -1,5 +1,5 @@
 /**
- * KOM-277 — mcp_request_log retention.
+ * request-log retention — mcp_request_log retention.
  *
  * Verifies:
  *   - reconciliation migration v131 lands mcp_request_log_purged (documented
@@ -250,7 +250,7 @@ describe('purgeStaleMcpRequestLog', () => {
   });
 });
 
-describe('KOM-277 — dream cycle purge-phase wiring (structural pin)', () => {
+describe('request-log retention — dream cycle purge-phase wiring (structural pin)', () => {
   test("the dream cycle's purge phase invokes purgeStaleMcpRequestLog and reports the count", () => {
     // test-reads-source-ok: the dream cycle cannot run hermetically here; this pins that the purge phase stays wired into cycle.ts, not a drifting copy.
     const src = readFileSync('src/core/cycle.ts', 'utf8');

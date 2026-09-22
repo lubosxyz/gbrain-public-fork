@@ -200,7 +200,7 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // Pre-v121 brains have timeline_entries without this column (CREATE TABLE
   // IF NOT EXISTS is a no-op on the existing table, so the A2 static check's
   // "declared in CREATE TABLE body" coverage does NOT protect old brains).
-  // Wedged the v0.13.0 orchestrator migration on a v119 brain (KOM-250).
+  // Wedged the v0.13.0 orchestrator migration on a v119 brain (migration-failure reporting).
   { kind: 'column', table: 'timeline_entries', column: 'event_page_id' },
   // v7-era — surfaced by the #2626-class scanner sweep: both columns are
   // migration-added (v7) AND referenced by blob indexes
@@ -318,7 +318,7 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       ALTER TABLE pages DROP COLUMN IF EXISTS contextual_retrieval_mode;
       ALTER TABLE pages DROP COLUMN IF EXISTS corpus_generation;
 
-      -- v121 (KOM-250): pre-v121 brains lack timeline_entries.event_page_id.
+      -- v121 (migration-failure reporting): pre-v121 brains lack timeline_entries.event_page_id.
       DROP INDEX IF EXISTS idx_timeline_event_dedup;
       DROP INDEX IF EXISTS idx_timeline_event_page;
       ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
@@ -423,7 +423,7 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       ALTER TABLE pages DROP COLUMN IF EXISTS salience_touched_at;
       ALTER TABLE pages DROP COLUMN IF EXISTS emotional_weight;
 
-      -- v121 (KOM-250): schema-blob replay must survive a pre-v121
+      -- v121 (migration-failure reporting): schema-blob replay must survive a pre-v121
       -- timeline_entries (its CREATE INDEX references event_page_id, and
       -- CREATE TABLE IF NOT EXISTS won't re-add the column).
       DROP INDEX IF EXISTS idx_timeline_event_dedup;

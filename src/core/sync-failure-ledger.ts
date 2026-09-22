@@ -271,7 +271,7 @@ export function classifyErrorCode(errorMsg: string): string {
   if (/insufficient_quota|quota exceeded|exceeded.*quota|credit balance is too low|billing|EMBEDDING_QUOTA/i.test(errorMsg)) {
     return 'EMBEDDING_QUOTA';
   }
-  // KOM-287: OR'd with the strict predicate that DRIVES behavior, so a chunk
+  // parked-chunk accounting: OR'd with the strict predicate that DRIVES behavior, so a chunk
   // the embed path actually parked can never report here as UNKNOWN. The two
   // are deliberately not the same list and neither is redundant:
   //
