@@ -53,17 +53,49 @@ function createPrivate(path: string, value: unknown): boolean {
   flushDirectory(dirname(path));
   return true;
 }
-export function readPhysicalRootReservation(path: string): PhysicalRootReservation | null {
-  const root = canonicalFilesystemPath(path);
+/** Every invariant except where the coordination lock lives; the caller decides about that one. */
+function readReservationIdentity(root: string): PhysicalRootReservation | null {
   const value = readPrivate(physicalRootReservationPath(root)) as PhysicalRootReservation | null;
   if (value === null) return null;
   if (value.version !== 1 || ![value.token,value.brainId,value.worktreeId,value.hostId].every(uuid)
     || value.root !== root || typeof value.coordinationPath !== 'string' || !isAbsolute(value.coordinationPath) || value.coordinationPath.includes('\0')
+    || canonicalFilesystemPath(value.coordinationPath) !== value.coordinationPath
     || ![value.initialDevice,value.initialInode,value.initialBirth].every(part => part === null || typeof part === 'string' && /^\d+$/.test(part))) throw physicalRootError();
-  const lockRelative = relative(root, value.coordinationPath);
-  if (canonicalFilesystemPath(value.coordinationPath) !== value.coordinationPath
-    || !isAbsolute(lockRelative) && lockRelative !== '..' && !lockRelative.startsWith(`..${sep}`)) throw physicalRootError('The stable coordination lock must live outside the canonical checkout.');
   return value;
+}
+export function coordinationLockIsInsideRoot(root: string, coordinationPath: string): boolean {
+  const lockRelative = relative(root, coordinationPath);
+  return !isAbsolute(lockRelative) && lockRelative !== '..' && !lockRelative.startsWith(`..${sep}`);
+}
+export function readPhysicalRootReservation(path: string): PhysicalRootReservation | null {
+  const root = canonicalFilesystemPath(path);
+  const value = readReservationIdentity(root);
+  if (value === null) return null;
+  if (coordinationLockIsInsideRoot(root, value.coordinationPath)) throw physicalRootError('The stable coordination lock must live outside the canonical checkout.');
+  return value;
+}
+/**
+ * Move an existing reservation's coordination lock out of its own checkout, keeping every identity
+ * field. A v0.51 claim writes the reservation BEFORE validating it, so a brain whose persistence
+ * home was inside its source root is left holding a record that no later read can accept — the
+ * source is then unclaimable and every write fail-closes. Repair is identity-preserving (same
+ * token, brain, worktree, host, inode stamps) and only ever moves the lock OUT of the root, so it
+ * cannot adopt another owner's root or invent a new worktree.
+ */
+export function repairReservationCoordinationPath(path: string, compliant: (worktreeId: string) => string,
+  localBrainId: string, localHostId: string): PhysicalRootReservation | null {
+  const root = canonicalFilesystemPath(path);
+  const value = readReservationIdentity(root);
+  if (value === null || !coordinationLockIsInsideRoot(root, value.coordinationPath)) return value;
+  if (value.brainId !== localBrainId || value.hostId !== localHostId) throw physicalRootError();
+  const coordinationPath = compliant(value.worktreeId);
+  if (coordinationLockIsInsideRoot(root, coordinationPath)) throw physicalRootError('The repaired coordination lock still lies inside the canonical checkout.');
+  const repaired: PhysicalRootReservation = { ...value, coordinationPath };
+  const target = physicalRootReservationPath(root);
+  const temporary = `${target}.${randomUUID()}.tmp`;
+  try { createPrivate(temporary, repaired); renameSync(temporary, target); flushDirectory(dirname(target)); }
+  finally { try { unlinkSync(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; } }
+  return readPhysicalRootReservation(root);
 }
 export function reservePhysicalRootRecord(root: string, identity: Omit<PhysicalRootReservation, 'version' | 'token' | 'root' | 'initialDevice' | 'initialInode' | 'initialBirth'>): PhysicalRootReservation {
   const info = existsSync(root) ? statSync(root, { bigint: true }) : null;

@@ -10,7 +10,7 @@ import { localHostId } from './identity.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
 import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from './filesystem-guard.ts';
-import { assertPhysicalRoot, claimPhysicalRoot, isPhysicalRootMetadata, preparePhysicalRootTransfer, readPhysicalRootReservation } from './physical-root.ts';
+import { assertPhysicalRoot, claimPhysicalRoot, isPhysicalRootMetadata, preparePhysicalRootTransfer, readPhysicalRootReservation, repairReservationCoordinationPath } from './physical-root.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
 
 export interface WorktreeBinding {
@@ -60,7 +60,13 @@ export async function claimWorktree(engine: BrainEngine, sourceId: string, path:
   try { root = realpathSync(discoverGitRoot(root)); } catch { /* ordinary directory source */ }
   // Probe the native capability before recording ownership. Stable lock lives
   // outside any source directory, so reclone cannot produce a second inode.
-  const existingPhysical = readPhysicalRootReservation(root);
+  // A reservation left behind by a refused v0.51 claim still names a lock inside this checkout;
+  // repair moves it out while keeping the recorded identity, so such a source is claimable again
+  // instead of permanently wedged (the reservation is written before it is validated upstream).
+  const [localBrain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
+  const existingPhysical = localBrain
+    ? repairReservationCoordinationPath(root, worktreeId => coordinationLockPath(root, worktreeId), localBrain.brain_id, hostId)
+    : readPhysicalRootReservation(root);
   const candidateId = existingPhysical?.worktreeId ?? randomUUID();
   const lockPath = existingPhysical?.coordinationPath ?? coordinationLockPath(root, candidateId);
   const probe = await tryAcquireNativeLock(lockPath);
@@ -167,7 +173,10 @@ export async function acceptWriterTransfer(engine: BrainEngine, sourceId: string
   if (manifest.digest !== expectedManifest) throw new OperationError('writer_manifest_mismatch', 'Successor checkout differs from the recorded canonical manifest.');
   const binding = await getWorktreeBinding(engine, sourceId, hostId);
   if (!binding) throw new OperationError('not_found', 'Source has no worktree owner.');
-  const coordination = readPhysicalRootReservation(root)?.coordinationPath ?? coordinationLockPath(root, binding.worktree_id);
+  // The worktree's recorded lock stays its identity across a transfer; only a successor that has
+  // no usable recorded path mints a new one, and never one inside its own checkout.
+  const recorded = binding.coordination_path && !containsPath(root, binding.coordination_path) ? binding.coordination_path : null;
+  const coordination = recorded ?? readPhysicalRootReservation(root)?.coordinationPath ?? coordinationLockPath(root, binding.worktree_id);
   const lock = await acquireNativeLock(coordination, { timeoutMs: 5000 });
   if (!lock) throw new OperationError('write_pending', 'Successor worktree is busy.');
   try {

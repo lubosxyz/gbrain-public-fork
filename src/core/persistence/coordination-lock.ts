@@ -1,6 +1,7 @@
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { OperationError } from '../ops/contract.ts';
+import { sha256 } from './digest.ts';
 import { persistenceHome } from './identity.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
 
@@ -34,7 +35,12 @@ function userCoordinationLocks(): string {
  */
 export function coordinationLockPath(root: string, worktreeId: string): string {
   const canonicalRoot = canonicalFilesystemPath(root);
-  for (const base of [join(persistenceHome(), 'locks'), userCoordinationLocks()]) {
+  // The shared fallback is namespaced by the canonical root, not just by worktree id: two brains
+  // restored from one database clone keep the same worktree id on different checkouts, and a flat
+  // directory would make their unrelated writes block on one lock file. The root is the identity
+  // the lock protects, and it survives a reclone into the same path.
+  const shared = join(userCoordinationLocks(), sha256(canonicalRoot).slice(0, 32));
+  for (const base of [join(persistenceHome(), 'locks'), shared]) {
     const candidate = canonicalFilesystemPath(join(base, `${worktreeId}.lock`));
     if (isOutsideRoot(canonicalRoot, candidate)) return candidate;
   }
