@@ -5,7 +5,8 @@ import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
 import { discoverGitRoot } from '../sync-git.ts';
 import { digest, sha256 } from './digest.ts';
-import { localHostId, persistenceHome } from './identity.ts';
+import { coordinationLockPath } from './coordination-lock.ts';
+import { localHostId } from './identity.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
 import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from './filesystem-guard.ts';
@@ -61,7 +62,7 @@ export async function claimWorktree(engine: BrainEngine, sourceId: string, path:
   // outside any source directory, so reclone cannot produce a second inode.
   const existingPhysical = readPhysicalRootReservation(root);
   const candidateId = existingPhysical?.worktreeId ?? randomUUID();
-  const lockPath = existingPhysical?.coordinationPath ?? canonicalFilesystemPath(join(persistenceHome(), 'locks', `${candidateId}.lock`));
+  const lockPath = existingPhysical?.coordinationPath ?? coordinationLockPath(root, candidateId);
   const probe = await tryAcquireNativeLock(lockPath);
   if (!probe) throw new OperationError('writer_lock_unavailable', 'Cannot acquire the new worktree coordination lock.');
   await probe.release();
@@ -166,7 +167,7 @@ export async function acceptWriterTransfer(engine: BrainEngine, sourceId: string
   if (manifest.digest !== expectedManifest) throw new OperationError('writer_manifest_mismatch', 'Successor checkout differs from the recorded canonical manifest.');
   const binding = await getWorktreeBinding(engine, sourceId, hostId);
   if (!binding) throw new OperationError('not_found', 'Source has no worktree owner.');
-  const coordination = readPhysicalRootReservation(root)?.coordinationPath ?? join(persistenceHome(), 'locks', `${binding.worktree_id}.lock`);
+  const coordination = readPhysicalRootReservation(root)?.coordinationPath ?? coordinationLockPath(root, binding.worktree_id);
   const lock = await acquireNativeLock(coordination, { timeoutMs: 5000 });
   if (!lock) throw new OperationError('write_pending', 'Successor worktree is busy.');
   try {

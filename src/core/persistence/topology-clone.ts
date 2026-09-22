@@ -10,7 +10,8 @@ import { parseSourceConfig } from '../sources-load.ts';
 import type { SourceLifecycleInput } from './source-lifecycle.ts';
 import type { TopologyCloneRecovery } from './topology-clone-model.ts';
 import { getWorktreeBinding, worktreeManifest } from './ownership.ts';
-import { localHostId, persistenceHome } from './identity.ts';
+import { coordinationLockPath } from './coordination-lock.ts';
+import { localHostId } from './identity.ts';
 import { acquireNativeLock, type NativeLockHandle } from './native-lock.ts';
 import { canonicalFilesystemPath, recordManagedRoots } from './root-registry.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
@@ -54,7 +55,7 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
     if(input.operation==='reclone'&&(!currentBinding||currentBinding.worktree_id!==binding!.worktree_id))throw new OperationError('source_changed','The canonical clone binding changed.');
     const reservedIdentity=readPhysicalRootReservation(target);
     const worktreeId=currentBinding?.worktree_id??reservedIdentity?.worktreeId??randomUUID();
-    const coordination=currentBinding?.coordination_path??reservedIdentity?.coordinationPath??join(persistenceHome(),'locks',`${worktreeId}.lock`);
+    const coordination=currentBinding?.coordination_path??reservedIdentity?.coordinationPath??coordinationLockPath(target,worktreeId);
     let newLock:NativeLockHandle|null=null;
     if(!bindings.some(binding=>binding.worktree_id===worktreeId)){newLock=await acquireNativeLock(coordination!,{timeoutMs:5000});if(!newLock)throw new OperationError('writer_lock_unavailable','The new clone coordination lock is busy.');}
     let accepted:TopologyChange|undefined;

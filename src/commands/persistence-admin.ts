@@ -125,7 +125,10 @@ export async function runPersistenceAdminCli(group: Group, args: string[], conne
       }
       result = await runPersistenceAdministration(connected ?? owned!, parsed.operation, parsed.params);
     }
-    await writeStdoutFinal(JSON.stringify(result, null, 2) + '\n');
+    // owner_epoch and the topology counters arrive as BigInt from Postgres, and a bare
+    // JSON.stringify refuses them — which made `writer status`/`claim` unprintable (and the
+    // exit code a lie) the moment a binding existed. Emit them as decimal strings.
+    await writeStdoutFinal(JSON.stringify(result, (_key, value) => typeof value === 'bigint' ? value.toString() : value, 2) + '\n');
   } catch (error) {
     if (!await reportPersistenceCliError(error, args.includes('--json'))) {
       console.error(error instanceof Error ? error.message : String(error));
