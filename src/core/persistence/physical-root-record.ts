@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { OperationError } from '../ops/contract.ts';
+import { acquireNativeLock } from './native-lock.ts';
 import { sha256 } from './digest.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
 
@@ -82,20 +83,37 @@ export function readPhysicalRootReservation(path: string): PhysicalRootReservati
  * token, brain, worktree, host, inode stamps) and only ever moves the lock OUT of the root, so it
  * cannot adopt another owner's root or invent a new worktree.
  */
-export function repairReservationCoordinationPath(path: string, compliant: (worktreeId: string) => string,
-  localBrainId: string, localHostId: string): PhysicalRootReservation | null {
+export async function repairReservationCoordinationPath(path: string, compliant: (worktreeId: string) => string,
+  localBrainId: string, localHostId: string, repairLock: (root: string) => string): Promise<PhysicalRootReservation | null> {
   const root = canonicalFilesystemPath(path);
-  const value = readReservationIdentity(root);
-  if (value === null || !coordinationLockIsInsideRoot(root, value.coordinationPath)) return value;
-  if (value.brainId !== localBrainId || value.hostId !== localHostId) throw physicalRootError();
-  const coordinationPath = compliant(value.worktreeId);
-  if (coordinationLockIsInsideRoot(root, coordinationPath)) throw physicalRootError('The repaired coordination lock still lies inside the canonical checkout.');
-  const repaired: PhysicalRootReservation = { ...value, coordinationPath };
-  const target = physicalRootReservationPath(root);
-  const temporary = `${target}.${randomUUID()}.tmp`;
-  try { createPrivate(temporary, repaired); renameSync(temporary, target); flushDirectory(dirname(target)); }
-  finally { try { unlinkSync(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; } }
-  return readPhysicalRootReservation(root);
+  if (!coordinationLockIsInsideRoot(root, readReservationIdentity(root)?.coordinationPath ?? root)) {
+    return readPhysicalRootReservation(root);
+  }
+  // Serialize repairers of THIS reservation: two of them (different GBRAIN_COORDINATION_HOME, say)
+  // could otherwise each read the same wedged record and the slower rename would replace a path a
+  // binding already committed to, leaving database and reservation disagreeing forever.
+  const guard = await acquireNativeLock(repairLock(root), { timeoutMs: 2000 });
+  if (!guard) throw new OperationError('writer_lock_unavailable', 'Another process is repairing this reservation.');
+  try {
+    const value = readReservationIdentity(root);
+    if (value === null || !coordinationLockIsInsideRoot(root, value.coordinationPath)) return readPhysicalRootReservation(root);
+    if (value.brainId !== localBrainId) throw physicalRootError();
+    if (value.hostId !== localHostId) throw physicalRootError('Another host reserved this physical checkout.');
+    const coordinationPath = compliant(value.worktreeId);
+    if (coordinationLockIsInsideRoot(root, coordinationPath)) throw physicalRootError('The repaired coordination lock still lies inside the canonical checkout.');
+    const repaired: PhysicalRootReservation = { ...value, coordinationPath };
+    const target = physicalRootReservationPath(root);
+    const temporary = `${target}.${randomUUID()}.tmp`;
+    try {
+      createPrivate(temporary, repaired);
+      // Re-read under the guard: refuse if anything replaced the record while we prepared the copy.
+      const current = readReservationIdentity(root);
+      if (!current || current.token !== value.token || current.coordinationPath !== value.coordinationPath) throw physicalRootError();
+      renameSync(temporary, target); flushDirectory(dirname(target));
+    }
+    finally { try { unlinkSync(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; } }
+    return readPhysicalRootReservation(root);
+  } finally { await guard.release(); }
 }
 export function reservePhysicalRootRecord(root: string, identity: Omit<PhysicalRootReservation, 'version' | 'token' | 'root' | 'initialDevice' | 'initialInode' | 'initialBirth'>): PhysicalRootReservation {
   const info = existsSync(root) ? statSync(root, { bigint: true }) : null;

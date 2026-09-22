@@ -5,7 +5,7 @@ import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
 import { discoverGitRoot } from '../sync-git.ts';
 import { digest, sha256 } from './digest.ts';
-import { coordinationLockPath } from './coordination-lock.ts';
+import { coordinationLockPath, reservationRepairLockPath } from './coordination-lock.ts';
 import { localHostId } from './identity.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
@@ -41,7 +41,24 @@ export async function getWorktreeBinding(engine: SqlEngine, sourceId: string, ho
     WHERE s.source_id=$1`, [sourceId, hostId]);
   return row ?? null;
 }
+/**
+ * Move a wedged reservation's lock out of the checkout, for every claim path. Resolving the git
+ * root mirrors claimWorktree so both agree on which directory carries the reservation.
+ */
+export async function repairWedgedReservation(engine: SqlEngine, path: string, hostId = localHostId()): Promise<void> {
+  let root: string;
+  try { root = realpathSync(resolve(path)); } catch { return; }
+  try { root = realpathSync(discoverGitRoot(root)); } catch { /* ordinary directory source */ }
+  const [localBrain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
+  if (!localBrain) return;
+  await repairReservationCoordinationPath(root, worktreeId => coordinationLockPath(root, worktreeId),
+    localBrain.brain_id, hostId, reservationRepairLockPath);
+}
 export async function claimWorktree(engine: BrainEngine, sourceId: string, path: string, hostId = localHostId()): Promise<WorktreeBinding> {
+  // Repair first, before either path reads the reservation strictly: a record wedged by a refused
+  // v0.51 claim would otherwise make the source unclaimable in managed mode too, where the
+  // lifecycle below never reaches this function's own repair.
+  await repairWedgedReservation(engine, path, hostId);
   if(await managedPersistenceEnabled(engine)) {
     if(hostId!==localHostId()) throw new OperationError('permission_denied','A source can be claimed only by the local registered host.');
     const { runManagedSourceLifecycle }=await import('./source-lifecycle.ts');
@@ -63,10 +80,7 @@ export async function claimWorktree(engine: BrainEngine, sourceId: string, path:
   // A reservation left behind by a refused v0.51 claim still names a lock inside this checkout;
   // repair moves it out while keeping the recorded identity, so such a source is claimable again
   // instead of permanently wedged (the reservation is written before it is validated upstream).
-  const [localBrain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
-  const existingPhysical = localBrain
-    ? repairReservationCoordinationPath(root, worktreeId => coordinationLockPath(root, worktreeId), localBrain.brain_id, hostId)
-    : readPhysicalRootReservation(root);
+  const existingPhysical = readPhysicalRootReservation(root);
   const candidateId = existingPhysical?.worktreeId ?? randomUUID();
   const lockPath = existingPhysical?.coordinationPath ?? coordinationLockPath(root, candidateId);
   const probe = await tryAcquireNativeLock(lockPath);
@@ -173,10 +187,13 @@ export async function acceptWriterTransfer(engine: BrainEngine, sourceId: string
   if (manifest.digest !== expectedManifest) throw new OperationError('writer_manifest_mismatch', 'Successor checkout differs from the recorded canonical manifest.');
   const binding = await getWorktreeBinding(engine, sourceId, hostId);
   if (!binding) throw new OperationError('not_found', 'Source has no worktree owner.');
-  // The worktree's recorded lock stays its identity across a transfer; only a successor that has
-  // no usable recorded path mints a new one, and never one inside its own checkout.
+  // The successor's own reservation is the physical identity of that checkout, so it wins; a
+  // recorded binding path is the fallback that keeps the lock stable when the successor has no
+  // reservation yet, and only a worktree with neither mints a fresh one.
+  await repairWedgedReservation(engine, root, hostId);
+  const reserved = readPhysicalRootReservation(root)?.coordinationPath ?? null;
   const recorded = binding.coordination_path && !containsPath(root, binding.coordination_path) ? binding.coordination_path : null;
-  const coordination = recorded ?? readPhysicalRootReservation(root)?.coordinationPath ?? coordinationLockPath(root, binding.worktree_id);
+  const coordination = reserved ?? recorded ?? coordinationLockPath(root, binding.worktree_id);
   const lock = await acquireNativeLock(coordination, { timeoutMs: 5000 });
   if (!lock) throw new OperationError('write_pending', 'Successor worktree is busy.');
   try {

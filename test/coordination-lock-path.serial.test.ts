@@ -18,6 +18,9 @@ import { withEnv } from './helpers/with-env.ts';
 import { coordinationLockPath, isOutsideRoot } from '../src/core/persistence/coordination-lock.ts';
 import { physicalRootReservationPath, readPhysicalRootReservation, repairReservationCoordinationPath,
   coordinationLockIsInsideRoot } from '../src/core/persistence/physical-root-record.ts';
+import { reservationRepairLockPath, coordinationNamespace } from '../src/core/persistence/coordination-lock.ts';
+import { acquireNativeLock } from '../src/core/persistence/native-lock.ts';
+import { statSync } from 'node:fs';
 
 const outside = (root: string, path: string) => {
   const rel = relative(root, path);
@@ -69,6 +72,16 @@ describe('coordination lock placement', () => {
     expect(outside(b, lockB)).toBe(true);
   });
 
+  // A shared home plus identical local checkout paths on two hosts must not share one lock.
+  test('namespaces the shared fallback by host identity as well as root', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gb-host-')));
+    const homeA = realpathSync(mkdtempSync(join(tmpdir(), 'gb-hostA-')));
+    const homeB = realpathSync(mkdtempSync(join(tmpdir(), 'gb-hostB-')));
+    const nsA = await withEnv({ GBRAIN_HOME: homeA }, () => coordinationNamespace(root));
+    const nsB = await withEnv({ GBRAIN_HOME: homeB }, () => coordinationNamespace(root));
+    expect(nsA).not.toBe(nsB);
+  });
+
   test('isOutsideRoot rejects a nested path and accepts a sibling', () => {
     expect(isOutsideRoot('/a/b', '/a/b/.gbrain/persistence/locks/x.lock')).toBe(false);
     expect(isOutsideRoot('/a/b', '/a/c/locks/x.lock')).toBe(true);
@@ -79,9 +92,10 @@ describe('coordination lock placement', () => {
 /** A refused v0.51 claim leaves a reservation naming a lock inside the checkout. */
 describe('reservation repair', () => {
   const writeBadReservation = (root: string, brainId: string, hostId: string, worktreeId: string) => {
+    const info = statSync(root, { bigint: true });
     const record = { version: 1, token: randomUUID(), brainId, worktreeId, hostId, root,
       coordinationPath: join(root, '.gbrain', 'persistence', 'locks', `${worktreeId}.lock`),
-      initialDevice: null, initialInode: null, initialBirth: null };
+      initialDevice: info.dev.toString(), initialInode: info.ino.toString(), initialBirth: info.birthtimeNs.toString() };
     const path = physicalRootReservationPath(root);
     writeFileSync(path, JSON.stringify(record));
     chmodSync(path, 0o600);
@@ -94,19 +108,48 @@ describe('reservation repair', () => {
     const before = writeBadReservation(root, brainId, hostId, worktreeId);
     expect(() => readPhysicalRootReservation(root)).toThrow();
     const repaired = await withEnv({ GBRAIN_HOME: root, GBRAIN_COORDINATION_HOME: undefined },
-      () => repairReservationCoordinationPath(root, id => coordinationLockPath(root, id), brainId, hostId));
-    expect(repaired?.token).toBe(before.token);
-    expect(repaired?.worktreeId).toBe(worktreeId);
+      () => repairReservationCoordinationPath(root, id => coordinationLockPath(root, id), brainId, hostId, reservationRepairLockPath));
     expect(coordinationLockIsInsideRoot(root, repaired!.coordinationPath)).toBe(false);
     expect(readPhysicalRootReservation(root)?.coordinationPath).toBe(repaired!.coordinationPath);
-    expect(JSON.parse(readFileSync(physicalRootReservationPath(root), 'utf8')).brainId).toBe(brainId);
+    // Everything except the lock location must survive byte for byte.
+    const after = JSON.parse(readFileSync(physicalRootReservationPath(root), 'utf8'));
+    for (const field of ['token','brainId','worktreeId','hostId','root','initialDevice','initialInode','initialBirth'] as const) {
+      expect(after[field]).toBe((before as Record<string, unknown>)[field]);
+    }
+    expect(after.coordinationPath).not.toBe(before.coordinationPath);
   });
 
-  test('refuses to repair another brain or another host', async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gb-foreign-')));
-    writeBadReservation(root, randomUUID(), randomUUID(), randomUUID());
+  // Each guard is checked on its own, so deleting either one fails a test.
+  test('refuses a record belonging to another brain', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gb-foreign-brain-')));
+    const hostId = randomUUID();
+    writeBadReservation(root, randomUUID(), hostId, randomUUID());
     await expect(withEnv({ GBRAIN_HOME: root, GBRAIN_COORDINATION_HOME: undefined },
-      () => repairReservationCoordinationPath(root, id => coordinationLockPath(root, id), randomUUID(), randomUUID()))).rejects.toThrow();
+      () => repairReservationCoordinationPath(root, id => coordinationLockPath(root, id), randomUUID(), hostId, reservationRepairLockPath))).rejects.toThrow();
+    expect(JSON.parse(readFileSync(physicalRootReservationPath(root), 'utf8')).coordinationPath.startsWith(root)).toBe(true);
+  });
+
+  test('refuses a record reserved by another host', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gb-foreign-host-')));
+    const brainId = randomUUID();
+    writeBadReservation(root, brainId, randomUUID(), randomUUID());
+    await expect(withEnv({ GBRAIN_HOME: root, GBRAIN_COORDINATION_HOME: undefined },
+      () => repairReservationCoordinationPath(root, id => coordinationLockPath(root, id), brainId, randomUUID(), reservationRepairLockPath))).rejects.toThrow();
+  });
+
+  // Serialization: while one repairer holds the guard, a second must refuse rather than race.
+  test('refuses while another repairer holds the reservation guard', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gb-race-')));
+    const brainId = randomUUID(), hostId = randomUUID();
+    writeBadReservation(root, brainId, hostId, randomUUID());
+    await withEnv({ GBRAIN_HOME: root, GBRAIN_COORDINATION_HOME: undefined }, async () => {
+      const guard = await acquireNativeLock(reservationRepairLockPath(root), { timeoutMs: 1000 });
+      expect(guard).not.toBeNull();
+      try {
+        await expect(repairReservationCoordinationPath(root, id => coordinationLockPath(root, id),
+          brainId, hostId, reservationRepairLockPath)).rejects.toThrow();
+      } finally { await guard!.release(); }
+    });
   });
 
   test('leaves a compliant reservation untouched', async () => {
@@ -119,7 +162,7 @@ describe('reservation repair', () => {
     writeFileSync(physicalRootReservationPath(root), JSON.stringify(good));
     chmodSync(physicalRootReservationPath(root), 0o600);
     const same = await withEnv({ GBRAIN_HOME: home, GBRAIN_COORDINATION_HOME: undefined },
-      () => repairReservationCoordinationPath(root, id => coordinationLockPath(root, id), brainId, hostId));
+      () => repairReservationCoordinationPath(root, id => coordinationLockPath(root, id), brainId, hostId, reservationRepairLockPath));
     expect(same?.coordinationPath).toBe(good.coordinationPath);
     expect(same?.token).toBe(good.token);
   });

@@ -2,7 +2,7 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { OperationError } from '../ops/contract.ts';
 import { sha256 } from './digest.ts';
-import { persistenceHome } from './identity.ts';
+import { localHostId, persistenceHome } from './identity.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
 
 /** The reservation record refuses a coordination lock stored inside its canonical checkout. */
@@ -33,13 +33,28 @@ function userCoordinationLocks(): string {
  * per-user persistence home (or `GBRAIN_COORDINATION_HOME`), which keeps one stable path per
  * worktree id without ever living in the checkout.
  */
+/**
+ * Namespace for the shared fallback. The canonical root alone is not unique: two machines can
+ * share a home over NFS and hold different checkouts at the same local path, and a restored
+ * database clone keeps the worktree id. The registered host identity separates those.
+ */
+export function coordinationNamespace(canonicalRoot: string): string {
+  return sha256(`${canonicalRoot}\0${localHostId()}`).slice(0, 32);
+}
+
+/** Serializes repairers of one reservation; lives beside the locks, never inside the checkout. */
+export function reservationRepairLockPath(root: string): string {
+  const canonicalRoot = canonicalFilesystemPath(root);
+  return join(userCoordinationLocks(), coordinationNamespace(canonicalRoot), 'reservation-repair.lock');
+}
+
 export function coordinationLockPath(root: string, worktreeId: string): string {
   const canonicalRoot = canonicalFilesystemPath(root);
   // The shared fallback is namespaced by the canonical root, not just by worktree id: two brains
   // restored from one database clone keep the same worktree id on different checkouts, and a flat
   // directory would make their unrelated writes block on one lock file. The root is the identity
   // the lock protects, and it survives a reclone into the same path.
-  const shared = join(userCoordinationLocks(), sha256(canonicalRoot).slice(0, 32));
+  const shared = join(userCoordinationLocks(), coordinationNamespace(canonicalRoot));
   for (const base of [join(persistenceHome(), 'locks'), shared]) {
     const candidate = canonicalFilesystemPath(join(base, `${worktreeId}.lock`));
     if (isOutsideRoot(canonicalRoot, candidate)) return candidate;

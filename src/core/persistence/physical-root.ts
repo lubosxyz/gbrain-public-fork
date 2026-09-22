@@ -2,10 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { SqlEngine } from './model.ts';
-import { coordinationLockPath } from './coordination-lock.ts';
+import { coordinationLockPath, reservationRepairLockPath } from './coordination-lock.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
 import { adoptTransferredRootStamp, assertNoPhysicalRootOverlap, assertPhysicalRoot, assertPhysicalRootStamp, PHYSICAL_ROOT_MARKER, physicalRootError,
-  readPhysicalRootReservation, reservePhysicalRootRecord, writePhysicalRootStamp, type PhysicalRootReservation } from './physical-root-record.ts';
+  readPhysicalRootReservation, repairReservationCoordinationPath, reservePhysicalRootRecord, writePhysicalRootStamp, type PhysicalRootReservation } from './physical-root-record.ts';
 
 export { assertPhysicalRoot, coordinationLockIsInsideRoot, isPhysicalRootMetadata, readPhysicalRootReservation, repairReservationCoordinationPath } from './physical-root-record.ts';
 export interface PhysicalRootClaim { hostId: string; worktreeId?: string; coordinationPath?: string; }
@@ -21,6 +21,10 @@ async function brainIdentity(tx: SqlEngine): Promise<string> {
  */
 export async function reservePhysicalRoot(tx: SqlEngine, path: string, opts: PhysicalRootClaim): Promise<PhysicalRootReservation> {
   const root = canonicalFilesystemPath(path), brainId = await brainIdentity(tx);
+  // Shared boundary for every claim, managed lifecycle included: a reservation wedged inside its
+  // own checkout by a refused v0.51 claim is moved out before the strict read rejects it.
+  await repairReservationCoordinationPath(root, worktreeId => coordinationLockPath(root, worktreeId),
+    brainId, opts.hostId, reservationRepairLockPath);
   const previous = readPhysicalRootReservation(root);
   const worktreeId = opts.worktreeId ?? previous?.worktreeId ?? randomUUID();
   const coordinationPath = opts.coordinationPath ?? previous?.coordinationPath ?? coordinationLockPath(root, worktreeId);
