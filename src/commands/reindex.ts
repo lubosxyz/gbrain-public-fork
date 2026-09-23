@@ -79,6 +79,7 @@ const REINDEX_HELP = `gbrain reindex — re-chunk / re-embed existing pages afte
 
 USAGE
   gbrain reindex --markdown   [--type PAGE_TYPE] [--limit N] [--dry-run] [--no-embed] [--json] [--repo PATH]
+  gbrain reindex --code       [--source <id>] [--limit N] [--workers N] [--dry-run] [--force] [--no-embed] [--yes] [--json]
   gbrain reindex --multimodal [--limit N] [--workers N] [--dry-run] [--cost-estimate] [--no-embed] [--yes] [--json]
   gbrain reindex --aliases    [--limit N] [--dry-run] [--json] [--source <id>]
 
@@ -86,6 +87,8 @@ TARGETS (exactly one required)
   --markdown        Re-chunk markdown pages whose chunker_version lags the
                     current chunker (or whose contextual-retrieval state is
                     unset when embedding is on).
+  --code            Re-chunk code pages (delegates to reindex-code; pass
+                    --force to bypass content_hash early-return).
   --multimodal      Re-embed image/PDF chunks through the multimodal
                     embedding pipeline (Voyage batches).
   --aliases         Backfill the free-text alias layer (page_aliases) for
@@ -94,13 +97,14 @@ TARGETS (exactly one required)
 OPTIONS
   --type <t>        --markdown only: restrict to one page type
   --limit N         Cap pages/chunks processed this run
-  --workers N       --multimodal only: parallel UPDATEs per batch
+  --workers N       --code / --multimodal: parallel UPDATEs per batch
                     (--concurrency is an alias)
   --dry-run         Report what would change; write nothing
   --cost-estimate   --multimodal only: print the embed cost estimate and stop
   --no-embed        Skip re-embedding (chunk-only reindex)
-  --yes             --multimodal only: skip the cost confirm
-  --source <id>     --aliases only: restrict to one source
+  --force           --code only: bypass content_hash check and force re-chunk
+  --yes             --code / --multimodal: skip the cost confirm
+  --source <id>     --code / --aliases: restrict to one source
   --repo PATH       --markdown only: brain repo override
   --json            Machine-readable output
   --help, -h        Show this help
@@ -113,7 +117,7 @@ export function printReindexHelp(): void {
   console.log(REINDEX_HELP);
 }
 
-const REINDEX_VALUE_FLAGS = new Set(['--type', '--limit', '--repo', '--workers', '--concurrency']);
+const REINDEX_VALUE_FLAGS = new Set(['--type', '--limit', '--repo', '--workers', '--concurrency', '--source']);
 
 export function normalizeReindexArgs(args: string[]): string[] {
   return args.flatMap((arg) => {
@@ -142,6 +146,7 @@ export function validateReindexModeScope(args: string[]): string | null {
   if (!args.includes('--type')) return null;
   if (args.includes('--multimodal')) return '--type is only supported with reindex --markdown, not --multimodal';
   if (args.includes('--aliases')) return '--type is only supported with reindex --markdown, not --aliases';
+  if (args.includes('--code')) return '--type is only supported with reindex --markdown, not --code';
   return null;
 }
 
@@ -314,16 +319,51 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
     setCliExitVerdict(2);
     return { pending: 0, pendingAfter: 0, reindexed: 0, skipped: 0, failed: 0, dryRun: args.includes('--dry-run'), chunkerVersion: MARKDOWN_CHUNKER_VERSION, type: null };
   }
+  if (args.includes('--code')) {
+    const { runReindexCode } = await import('./reindex-code.ts');
+    const sourceIdx = args.indexOf('--source');
+    const sourceId = sourceIdx >= 0 ? args[sourceIdx + 1] : undefined;
+    const dryRun = args.includes('--dry-run');
+    const yes = args.includes('--yes') || args.includes('-y');
+    const json = args.includes('--json');
+    const force = args.includes('--force');
+    const noEmbed = args.includes('--no-embed');
+    const limitIdx = args.indexOf('--limit');
+    const limit = limitIdx >= 0 ? parseInt(args[limitIdx + 1] ?? '', 10) : undefined;
+    const workersIdx = args.findIndex((a) => a === '--workers' || a === '--concurrency');
+    const workers = workersIdx >= 0 ? parseInt(args[workersIdx + 1] ?? '', 10) : undefined;
+
+    const res = await runReindexCode(engine, {
+      sourceId,
+      dryRun,
+      yes,
+      json,
+      force,
+      noEmbed,
+      batchSize: Number.isFinite(limit) && limit! > 0 ? limit : undefined,
+      workers: Number.isFinite(workers) && workers! > 0 ? workers : undefined,
+    });
+    return {
+      pending: res.codePages,
+      pendingAfter: res.codePages - res.reindexed,
+      reindexed: res.reindexed,
+      skipped: res.skipped,
+      failed: res.failed,
+      dryRun: res.status === 'dry_run',
+      chunkerVersion: MARKDOWN_CHUNKER_VERSION,
+      type: 'code',
+    };
+  }
+
   const opts = parseArgs(args);
   const type = opts.type ?? null;
 
-  // Require `--markdown` explicitly. Future modes (e.g. --code) get their
-  // own routing here.
+  // Require `--markdown` explicitly.
   if (!args.includes('--markdown')) {
     if (opts.json) {
-      process.stdout.write(JSON.stringify({ error: 'gbrain reindex requires a target flag, e.g. --markdown' }) + '\n');
+      process.stdout.write(JSON.stringify({ error: 'gbrain reindex requires a target flag, e.g. --markdown or --code' }) + '\n');
     } else {
-      process.stderr.write('Usage: gbrain reindex --markdown [--type PAGE_TYPE] [--limit N] [--dry-run] [--json] [--repo PATH]\n');
+      process.stderr.write('Usage: gbrain reindex --markdown | --code [--limit N] [--dry-run] [--json] [--repo PATH]\n');
     }
     setCliExitVerdict(2);
     return { pending: 0, pendingAfter: 0, reindexed: 0, skipped: 0, failed: 0, dryRun: !!opts.dryRun, chunkerVersion: MARKDOWN_CHUNKER_VERSION, type };
