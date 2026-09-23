@@ -209,6 +209,12 @@ export async function runReindexCode(
     if (decision.shouldNudge) printCodeModelNudge(decision);
   }
 
+  if (opts.force && opts.noEmbed && totalPages > 0 && !opts.json) {
+    process.stderr.write(
+      '[reindex-code] Warning: --force with --no-embed preserves matching chunk embeddings, but new or changed chunks will not be embedded.\n',
+    );
+  }
+
   if (opts.dryRun) {
     return {
       status: 'dry_run',
@@ -448,6 +454,12 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
   const json = args.includes('--json');
   const force = args.includes('--force');
   const noEmbed = args.includes('--no-embed');
+
+  if (force && noEmbed && !json) {
+    process.stderr.write(
+      '[reindex-code] Warning: --force with --no-embed preserves matching chunk embeddings, but new or changed chunks will not be embedded.\n',
+    );
+  }
 
   // v0.41.15.0 (T11, D9): --workers N for per-batch parallelism.
   let workers: number | undefined;
