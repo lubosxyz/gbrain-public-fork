@@ -319,41 +319,6 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
     setCliExitVerdict(2);
     return { pending: 0, pendingAfter: 0, reindexed: 0, skipped: 0, failed: 0, dryRun: args.includes('--dry-run'), chunkerVersion: MARKDOWN_CHUNKER_VERSION, type: null };
   }
-  if (args.includes('--code')) {
-    const { runReindexCode } = await import('./reindex-code.ts');
-    const sourceIdx = args.indexOf('--source');
-    const sourceId = sourceIdx >= 0 ? args[sourceIdx + 1] : undefined;
-    const dryRun = args.includes('--dry-run');
-    const yes = args.includes('--yes') || args.includes('-y');
-    const json = args.includes('--json');
-    const force = args.includes('--force');
-    const noEmbed = args.includes('--no-embed');
-    const limitIdx = args.indexOf('--limit');
-    const limit = limitIdx >= 0 ? parseInt(args[limitIdx + 1] ?? '', 10) : undefined;
-    const workersIdx = args.findIndex((a) => a === '--workers' || a === '--concurrency');
-    const workers = workersIdx >= 0 ? parseInt(args[workersIdx + 1] ?? '', 10) : undefined;
-
-    const res = await runReindexCode(engine, {
-      sourceId,
-      dryRun,
-      yes,
-      json,
-      force,
-      noEmbed,
-      batchSize: Number.isFinite(limit) && limit! > 0 ? limit : undefined,
-      workers: Number.isFinite(workers) && workers! > 0 ? workers : undefined,
-    });
-    return {
-      pending: res.codePages,
-      pendingAfter: res.codePages - res.reindexed,
-      reindexed: res.reindexed,
-      skipped: res.skipped,
-      failed: res.failed,
-      dryRun: res.status === 'dry_run',
-      chunkerVersion: MARKDOWN_CHUNKER_VERSION,
-      type: 'code',
-    };
-  }
 
   const opts = parseArgs(args);
   const type = opts.type ?? null;

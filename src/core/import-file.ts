@@ -1599,13 +1599,17 @@ export async function importCodeFile(
   // header-stripped body: the header carries line numbers and the index shifts
   // when a symbol is added above, so keying on either re-embedded
   // byte-identical bodies.
-  // `getChunksWithEmbeddings` (or `getChunks` with `includeEmbedding`) is load-bearing:
-  // #2544 dropped the vector from the default column list, which silently made this
-  // whole cache a no-op.
-  const existingChunks = existing && !opts.noEmbed
-    ? (typeof engine.getChunksWithEmbeddings === 'function'
-        ? await engine.getChunksWithEmbeddings(slug, { sourceId: sourceId ?? 'default', includeUnsealed: true })
-        : await engine.getChunks(slug, { sourceId: sourceId ?? 'default', includeEmbedding: true, includeUnsealed: true }))
+  // `getChunks` with `includeEmbedding` + `includeUnsealed` respects scope and RLS boundaries
+  // (engine contract lines 1144-1152), unlike `getChunksWithEmbeddings`.
+  // `requireSafeChunks` is omitted: safeChunksFilter requires chunker_version >= 4 (markdown
+  // fences), which blocked repair of legacy code pages. Omitting is safe: key is exact body match.
+  // Existing chunks are read even under `noEmbed` so matching embeddings are preserved, not wiped.
+  const existingChunks = existing
+    ? await engine.getChunks(slug, {
+        sourceId: sourceId ?? 'default',
+        includeEmbedding: true,
+        includeUnsealed: true,
+      })
     : [];
   const { reuse, needsEmbedIndexes } = planEmbeddingReuse(existingChunks, chunks);
   for (const [i, matched] of reuse) {
