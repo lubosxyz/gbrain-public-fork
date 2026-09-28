@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -105,7 +106,7 @@ await runApplyMigrations(['--yes']);
 
   test.each(['file-postgres', 'env-overrides-pglite'])('failed applicable install retries in %s, while a historical complete requires explicit force-retry', async (context) => {
     await fixture(async (home, ledger) => {
-      const databaseUrl = 'postgresql://fixture:fixture@127.0.0.1:1/gbrain_test';
+      const databaseUrl = credentialFixture('postgresql://127.0.0.1:1/gbrain_test');
       if (context === 'file-postgres') {
         writeFileSync(join(home, '.gbrain/config.json'), JSON.stringify({ engine: 'postgres', database_url: databaseUrl }));
       }
@@ -236,3 +237,10 @@ await runApplyMigrations(process.argv.slice(2));
     });
   }
 });
+
+function credentialFixture(target: string): string {
+  const url = new URL(target);
+  url.username = 'synthetic-user';
+  url.password = randomUUID();
+  return url.href;
+}

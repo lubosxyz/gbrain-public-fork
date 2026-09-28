@@ -6,6 +6,10 @@ on:
 permissions:
   contents: read
 
+# Synthetic credentials for disposable CI database services.
+env:
+  POSTGRES_TEST_PASSWORD: postgres
+
 jobs:
   openclaw:
     name: OpenClaw 2026.9.4 native context-engine startup
@@ -38,7 +42,7 @@ jobs:
       - name: Exercise real plugin load and fresh conversations with a loopback-only provider
         env:
           GBRAIN_TEST_OPENCLAW_BIN: ${{ runner.temp }}/openclaw-host/node_modules/.bin/openclaw
-          GBRAIN_TEST_OPENCLAW_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/gbrain_test
+          GBRAIN_TEST_OPENCLAW_DATABASE_URL: postgresql://postgres:${{ env.POSTGRES_TEST_PASSWORD }}@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/gbrain_test
           GBRAIN_CI_DISABLE_TEST_ENV_FILE: '1'
         run: bun test --timeout=60000 test/openclaw-context-engine-native.serial.test.ts
 

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { describe, expect, test } from 'bun:test';
 import { mcpAdministrationGuidance } from '../src/mcp/capabilities.ts';
 
@@ -18,15 +19,22 @@ describe('MCP administration discovery', () => {
   });
 
   test.each([
-    'https://owner:secret@brain.example.com/mcp',
+    credentialFixture('https://brain.example.com/mcp'),
     'https://brain.example.com/mcp?token=secret',
     'https://brain.example.com/mcp#secret',
     'https://brain.example.com/unrelated',
     'file:///private/mcp',
     'invalid',
-  ])('does not publish credentials or invent endpoints from %s', input => {
+  ])('does not publish userinfo or invent endpoints for an unsafe input', input => {
     const guidance = mcpAdministrationGuidance(input);
     expect(guidance).not.toHaveProperty('admin_url');
     expect(JSON.stringify(guidance)).not.toContain(input);
   });
 });
+
+function credentialFixture(target: string): string {
+  const url = new URL(target);
+  url.username = 'synthetic-user';
+  url.password = randomUUID();
+  return url.href;
+}

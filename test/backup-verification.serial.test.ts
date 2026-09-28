@@ -1,7 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import * as childProcess from 'node:child_process';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -18,7 +19,7 @@ const now = new Date('2026-09-22T12:00:00Z');
 const verified = { localGitProbes: true, verifyRemoteRefs: true, now };
 
 beforeEach(() => {
-  tmp = mkdtempSync(join(tmpdir(), 'gbrain-backup-evidence-'));
+  tmp = realpathSync(mkdtempSync(join(tmpdir(), 'gbrain-backup-evidence-')));
   oldHome = process.env.GBRAIN_HOME;
   process.env.GBRAIN_HOME = tmp;
   __setBackupStatusPathForTests(join(tmp, 'status.json'));
@@ -173,7 +174,7 @@ test('timeouts spend a sweep-wide deadline, return no credentials, and never ver
   const timeouts: number[] = [];
   const probe = spyOn(childProcess, 'execFile').mockImplementation(((file: string, args: string[], options: { timeout: number }, callback: Function) => {
     timeouts.push(options.timeout);
-    setTimeout(() => callback(new Error('https://fixture-user:fixture-password@example.invalid/private'), ''), options.timeout);
+    setTimeout(() => callback(new Error(credentialFixture('https://example.invalid/private')), ''), options.timeout);
     return {};
   }) as unknown as typeof childProcess.execFile);
   const started = Date.now();
@@ -204,7 +205,7 @@ test('fresh remote evidence supersedes a historical failed push but a new mismat
   const { root, remote } = await repository();
   const statusPath = pushStatusPathForRoot(root);
   mkdirSync(join(statusPath, '..'), { recursive: true });
-  writeFileSync(statusPath, JSON.stringify({ ok: false, reason: 'https://fixture-user:fixture-password@example.invalid/private', ts: now.toISOString(), repoRoot: root }));
+  writeFileSync(statusPath, JSON.stringify({ ok: false, reason: credentialFixture('https://example.invalid/private'), ts: now.toISOString(), repoRoot: root }));
   const before = readFileSync(statusPath, 'utf8');
   let result = await getBackupStatus(engine([root]), { ...verified, forceRefresh: true });
   expect(result.overall).toBe('ok');
@@ -279,3 +280,10 @@ test('retained evidence is invalidated by local identity, source, commit, remote
     expect(result.verification?.state).not.toBe('verified');
   }
 }, 15_000);
+
+function credentialFixture(target: string): string {
+  const url = new URL(target);
+  url.username = 'synthetic-user';
+  url.password = randomUUID();
+  return url.href;
+}

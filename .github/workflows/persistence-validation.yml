@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+# Synthetic credentials for disposable CI database services.
+env:
+  POSTGRES_TEST_PASSWORD: gbrain_test
+
 jobs:
   read-performance:
     name: Read latency / ${{ matrix.engine }} / Bun ${{ matrix.bun }}
@@ -123,7 +127,7 @@ jobs:
       - name: Require data-safety on PostgreSQL
         timeout-minutes: 10
         env:
-          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          DATABASE_URL: postgres://gbrain_test:${{ env.POSTGRES_TEST_PASSWORD }}@127.0.0.1:5432/gbrain_test
           GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
           GBRAIN_CI_DISABLE_TEST_ENV_FILE: '1'
         run: |
@@ -135,10 +139,10 @@ jobs:
       - name: Require canonical reconciliation through direct and pooled PostgreSQL
         timeout-minutes: 5
         env:
-          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          DATABASE_URL: postgres://gbrain_test:${{ env.POSTGRES_TEST_PASSWORD }}@127.0.0.1:5432/gbrain_test
           GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
-          GBRAIN_PGBOUNCER_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:55433/gbrain_test
-          GBRAIN_PGBOUNCER_DIRECT_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_PGBOUNCER_URL: postgres://gbrain_test:${{ env.POSTGRES_TEST_PASSWORD }}@127.0.0.1:55433/gbrain_test
+          GBRAIN_PGBOUNCER_DIRECT_URL: postgres://gbrain_test:${{ env.POSTGRES_TEST_PASSWORD }}@127.0.0.1:5432/gbrain_test
           GBRAIN_CI_REQUIRE_PGBOUNCER: '1'
         run: >-
           bun --no-env-file test --timeout=120000
@@ -187,7 +191,7 @@ jobs:
       - name: Require all reconciliation crash boundaries before and after activation
         timeout-minutes: 12
         env:
-          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          DATABASE_URL: postgres://gbrain_test:${{ env.POSTGRES_TEST_PASSWORD }}@127.0.0.1:5432/gbrain_test
           GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
           GBRAIN_TEST_RECONCILE_CRASH_MANIFEST_DIR: .context/reconcile-crashes
         run: |
