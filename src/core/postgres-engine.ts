@@ -120,6 +120,8 @@ import type { PgSalienceDeps } from './postgres-engine/salience.ts';
 import { hasCJK } from './cjk.ts';
 import { searchKeywordCJK as searchKeywordCJKImpl } from './postgres-engine/cjk-search.ts';
 import type { CjkKeywordCtx } from './search/cjk-keyword-sql.ts';
+import { shouldForceAnnScan, SourcePageCountCache } from './search/vector-scope-routing.ts';
+import type { SourcePageCounts } from './search/vector-scope-routing.ts';
 
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
@@ -156,6 +158,8 @@ export class PostgresEngine implements BrainEngine {
   readonly kind = 'postgres' as const;
   private readonly _beforeDisconnect = new Set<() => Promise<void>>();
   private _disconnectPromise: Promise<void> | null = null;
+  /** Live page counts per source, cached for vector-arm plan routing (vector-scope-routing.ts). */
+  private readonly _sourcePageCounts = new SourcePageCountCache();
 
   registerBeforeDisconnect(stop: () => Promise<void>): () => void {
     this._beforeDisconnect.add(stop);
@@ -2113,10 +2117,21 @@ export class PostgresEngine implements BrainEngine {
     // a non-full pool is a genuine final page (corpus/filter exhausted) —
     // no retry, no event. Zero rows with offset>0 escalates (deep
     // pagination) but never emits: pool state is unknowable there.
+    // Fork patch (vector-scope-routing.ts): a scope covering nearly the whole
+    // brain is mis-planned as an exact scan over every chunk (column-equality
+    // visibility predicate estimated at 0.5 % instead of ~93 %), which blows the
+    // 8 s timeout. For such scopes disable the explicit distance Sort so the
+    // HNSW-ordered scan wins; narrow or otherwise filtered scopes keep the plan.
+    const forceAnn = shouldForceAnnScan(
+      await this._sourcePageCounts.get(() => this.loadSourcePageCounts()),
+      opts ?? {},
+      { hnswIndexed: innerCap !== Number.MAX_SAFE_INTEGER },
+    );
     const runOnce = async (il: number) =>
       await this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async (tx) => {
         await tx`SET LOCAL statement_timeout = '8s'`;
         await tx`SELECT set_config('hnsw.ef_search', ${String(hnswEfSearchFor(il))}, true)`;
+        if (forceAnn) await tx`SET LOCAL enable_sort = off`;
         return await tx.unsafe(rawQuery, params as Parameters<typeof tx.unsafe>[1]);
       }, { alwaysTransaction: true });
     let escalations = 0;
@@ -2138,6 +2153,14 @@ export class PostgresEngine implements BrainEngine {
       rows = await runOnce(params[innerLimitIdx] as number);
     }
     return rows.map(rowToSearchResult);
+  }
+
+  /** Count live pages per source; cheap index-only scan, cached by the caller. */
+  private async loadSourcePageCounts(): Promise<SourcePageCounts> {
+    const rows = await this.sql`
+      SELECT source_id, count(*)::int AS n FROM pages WHERE deleted_at IS NULL GROUP BY source_id
+    `;
+    return new Map(rows.map((r) => [String(r.source_id), Number(r.n)]));
   }
 
   async getEmbeddingsByChunkIds(
