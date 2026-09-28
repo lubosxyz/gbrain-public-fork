@@ -536,9 +536,13 @@ export async function runLintCore(opts: LintOpts): Promise<LintResult> {
     throw new Error(`Not found: ${opts.target}`);
   }
 
-  if (opts.engine && !hasSourceFilesystemLock(opts.target)) {
+  const managed = opts.engine && await (await import('../core/persistence/ownership.ts')).managedPersistenceEnabled(opts.engine);
+  if (opts.engine && !managed && !hasSourceFilesystemLock(opts.target)) {
     return withSourceFilesystemLock(opts.engine, opts.target, () => runLintCore(opts), { signal: opts.signal });
   }
+  const publish = managed && opts.fix && !opts.dryRun
+    ? await (await import('../core/persistence/lint-publication.ts')).managedLintPublisher(opts.engine!, opts.target)
+    : null;
 
   const isSingleFile = statSync(opts.target).isFile();
   const pages = isSingleFile ? [opts.target] : collectPages(opts.target, opts.exclude ?? []);
@@ -596,8 +600,13 @@ export async function runLintCore(opts: LintOpts): Promise<LintResult> {
         totalFixed += fixCount;
         if (!opts.dryRun) {
           assertSourceFilesystemActive();
-          writeSourceFileSync(page, fixed);
-          if (commitFixes) {
+          if (publish) {
+            const prepared = await publish(page);
+            if (prepared.content !== content) throw new Error('Lint target changed during repair preparation; retry lint.');
+            await prepared.publish(fixed);
+          }
+          else writeSourceFileSync(page, fixed);
+          if (commitFixes && !publish) {
             commitWriteThroughFile(repoProbe, page, relative(repoProbe, page).replace(/\.md$/u, ''));
           }
         }

@@ -6,6 +6,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MIGRATIONS, LATEST_VERSION, runMigrations } from '../src/core/migrate.ts';
+import { PROJECTION_STATISTICS_NAME, verifyProjectionStatistics } from '../src/core/search/projection-statistics.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 
 let engine: PGLiteEngine;
@@ -26,15 +27,28 @@ beforeEach(async () => {
   await engine.executeRaw('DELETE FROM minion_jobs');
 });
 
-describe('migration v150 — fork/upstream reconciliation (v128 lane replayed after the 0.50 merge renumbered it out of v131)', () => {
+describe('fork/upstream migration reconciliation', () => {
   test('contains both independently shipped v128 semantics and is idempotent', () => {
-    const migration = MIGRATIONS.find((candidate) => candidate.version === 150);
-    expect(migration?.name).toBe('fork_upstream_v131_v132_reconciliation');
+    const migration = MIGRATIONS.find((candidate) => candidate.name === 'fork_upstream_v150_reconciliation');
+    expect(migration?.version).toBeGreaterThan(165);
     expect(migration?.idempotent).toBe(true);
     expect(migration?.sql).toContain('CREATE TABLE IF NOT EXISTS mcp_request_log_purged');
     expect(migration?.sql).toContain('UPDATE minion_jobs');
     expect(migration?.sql).toContain("error_text = 'v131: superseded duplicate autopilot cycle'");
-    expect(LATEST_VERSION).toBeGreaterThanOrEqual(150);
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(169);
+  });
+
+  test('repairs upstream migrations skipped by an already-upgraded fork at v161', async () => {
+    await engine.executeRaw('DROP INDEX IF EXISTS idx_pages_projection_pending');
+    await engine.executeRaw(`DROP STATISTICS IF EXISTS ${PROJECTION_STATISTICS_NAME}`);
+    await engine.setConfig('version', '161');
+    await runMigrations(engine);
+    const indexes = await engine.executeRaw<{ name: string }>(
+      "SELECT indexname AS name FROM pg_indexes WHERE indexname='idx_pages_projection_pending'");
+    expect(indexes).toHaveLength(1);
+    await verifyProjectionStatistics(engine);
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    expect((await runMigrations(engine)).applied).toBe(0);
   });
 
   test('repairs an upstream-shaped v130 brain that never created the fork table', async () => {
