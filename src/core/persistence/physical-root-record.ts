@@ -179,6 +179,24 @@ export function adoptTransferredRootStamp(directory: string, reservation: Physic
   finally { try { unlinkSync(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; } }
   assertPhysicalRootStamp(directory, reservation);
 }
+/** Evidence that only the volume's st_dev moved while the checkout itself stayed the same directory. */
+export interface DeviceDriftEvidence { root: string; token: string; inode: string; birth: string; device_recorded: string; device_current: string; }
+/**
+ * macOS numbers APFS volumes per boot, so a reboot or kernel panic can change st_dev while the
+ * checkout (inode, birth time, reservation token) is untouched and every write then fail-closes.
+ * Accept exactly that: every stamp field except the device must still match this root. A copied,
+ * recloned or replaced checkout has a new inode/birth and is refused. Backport of upstream
+ * v0.54.1 self-transfer (physical-root-recovery.ts); see ownership.ts prepareWriterTransfer.
+ */
+export function inspectDeviceDrift(root: string, reservation: PhysicalRootReservation): DeviceDriftEvidence {
+  if (realpathSync(root) !== root || lstatSync(root).isSymbolicLink() || reservation.root !== root) throw physicalRootError();
+  const value = readPrivate(join(root, PHYSICAL_ROOT_MARKER)) as PhysicalRootStamp | null;
+  const info = statSync(root, { bigint: true });
+  if (!info.isDirectory() || !value || value.version !== 1 || value.token !== reservation.token || value.brainId !== reservation.brainId
+    || value.worktreeId !== reservation.worktreeId || value.root !== root || value.inode !== info.ino.toString()
+    || value.birth !== info.birthtimeNs.toString() || typeof value.device !== 'string' || !/^\d+$/.test(value.device)) throw physicalRootError();
+  return { root, token: value.token, inode: value.inode, birth: value.birth, device_recorded: value.device, device_current: info.dev.toString() };
+}
 export function assertPhysicalRoot(path: string, identity: { worktreeId: string; coordinationPath?: string | null }): void {
   try {
     const root = realpathSync(path);

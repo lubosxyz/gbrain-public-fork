@@ -7,7 +7,8 @@ import { canonicalFilesystemPath } from './root-registry.ts';
 import { adoptTransferredRootStamp, assertNoPhysicalRootOverlap, assertPhysicalRoot, assertPhysicalRootStamp, PHYSICAL_ROOT_MARKER, physicalRootError,
   readPhysicalRootReservation, repairReservationCoordinationPath, reservePhysicalRootRecord, writePhysicalRootStamp, type PhysicalRootReservation } from './physical-root-record.ts';
 
-export { assertPhysicalRoot, coordinationLockIsInsideRoot, isPhysicalRootMetadata, readPhysicalRootReservation, repairReservationCoordinationPath, reservationRepairGuardPath } from './physical-root-record.ts';
+export type { DeviceDriftEvidence } from './physical-root-record.ts';
+export { assertPhysicalRoot, coordinationLockIsInsideRoot, inspectDeviceDrift, isPhysicalRootMetadata, physicalRootError, readPhysicalRootReservation, repairReservationCoordinationPath, reservationRepairGuardPath } from './physical-root-record.ts';
 export interface PhysicalRootClaim { hostId: string; worktreeId?: string; coordinationPath?: string; }
 async function brainIdentity(tx: SqlEngine): Promise<string> {
   const [brain] = await tx.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');

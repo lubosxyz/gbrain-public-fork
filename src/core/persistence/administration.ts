@@ -6,7 +6,7 @@ import { isValidSourceId } from '../source-id.ts';
 import { assertValidSlugPrefixes } from '../grants/encoding.ts';
 import { isWriteRequestId } from './types.ts';
 import { writerDiagnostics } from './control.ts';
-import { acceptWriterTransfer, claimWorktree, getWorktreeBinding, prepareWriterTransfer, worktreeManifest } from './ownership.ts';
+import { acceptWriterTransfer, claimWorktree, getWorktreeBinding, inspectSelfTransfer, prepareWriterTransfer, worktreeManifest } from './ownership.ts';
 import { localHostId, persistenceHome, readLocalWriter, registerLocalWriter, revokeLocalWriter, type LocalGrant } from './identity.ts';
 import type { PersistenceAdminOperation } from './admin-contract.ts';
 
@@ -31,6 +31,7 @@ function keys(params: Record<string, unknown>, allowed: string[]) {
   const unknown = Object.keys(params).filter(key => !allowed.includes(key));
   if (unknown.length) throw invalid(`Unsupported administration parameters: ${unknown.join(', ')}.`);
   if (params.dry_run !== undefined && typeof params.dry_run !== 'boolean') throw invalid('dry_run must be a boolean.');
+  if (params.self_transfer !== undefined && typeof params.self_transfer !== 'boolean') throw invalid('self_transfer must be a boolean.');
 }
 
 async function registrationGrant(engine: BrainEngine, params: Record<string, unknown>): Promise<LocalGrant> {
@@ -117,27 +118,35 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
       ...(params.dry_run ? { dry_run: true, action: operation } : {}) };
   }
   if (operation === 'writer_transfer_prepare') {
-    keys(params, ['source_id', 'dry_run']);
-    const sourceId = source(params.source_id);
+    keys(params, ['source_id', 'self_transfer', 'dry_run']);
+    const sourceId = source(params.source_id), selfTransfer = params.self_transfer === true;
     if (params.dry_run) {
       const binding = await getWorktreeBinding(engine, sourceId);
       if (!binding || binding.owner_host_id !== localHostId() || !binding.local_path) throw new OperationError('permission_denied', 'Only the current owner can prepare a transfer.');
+      // Read-only: the drift inspection never takes the lock or touches the stamp.
+      const evidence = selfTransfer ? await inspectSelfTransfer(engine, binding, localHostId()) : undefined;
       const manifest = worktreeManifest(binding.local_path);
-      return { dry_run: true, action: operation, binding, manifest: { digest: manifest.digest, file_count: Object.keys(manifest.files).length } };
+      return { dry_run: true, action: operation, binding, manifest: { digest: manifest.digest, file_count: Object.keys(manifest.files).length },
+        ...(evidence ? { self_transfer: evidence } : {}) };
     }
-    const prepared = await prepareWriterTransfer(engine, sourceId);
+    const prepared = await prepareWriterTransfer(engine, sourceId, undefined, { selfTransfer });
     return { prepared: true, source_id: sourceId, worktree_id: prepared.worktree_id, owner_epoch: prepared.owner_epoch,
-      manifest: { digest: prepared.manifest.digest, file_count: Object.keys(prepared.manifest.files).length } };
+      manifest: { digest: prepared.manifest.digest, file_count: Object.keys(prepared.manifest.files).length },
+      ...(prepared.manifest.self_transfer ? { self_transfer: prepared.manifest.self_transfer } : {}) };
   }
   if (operation === 'writer_transfer_accept') {
-    keys(params, ['source_id', 'path', 'expected_epoch', 'manifest', 'dry_run']);
+    keys(params, ['source_id', 'path', 'expected_epoch', 'manifest', 'self_transfer', 'dry_run']);
     const sourceId = source(params.source_id), root = path(params.path);
     if (typeof params.expected_epoch !== 'string' || !/^[1-9]\d{0,18}$/.test(params.expected_epoch)
       || BigInt(params.expected_epoch) > 9_223_372_036_854_775_807n) throw invalid('expected_epoch must be the prepared positive owner epoch.');
     if (typeof params.manifest !== 'string' || !/^[a-f0-9]{64}$/.test(params.manifest)) throw invalid('manifest must be the prepared SHA-256 manifest digest.');
-    if (params.dry_run) return { dry_run: true, action: operation, source_id: sourceId, current: await getWorktreeBinding(engine, sourceId),
-      manifest_matches: worktreeManifest(root).digest === params.manifest, expected_epoch: params.expected_epoch };
-    await acceptWriterTransfer(engine, sourceId, root, params.expected_epoch, params.manifest);
+    if (params.dry_run) {
+      const current = await getWorktreeBinding(engine, sourceId);
+      return { dry_run: true, action: operation, source_id: sourceId, current,
+        manifest_matches: worktreeManifest(root).digest === params.manifest, expected_epoch: params.expected_epoch,
+        ...(params.self_transfer === true ? { self_transfer: true, path_matches_binding: current?.local_path === root } : {}) };
+    }
+    await acceptWriterTransfer(engine, sourceId, root, params.expected_epoch, params.manifest, undefined, { selfTransfer: params.self_transfer === true });
     return { transferred: true, binding: await getWorktreeBinding(engine, sourceId) };
   }
   if (operation === 'local_writer_list') {
