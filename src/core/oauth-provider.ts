@@ -37,7 +37,7 @@ import {
   dcrScopeViolation,
 } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
-import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions, normalizeTokenScopes } from './legacy-token-scope.ts';
+import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions, normalizeTokenScopes, parseLegacyOperationGrant } from './legacy-token-scope.ts';
 import { writeAuthAudit } from './auth-audit.ts';
 import { grantFromRow, normalizeGrantBrain, intersectGrantedScopes, type GrantPatch } from './grants/model.ts';
 import { assertValidSlugPrefixes, pgArray } from './grants/encoding.ts';
@@ -1021,6 +1021,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // — a legacy token NAMED 'gbrain_cl_*' still reports as legacy.
         tokenKind: 'legacy',
         scopes: grantedScopes ?? ['read', 'write', 'admin'],
+        ...(permissions?.allowed_operations === undefined ? {} : { allowedOperations: parseLegacyOperationGrant(permissions.allowed_operations) }),
         // v132: tenant-scoped tokens carry their REAL server-side expiry;
         // grandfathered tokens keep the historical synthetic 1yr-future value
         // (they never expire; the SDK requires a numeric expiresAt).
