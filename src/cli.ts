@@ -3242,6 +3242,11 @@ async function handleCliOnly(command: string, args: string[]) {
           await runReindexAliases(engine, args);
           break;
         }
+        if (args.includes('--code')) {
+          const { runReindexCodeCli } = await import('./commands/reindex-code.ts');
+          await runReindexCodeCli(engine, args.filter((a) => a !== '--code'));
+          break;
+        }
         const { runReindex } = await import('./commands/reindex.ts');
         await runReindex(engine, args);
         break;
