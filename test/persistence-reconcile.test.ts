@@ -436,6 +436,20 @@ test('derived page telemetry does not stale canonical preimages and CRLF-only di
   });
 }), 120_000);
 
+// Fork: rowToPage projects pages.last_retrieved_at (fork PR #2). The read-time
+// bump must neither break artifact validation nor stale the canonical preimage.
+// See src/core/persistence/reconcile-state.ts validateReconcileArtifact.
+test('retrieval telemetry (last_retrieved_at) survives artifact validation and does not stale the preview', async () => isolated(async engine => {
+  const f = await fixture(engine);
+  await engine.executeRaw(`UPDATE pages SET last_retrieved_at=NOW() - INTERVAL '1 hour' WHERE id=$1`, [f.snapshot.page.id]);
+  await local(engine, f.registration, async () => {
+    const { preview } = await runReconcilePreview(engine, { source_id: f.id, slug: f.slug });
+    expect(typeof (preview.preimages.database.page as unknown as Record<string, unknown>).last_retrieved_at).toBe('string');
+    await engine.executeRaw('UPDATE pages SET last_retrieved_at=NOW() WHERE id=$1', [f.snapshot.page.id]);
+    expect((await runReconcileApply(engine, { source_id: f.id, slug: f.slug, preview, request_id: randomUUID() })).state).toBe('committed');
+  });
+}), 120_000);
+
 test('unadmitted private backups cannot be removed through receipt administration', async () => isolated(async engine => {
   const f = await fixture(engine);
   await local(engine, f.registration, async () => {
