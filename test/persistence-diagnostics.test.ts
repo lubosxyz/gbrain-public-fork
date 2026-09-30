@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { runMigrations } from '../src/core/migrate.ts';
+import { runMigrations, LATEST_VERSION, MIGRATIONS } from '../src/core/migrate.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { submissionAuthority } from '../src/core/persistence/authority.ts';
@@ -95,12 +95,16 @@ test('fresh and upgraded engines agree on the database-only pending index', asyn
         expect(await interrupted).toBe(true);
       } finally { abort.abort(); release.resolve(); await holding; await interrupted; }
     }
-    await engine.setConfig('version', '164');
-    expect(await runMigrations(engine)).toEqual({ applied: 1, current: 165 });
+    // Derive from the migration registry (fork migrations get renumbered on every upstream merge).
+    const pendingIndex = MIGRATIONS.find((m) => m.name === 'index_database_only_pending_writes')!;
+    expect(pendingIndex).toBeDefined();
+    await engine.setConfig('version', String(pendingIndex.version - 1));
+    expect(await runMigrations(engine)).toEqual({
+      applied: MIGRATIONS.filter((m) => m.version >= pendingIndex.version).length, current: LATEST_VERSION });
     const [upgraded] = await engine.executeRaw<{ indexdef: string }>(
       "SELECT indexdef FROM pg_indexes WHERE indexname='persistence_requests_database_pending'");
     expect(upgraded.indexdef).toBe(fresh.indexdef);
-    expect(await engine.getConfig('version')).toBe('165');
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
   }
 }, 15000);
 

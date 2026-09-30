@@ -63,6 +63,17 @@ function context(remote = true) {
   return { ctx, meta };
 }
 
+// Fork contract (6f312c8ff, kept through the 0.57.1 merge): redactSearchResults runs
+// BEFORE upstream's identity-preserving redactRetrievalOutput, so a slug that itself
+// embeds a credential-shaped string is masked like every other field. Upstream
+// expects the slug verbatim; the fork deliberately trades that away because an
+// agent cannot tell a synthetic fixture from a live key once it reached a transcript.
+// Slugs without credential-shaped text are untouched (see the 'notes/synthetic' cases).
+function expectSlugRedacted(slug: string) {
+  expect(slug.includes(syntheticKey)).toBe(false);
+  expect(slug).toBe('notes/<REDACTED:openai_api_key>');
+}
+
 function expectScrubbed(result: SearchResult) {
   for (const value of [result.title, result.chunk_text, result.source_subject, result.status, result.content_flag?.detail]) {
     expect(value?.includes(syntheticKey)).toBe(false);
@@ -136,7 +147,7 @@ describe('retrieval output boundary', () => {
       const result = await operationsByName.search.handler(ctx, { query: 'synthetic' }) as SearchResult[];
       expectScrubbed(result[0]);
       expect(rows).toEqual(original);
-      expect(result[0].slug).toBe(original[0].slug);
+      expectSlugRedacted(result[0].slug);
       expect(result[0].score).toBe(original[0].score);
       expect(meta.retrieval.projection_readiness).toEqual({ status: 'ready', ready: true });
     } finally { keyword.mockRestore(); }
@@ -149,7 +160,7 @@ describe('retrieval output boundary', () => {
     const result = await operationsByName[op].handler(ctx, { query: 'synthetic', expand: false }) as SearchResult[];
     expectScrubbed(result[0]);
     expect(rows).toEqual(original);
-    expect(result[0].slug).toBe(original[0].slug);
+    expectSlugRedacted(result[0].slug);
     expect(result[0].score).toBe(original[0].score);
     expect(decodeDeepResearchId((result[0] as any).id)).toEqual({ sourceId: 'default', slug: original[0].slug });
     expect(JSON.stringify(meta).includes(syntheticKey)).toBe(false);
@@ -196,12 +207,17 @@ describe('retrieval output boundary', () => {
     expect(rows[0].chunk_text).toBe(syntheticBearer);
   });
 
-  test.each(['search', 'query'])('%s eval capture retains internal pre-redaction text', async op => {
+  test.each(['search', 'query'])('%s eval capture persists redacted text, never the raw credential', async op => {
     const { ctx } = context();
     ctx.config = { engine: 'pglite', eval: { capture: true } };
     const result = await operationsByName[op].handler(ctx, { query: 'synthetic', expand: false, snippet_chars: 12 }) as SearchResult[];
     expect(capturedRows).toHaveLength(1);
-    expect(capturedRows[0][0].chunk_text).toBe(content);
+    // Fork contract: captures are persisted to the eval tables, so the fork scrubs
+    // them with redactSearchResults before capture (upstream keeps raw text here).
+    const captured = capturedRows[0][0];
+    expect(captured.chunk_text.includes(syntheticKey)).toBe(false);
+    expect(captured.chunk_text.includes(syntheticBearer)).toBe(false);
+    expect(captured.chunk_text).toContain('<REDACTED:');
     expect(result[0].chunk_text.startsWith(content.slice(0, 20))).toBe(false);
   });
 
