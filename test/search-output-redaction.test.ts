@@ -5,6 +5,8 @@ import { operationsByName } from '../src/core/operations.ts';
 import {
   redactCredentialLikeText,
   redactSearchResults,
+  OUTPUT_REDACTION_LIMIT,
+  OUTPUT_REDACTION_MAX_FIELD_CHARS,
 } from '../src/core/search/output-redaction.ts';
 import type { SearchResult } from '../src/core/types.ts';
 
@@ -30,6 +32,7 @@ const sshPublicKey = `ssh-ed25519 ${'R'.repeat(68)} fixture-comment`;
 function resultWith(text: string): SearchResult {
   return {
     slug: 'code/example',
+    source_id: 'default',
     page_id: 1,
     title: `Credential evidence ${text}`,
     type: 'code',
@@ -66,6 +69,14 @@ describe('search output credential redaction', () => {
       expect(output).not.toContain(credential);
       expect(output).toContain('<REDACTED:');
     }
+  });
+
+  test('fork sanitation retains upstream bounds before the second output pass', () => {
+    expect(redactCredentialLikeText('x'.repeat(OUTPUT_REDACTION_MAX_FIELD_CHARS + 1))).toBe(OUTPUT_REDACTION_LIMIT);
+    const nested: Record<string, unknown> = {};
+    nested.cycle = nested;
+    const output = redactSearchResults([{ ...resultWith('ordinary'), content_flag: nested } as unknown as SearchResult]);
+    expect(JSON.stringify(output)).toContain(OUTPUT_REDACTION_LIMIT);
   });
 
   test('does not redact ordinary hashes, identifiers, or short test labels', () => {
