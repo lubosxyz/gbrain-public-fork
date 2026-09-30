@@ -52,7 +52,12 @@ async function executeMigrationStatements(engine: PGLiteEngine, sql: string): Pr
   }
 }
 
-describe('v160 — fork/upstream v131+v132 reconciliation (fork v128+tenant lanes replayed; moved from v150 in the 0.51.6.0 merge)', () => {
+// Fork migration numbers move on every upstream merge (v150 -> v160 -> v166), so look the
+// entries up by name instead of pinning a version.
+const reconciliation = () => MIGRATIONS.find((x) => x.name === 'fork_upstream_v150_reconciliation');
+const replayV150 = () => MIGRATIONS.find((x) => x.name === 'fork_replay_upstream_v150_canonical_page_revisions');
+
+describe('fork/upstream v131+v132 reconciliation (fork v128+tenant lanes replayed; number tracked by name)', () => {
   let engine: PGLiteEngine;
   beforeAll(async () => {
     engine = new PGLiteEngine();
@@ -63,15 +68,15 @@ describe('v160 — fork/upstream v131+v132 reconciliation (fork v128+tenant lane
     if (engine) await engine.disconnect();
   }, 60_000);
 
-  test('v160 entry exists, named + idempotent', () => {
-    const m = MIGRATIONS.find((x) => x.version === 160);
+  test('reconciliation entry exists, named + idempotent', () => {
+    const m = reconciliation();
     expect(m).toBeDefined();
     expect(m!.name).toBe('fork_upstream_v150_reconciliation');
     expect(m!.idempotent).toBe(true);
   });
 
-  test('LATEST_VERSION is at or above 161', () => {
-    expect(LATEST_VERSION).toBeGreaterThanOrEqual(161);
+  test('LATEST_VERSION is at or above the replay migration', () => {
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(replayV150()!.version);
   });
 
   test('table exists after initSchema with the documented columns', async () => {
@@ -99,15 +104,16 @@ describe('v160 — fork/upstream v131+v132 reconciliation (fork v128+tenant lane
     expect(rows.length).toBe(1);
   });
 
-  test('v161 replays upstream v150 (canonical page revisions) for fork brains that skipped it', () => {
-    const replay = MIGRATIONS.find((x) => x.version === 161);
+  test('replay migration re-applies upstream v150 (canonical page revisions) for fork brains that skipped it', () => {
+    const replay = replayV150();
+    expect(replay!.version).toBeGreaterThan(reconciliation()!.version);
     expect(replay?.name).toBe('fork_replay_upstream_v150_canonical_page_revisions');
     expect(replay?.idempotent).toBe(true);
     expect(replay?.sql).toBe(MIGRATIONS.find((x) => x.version === 150)!.sql);
   });
 
   test('re-running the migration SQL is a no-op (idempotent CREATE TABLE IF NOT EXISTS)', async () => {
-    const m = MIGRATIONS.find((x) => x.version === 160)!;
+    const m = reconciliation()!;
     await expect(executeMigrationStatements(engine, m.sql)).resolves.toBeUndefined();
   });
 });
@@ -244,7 +250,7 @@ describe('purgeStaleMcpRequestLog', () => {
       expect(left.length).toBe(1);
     } finally {
       // Restore the table so later tests in this file aren't affected.
-      const m = MIGRATIONS.find((x) => x.version === 160)!;
+      const m = reconciliation()!;
       await executeMigrationStatements(engine, m.sql);
     }
   });
