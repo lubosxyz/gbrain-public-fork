@@ -13,6 +13,7 @@ import { getFtsLanguage } from '../fts-language.ts';
 import { getEmbeddingModel } from '../ai/gateway.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
 import { planEmbeddingReuse } from '../embed-reuse.ts';
+import { parseEmbedding } from '../utils.ts';
 
 /** Complete the searchable snapshot only after its sanitized chunks are installed. */
 export async function sealPageTextProjection(engine: BrainEngine, slug: string, sourceId: string): Promise<void> {
@@ -82,17 +83,23 @@ export async function readProjectionSnapshot(engine: BrainEngine, slug: string, 
  * Carry stored vectors onto re-chunked code whose header-stripped body is unchanged, so a
  * metadata repair costs no embedding calls. installPageProjection only keeps rows whose
  * index and symbol metadata are identical, which never holds when metadata is being restored.
- * Only vectors of the active model are reused; contextual retrieval embeds other text.
+ * Reads the active column and applies installPageProjection's validity rule (model and text
+ * hash), so a stale or foreign vector is never re-stamped as current.
  */
 export async function reuseStoredEmbeddings(engine: BrainEngine, prepared: ProjectionSnapshot, chunks: ChunkInput[]): Promise<void> {
   const { page } = prepared.snapshot;
   if (![null, undefined, 'none'].includes(page.contextual_retrieval_mode)) return;
-  const model = prepared.embeddingColumn.name === 'embedding' ? prepared.embeddingModel : prepared.embeddingColumn.embeddingModel;
+  const column = prepared.embeddingColumn;
+  const model = column.name === 'embedding' ? prepared.embeddingModel : column.embeddingModel;
   if (!model) return;
-  const stored = await engine.getChunks(page.slug, { sourceId: page.source_id, includeEmbedding: true, includeUnsealed: true });
-  const { reuse } = planEmbeddingReuse(stored.filter(chunk => chunk.model === model), chunks);
-  for (const [i, matched] of reuse) {
-    chunks[i]!.embedding = matched.embedding as Float32Array;
+  const col = quoteIdentifier(column.name);
+  const rows = await engine.executeRaw<{ chunk_text: string; token_count: number | null; embedding: string }>(
+    `SELECT chunk_text, token_count, ${col}::text AS embedding FROM content_chunks WHERE page_id=$1 AND model=$2
+      AND ${col} IS NOT NULL AND (embedded_text_hash IS NULL OR embedded_text_hash = md5(chunk_text)) ORDER BY chunk_index`,
+    [page.id, model]);
+  const stored = rows.map(row => ({ chunk_text: row.chunk_text, token_count: row.token_count, embedding: parseEmbedding(row.embedding) }));
+  for (const [i, matched] of planEmbeddingReuse(stored, chunks).reuse) {
+    chunks[i]!.embedding = matched.embedding!;
     chunks[i]!.token_count = matched.token_count ?? undefined;
     chunks[i]!.model = model;
   }

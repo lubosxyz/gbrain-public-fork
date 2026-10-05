@@ -247,4 +247,28 @@ describe('code metadata repair path', () => {
         WHERE page_id = (SELECT id FROM pages WHERE slug = $1)`, [slug]);
     }
   });
+  test('reindex --code --force never reuses a vector whose text hash is stale', async () => {
+    const staleRel = 'src/stale.ts';
+    const staleFile = join(tmpDir, 'stale.ts');
+    const slug = 'src-stale-ts';
+    writeFileSync(staleFile, 'export function epsilon(): number {\n  return 5;\n}\n');
+    mockEmbedBatchFn = async (texts: string[]) => texts.map(() => new Float32Array(1536).fill(0.11));
+    await importFromFile(engine, staleFile, staleRel, {});
+    const pageId = `(SELECT id FROM pages WHERE slug = $1)`;
+    for (const noEmbed of [true, false]) {
+      await engine.executeRaw(`UPDATE content_chunks SET symbol_name_qualified = NULL, embedded_text_hash = 'stale' WHERE page_id = ${pageId}`, [slug]);
+      embedBatchCalls = [];
+      mockEmbedBatchFn = async (texts: string[]) => texts.map(() => new Float32Array(1536).fill(0.55));
+      expect((await reindexCodeProjection(engine, slug, 'default', { force: true, noEmbed })).status).toBe('imported');
+      const repaired = await engine.getChunks(slug, { includeEmbedding: true, includeUnsealed: true });
+      expect(repaired.map((c) => c.symbol_name_qualified)).toEqual(['epsilon']);
+      if (noEmbed) {
+        expect(embedBatchCalls.length).toBe(0);
+        expect(repaired.every((c) => c.embedding === null)).toBe(true);
+      } else {
+        expect(embedBatchCalls.length).toBe(1);
+        expect(repaired.every((c) => c.embedding !== null && Math.abs(c.embedding[0]! - 0.55) < 1e-6)).toBe(true);
+      }
+    }
+  });
 });
