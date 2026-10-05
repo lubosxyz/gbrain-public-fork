@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll, mock } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, mock, spyOn } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -20,7 +20,7 @@ mock.module('../src/core/embed-retry.ts', () => ({
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromFile } from '../src/core/import-file.ts';
-import { validateReindexModeScope } from '../src/commands/reindex.ts';
+import { validateReindexModeScope, dispatchReindex } from '../src/commands/reindex.ts';
 import { runReindexCode } from '../src/commands/reindex-code.ts';
 import { reindexCodeProjection } from '../src/core/persistence/projection-reindex.ts';
 
@@ -255,7 +255,9 @@ describe('code metadata repair path', () => {
     mockEmbedBatchFn = async (texts: string[]) => texts.map(() => new Float32Array(1536).fill(0.11));
     await importFromFile(engine, staleFile, staleRel, {});
     const pageId = `(SELECT id FROM pages WHERE slug = $1)`;
-    for (const noEmbed of [true, false]) {
+    // Embed mode first: both passes then start from a stored vector (0.11, later 0.55) marked stale.
+    for (const noEmbed of [false, true]) {
+      expect((await engine.getChunks(slug, { includeEmbedding: true, includeUnsealed: true })).every((c) => c.embedding !== null)).toBe(true);
       await engine.executeRaw(`UPDATE content_chunks SET symbol_name_qualified = NULL, embedded_text_hash = 'stale' WHERE page_id = ${pageId}`, [slug]);
       embedBatchCalls = [];
       mockEmbedBatchFn = async (texts: string[]) => texts.map(() => new Float32Array(1536).fill(0.55));
@@ -270,5 +272,43 @@ describe('code metadata repair path', () => {
         expect(repaired.every((c) => c.embedding !== null && Math.abs(c.embedding[0]! - 0.55) < 1e-6)).toBe(true);
       }
     }
+  });
+  // Value: protects=a code edit re-embeds only the changed chunk and the untouched neighbour keeps its vector at its own index; fails_when=importCodeFile stops reading stored vectors or maps a reused vector onto the wrong chunk; why_new=existing repair tests only cover fully unchanged files; seam=none
+  test('editing one function re-embeds only that chunk and keeps the unchanged neighbour vector', async () => {
+    const partialFile = join(tmpDir, 'partial.ts');
+    const slug = 'src-partial-ts';
+    writeFileSync(partialFile, 'export function iota(): number {\n  return 1;\n}\n\nexport function kappa(): number {\n  return 2;\n}\n');
+    mockEmbedBatchFn = async (texts: string[]) => texts.map(() => new Float32Array(1536).fill(0.21));
+    await importFromFile(engine, partialFile, 'src/partial.ts', {});
+    writeFileSync(partialFile, 'export function iota(): number {\n  return 1;\n}\n\nexport function kappa(): number {\n  return 3;\n}\n');
+    embedBatchCalls = [];
+    mockEmbedBatchFn = async (texts: string[]) => texts.map(() => new Float32Array(1536).fill(0.77));
+    expect((await importFromFile(engine, partialFile, 'src/partial.ts', {})).status).toBe('imported');
+    expect(embedBatchCalls.flat().length).toBe(1);
+    expect(embedBatchCalls.flat()[0]).toContain('return 3');
+    const chunks = await engine.getChunks(slug, { includeEmbedding: true, includeUnsealed: true });
+    const vectorOf = (name: string) => chunks.find((c) => c.symbol_name_qualified === name)!.embedding![0];
+    expect(vectorOf('iota')).toBeCloseTo(0.21);
+    expect(vectorOf('kappa')).toBeCloseTo(0.77);
+  });
+  // Value: protects=`gbrain reindex --code` reaches the code reindexer while `--markdown` stays on the markdown reindexer; fails_when=dispatchReindex routes --code to runReindex (which demands --markdown) or sends markdown args to runReindexCodeCli; why_new=the dispatch moved out of cli.ts's untestable switch and no test exercised it; seam=none
+  test('dispatchReindex routes --code to the code reindexer and --markdown to the markdown reindexer', async () => {
+    const lines: string[] = [];
+    const log = spyOn(console, 'log').mockImplementation((...a: unknown[]) => { lines.push(a.join(' ')); });
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
+    const dispatchFile = join(tmpDir, 'dispatch.ts');
+    writeFileSync(dispatchFile, 'export function zeta(): number {\n  return 6;\n}\n');
+    await importFromFile(engine, dispatchFile, 'src/dispatch.ts', { noEmbed: true });
+    try {
+      await dispatchReindex(engine, ['--code', '--dry-run', '--json']);
+      const code = JSON.parse(lines.join('\n'));
+      expect(code.status).toBe('dry_run');
+      expect(code.codePages).toBeGreaterThan(0);
+      lines.length = 0;
+      await dispatchReindex(engine, ['--markdown', '--dry-run', '--json']);
+      const markdown = JSON.parse(lines.join('\n'));
+      expect(markdown.chunker_version).toBeDefined();
+      expect(markdown.codePages).toBeUndefined();
+    } finally { log.mockRestore(); write.mockRestore(); }
   });
 });

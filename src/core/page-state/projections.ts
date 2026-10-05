@@ -79,6 +79,9 @@ export async function readProjectionSnapshot(engine: BrainEngine, slug: string, 
   });
 }
 
+/** Contextual chunks embed a page-dependent prefix, so their stored vectors are never carried over. */
+const contextualRetrievalActive = (mode: string | null | undefined) => ![null, undefined, 'none'].includes(mode);
+
 /**
  * Carry stored vectors onto re-chunked code whose header-stripped body is unchanged, so a
  * metadata repair costs no embedding calls. installPageProjection only keeps rows whose
@@ -88,7 +91,7 @@ export async function readProjectionSnapshot(engine: BrainEngine, slug: string, 
  */
 export async function reuseStoredEmbeddings(engine: BrainEngine, prepared: ProjectionSnapshot, chunks: ChunkInput[]): Promise<void> {
   const { page } = prepared.snapshot;
-  if (![null, undefined, 'none'].includes(page.contextual_retrieval_mode)) return;
+  if (contextualRetrievalActive(page.contextual_retrieval_mode)) return;
   const column = prepared.embeddingColumn;
   const model = column.name === 'embedding' ? prepared.embeddingModel : column.embeddingModel;
   if (!model) return;
@@ -144,7 +147,7 @@ export async function installPageProjection(engine: BrainEngine, prepared: Proje
         embedded_at=NULL,embedded_text_hash=NULL WHERE page_id=$1 AND
         (model IS DISTINCT FROM $2 OR embedded_text_hash <> md5(chunk_text) OR $3::boolean)`,
       [snapshot.page.id, context.column.name === 'embedding' ? context.model : context.column.embeddingModel,
-        ![null, undefined, 'none'].includes(snapshot.page.contextual_retrieval_mode)]);
+        contextualRetrievalActive(snapshot.page.contextual_retrieval_mode)]);
     } else if (opts.seal) await tx.deleteChunks(slug, { sourceId });
     await tx.upsertChunks(slug, chunks, { sourceId, expectedRevision: snapshot.revision, embeddingColumn: context.column });
     if (opts.code) await installCodeChunkEdges(tx, slug, sourceId, opts.code);
