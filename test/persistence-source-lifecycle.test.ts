@@ -158,16 +158,20 @@ test('reclone refuses a renumbered device before cloning or moving the active ch
   expect(await reclone()).toMatchObject({state:'committed',cloned:true});expect(leftovers(home)).toEqual([]);
 }),60_000);
 
-test('a device renumbered during clone preparation fails the reclone and leaves the checkout active',()=>fixture(async(home,source,root)=>{
+test('a device renumbered during clone preparation never moves the active checkout',()=>fixture(async(home,source,root)=>{
+  // macOS tolerates the drift while aborting in place, so the worktree returns to active; elsewhere the
+  // device stays part of the identity and the abort keeps the clone in recovery. Neither moves the checkout.
   await engine.executeRaw('UPDATE sources SET config=$2::text::jsonb WHERE id=$1',[source,JSON.stringify({managed_clone:true,remote_url:'https://example.invalid/brain.git'})]);
   const input={operation:'reclone' as const,sourceId:source,requestId:randomUUID()};
-  const result=await runManagedSourceClone(engine,input,await topologyPrincipal(engine),input.requestId,{...input,requestId:undefined,dryRun:undefined},{
+  const result=runManagedSourceClone(engine,input,await topologyPrincipal(engine),input.requestId,{...input,requestId:undefined,dryRun:undefined},{
     clone:async(_url,stage)=>{cpSync(root,stage,{recursive:true,filter:path=>!isPhysicalRootMetadata(basename(path))});},
     boundary:async(name)=>{if(name==='reserved')renumberStampDevice(root);},
   });
-  expect(result).toMatchObject({state:'failed'});
-  expect(readFileSync(join(root,'example.md'),'utf8')).toContain('Canonical');expect(leftovers(home)).toEqual([]);
-  expect((await getWorktreeBinding(engine,source))!.state).toBe('active');
+  if(process.platform==='darwin')expect(await result).toMatchObject({state:'failed'});
+  else await expect(result).rejects.toMatchObject({code:'recovery_required'});
+  expect(readFileSync(join(root,'example.md'),'utf8')).toContain('Canonical');
+  expect(readdirSync(home).filter(name=>name.includes('gbrain-old'))).toEqual([]);
+  expect((await getWorktreeBinding(engine,source))!.state).toBe(process.platform==='darwin'?'active':'recovering');
 }),60_000);
 
 test('stale cloned bytes fail before touching the active worktree and preserve a permanent failure receipt',()=>fixture(async(_home,source,root)=>{
