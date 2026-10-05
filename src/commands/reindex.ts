@@ -34,6 +34,7 @@ import { resolve } from 'path';
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
+import { REINDEX_CODE_BOOLEAN_FLAGS, REINDEX_CODE_VALUE_FLAGS } from './reindex-code.ts';
 
 interface ReindexOpts {
   /** Cap total pages reindexed. Useful for triage runs on huge brains. */
@@ -89,7 +90,9 @@ TARGETS (exactly one required)
                     current chunker (or whose contextual-retrieval state is
                     unset when embedding is on).
   --code            Re-chunk code pages (delegates to reindex-code; pass
-                    --force to bypass content_hash early-return).
+                    --force to bypass content_hash early-return). Accepts
+                    exactly reindex-code's flags, including its embedding
+                    budget cap; see \`gbrain reindex-code --help\`.
   --multimodal      Re-embed image/PDF chunks through the multimodal
                     embedding pipeline (Voyage batches).
   --aliases         Backfill the free-text alias layer (page_aliases) for
@@ -97,7 +100,7 @@ TARGETS (exactly one required)
 
 OPTIONS
   --type <t>        --markdown only: restrict to one page type
-  --limit N         Not --code: cap pages/chunks processed this run
+  --limit N         --markdown / --multimodal / --aliases: cap pages/chunks processed this run
   --workers N       --code / --multimodal: parallel UPDATEs per batch
                     (--concurrency is an alias)
   --dry-run         Report what would change; write nothing
@@ -118,7 +121,7 @@ export function printReindexHelp(): void {
   console.log(REINDEX_HELP);
 }
 
-const REINDEX_VALUE_FLAGS = new Set(['--type', '--limit', '--repo', '--workers', '--concurrency', '--source']);
+const REINDEX_VALUE_FLAGS = new Set<string>(['--type', '--limit', '--repo', ...REINDEX_CODE_VALUE_FLAGS]);
 
 export function normalizeReindexArgs(args: string[]): string[] {
   return args.flatMap((arg) => {
@@ -142,11 +145,23 @@ function pendingDriftPredicate(noEmbed: boolean): string {
     : '(chunker_version < $1 OR contextual_retrieval_mode IS NULL)';
 }
 
-export function validateReindexModeScope(args: string[]): string | null {
+/**
+ * `--code` delegates to reindex-code, which reads exact tokens and ignores anything else, so an
+ * accepted-but-unread flag (a page cap, a `--dry-run=true`) would silently run a full, possibly paid,
+ * rebuild. `codeFlags` is reindex-code's own flag registry; without it only the markdown scope flags
+ * are refused.
+ */
+export function validateReindexModeScope(args: string[], codeFlags?: readonly string[]): string | null {
   args = normalizeReindexArgs(args);
-  // reindex-code has no page cap or repo override; refusing beats silently running the whole source.
-  const codeOnlyUnsupported = args.includes('--code') && ['--limit', '--repo'].find(f => args.includes(f));
-  if (codeOnlyUnsupported) return `${codeOnlyUnsupported} is not supported with reindex --code`;
+  if (args.includes('--code')) {
+    const otherTarget = ['--markdown', '--multimodal', '--aliases'].find(f => args.includes(f));
+    if (otherTarget) return `--code cannot be combined with ${otherTarget}`;
+    for (const arg of args.filter(a => a.startsWith('--') && a !== '--code')) {
+      const flag = arg.split('=')[0]!;
+      if (codeFlags ? !codeFlags.includes(flag) : ['--limit', '--repo'].includes(flag)) return `${flag} is not supported with reindex --code`;
+      if (arg !== flag && (REINDEX_CODE_BOOLEAN_FLAGS as readonly string[]).includes(flag)) return `${flag} takes no value with reindex --code`;
+    }
+  }
   if (!args.includes('--type')) return null;
   if (args.includes('--multimodal')) return '--type is only supported with reindex --markdown, not --multimodal';
   if (args.includes('--aliases')) return '--type is only supported with reindex --markdown, not --aliases';

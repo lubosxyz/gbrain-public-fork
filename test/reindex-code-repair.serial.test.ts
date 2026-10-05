@@ -20,7 +20,8 @@ mock.module('../src/core/embed-retry.ts', () => ({
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromFile } from '../src/core/import-file.ts';
-import { validateReindexModeScope, dispatchReindex } from '../src/commands/reindex.ts';
+import { validateReindexModeScope, dispatchReindex, normalizeReindexArgs } from '../src/commands/reindex.ts';
+import { CLI_FLAG_REGISTRY } from '../src/core/cli-flag-registry.generated.ts';
 import { runReindexCode } from '../src/commands/reindex-code.ts';
 import { reindexCodeProjection } from '../src/core/persistence/projection-reindex.ts';
 
@@ -76,6 +77,21 @@ describe('code metadata repair path', () => {
       expect(validateReindexModeScope(args)).toContain('is not supported with reindex --code');
     }
     expect(validateReindexModeScope(['--markdown', '--limit', '5'])).toBeNull();
+    // With reindex-code's registry (what the CLI passes), --code accepts exactly reindex-code's flags.
+    const codeFlags = CLI_FLAG_REGISTRY['reindex-code'];
+    expect(validateReindexModeScope(['--code', '--source', 'x', '--workers', '2', '--force', '--no-embed', '--yes', '--json', '--max-cost', '5'], codeFlags)).toBeNull();
+    expect(normalizeReindexArgs(['--code', '--max-cost=5', '--max-cost-usd=off'])).toEqual(['--code', '--max-cost', '5', '--max-cost-usd', 'off']);
+    expect(validateReindexModeScope(['--code', '--max-cost=5'], codeFlags)).toBeNull();
+    for (const [args, message] of [
+      [['--code', '--dry-run=true', '--yes'], '--dry-run takes no value'],
+      [['--code', '--cost-estimate', '--yes'], '--cost-estimate is not supported'],
+      [['--code', '--force-rechunk'], '--force-rechunk is not supported'],
+      [['--code', '--limit', '5'], '--limit is not supported'],
+      [['--code', '--multimodal'], '--code cannot be combined with --multimodal'],
+      [['--code', '--markdown'], '--code cannot be combined with --markdown'],
+    ] as const) {
+      expect(validateReindexModeScope([...args], codeFlags)).toContain(message);
+    }
 
     // runReindexCode with --dry-run
     const result = await runReindexCode(engine, { dryRun: true });

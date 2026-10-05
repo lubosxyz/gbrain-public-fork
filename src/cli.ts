@@ -3203,7 +3203,7 @@ async function handleCliOnly(command: string, args: string[]) {
       }
       case 'reindex': {
         const reindex = await import('./commands/reindex.ts'); args = reindex.normalizeReindexArgs(args);
-        const scopeError = reindex.validateReindexModeScope(args);
+        const scopeError = reindex.validateReindexModeScope(args, CLI_FLAG_REGISTRY['reindex-code']);
         if (scopeError) { process.stderr.write(`[reindex] ${scopeError}\n`); setCliExitVerdict(2); break; }
         if (args.includes('--multimodal')) {
           const { runReindexMultimodal } = await import('./commands/reindex-multimodal.ts');
