@@ -469,6 +469,14 @@ This is not an automatic takeover or a way to rewrite the original reservation
 owner. Wrong identity, changed tokens, malformed physical records or uncertain
 liveness refuse. The native lock derives from the database binding.
 
+On macOS, a reboot can renumber the APFS volume (`st_dev`) under an unchanged
+checkout. Writes accept that device-only difference when the canonical path,
+private token, inode and birth time all still match, so no self-transfer is
+needed after a restart. Copies and moves still refuse; a block-level clone or
+snapshot of the whole volume mounted at the same path is not distinguished.
+Other platforms keep the device in the identity and need the reviewed
+self-transfer below.
+
 ```bash
 gbrain sources writer transfer prepare default --brain host --self-transfer \
   --admin-intent writer_transfer_prepare --expected-state <reviewed-admin-state> --dry-run --json
