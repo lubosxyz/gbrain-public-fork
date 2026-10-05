@@ -22,6 +22,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromFile } from '../src/core/import-file.ts';
 import { validateReindexModeScope } from '../src/commands/reindex.ts';
 import { runReindexCode } from '../src/commands/reindex-code.ts';
+import { reindexCodeProjection } from '../src/core/persistence/projection-reindex.ts';
 
 describe('code metadata repair path', () => {
   let engine: PGLiteEngine;
@@ -212,5 +213,38 @@ describe('code metadata repair path', () => {
     expect(afterChunks.length).toBeGreaterThan(0);
     expect(afterChunks[0]!.embedding).not.toBeNull();
     expect(afterChunks[0]!.embedding![0]).toBeCloseTo(0.42);
+  });
+
+  test('reindex --code --force restores wiped metadata without any embedding call', async () => {
+    const repairRel = 'src/repair.ts';
+    const repairFile = join(tmpDir, 'repair.ts');
+    const slug = 'src-repair-ts';
+    writeFileSync(repairFile, 'export function gamma(): number {\n  return 7;\n}\n\nexport function delta(): number {\n  return 8;\n}\n');
+    embedBatchCalls = [];
+    mockEmbedBatchFn = async (texts: string[]) => texts.map(() => new Float32Array(1536).fill(0.33));
+    await importFromFile(engine, repairFile, repairRel, {});
+    expect(embedBatchCalls.length).toBe(1);
+    const embedded = await engine.getChunks(slug, { includeEmbedding: true, includeUnsealed: true });
+    expect(embedded.length).toBe(2);
+    expect(embedded.every((c) => c.embedding && c.model)).toBe(true);
+
+    // Simulate the metadata-blind writer: same text and vectors, symbol columns gone.
+    await engine.executeRaw(`UPDATE content_chunks SET symbol_name = NULL, symbol_type = NULL, language = NULL,
+      symbol_name_qualified = NULL, parent_symbol_path = NULL WHERE page_id = (SELECT id FROM pages WHERE slug = $1)`, [slug]);
+
+    for (const noEmbed of [false, true]) {
+      embedBatchCalls = [];
+      const res = await reindexCodeProjection(engine, slug, 'default', { force: true, noEmbed });
+      expect(res.status).toBe('imported');
+      expect(embedBatchCalls.length).toBe(0);
+      const repaired = await engine.getChunks(slug, { includeEmbedding: true, includeUnsealed: true });
+      expect(repaired.map((c) => c.symbol_name_qualified).sort()).toEqual(['delta', 'gamma']);
+      for (const chunk of repaired) {
+        expect(chunk.embedding).not.toBeNull();
+        expect(chunk.embedding![0]).toBeCloseTo(0.33);
+      }
+      await engine.executeRaw(`UPDATE content_chunks SET symbol_name = NULL, symbol_name_qualified = NULL, language = NULL
+        WHERE page_id = (SELECT id FROM pages WHERE slug = $1)`, [slug]);
+    }
   });
 });

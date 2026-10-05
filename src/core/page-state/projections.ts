@@ -12,6 +12,7 @@ import { quoteIdentifier, resolveWriteColumnFromConfigRows, vectorCastSuffix } f
 import { getFtsLanguage } from '../fts-language.ts';
 import { getEmbeddingModel } from '../ai/gateway.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
+import { planEmbeddingReuse } from '../embed-reuse.ts';
 
 /** Complete the searchable snapshot only after its sanitized chunks are installed. */
 export async function sealPageTextProjection(engine: BrainEngine, slug: string, sourceId: string): Promise<void> {
@@ -75,6 +76,26 @@ export async function readProjectionSnapshot(engine: BrainEngine, slug: string, 
     return { snapshot, chunks: await tx.getChunks(slug, { sourceId, includeUnsealed: true }), indexingContext: context.key,
       embeddingModel: context.model, embeddingColumn: context.column, maxChunkTokens: context.maxChunkTokens, maxChunkTokensOverride: opts.maxChunkTokens, pageKind: context.pageKind };
   });
+}
+
+/**
+ * Carry stored vectors onto re-chunked code whose header-stripped body is unchanged, so a
+ * metadata repair costs no embedding calls. installPageProjection only keeps rows whose
+ * index and symbol metadata are identical, which never holds when metadata is being restored.
+ * Only vectors of the active model are reused; contextual retrieval embeds other text.
+ */
+export async function reuseStoredEmbeddings(engine: BrainEngine, prepared: ProjectionSnapshot, chunks: ChunkInput[]): Promise<void> {
+  const { page } = prepared.snapshot;
+  if (![null, undefined, 'none'].includes(page.contextual_retrieval_mode)) return;
+  const model = prepared.embeddingColumn.name === 'embedding' ? prepared.embeddingModel : prepared.embeddingColumn.embeddingModel;
+  if (!model) return;
+  const stored = await engine.getChunks(page.slug, { sourceId: page.source_id, includeEmbedding: true, includeUnsealed: true });
+  const { reuse } = planEmbeddingReuse(stored.filter(chunk => chunk.model === model), chunks);
+  for (const [i, matched] of reuse) {
+    chunks[i]!.embedding = matched.embedding as Float32Array;
+    chunks[i]!.token_count = matched.token_count ?? undefined;
+    chunks[i]!.model = model;
+  }
 }
 
 /** No provider work under the guard. Delayed derived results lose to newer content. */

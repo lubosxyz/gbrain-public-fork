@@ -280,6 +280,16 @@ async function readBatch(
   );
 }
 
+/** CLI entry for `--markdown` and `--code`; `--code` delegates to reindex-code with its own flags. */
+export async function dispatchReindex(engine: BrainEngine, args: string[]): Promise<void> {
+  if (args.includes('--code')) {
+    const { runReindexCodeCli } = await import('./reindex-code.ts');
+    await runReindexCodeCli(engine, args.filter((a) => a !== '--code'));
+    return;
+  }
+  await runReindex(engine, args);
+}
+
 export async function runReindex(engine: BrainEngine, args: string[]): Promise<ReindexResult> {
   args = normalizeReindexArgs(args);
   const invalidType = args.some((arg, index) =>
