@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { isPhysicalRootMetadata } from '../src/core/persistence/physical-root.ts';
+import { PHYSICAL_ROOT_MARKER } from '../src/core/persistence/physical-root-record.ts';
 import { tmpdir } from 'node:os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
@@ -112,6 +113,65 @@ test('clone publication rolls forward after the directory rename and retains exa
   expect(readFileSync(join(root,'example.md'),'utf8')).toContain('Canonical');
   expect(readdirSync(home).some(name=>name.includes('gbrain-old')||name.startsWith('.gbrain-clone'))).toBe(false);
   expect((await engine.executeRaw<{recovery_bytes:string}>("SELECT recovery_bytes::text FROM persistence_counters WHERE key='brain'"))[0].recovery_bytes).toBe('0');
+}),60_000);
+
+test('post-commit cleanup retains the old checkout when its recorded device changed',()=>fixture(async(home,source,root)=>{
+  // A macOS reboot between commit and cleanup renumbers st_dev. Writes tolerate that, but deleting
+  // the retained old checkout must not: cleanup stops and keeps its bytes for manual recovery.
+  await engine.executeRaw('UPDATE sources SET config=$2::text::jsonb WHERE id=$1',[source,JSON.stringify({managed_clone:true,remote_url:'https://example.invalid/brain.git'})]);
+  const input={operation:'reclone' as const,sourceId:source,requestId:randomUUID()};
+  const aside=()=>readdirSync(home).filter(name=>name.includes('gbrain-old')).map(name=>join(home,name));
+  await expect(runManagedSourceClone(engine,input,await topologyPrincipal(engine),input.requestId,{...input,requestId:undefined,dryRun:undefined},{
+    clone:async(_url,stage)=>{cpSync(root,stage,{recursive:true,filter:path=>!isPhysicalRootMetadata(basename(path))});},
+    boundary:async(name)=>{
+      if(name!=='committed')return;
+      const stamp=join(aside()[0],PHYSICAL_ROOT_MARKER),value=JSON.parse(readFileSync(stamp,'utf8'));
+      writeFileSync(stamp,JSON.stringify({...value,device:String(BigInt(value.device)+7n)}));
+    },
+  })).rejects.toMatchObject({code:'recovery_required'});
+  expect(aside()).toHaveLength(1);
+  expect(readFileSync(join(aside()[0],'example.md'),'utf8')).toContain('Canonical');
+}),60_000);
+
+function renumberStampDevice(directory:string):string{
+  const stamp=join(directory,PHYSICAL_ROOT_MARKER),original=readFileSync(stamp,'utf8'),value=JSON.parse(original);
+  writeFileSync(stamp,JSON.stringify({...value,device:String(BigInt(value.device)+7n)}));
+  return original;
+}
+const leftovers=(home:string)=>readdirSync(home).filter(name=>name.includes('gbrain-old')||name.startsWith('.gbrain-clone'));
+
+test('reclone refuses a renumbered device before cloning or moving the active checkout',()=>fixture(async(home,source,root)=>{
+  // Writes tolerate a macOS reboot, but recloning renames the checkout aside: re-stamp first, never get stuck recovering.
+  await engine.executeRaw('UPDATE sources SET config=$2::text::jsonb WHERE id=$1',[source,JSON.stringify({managed_clone:true,remote_url:'https://example.invalid/brain.git'})]);
+  const original=renumberStampDevice(root);
+  let providerCalls=0;
+  const reclone=async()=>{
+    const input={operation:'reclone' as const,sourceId:source,requestId:randomUUID()};
+    return runManagedSourceClone(engine,input,await topologyPrincipal(engine),input.requestId,{...input,requestId:undefined,dryRun:undefined},{
+      clone:async(_url,stage)=>{providerCalls++;cpSync(root,stage,{recursive:true,filter:path=>!isPhysicalRootMetadata(basename(path))});},
+    });
+  };
+  await expect(reclone()).rejects.toMatchObject({code:'recovery_required',message:expect.stringContaining('device identifier')});
+  expect(providerCalls).toBe(0);expect(leftovers(home)).toEqual([]);
+  expect((await getWorktreeBinding(engine,source))!.state).toBe('active');
+  writeFileSync(join(root,PHYSICAL_ROOT_MARKER),original);
+  expect(await reclone()).toMatchObject({state:'committed',cloned:true});expect(leftovers(home)).toEqual([]);
+}),60_000);
+
+test('a device renumbered during clone preparation never moves the active checkout',()=>fixture(async(home,source,root)=>{
+  // macOS tolerates the drift while aborting in place, so the worktree returns to active; elsewhere the
+  // device stays part of the identity and the abort keeps the clone in recovery. Neither moves the checkout.
+  await engine.executeRaw('UPDATE sources SET config=$2::text::jsonb WHERE id=$1',[source,JSON.stringify({managed_clone:true,remote_url:'https://example.invalid/brain.git'})]);
+  const input={operation:'reclone' as const,sourceId:source,requestId:randomUUID()};
+  const result=runManagedSourceClone(engine,input,await topologyPrincipal(engine),input.requestId,{...input,requestId:undefined,dryRun:undefined},{
+    clone:async(_url,stage)=>{cpSync(root,stage,{recursive:true,filter:path=>!isPhysicalRootMetadata(basename(path))});},
+    boundary:async(name)=>{if(name==='reserved')renumberStampDevice(root);},
+  });
+  if(process.platform==='darwin')expect(await result).toMatchObject({state:'failed'});
+  else await expect(result).rejects.toMatchObject({code:'recovery_required'});
+  expect(readFileSync(join(root,'example.md'),'utf8')).toContain('Canonical');
+  expect(readdirSync(home).filter(name=>name.includes('gbrain-old'))).toEqual([]);
+  expect((await getWorktreeBinding(engine,source))!.state).toBe(process.platform==='darwin'?'active':'recovering');
 }),60_000);
 
 test('stale cloned bytes fail before touching the active worktree and preserve a permanent failure receipt',()=>fixture(async(_home,source,root)=>{

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { SqlEngine } from './model.ts';
 import { coordinationLockPath } from './coordination-lock.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
-import { adoptTransferredRootStamp, assertNoPhysicalRootOverlap, assertPhysicalRoot, assertPhysicalRootStamp, PHYSICAL_ROOT_MARKER, physicalRootError,
+import { adoptTransferredRootStamp, assertNoPhysicalRootOverlap, assertPhysicalRoot, assertPhysicalRootStamp, PHYSICAL_ROOT_MARKER, physicalRootError, sameRootDevice,
   readPhysicalRootReservation, repairReservationCoordinationPath, reservePhysicalRootRecord, writePhysicalRootStamp, type PhysicalRootReservation } from './physical-root-record.ts';
 
 export { assertPhysicalRoot, coordinationLockIsInsideRoot, isPhysicalRootMetadata, readPhysicalRootReservation, repairReservationCoordinationPath, reservationRepairGuardPath } from './physical-root-record.ts';
@@ -49,7 +49,7 @@ export async function claimPhysicalRoot(tx: SqlEngine, path: string, opts: Physi
   }
   else {
     const info = statSync(reservation.root, { bigint: true });
-    if (reservation.initialDevice !== info.dev.toString() || reservation.initialInode !== info.ino.toString() || reservation.initialBirth !== info.birthtimeNs.toString()) throw physicalRootError();
+    if (!sameRootDevice(reservation.initialDevice, info.dev) || reservation.initialInode !== info.ino.toString() || reservation.initialBirth !== info.birthtimeNs.toString()) throw physicalRootError();
     writePhysicalRootStamp(reservation.root, reservation);
   }
   return reservation;
@@ -64,7 +64,7 @@ export async function preparePhysicalRootReplacement(tx: SqlEngine, stage: strin
   const reservation = await reservePhysicalRoot(tx, target, opts);
   const [owner] = await tx.executeRaw<{ owner_host_id: string; state: string }>('SELECT owner_host_id,state FROM persistence_worktrees WHERE id=$1::uuid', [opts.worktreeId]);
   if (owner?.owner_host_id !== opts.hostId || owner.state !== 'recovering') throw physicalRootError('A directory replacement requires durable source recovery.');
-  if (existsSync(target)) assertPhysicalRoot(target, opts);
+  if (existsSync(target)) assertPhysicalRoot(target, opts, true);
   writePhysicalRootStamp(stage, reservation);
   assertPhysicalRootStamp(stage, reservation);
 }

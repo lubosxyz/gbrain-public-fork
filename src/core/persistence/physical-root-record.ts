@@ -168,13 +168,29 @@ export function writePhysicalRootStamp(directory: string, reservation: PhysicalR
   createPrivate(join(directory, PHYSICAL_ROOT_MARKER), stamp);
   assertPhysicalRootStamp(directory, reservation);
 }
-/** directory may be a verified staging directory; its stamp always names the final root. */
-export function assertPhysicalRootStamp(directory: string, reservation: PhysicalRootReservation): void {
+/**
+ * Whether a recorded st_dev still names the volume a checkout lives on. APFS numbers volumes at
+ * mount time, so a macOS reboot can renumber an unchanged checkout; there a well-formed
+ * device-only difference is accepted and the canonical path, inode, birth time and private token
+ * remain the identity. Ordinary copies and moves still refuse, but a block-level clone or
+ * snapshot of the volume mounted at the same path is no longer told apart (macOS assigns st_dev
+ * by mount order, so the device never reliably told it apart). Elsewhere the device stays part of
+ * the identity.
+ */
+export function sameRootDevice(recorded: string | null, current: bigint, platform: NodeJS.Platform = process.platform): boolean {
+  if (recorded === current.toString()) return true;
+  return platform === 'darwin' && typeof recorded === 'string' && /^\d+$/.test(recorded);
+}
+/**
+ * directory may be a verified staging directory; its stamp always names the final root.
+ * exactDevice is for re-stamping, which must notice a renumbered volume even where writes tolerate it.
+ */
+export function assertPhysicalRootStamp(directory: string, reservation: PhysicalRootReservation, exactDevice = false): void {
   const value = readPrivate(join(directory, PHYSICAL_ROOT_MARKER)) as PhysicalRootStamp | null;
   const info = statSync(directory, { bigint: true });
   if (!value || value.version !== 1 || value.token !== reservation.token || value.brainId !== reservation.brainId || value.worktreeId !== reservation.worktreeId
     || value.root !== reservation.root || value.inode !== info.ino.toString() || value.birth !== info.birthtimeNs.toString()) throw physicalRootError();
-  if (value.device !== info.dev.toString()) {
+  if (exactDevice ? value.device !== info.dev.toString() : !sameRootDevice(value.device, info.dev)) {
     if (typeof value.device === 'string' && /^\d+$/.test(value.device)) throw physicalRootError('The filesystem device identifier changed while the other checkout identity fields still match. Inspect writer status and use deliberate self-transfer to re-stamp this same root.');
     throw physicalRootError();
   }
@@ -185,7 +201,7 @@ export function adoptTransferredRootStamp(directory: string, reservation: Physic
   const previous = readPrivate(path) as PhysicalRootStamp | null;
   if (previous && (previous.brainId !== reservation.brainId || previous.worktreeId !== reservation.worktreeId)) throw physicalRootError();
   if (previous) {
-    try { assertPhysicalRootStamp(directory, reservation); return; } catch {}
+    try { assertPhysicalRootStamp(directory, reservation, true); return; } catch {}
   }
   const info = statSync(directory, { bigint: true });
   const stamp: PhysicalRootStamp = { version: 1, token: reservation.token, brainId: reservation.brainId, worktreeId: reservation.worktreeId,
@@ -199,12 +215,13 @@ export function adoptTransferredRootStamp(directory: string, reservation: Physic
   } finally { if (created) try { unlinkSync(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; } }
   assertPhysicalRootStamp(directory, reservation);
 }
-export function assertPhysicalRoot(path: string, identity: { worktreeId: string; coordinationPath?: string | null }): void {
+/** exactDevice is for callers about to rename or replace the root, which never excuse a renumbered volume. */
+export function assertPhysicalRoot(path: string, identity: { worktreeId: string; coordinationPath?: string | null }, exactDevice = false): void {
   try {
     const root = realpathSync(path);
     if (root !== path || lstatSync(path).isSymbolicLink()) throw physicalRootError();
     const reservation = readPhysicalRootReservation(root);
     if (!reservation || reservation.worktreeId !== identity.worktreeId || identity.coordinationPath && reservation.coordinationPath !== identity.coordinationPath) throw physicalRootError();
-    assertPhysicalRootStamp(root, reservation);
+    assertPhysicalRootStamp(root, reservation, exactDevice);
   } catch (error) { if (error instanceof OperationError) throw error; throw physicalRootError(); }
 }

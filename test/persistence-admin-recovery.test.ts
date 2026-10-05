@@ -45,12 +45,18 @@ for (const kind of ['pglite', 'postgres'] as const) describe.skipIf(kind === 'po
     const path = join(root, PHYSICAL_ROOT_MARKER), stamp = JSON.parse(readFileSync(path, 'utf8'));
     stamp.device = String(BigInt(stamp.device) + 1n); writeFileSync(path, JSON.stringify(stamp));
   }
+  // APFS renumbers st_dev across reboots, so on macOS a device-only drift is the same root.
+  const benignDeviceDrift = process.platform === 'darwin';
   for (const damage of ['device', 'reservation', 'stamp', 'both']) test(`explicit self-transfer repairs ${damage} and preserves strict ordinary checks`, () => fixture(async f => {
     if (damage === 'device') drift(f.root);
     if (damage === 'reservation' || damage === 'both') rmSync(physicalRootReservationPath(f.root));
     if (damage === 'stamp' || damage === 'both') rmSync(join(f.root, PHYSICAL_ROOT_MARKER));
-    await expect(acquireWorktree(f.binding)).rejects.toMatchObject({ code: 'recovery_required' });
-    await expect(administer('writer_transfer_prepare', { source_id: f.source })).rejects.toMatchObject({ code: 'recovery_required' });
+    if (damage === 'device' && benignDeviceDrift) {
+      const held = await acquireWorktree(f.binding); expect(held).not.toBeNull(); await held?.release();
+    } else {
+      await expect(acquireWorktree(f.binding)).rejects.toMatchObject({ code: 'recovery_required' });
+      await expect(administer('writer_transfer_prepare', { source_id: f.source })).rejects.toMatchObject({ code: 'recovery_required' });
+    }
     const prepared = await administer('writer_transfer_prepare', { source_id: f.source, self_transfer: true }) as any;
     await administer('writer_transfer_accept', { source_id: f.source, path: f.root, expected_epoch: prepared.owner_epoch, manifest: prepared.manifest.digest, self_transfer: true });
     const binding = (await getWorktreeBinding(engine, f.source))!;
@@ -59,7 +65,8 @@ for (const kind of ['pglite', 'postgres'] as const) describe.skipIf(kind === 'po
   }));
   test('device drift is distinguished only when all other stamp fields match', () => fixture(async f => {
     drift(f.root);
-    await expect(acquireWorktree(f.binding)).rejects.toThrow('device identifier');
+    if (benignDeviceDrift) { const held = await acquireWorktree(f.binding); expect(held).not.toBeNull(); await held?.release(); }
+    else await expect(acquireWorktree(f.binding)).rejects.toThrow('device identifier');
     const path = join(f.root, PHYSICAL_ROOT_MARKER), stamp = JSON.parse(readFileSync(path, 'utf8'));
     stamp.token = randomUUID(); writeFileSync(path, JSON.stringify(stamp));
     await expect(acquireWorktree(f.binding)).rejects.not.toThrow('device identifier');

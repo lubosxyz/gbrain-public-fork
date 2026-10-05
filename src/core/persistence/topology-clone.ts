@@ -20,7 +20,7 @@ import { priorTopologyChange, recordTopologyChange, topologyReceipt, type Topolo
 import { readJournalLimits } from './limits.ts';
 import { cloneTopologyCheckout, flushTopologyDirectory, flushTopologyTree, topologyDirectoryBytes, topologyDirectoryIdentity } from './topology-filesystem.ts';
 import { finishTopologyClone } from './topology-recovery.ts';
-import { reservePhysicalRoot, preparePhysicalRootReplacement, readPhysicalRootReservation } from './physical-root.ts';
+import { assertPhysicalRoot, reservePhysicalRoot, preparePhysicalRootReplacement, readPhysicalRootReservation } from './physical-root.ts';
 
 /** Provider seam only for deterministic storage-boundary tests. */
 export interface CloneLifecycleHooks {
@@ -60,6 +60,8 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
     if(!bindings.some(binding=>binding.worktree_id===worktreeId)){newLock=await acquireNativeLock(coordination!,{timeoutMs:5000});if(!newLock)throw new OperationError('writer_lock_unavailable','The new clone coordination lock is busy.');}
     let accepted:TopologyChange|undefined;
     try{
+      // Recloning renames the active checkout aside, so a renumbered device must be re-stamped first.
+      if(input.operation==='reclone'&&existsSync(target))assertPhysicalRoot(target,{worktreeId,coordinationPath:coordination},true);
       const before=existsSync(target)?worktreeManifest(target):null;
       const limits=await readJournalLimits(engine);
       const reserved=Math.min(limits.worktreeRecoveryBytes,limits.brainRecoveryBytes);
