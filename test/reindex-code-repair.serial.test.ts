@@ -77,6 +77,11 @@ describe('code metadata repair path', () => {
       expect(validateReindexModeScope(args)).toContain('is not supported with reindex --code');
     }
     expect(validateReindexModeScope(['--markdown', '--limit', '5'])).toBeNull();
+    // Only reindex-code honours a spend cap; every other mode must refuse it rather than run uncapped.
+    for (const mode of ['--markdown', '--multimodal', '--aliases']) {
+      expect(validateReindexModeScope([mode, '--max-cost', '5', '--yes'])).toContain('--max-cost is only supported with reindex --code');
+      expect(validateReindexModeScope([mode, '--max-cost-usd=5'])).toContain('--max-cost-usd is only supported with reindex --code');
+    }
     // With reindex-code's registry (what the CLI passes), --code accepts exactly reindex-code's flags.
     const codeFlags = CLI_FLAG_REGISTRY['reindex-code'];
     expect(validateReindexModeScope(['--code', '--source', 'x', '--workers', '2', '--force', '--no-embed', '--yes', '--json', '--max-cost', '5'], codeFlags)).toBeNull();
@@ -89,6 +94,13 @@ describe('code metadata repair path', () => {
       [['--code', '--limit', '5'], '--limit is not supported'],
       [['--code', '--multimodal'], '--code cannot be combined with --multimodal'],
       [['--code', '--markdown'], '--code cannot be combined with --markdown'],
+      // Registry bleed reindex-code never reads: a paid rebuild must not run with a different model.
+      [['--code', '--embedding-model', 'other:model', '--force', '--yes'], '--embedding-model is not supported'],
+      [['--code', '--status'], '--status is not supported'],
+      // An empty or missing value would widen the run to every source.
+      [['--code', '--source=', '--force', '--yes'], '--source requires a value'],
+      [['--code', '--source', '--force'], '--source requires a value'],
+      [['--code', '--max-cost'], '--max-cost requires a value'],
     ] as const) {
       expect(validateReindexModeScope([...args], codeFlags)).toContain(message);
     }

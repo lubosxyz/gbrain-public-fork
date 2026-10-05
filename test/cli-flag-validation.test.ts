@@ -117,6 +117,10 @@ describe('#2185 acceptance — real usage stays legal', () => {
     expect(validateCommandFlags('post-upgrade', ['--type', 'atom'])).toBe('--type');
     expect(validateCommandFlags('upgrade', ['--aliases'])).toBe('--aliases');
     expect(validateCommandFlags('post-upgrade', ['--aliases'])).toBe('--aliases');
+    // reindex imports the --code delegate; upgrade surfaces must not inherit a mode they ignore.
+    expect(validateCommandFlags('upgrade', ['--code'])).toBe('--code');
+    expect(validateCommandFlags('post-upgrade', ['--code'])).toBe('--code');
+    expect(validateCommandFlags('jobs', ['--code'])).toBe('--code');
   });
 
   test('sources push accepts --message/--allow-unverified-remote (registry-regen regression)', () => {
