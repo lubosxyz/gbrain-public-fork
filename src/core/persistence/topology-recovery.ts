@@ -42,7 +42,8 @@ function treeHash(path:string):string|null{
 function assertRetainedRoot(record:TopologyCloneRecovery,path:string):void{
   const reservation=readPhysicalRootReservation(record.target);
   if(!reservation||reservation.worktreeId!==record.worktreeId)throw new OperationError('recovery_required','The retained checkout identity cannot be verified.');
-  assertPhysicalRootStamp(path,reservation);
+  // Recovery renames or deletes this checkout, so a renumbered device is never excused here.
+  assertPhysicalRootStamp(path,reservation,true);
 }
 function assertStagingOwned(record:TopologyCloneRecovery):void{
   if(!existsSync(record.stage))return;

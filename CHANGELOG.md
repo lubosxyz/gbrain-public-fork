@@ -41,15 +41,17 @@ a restart starts accepting them on the next write.
   device-number-only difference in the physical root stamp and reservation.
 - Deliberate self-transfer still compares the device number exactly, so it
   re-stamps a changed device as before.
-- Interrupted clone staging recovery still compares the device number exactly
-  before it deletes anything.
+- Clone recovery still compares the device number exactly before it renames or
+  deletes a staged or retained old checkout. A restart in the middle of a clone
+  stops for manual recovery and keeps the old checkout's bytes.
 
 ### For contributors
 
 - Add `test/persistence-device-drift.test.ts` for the tolerated restart case.
   It also checks that every other identity change is still refused, that
   copies, self-transfer and an interrupted first claim behave as expected, and
-  that Linux stays strict.
+  that Linux stays strict. `test/persistence-source-lifecycle.test.ts` checks
+  that post-commit clone cleanup keeps the old checkout after a device change.
 - Platform-condition the device-drift expectations in
   `test/persistence-admin-recovery.test.ts`.
 
