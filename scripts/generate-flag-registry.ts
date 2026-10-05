@@ -306,8 +306,9 @@ export function buildFlagRegistry(): Record<string, string[]> {
   // affected dispatch surfaces so callers never get silently ignored selectors.
   const SCOPING_FLAGS_BY_COMMAND: Record<string, string[]> = {
     reindex: ['--type'],
-    upgrade: ['--type', '--aliases'],
-    'post-upgrade': ['--type', '--aliases'],
+    upgrade: ['--type', '--aliases', '--code'],
+    'post-upgrade': ['--type', '--aliases', '--code'],
+    jobs: ['--code'],
   };
   const consumes = (text: string, flag: string): boolean =>
     new RegExp(`['"\`]${flag}['"\`]`).test(text);

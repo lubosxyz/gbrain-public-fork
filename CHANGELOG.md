@@ -10,6 +10,54 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.57.3.0] - 2026-10-05
+
+**Repair code chunks that lost their symbol metadata without paying to re-embed them.**
+
+Brains damaged before the metadata-blind writer guard keep code chunks without
+symbol names, so code search and `gbrain dream` treat almost every code page as
+unmatched. `gbrain reindex-code --force` (also reachable as `gbrain reindex --code
+--force`) now re-chunks those files and carries
+each stored vector over to the new chunk whose body is unchanged. A repair of an
+otherwise unchanged repository makes no embedding calls. Only chunks whose code
+actually changed are re-embedded, and a vector is reused only from the active
+embedding column, for the same model, when its recorded text hash still matches.
+
+### To take advantage of v0.57.3.0
+
+Run `gbrain reindex-code --force --dry-run` to see what would be rebuilt, then
+`gbrain reindex-code --force --yes`. Add `--source <id>` to repair one source.
+The cost preview still estimates a full re-embed; actual spend covers changed
+chunks only, and `--max-cost` caps it. On a PGLite brain with `gbrain serve`
+running, use `reindex-code`: it hands the work to the server, while
+`reindex --code` does not.
+
+**Say to your agent:** *"Repair the missing symbol metadata on my code pages
+without re-embedding unchanged code."*
+
+### Itemized changes
+
+### Fixed
+
+- `reindex-code --force` and `reindex --code --force` re-chunk unchanged code files and reuse their stored
+  vectors instead of skipping them or re-embedding every chunk.
+- Reuse reads only valid vectors from the active embedding column: a foreign
+  model, a stale text hash or a contextual-retrieval page is re-embedded.
+  Legacy vectors without a recorded text hash are kept.
+- `reindex --code` accepts exactly the flags the code reindexer reads and passes
+  the flag validator. A page cap, repo override, another target, a `=value` on a
+  boolean flag or a missing value is refused instead of silently ignored.
+- `--max-cost` and `--max-cost-usd` are refused by the other reindex modes, which
+  never honoured a spend cap. `upgrade`, `post-upgrade` and `jobs` no longer accept
+  a `--code` flag they ignore.
+
+### For contributors
+
+- Regression tests prove that re-chunking an unchanged file makes no embed call,
+  that editing one function re-embeds only that chunk, and that stale, foreign
+  and contextual vectors are never carried over.
+- Key-file references describe the repair path, vector reuse and validation.
+
 ## [0.57.1.0] - 2026-09-24
 
 ### Fork integration

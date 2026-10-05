@@ -34,6 +34,7 @@ import { resolve } from 'path';
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
+import { REINDEX_CODE_BOOLEAN_FLAGS, REINDEX_CODE_COST_FLAGS, REINDEX_CODE_GLOBAL_FLAGS, REINDEX_CODE_VALUE_FLAGS } from './reindex-code.ts';
 
 interface ReindexOpts {
   /** Cap total pages reindexed. Useful for triage runs on huge brains. */
@@ -80,7 +81,7 @@ const REINDEX_HELP = `gbrain reindex — re-chunk / re-embed existing pages afte
 
 USAGE
   gbrain reindex --markdown   [--type PAGE_TYPE] [--limit N] [--dry-run] [--no-embed] [--json] [--repo PATH]
-  gbrain reindex --code       [--source <id>] [--limit N] [--workers N] [--dry-run] [--force] [--no-embed] [--yes] [--json]
+  gbrain reindex --code       [--source <id>] [--workers N] [--dry-run] [--force] [--no-embed] [--yes] [--json]
   gbrain reindex --multimodal [--limit N] [--workers N] [--dry-run] [--cost-estimate] [--no-embed] [--yes] [--json]
   gbrain reindex --aliases    [--limit N] [--dry-run] [--json] [--source <id>]
 
@@ -89,7 +90,9 @@ TARGETS (exactly one required)
                     current chunker (or whose contextual-retrieval state is
                     unset when embedding is on).
   --code            Re-chunk code pages (delegates to reindex-code; pass
-                    --force to bypass content_hash early-return).
+                    --force to bypass content_hash early-return). Accepts
+                    exactly reindex-code's flags, including its embedding
+                    budget cap; see \`gbrain reindex-code --help\`.
   --multimodal      Re-embed image/PDF chunks through the multimodal
                     embedding pipeline (Voyage batches).
   --aliases         Backfill the free-text alias layer (page_aliases) for
@@ -97,7 +100,7 @@ TARGETS (exactly one required)
 
 OPTIONS
   --type <t>        --markdown only: restrict to one page type
-  --limit N         Cap pages/chunks processed this run
+  --limit N         --markdown / --multimodal / --aliases: cap pages/chunks processed this run
   --workers N       --code / --multimodal: parallel UPDATEs per batch
                     (--concurrency is an alias)
   --dry-run         Report what would change; write nothing
@@ -118,7 +121,9 @@ export function printReindexHelp(): void {
   console.log(REINDEX_HELP);
 }
 
-const REINDEX_VALUE_FLAGS = new Set(['--type', '--limit', '--repo', '--workers', '--concurrency', '--source']);
+const REINDEX_VALUE_FLAGS = new Set<string>(['--type', '--limit', '--repo', ...REINDEX_CODE_VALUE_FLAGS]);
+/** What runReindexCodeCli actually reads; its generated registry also lists flags it ignores. */
+const REINDEX_CODE_READ_FLAGS = new Set<string>([...REINDEX_CODE_VALUE_FLAGS, ...REINDEX_CODE_BOOLEAN_FLAGS, ...REINDEX_CODE_GLOBAL_FLAGS]);
 
 export function normalizeReindexArgs(args: string[]): string[] {
   return args.flatMap((arg) => {
@@ -142,8 +147,32 @@ function pendingDriftPredicate(noEmbed: boolean): string {
     : '(chunker_version < $1 OR contextual_retrieval_mode IS NULL)';
 }
 
-export function validateReindexModeScope(args: string[]): string | null {
+/**
+ * `--code` delegates to reindex-code, which reads exact tokens and ignores anything else, so an
+ * accepted-but-unread flag (a page cap, a `--dry-run=true`) would silently run a full, possibly paid,
+ * rebuild. `codeFlags` is reindex-code's own flag registry, narrowed to the flags it actually reads;
+ * without it only the markdown scope flags are refused. reindex-code's spend caps are refused outside
+ * `--code`, where no mode would honour them.
+ */
+export function validateReindexModeScope(args: string[], codeFlags?: readonly string[]): string | null {
   args = normalizeReindexArgs(args);
+  if (args.includes('--code')) {
+    const otherTarget = ['--markdown', '--multimodal', '--aliases'].find(f => args.includes(f));
+    if (otherTarget) return `--code cannot be combined with ${otherTarget}`;
+    for (const arg of args.filter(a => a.startsWith('--') && a !== '--code')) {
+      const flag = arg.split('=')[0]!;
+      if (codeFlags ? !(codeFlags.includes(flag) && REINDEX_CODE_READ_FLAGS.has(flag)) : ['--limit', '--repo'].includes(flag)) return `${flag} is not supported with reindex --code`;
+      if (arg !== flag && (REINDEX_CODE_BOOLEAN_FLAGS as readonly string[]).includes(flag)) return `${flag} takes no value with reindex --code`;
+    }
+    // A missing or empty value would widen the run (an empty source means every source).
+    for (const flag of REINDEX_CODE_VALUE_FLAGS) {
+      const value = args.includes(flag) ? args[args.indexOf(flag) + 1] : 'present';
+      if (value == null || value.trim() === '' || value.startsWith('--')) return `${flag} requires a value with reindex --code`;
+    }
+  } else {
+    const costFlag = REINDEX_CODE_COST_FLAGS.find(f => args.includes(f));
+    if (costFlag) return `${costFlag} is only supported with reindex --code; other modes would ignore the spend cap`;
+  }
   if (!args.includes('--type')) return null;
   if (args.includes('--multimodal')) return '--type is only supported with reindex --markdown, not --multimodal';
   if (args.includes('--aliases')) return '--type is only supported with reindex --markdown, not --aliases';
@@ -278,6 +307,16 @@ async function readBatch(
       LIMIT $2`,
     [MARKDOWN_CHUNKER_VERSION, batchSize, afterId],
   );
+}
+
+/** CLI entry for `--markdown` and `--code`; `--code` delegates to reindex-code with its own flags. */
+export async function dispatchReindex(engine: BrainEngine, args: string[]): Promise<void> {
+  if (args.includes('--code')) {
+    const { runReindexCodeCli } = await import('./reindex-code.ts');
+    await runReindexCodeCli(engine, args.filter((a) => a !== '--code'));
+    return;
+  }
+  await runReindex(engine, args);
 }
 
 export async function runReindex(engine: BrainEngine, args: string[]): Promise<ReindexResult> {

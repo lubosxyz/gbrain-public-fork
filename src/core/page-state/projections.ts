@@ -12,6 +12,8 @@ import { quoteIdentifier, resolveWriteColumnFromConfigRows, vectorCastSuffix } f
 import { getFtsLanguage } from '../fts-language.ts';
 import { getEmbeddingModel } from '../ai/gateway.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
+import { planEmbeddingReuse } from '../embed-reuse.ts';
+import { parseEmbedding } from '../utils.ts';
 
 /** Complete the searchable snapshot only after its sanitized chunks are installed. */
 export async function sealPageTextProjection(engine: BrainEngine, slug: string, sourceId: string): Promise<void> {
@@ -77,6 +79,35 @@ export async function readProjectionSnapshot(engine: BrainEngine, slug: string, 
   });
 }
 
+/** Contextual chunks embed a page-dependent prefix, so their stored vectors are never carried over. */
+const contextualRetrievalActive = (mode: string | null | undefined) => ![null, undefined, 'none'].includes(mode);
+
+/**
+ * Carry stored vectors onto re-chunked code whose header-stripped body is unchanged, so a
+ * metadata repair costs no embedding calls. installPageProjection only keeps rows whose
+ * index and symbol metadata are identical, which never holds when metadata is being restored.
+ * Reads the active column and applies installPageProjection's validity rule (model and text
+ * hash), so a stale or foreign vector is never re-stamped as current.
+ */
+export async function reuseStoredEmbeddings(engine: BrainEngine, prepared: ProjectionSnapshot, chunks: ChunkInput[]): Promise<void> {
+  const { page } = prepared.snapshot;
+  if (contextualRetrievalActive(page.contextual_retrieval_mode)) return;
+  const column = prepared.embeddingColumn;
+  const model = column.name === 'embedding' ? prepared.embeddingModel : column.embeddingModel;
+  if (!model) return;
+  const col = quoteIdentifier(column.name);
+  const rows = await engine.executeRaw<{ chunk_text: string; token_count: number | null; embedding: string }>(
+    `SELECT chunk_text, token_count, ${col}::text AS embedding FROM content_chunks WHERE page_id=$1 AND model=$2
+      AND ${col} IS NOT NULL AND (embedded_text_hash IS NULL OR embedded_text_hash = md5(chunk_text)) ORDER BY chunk_index`,
+    [page.id, model]);
+  const stored = rows.map(row => ({ chunk_text: row.chunk_text, token_count: row.token_count, embedding: parseEmbedding(row.embedding) }));
+  for (const [i, matched] of planEmbeddingReuse(stored, chunks).reuse) {
+    chunks[i]!.embedding = matched.embedding!;
+    chunks[i]!.token_count = matched.token_count ?? undefined;
+    chunks[i]!.model = model;
+  }
+}
+
 /** No provider work under the guard. Delayed derived results lose to newer content. */
 export async function installPageProjection(engine: BrainEngine, prepared: ProjectionSnapshot, chunks: ChunkInput[], opts: { seal?: boolean; signature?: string; preserveEmbeddings?: boolean; code?: Awaited<ReturnType<typeof prepareCodeChunks>> } = {}): Promise<void> {
   const { snapshot } = prepared;
@@ -116,7 +147,7 @@ export async function installPageProjection(engine: BrainEngine, prepared: Proje
         embedded_at=NULL,embedded_text_hash=NULL WHERE page_id=$1 AND
         (model IS DISTINCT FROM $2 OR embedded_text_hash <> md5(chunk_text) OR $3::boolean)`,
       [snapshot.page.id, context.column.name === 'embedding' ? context.model : context.column.embeddingModel,
-        ![null, undefined, 'none'].includes(snapshot.page.contextual_retrieval_mode)]);
+        contextualRetrievalActive(snapshot.page.contextual_retrieval_mode)]);
     } else if (opts.seal) await tx.deleteChunks(slug, { sourceId });
     await tx.upsertChunks(slug, chunks, { sourceId, expectedRevision: snapshot.revision, embeddingColumn: context.column });
     if (opts.code) await installCodeChunkEdges(tx, slug, sourceId, opts.code);

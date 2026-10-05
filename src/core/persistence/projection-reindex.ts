@@ -3,7 +3,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { OperationError } from '../ops/contract.ts';
 import { loadConfig } from '../config.ts';
-import { readProjectionSnapshot, preparePageProjection, installPageProjection, installPageEmbeddings } from '../page-state/projections.ts';
+import { readProjectionSnapshot, preparePageProjection, installPageProjection, installPageEmbeddings, reuseStoredEmbeddings } from '../page-state/projections.ts';
 import { embedBatchWithBackoff } from '../embed-retry.ts';
 import { submissionAuthority } from './authority.ts';
 import { currentVerifiedLocalWriter, registerLocalWriter } from './identity.ts';
@@ -22,6 +22,7 @@ export async function prepareCodeReindex(engine: BrainEngine, row: WriteRequest)
   }
   const noop = row.intent.force !== true && prepared.snapshot.page.text_projection_revision === prepared.snapshot.revision;
   const projection = noop ? undefined : await preparePageProjection(prepared);
+  if (projection) await reuseStoredEmbeddings(engine, prepared, projection.chunks);
   return { observedRevision: prepared.snapshot.revision, noop, deferEmbedding: true, apply: async tx => {
     if (projection) await installPageProjection(tx, prepared, projection.chunks, { seal: true, preserveEmbeddings: true, code: projection.code });
     return { status: noop ? 'skipped' : 'imported', chunks: projection?.chunks.length ?? 0, noop };
@@ -53,6 +54,7 @@ export async function reindexCodeProjection(engine: BrainEngine, slug: string, s
     result = { status: 'skipped', chunks: 0 };
   } else {
     const projection = await preparePageProjection(snapshot);
+    await reuseStoredEmbeddings(engine, snapshot, projection.chunks);
     await installPageProjection(engine, snapshot, projection.chunks, { seal: true, preserveEmbeddings: true, code: projection.code });
     result = { status: 'imported', chunks: projection.chunks.length };
   }

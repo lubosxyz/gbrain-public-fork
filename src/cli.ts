@@ -3203,7 +3203,7 @@ async function handleCliOnly(command: string, args: string[]) {
       }
       case 'reindex': {
         const reindex = await import('./commands/reindex.ts'); args = reindex.normalizeReindexArgs(args);
-        const scopeError = reindex.validateReindexModeScope(args);
+        const scopeError = reindex.validateReindexModeScope(args, CLI_FLAG_REGISTRY['reindex-code']);
         if (scopeError) { process.stderr.write(`[reindex] ${scopeError}\n`); setCliExitVerdict(2); break; }
         if (args.includes('--multimodal')) {
           const { runReindexMultimodal } = await import('./commands/reindex-multimodal.ts');
@@ -3242,13 +3242,8 @@ async function handleCliOnly(command: string, args: string[]) {
           await runReindexAliases(engine, args);
           break;
         }
-        if (args.includes('--code')) {
-          const { runReindexCodeCli } = await import('./commands/reindex-code.ts');
-          await runReindexCodeCli(engine, args.filter((a) => a !== '--code'));
-          break;
-        }
-        const { runReindex } = await import('./commands/reindex.ts');
-        await runReindex(engine, args);
+        const { dispatchReindex } = await import('./commands/reindex.ts');
+        await dispatchReindex(engine, args);
         break;
       }
       // v0.29 — Salience + Anomaly Detection

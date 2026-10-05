@@ -109,10 +109,18 @@ describe('#2185 acceptance — real usage stays legal', () => {
 
   test('scope flags require direct consumption on upgrade surfaces', () => {
     expect(validateCommandFlags('reindex', ['--markdown', '--type', 'atom'])).toBeNull();
+    // The documented code-metadata repair (`reindex --help`, doctor's
+    // code_chunk_metadata remedy) must reach the reindex-code delegate.
+    expect(validateCommandFlags('reindex', ['--code', '--source', 'x', '--force', '--workers', '2', '--yes'])).toBeNull();
+    expect(validateCommandFlags('reindex', ['--code', '--dry-run', '--no-embed', '--json'])).toBeNull();
     expect(validateCommandFlags('upgrade', ['--type', 'atom'])).toBe('--type');
     expect(validateCommandFlags('post-upgrade', ['--type', 'atom'])).toBe('--type');
     expect(validateCommandFlags('upgrade', ['--aliases'])).toBe('--aliases');
     expect(validateCommandFlags('post-upgrade', ['--aliases'])).toBe('--aliases');
+    // reindex imports the --code delegate; upgrade surfaces must not inherit a mode they ignore.
+    expect(validateCommandFlags('upgrade', ['--code'])).toBe('--code');
+    expect(validateCommandFlags('post-upgrade', ['--code'])).toBe('--code');
+    expect(validateCommandFlags('jobs', ['--code'])).toBe('--code');
   });
 
   test('sources push accepts --message/--allow-unverified-remote (registry-regen regression)', () => {

@@ -1200,11 +1200,7 @@ export async function importFromFile(
   // Route code files through the code import path
   if (isCodeFilePath(relativePath)) {
     return importCodeFile(engine, relativePath, content, {
-      noEmbed: opts.noEmbed,
-      sourceId: opts.sourceId,
-      force: opts.force ?? opts.forceRechunk,
-      forceRechunk: opts.forceRechunk ?? opts.force,
-    });
+      noEmbed: opts.noEmbed, sourceId: opts.sourceId, force: opts.force ?? opts.forceRechunk });
   }
 
   const preInferenceParsed = parseMarkdown(content, relativePath, { validate: true });
@@ -1359,7 +1355,7 @@ export async function importCodeFile(
   engine: BrainEngine,
   relativePath: string,
   content: string,
-  opts: { noEmbed?: boolean; force?: boolean; forceRechunk?: boolean; sourceId?: string;
+  opts: { noEmbed?: boolean; force?: boolean; sourceId?: string;
     prepare?: (prepared: import('./persistence/prepared-import.ts').PreparedContentImport) => Promise<ImportResult> } = {},
 ): Promise<ImportResult> {
   if (!opts.prepare) await assertUnmanagedCanonicalWriter(engine, 'direct file import');
@@ -1369,7 +1365,6 @@ export async function importCodeFile(
   const title = `${relativePath} (${lang})`;
   const sourceId = opts.sourceId;
   const txOpts = { sourceId: sourceId ?? 'default' };
-  const force = opts.force ?? opts.forceRechunk ?? false;
   // PostgreSQL text columns reject U+0000 even though source files may
   // legitimately contain it inside string/regex fixtures. Preserve a visible,
   // searchable representation instead of dropping the entire code page.
@@ -1409,7 +1404,7 @@ export async function importCodeFile(
   const existing = await engine.getPage(slug, { sourceId: sourceId ?? 'default', includeDeleted: true });
   const parsedPage: ParsedPage = { type: 'code', title, compiled_truth: storageContent, timeline: '',
     frontmatter: { ...existing?.frontmatter, language: lang, file: relativePath }, tags: ['code', lang] };
-  if (!force && existing?.content_hash === hash && !existing.deleted_at && existing.text_projection_revision === existing.knowledge_revision) {
+  if (!opts.force && existing?.content_hash === hash && !existing.deleted_at && existing.text_projection_revision === existing.knowledge_revision) {
     if (opts.prepare) {
       const result: ImportResult = { slug, status: 'skipped', chunks: 0 };
       return opts.prepare({ slug, parsedPage, observedRevision: existing.knowledge_revision ?? null, noop: true, result, apply: async () => {} });
@@ -1448,18 +1443,10 @@ export async function importCodeFile(
   // header-stripped body: the header carries line numbers and the index shifts
   // when a symbol is added above, so keying on either re-embedded
   // byte-identical bodies.
-  // `getChunks` with `includeEmbedding` + `includeUnsealed` respects scope and RLS boundaries
-  // (engine contract lines 1144-1152), unlike `getChunksWithEmbeddings`.
-  // `requireSafeChunks` is omitted: safeChunksFilter requires chunker_version >= 4 (markdown
-  // fences), which blocked repair of legacy code pages. Omitting is safe: key is exact body match.
-  // Existing chunks are read even under `noEmbed` so matching embeddings are preserved, not wiped.
+  // Read vectors even under noEmbed so matches survive; no requireSafeChunks, whose
+  // chunker_version >= 4 gate blocked repairing legacy code pages (the key is an exact body match).
   const existingChunks = existing
-    ? await engine.getChunks(slug, {
-        sourceId: sourceId ?? 'default',
-        includeEmbedding: true,
-        includeUnsealed: true,
-      })
-    : [];
+    ? await engine.getChunks(slug, { sourceId: sourceId ?? 'default', includeEmbedding: true, includeUnsealed: true }) : [];
   const { reuse, needsEmbedIndexes } = planEmbeddingReuse(existingChunks, chunks);
   for (const [i, matched] of reuse) {
     // Reuse the existing embedding verbatim. No API call, no cost. Carry the

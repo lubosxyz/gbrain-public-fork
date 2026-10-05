@@ -441,6 +441,15 @@ export function reindexForceHint(
   );
 }
 
+/** Spend caps only reindex-code reads; every other reindex mode would ignore them. */
+export const REINDEX_CODE_COST_FLAGS = ['--max-cost', '--max-cost-usd'] as const;
+/** Value-taking flags runReindexCodeCli reads as exact `--flag value` tokens. */
+export const REINDEX_CODE_VALUE_FLAGS = ['--source', '--workers', '--concurrency', ...REINDEX_CODE_COST_FLAGS] as const;
+/** Boolean flags runReindexCodeCli reads by exact token; a `--flag=value` form would be silently ignored. */
+export const REINDEX_CODE_BOOLEAN_FLAGS = ['--dry-run', '--yes', '--json', '--force', '--no-embed'] as const;
+/** Flags the CLI itself handles for every command (help, brain routing, progress, job wrapper). */
+export const REINDEX_CODE_GLOBAL_FLAGS = ['--help', '--brain', '--quiet', '--progress-json', '--progress-interval', '--timeout', '--explain', '--background', '--follow'] as const;
+
 /**
  * CLI entrypoint. Parses argv, wires cost-preview gate + JSON/TTY branching,
  * delegates to runReindexCode. Exit codes: 0 on success/dry-run, 2 on
