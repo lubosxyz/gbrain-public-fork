@@ -80,7 +80,7 @@ const REINDEX_HELP = `gbrain reindex — re-chunk / re-embed existing pages afte
 
 USAGE
   gbrain reindex --markdown   [--type PAGE_TYPE] [--limit N] [--dry-run] [--no-embed] [--json] [--repo PATH]
-  gbrain reindex --code       [--source <id>] [--limit N] [--workers N] [--dry-run] [--force] [--no-embed] [--yes] [--json]
+  gbrain reindex --code       [--source <id>] [--workers N] [--dry-run] [--force] [--no-embed] [--yes] [--json]
   gbrain reindex --multimodal [--limit N] [--workers N] [--dry-run] [--cost-estimate] [--no-embed] [--yes] [--json]
   gbrain reindex --aliases    [--limit N] [--dry-run] [--json] [--source <id>]
 
@@ -97,7 +97,7 @@ TARGETS (exactly one required)
 
 OPTIONS
   --type <t>        --markdown only: restrict to one page type
-  --limit N         Cap pages/chunks processed this run
+  --limit N         Not --code: cap pages/chunks processed this run
   --workers N       --code / --multimodal: parallel UPDATEs per batch
                     (--concurrency is an alias)
   --dry-run         Report what would change; write nothing
@@ -144,6 +144,9 @@ function pendingDriftPredicate(noEmbed: boolean): string {
 
 export function validateReindexModeScope(args: string[]): string | null {
   args = normalizeReindexArgs(args);
+  // reindex-code has no page cap or repo override; refusing beats silently running the whole source.
+  const codeOnlyUnsupported = args.includes('--code') && ['--limit', '--repo'].find(f => args.includes(f));
+  if (codeOnlyUnsupported) return `${codeOnlyUnsupported} is not supported with reindex --code`;
   if (!args.includes('--type')) return null;
   if (args.includes('--multimodal')) return '--type is only supported with reindex --markdown, not --multimodal';
   if (args.includes('--aliases')) return '--type is only supported with reindex --markdown, not --aliases';

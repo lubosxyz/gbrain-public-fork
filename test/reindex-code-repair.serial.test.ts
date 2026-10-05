@@ -71,6 +71,11 @@ describe('code metadata repair path', () => {
     // validateReindexModeScope allows --code
     expect(validateReindexModeScope(['--code'])).toBeNull();
     expect(validateReindexModeScope(['--code', '--type', 'page'])).toContain('--type is only supported with reindex --markdown');
+    // reindex-code has no page cap or repo override: these must be refused, not silently ignored.
+    for (const args of [['--code', '--limit', '5'], ['--code', '--limit=5'], ['--code', '--repo', '/tmp/x']]) {
+      expect(validateReindexModeScope(args)).toContain('is not supported with reindex --code');
+    }
+    expect(validateReindexModeScope(['--markdown', '--limit', '5'])).toBeNull();
 
     // runReindexCode with --dry-run
     const result = await runReindexCode(engine, { dryRun: true });
@@ -293,12 +298,12 @@ describe('code metadata repair path', () => {
   });
   // Value: protects=`gbrain reindex --code` reaches the code reindexer while `--markdown` stays on the markdown reindexer; fails_when=dispatchReindex routes --code to runReindex (which demands --markdown) or sends markdown args to runReindexCodeCli; why_new=the dispatch moved out of cli.ts's untestable switch and no test exercised it; seam=none
   test('dispatchReindex routes --code to the code reindexer and --markdown to the markdown reindexer', async () => {
-    const lines: string[] = [];
-    const log = spyOn(console, 'log').mockImplementation((...a: unknown[]) => { lines.push(a.join(' ')); });
-    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
     const dispatchFile = join(tmpDir, 'dispatch.ts');
     writeFileSync(dispatchFile, 'export function zeta(): number {\n  return 6;\n}\n');
     await importFromFile(engine, dispatchFile, 'src/dispatch.ts', { noEmbed: true });
+    const lines: string[] = [];
+    const log = spyOn(console, 'log').mockImplementation((...a: unknown[]) => { lines.push(a.join(' ')); });
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
     try {
       await dispatchReindex(engine, ['--code', '--dry-run', '--json']);
       const code = JSON.parse(lines.join('\n'));

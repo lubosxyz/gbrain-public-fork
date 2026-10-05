@@ -299,6 +299,22 @@ test('code metadata repair never reuses a vector recorded under another embeddin
   }
 });
 
+// Value: protects=legacy vectors stored before text hashes were recorded survive metadata repair, matching installPageProjection's NULL-hash allowance; fails_when=the `embedded_text_hash IS NULL` allowance is dropped from reuseStoredEmbeddings' SELECT (repair silently unembeds every legacy page); why_new=other reuse tests only seed md5 or stale hashes; seam=none
+test('code metadata repair keeps legacy vectors that carry no text hash', async () => {
+  for (const engine of engines) {
+    const slug = await seed(engine, 'repair-null-hash');
+    const prepared = (await readProjectionSnapshot(engine, slug, sourceId))!;
+    const pageId = prepared.snapshot.page.id;
+    await engine.executeRaw('UPDATE content_chunks SET embedding=$2::vector,model=$3,embedded_at=now(),embedded_text_hash=NULL WHERE page_id=$1',
+      [pageId, basisVector(0), prepared.embeddingModel]);
+    await engine.executeRaw(WIPE_SYMBOLS, [pageId]);
+    await reindexCodeProjection(engine, slug, sourceId, { force: true, noEmbed: true });
+    const chunks = await engine.getChunks(slug, { sourceId, includeEmbedding: true });
+    expect(chunks.map(c => c.symbol_name_qualified).sort()).toEqual(['alpha', 'beta']);
+    expect(chunks.every(c => !c.embedding_is_null && c.embedding![0] === 1)).toBe(true);
+  }
+});
+
 // Value: protects=the managed (journaled) reindex path restores wiped symbol metadata without discarding valid vectors; fails_when=prepareCodeReindex stops calling reuseStoredEmbeddings (managed repair silently leaves every chunk unembedded); why_new=the existing managed test only asserts receipts and revision, with no vectors present; seam=none
 test('managed code metadata repair keeps valid vectors while restoring symbol metadata', async () => withEnv({ GBRAIN_HOME: home }, async () => {
   for (const engine of engines) {
