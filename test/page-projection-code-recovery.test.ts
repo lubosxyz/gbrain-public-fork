@@ -219,7 +219,11 @@ test('archived sources stay unsealed and are excluded from reindex', async () =>
       expect((await rebuildPendingPageProjections(engine, 100)).rebuilt).toBe(0);
       expect((await runReindexCode(engine, { sourceId, noEmbed: true, force: true })).codePages).toBe(0);
       expect(await engine.getChunks(slug, { sourceId })).toEqual([]);
-    } finally { await engine.executeRaw('UPDATE sources SET archived=false WHERE id=$1', [sourceId]); }
+    } finally {
+      await engine.executeRaw('UPDATE sources SET archived=false WHERE id=$1', [sourceId]);
+      // Settle the queued projection so later source-wide reindex tests never race its consumer.
+      await rebuildPendingPageProjections(engine, 100);
+    }
   }
 });
 
