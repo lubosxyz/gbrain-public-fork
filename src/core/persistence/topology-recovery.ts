@@ -91,7 +91,8 @@ async function abortClone(engine:BrainEngine,row:TopologyChange,record:TopologyC
     // the database; its mirror resumes after the root becomes available.
     assertStagingOwned(record);
     const aside=treeHash(record.aside),target=treeHash(record.target);
-    if(target!==null)assertPhysicalRoot(record.target,{worktreeId:record.worktreeId});
+    // Exact only when the branches below rename the target; leaving the original in place tolerates a reboot.
+    if(target!==null)assertPhysicalRoot(record.target,{worktreeId:record.worktreeId},aside!==null||record.beforeHash===null);
     if(aside!==null){
       assertRetainedRoot(record,record.aside);
       if(aside!==record.beforeHash||target!==null&&target!==record.afterHash)throw new OperationError('recovery_required','Unexpected clone recovery bytes; nothing was overwritten.');
@@ -133,7 +134,7 @@ export async function finishTopologyClone(engine:BrainEngine,id:string,hooks:Clo
           if(stage!==null){
             assertRetainedRoot(record,record.stage);
             if(aside!==null)assertRetainedRoot(record,record.aside);
-            if(target!==null)assertPhysicalRoot(record.target,{worktreeId:record.worktreeId});
+            if(target!==null)assertPhysicalRoot(record.target,{worktreeId:record.worktreeId},true);
             if(stage!==record.afterHash||aside!==null&&aside!==record.beforeHash)throw new OperationError('recovery_required','Staged clone bytes changed.');
             if(target!==null){
               if(target!==record.beforeHash||aside!==null)throw new OperationError('recovery_required','The active checkout changed during clone preparation.');

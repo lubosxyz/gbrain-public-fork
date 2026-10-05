@@ -64,7 +64,7 @@ export async function preparePhysicalRootReplacement(tx: SqlEngine, stage: strin
   const reservation = await reservePhysicalRoot(tx, target, opts);
   const [owner] = await tx.executeRaw<{ owner_host_id: string; state: string }>('SELECT owner_host_id,state FROM persistence_worktrees WHERE id=$1::uuid', [opts.worktreeId]);
   if (owner?.owner_host_id !== opts.hostId || owner.state !== 'recovering') throw physicalRootError('A directory replacement requires durable source recovery.');
-  if (existsSync(target)) assertPhysicalRoot(target, opts);
+  if (existsSync(target)) assertPhysicalRoot(target, opts, true);
   writePhysicalRootStamp(stage, reservation);
   assertPhysicalRootStamp(stage, reservation);
 }

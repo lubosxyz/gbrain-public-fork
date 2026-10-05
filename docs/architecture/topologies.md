@@ -474,9 +474,10 @@ checkout. Writes accept that device-only difference when the canonical path,
 private token, inode and birth time all still match, so no self-transfer is
 needed after a restart. Copies and moves still refuse; a block-level clone or
 snapshot of the whole volume mounted at the same path is not distinguished.
-Clone recovery, which renames or deletes staged and retained old checkouts,
-still compares the device exactly, so a restart in the middle of a clone stops
-for manual recovery instead of deleting anything. Other platforms keep the
+Anything that renames, replaces or deletes a checkout still compares the device
+exactly: a reclone refuses a renumbered device before it starts (re-stamp with
+the self-transfer below first), and a restart in the middle of a clone stops
+for manual recovery instead of moving or deleting anything. Other platforms keep the
 device in the identity and need the reviewed self-transfer below.
 
 ```bash

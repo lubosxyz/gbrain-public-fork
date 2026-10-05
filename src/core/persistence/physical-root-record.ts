@@ -215,12 +215,13 @@ export function adoptTransferredRootStamp(directory: string, reservation: Physic
   } finally { if (created) try { unlinkSync(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; } }
   assertPhysicalRootStamp(directory, reservation);
 }
-export function assertPhysicalRoot(path: string, identity: { worktreeId: string; coordinationPath?: string | null }): void {
+/** exactDevice is for callers about to rename or replace the root, which never excuse a renumbered volume. */
+export function assertPhysicalRoot(path: string, identity: { worktreeId: string; coordinationPath?: string | null }, exactDevice = false): void {
   try {
     const root = realpathSync(path);
     if (root !== path || lstatSync(path).isSymbolicLink()) throw physicalRootError();
     const reservation = readPhysicalRootReservation(root);
     if (!reservation || reservation.worktreeId !== identity.worktreeId || identity.coordinationPath && reservation.coordinationPath !== identity.coordinationPath) throw physicalRootError();
-    assertPhysicalRootStamp(root, reservation);
+    assertPhysicalRootStamp(root, reservation, exactDevice);
   } catch (error) { if (error instanceof OperationError) throw error; throw physicalRootError(); }
 }

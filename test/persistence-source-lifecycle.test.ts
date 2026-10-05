@@ -133,6 +133,43 @@ test('post-commit cleanup retains the old checkout when its recorded device chan
   expect(readFileSync(join(aside()[0],'example.md'),'utf8')).toContain('Canonical');
 }),60_000);
 
+function renumberStampDevice(directory:string):string{
+  const stamp=join(directory,PHYSICAL_ROOT_MARKER),original=readFileSync(stamp,'utf8'),value=JSON.parse(original);
+  writeFileSync(stamp,JSON.stringify({...value,device:String(BigInt(value.device)+7n)}));
+  return original;
+}
+const leftovers=(home:string)=>readdirSync(home).filter(name=>name.includes('gbrain-old')||name.startsWith('.gbrain-clone'));
+
+test('reclone refuses a renumbered device before cloning or moving the active checkout',()=>fixture(async(home,source,root)=>{
+  // Writes tolerate a macOS reboot, but recloning renames the checkout aside: re-stamp first, never get stuck recovering.
+  await engine.executeRaw('UPDATE sources SET config=$2::text::jsonb WHERE id=$1',[source,JSON.stringify({managed_clone:true,remote_url:'https://example.invalid/brain.git'})]);
+  const original=renumberStampDevice(root);
+  let providerCalls=0;
+  const reclone=async()=>{
+    const input={operation:'reclone' as const,sourceId:source,requestId:randomUUID()};
+    return runManagedSourceClone(engine,input,await topologyPrincipal(engine),input.requestId,{...input,requestId:undefined,dryRun:undefined},{
+      clone:async(_url,stage)=>{providerCalls++;cpSync(root,stage,{recursive:true,filter:path=>!isPhysicalRootMetadata(basename(path))});},
+    });
+  };
+  await expect(reclone()).rejects.toMatchObject({code:'recovery_required',message:expect.stringContaining('device identifier')});
+  expect(providerCalls).toBe(0);expect(leftovers(home)).toEqual([]);
+  expect((await getWorktreeBinding(engine,source))!.state).toBe('active');
+  writeFileSync(join(root,PHYSICAL_ROOT_MARKER),original);
+  expect(await reclone()).toMatchObject({state:'committed',cloned:true});expect(leftovers(home)).toEqual([]);
+}),60_000);
+
+test('a device renumbered during clone preparation fails the reclone and leaves the checkout active',()=>fixture(async(home,source,root)=>{
+  await engine.executeRaw('UPDATE sources SET config=$2::text::jsonb WHERE id=$1',[source,JSON.stringify({managed_clone:true,remote_url:'https://example.invalid/brain.git'})]);
+  const input={operation:'reclone' as const,sourceId:source,requestId:randomUUID()};
+  const result=await runManagedSourceClone(engine,input,await topologyPrincipal(engine),input.requestId,{...input,requestId:undefined,dryRun:undefined},{
+    clone:async(_url,stage)=>{cpSync(root,stage,{recursive:true,filter:path=>!isPhysicalRootMetadata(basename(path))});},
+    boundary:async(name)=>{if(name==='reserved')renumberStampDevice(root);},
+  });
+  expect(result).toMatchObject({state:'failed'});
+  expect(readFileSync(join(root,'example.md'),'utf8')).toContain('Canonical');expect(leftovers(home)).toEqual([]);
+  expect((await getWorktreeBinding(engine,source))!.state).toBe('active');
+}),60_000);
+
 test('stale cloned bytes fail before touching the active worktree and preserve a permanent failure receipt',()=>fixture(async(_home,source,root)=>{
   await engine.executeRaw('UPDATE sources SET config=$2::text::jsonb WHERE id=$1',[source,JSON.stringify({managed_clone:true,remote_url:'https://example.invalid/brain.git'})]);
   const input={operation:'reclone' as const,sourceId:source,requestId:randomUUID()};
