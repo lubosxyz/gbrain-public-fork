@@ -19,10 +19,50 @@ to apply the diffs by hand.
 This doc lists the exact diffs each downstream agent needs to apply when upgrading.
 Cross-reference against your fork's local skill files.
 
+## Distribution fork: upgrading from 0.57.1
+
+This fork merges upstream 0.60.182.0 and retains its ownership, token auditing,
+search redaction, retrieval timestamps and permanent oversized-chunk handling.
+Back up the brain and canonical files before migration. Stop that brain's
+resident PGLite server before direct-engine maintenance. Use:
+
+```sh
+GBRAIN_NO_AUTOPILOT_INSTALL=1 GBRAIN_NO_REEMBED=1 gbrain apply-migrations --yes --no-autopilot-install
+```
+
+The old fork used schema numbers that overlap upstream migrations. The fork
+runner repairs skipped prerequisites before later migrations reference them,
+then applies its reconciliation tail through schema 244. Migration failure
+remains a failure; inspect the named phase and preserve the backup.
+
+A source claim and brain activation are separate operations. Inspect
+`gbrain writer status --json` and the current `gbrain writer` help. Claim each
+new source, then preview and activate the brain using the current administration
+intent and expected state. Do not claim an already bound source again merely
+because the brain is disabled. Activation applies to the whole brain and
+requires quiesced writers. Check every dream phase result as well as its exit:
+lint and sync refuse a claimed but disabled source. Enabled purge uses the
+coordinator per tombstone; a successful empty purge is not deletion evidence.
+
+For keyless isolated verification, use a fresh HOME and brain configuration
+with no inherited provider credentials. Set the brain configuration keys
+`facts.extraction_enabled=false`, `auto_chronicle=false` and
+`fences.normalize=false` before serve or dream. These are stored brain settings,
+not proven environment overrides. Provider-dependent phases may safely skip;
+do not enable paid providers just to make them run.
+
+The owner-stamp fix from fork PR #13 follows upstream's native-lock recovery
+for bound macOS roots and additionally accepts device-only drift during a
+first interrupted claim when inode and birth time still match. Other identity
+changes still refuse. Fork PR #14 retains the `reindex --code` repair path and
+metadata repair, with upstream's exact embedding provenance constraints.
+Header-stripped or contextual vector reuse is intentionally excluded.
+
 ## Why this exists
 
-`gbrain upgrade` ships the new binary. `gbrain post-upgrade [--execute --yes]` runs
-the schema migrations and backfills the data. But the **skill files themselves**
+`gbrain upgrade` ships the new binary and runs `gbrain post-upgrade`, which applies
+the schema migrations and backfills the data (`gbrain apply-migrations --yes` runs
+them by hand). But the **skill files themselves**
 that tell the agent how to behave — those are user-owned. If your `~/git/<your-agent>/workspace/skills/brain-ops/SKILL.md`
 says `# Based on gbrain v0.10.0` at the top, it doesn't know about v0.12.0 features.
 

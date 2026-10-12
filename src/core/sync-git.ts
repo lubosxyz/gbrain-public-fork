@@ -3,13 +3,15 @@
  * baseline-commit self-heal, and path-containment guards. Peeled out of
  * src/commands/sync.ts (containment sprint C13-C14) as a pure move.
  */
-import { existsSync, readFileSync, realpathSync } from 'fs';
+import { realpathSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { isAbsolute, join, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { resolveSlugForPath, DEFAULT_SOURCE_ID } from './sync.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
-import { loadStorageConfig } from './storage-config.ts';
+import { invalidateGitListingCache, knownOutsideGitRepo, noteGitFailure } from './git-visible-files.ts';
+import { hasUnresolvedDbOnlyDeclaration, loadStorageConfig } from './storage-config.ts';
+import { gitChildEnv } from './git-env.ts';
 
 /**
  * v0.32.7 CJK wave (codex post-merge F4): resolve a slug by `pages.source_path`
@@ -281,6 +283,14 @@ export function resolveNoEmbed(
   return args.includes('--no-embed') || cfg?.embedding_disabled === true;
 }
 
+/** Subcommands that never change a repository; any other one drops the doctor-run git memo (git-visible-files.ts). */
+const READ_ONLY_GIT = new Set(['rev-parse', 'ls-files', 'ls-tree', 'cat-file', 'diff', 'log', 'show', 'status', 'rev-list', 'merge-base',
+  'for-each-ref', 'show-ref', 'describe', 'check-ignore', 'name-rev', 'blame', 'grep', 'check-attr', 'var', 'version']);
+
+function noteGitCommand(args: string[]): void {
+  if (!READ_ONLY_GIT.has(args[0] ?? '')) invalidateGitListingCache();
+}
+
 /**
  * Shell out to git with a generous maxBuffer.
  *
@@ -307,7 +317,9 @@ export function git(
   timeoutMs = 30000,
   { silenceStderr = false }: { silenceStderr?: boolean } = {},
 ): string {
+  noteGitCommand(args);
   return execFileSync('git', buildGitInvocation(repoPath, args, configs), {
+    env: gitChildEnv(),
     encoding: 'utf-8',
     timeout: timeoutMs,
     maxBuffer: 100 * 1024 * 1024,
@@ -323,7 +335,9 @@ export function git(
  * live page was deleted on the corrupted evidence).
  */
 export function gitRawOutput(repoPath: string, args: string[]): string {
+  noteGitCommand(args);
   return execFileSync('git', buildGitInvocation(repoPath, args, []), {
+    env: gitChildEnv(),
     encoding: 'utf-8',
     timeout: 30000,
     maxBuffer: 100 * 1024 * 1024,
@@ -347,8 +361,10 @@ export function gitRawOutput(repoPath: string, args: string[]): string {
  */
 export function discoverGitRoot(inputPath: string): string {
   try {
+    if (knownOutsideGitRepo(inputPath)) throw new Error('outside a git repository');
     return git(inputPath, ['rev-parse', '--show-toplevel'], [], 30000, { silenceStderr: true });
-  } catch {
+  } catch (error) {
+    noteGitFailure(inputPath, error);
     throw new Error(
       `Not inside a git repository: ${inputPath}. GBrain sync requires a git-initialized repo (or a subdirectory of one).`,
     );
@@ -472,46 +488,21 @@ export function createSyncBaselineCommit(repoPath: string): void {
   const dbOnlyDirs = storageConfig?.db_only ?? [];
   // Sniff-test fail-closed (round 6, P2): `loadStorageConfig` warns-and-
   // returns an EMPTY config for syntactically-valid-but-unsupported YAML
-  // (e.g. flow-style `db_only: [dir/]` — the narrow custom parser only
+  // (e.g. flow-style `db_only: [dir/]`; the narrow custom parser only
   // handles block-style lists), which would silently resolve zero
-  // exclusions from a file that clearly intended some. If gbrain.yml
-  // exists and mentions db_only (or its deprecated pre-v0.22.11 alias
-  // `supabase_only` — same keep-out-of-git semantics, still a supported
-  // backward-compat key per storage-config.ts) but nothing resolved from
-  // it, refuse rather than guess "genuinely empty" vs "syntax ignored".
-  //
-  // Known false-positive (round 8 review): a genuinely, intentionally
-  // empty `db_only: []` mentioning the word also refuses, and can't be
-  // told apart from the unsupported-syntax case — `loadStorageConfig`
-  // returns the IDENTICAL `{db_tracked:[],db_only:[]}` for both (verified
-  // directly: flow-style `[dir/]` and literal `[]` both collapse to that
-  // same shape). Distinguishing them would mean teaching this function
-  // about the parser's internal line-recognition rules, which belongs in
-  // storage-config.ts, not here. Accepted trade-off: the false-positive
-  // cost is low and self-resolving (the brain stays wedged with a clear,
-  // actionable error until the user drops the pointless empty stanza or
-  // fixes their syntax; retried on every subsequent sync); the
-  // false-negative this guards against — silently committing db_only
-  // content into permanent git history — is high-cost and hard to undo.
-  if (dbOnlyDirs.length === 0) {
+  // exclusions from a file that clearly intended some. If gbrain.yml has a
+  // db_only (or deprecated `supabase_only`) key line but nothing resolved
+  // from it, refuse rather than guess; `hasUnresolvedDbOnlyDeclaration`
+  // owns the key-line rules. Accepted trade-off: an intentionally empty
+  // `db_only: []` also refuses (same empty config); silently committing
+  // db_only content into permanent git history is high-cost and hard to undo.
+  if (hasUnresolvedDbOnlyDeclaration(repoPath, storageConfig)) {
     const yamlPath = join(repoPath, 'gbrain.yml');
-    const yamlContent = existsSync(yamlPath) ? readFileSync(yamlPath, 'utf-8') : '';
-    // A YAML KEY line (`db_only:` / `supabase_only:`, ignoring leading
-    // whitespace and `#` comments), not a bare substring search — round 9,
-    // P2: a comment or unrelated prose value that happens to mention the
-    // word (e.g. `# db_only handling TBD`) must not trip this guard on an
-    // otherwise-genuinely-config-free gbrain.yml.
-    const mentionsUnresolvedKey = yamlContent.split('\n').some((line) => {
-      const trimmed = line.trim();
-      return !trimmed.startsWith('#') && /^(db_only|supabase_only)\s*:/.test(trimmed);
-    });
-    if (mentionsUnresolvedKey) {
-      throw new Error(
-        `${yamlPath} mentions db_only but no directories resolved from it — refusing to ` +
-          `auto-commit (cannot tell "genuinely empty" from "unsupported syntax silently ignored"). ` +
-          `Fix gbrain.yml's storage.db_only syntax, or git-init this directory manually.`,
-      );
-    }
+    throw new Error(
+      `${yamlPath} mentions db_only but no directories resolved from it — refusing to ` +
+        `auto-commit (cannot tell "genuinely empty" from "unsupported syntax silently ignored"). ` +
+        `Fix gbrain.yml's storage.db_only syntax, or git-init this directory manually.`,
+    );
   }
   // #2964 (round 9, P1): every db_only dir is ALWAYS pathspec-excluded,
   // unconditionally — never pre-filtered against what an existing
@@ -639,6 +630,7 @@ export function isPathSafe(filePath: string, gitRoot: string): boolean {
 export function hasOriginRemote(repoPath: string): boolean {
   try {
     execFileSync('git', buildGitInvocation(repoPath, ['remote', 'get-url', 'origin']), {
+      env: gitChildEnv(),
       encoding: 'utf-8',
       timeout: 30000,
       stdio: ['ignore', 'ignore', 'ignore'],

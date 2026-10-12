@@ -266,7 +266,7 @@ describe('request-log retention — dream cycle purge-phase wiring (structural p
 
   test('serve-http admin agents metrics fold in mcp_request_log_purged', () => {
     // test-reads-source-ok: the admin metrics endpoint needs a live HTTP server to test end-to-end; this pins the purged-counter fold-in at the source seam.
-    const src = readFileSync('src/commands/serve-http.ts', 'utf8');
+    const src = readFileSync('src/commands/serve-http-admin-api.ts', 'utf8');
     expect(src).toMatch(/mcp_request_log_purged/);
     expect(src).toMatch(/purged_requests/);
     expect(src).toMatch(/purged_last_used_at/);

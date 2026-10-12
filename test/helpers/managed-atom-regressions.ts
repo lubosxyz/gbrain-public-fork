@@ -9,6 +9,7 @@ import { OperationError } from '../../src/core/ops/contract.ts';
 import { managedAtomSession } from '../../src/core/persistence/atom-maintenance.ts';
 import { retryManagedAtomBatch } from '../../src/core/persistence/atom-retry.ts';
 import { withCoordinatedWrite } from '../../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './write-attribution.ts';
 import { sha256 } from '../../src/core/persistence/digest.ts';
 import { refreshManagedFilesystemRoots } from '../../src/core/persistence/filesystem-guard.ts';
 import { registerLocalWriter } from '../../src/core/persistence/identity.ts';
@@ -38,7 +39,7 @@ export async function exerciseAtomRetrySourceIsolation(engine: BrainEngine): Pro
           }
           if (phase === 'drain') {
             const pending = await current.executeRaw("SELECT id FROM persistence_requests WHERE id=$1::uuid AND state IN ('queued','running')", [pendingRetryId]);
-            if (pending.length) return current.executeRaw(sql.replace("WHERE r.state='queued'", "WHERE r.source_id=$3 AND r.state='queued'"), [...args!, priorSource]);
+            if (pending.length) return current.executeRaw(sql.replace("WHERE r.state='queued'", `WHERE r.source_id=$${args!.length + 1} AND r.state='queued'`), [...args!, priorSource]);
             phase = 'done';
           }
         }
@@ -86,7 +87,7 @@ export async function exerciseAtomRetryFence(engine: BrainEngine, state: typeof 
           await tx.lockPageKeys([{ sourceId, slug: slugs[0] }]);
           const atom = (await tx.getPage(slugs[0], { sourceId }))!;
           await tx.putPage(slugs[0], { ...atom, compiled_truth: 'Independent correction that must survive retry.' }, { sourceId });
-        }));
+        }, TEST_WRITE_ATTRIBUTION));
       };
       const observe = (target: BrainEngine, inTransaction = false): BrainEngine => new Proxy(target, {
         get(current, key) {

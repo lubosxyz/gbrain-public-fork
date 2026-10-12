@@ -91,6 +91,11 @@ export const HASH_EPHEMERAL_FRONTMATTER_KEYS: readonly string[] = [
   // (paraphrases defeat content_hash_duplicates). The marker is re-derived
   // deterministically from the body, so dropping it from the hash is safe.
   ATOMS_SCAN_HASH_KEY,
+  // #5575 CEO-21: the lower-only `trust_tier` marker a below-owner write-through stamps. It labels the
+  // content, it is not content: page purge tombstones match (source_id, content_hash) with or without it,
+  // and an agent stamping it onto identical content is no content change. (The tier trigger still treats
+  // it as content: trust/schema.ts TRUST_EPHEMERAL_FRONTMATTER_KEYS excludes it.)
+  'trust_tier',
 ];
 
 /**
@@ -224,7 +229,7 @@ export function rowToPage(row: Record<string, unknown>): Page {
     frontmatter: (typeof row.frontmatter === 'string' ? JSON.parse(row.frontmatter) : row.frontmatter) as Record<string, unknown>,
     content_hash: row.content_hash as string | undefined,
     ...(row.source_path !== undefined && { source_path: row.source_path as string | null }),
-    ...(row.knowledge_revision !== undefined && { knowledge_revision: String(row.knowledge_revision) }),
+    ...(row.knowledge_revision != null && { knowledge_revision: String(row.knowledge_revision) }),
     ...(row.text_projection_revision !== undefined && { text_projection_revision: row.text_projection_revision as string | null }),
     // v0.29 (column added in migration v40). Old brains pre-migration return undefined.
     emotional_weight: row.emotional_weight == null ? undefined : Number(row.emotional_weight),
@@ -379,6 +384,17 @@ export function isUndefinedTableError(error: unknown): boolean {
   return /relation .* does not exist|no such table|undefined table/i.test(message);
 }
 
+/**
+ * SQLSTATE 22007 / 22008: a date or timestamp the database could not parse.
+ * On a read path that is the caller's input, never a degraded result or a
+ * server fault: list_pages reports it as invalid_params and the hybrid
+ * lexical arms rethrow it instead of failing open.
+ */
+export function isDatetimeInputError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return code === '22007' || code === '22008';
+}
+
 const _warnedKeys = new Set<string>();
 
 /**
@@ -450,34 +466,17 @@ export function rowToChunk(row: Record<string, unknown>, includeEmbedding = fals
   };
 }
 
-export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
-  const result: SearchResult = {
-    slug: row.slug as string,
-    page_id: row.page_id as number,
-    title: row.title as string,
-    type: row.type as string,
-    chunk_text: row.chunk_text as string,
-    chunk_source: row.chunk_source as 'compiled_truth' | 'timeline',
-    chunk_id: row.chunk_id as number,
-    chunk_index: row.chunk_index as number,
-    score: Number(row.score),
-    stale: Boolean(row.stale),
-  };
-  // v0.17.0: source_id comes from the p.source_id column in search
-  // SELECTs. Keep the field optional so pre-v0.17 engines that didn't
-  // join sources don't crash on the absent column — rowToSearchResult
-  // is shared by both paths.
-  if (typeof row.source_id === 'string') {
-    result.source_id = row.source_id;
-  }
-  // v0.34: effective_date / effective_date_source carried through from the
-  // pages join. Same three-state read as readOptionalDate elsewhere: the
-  // field is left UNTOUCHED when the column isn't in the projection (so
-  // legacy callers see undefined), set to null when the column was selected
-  // but the page row has no date, and to YYYY-MM-DD when populated. Postgres
-  // returns Date objects via postgres.js; PGLite returns strings. Normalize
-  // to date-only ISO so downstream prompt-builders don't see noise from
-  // midnight-UTC timestamps.
+/**
+ * v0.34: effective_date / effective_date_source carried through from the
+ * pages join. Same three-state read as readOptionalDate elsewhere: the
+ * field is left UNTOUCHED when the column isn't in the projection (so
+ * legacy callers see undefined), set to null when the column was selected
+ * but the page row has no date, and to YYYY-MM-DD when populated. Postgres
+ * returns Date objects via postgres.js; PGLite returns strings. Normalize
+ * to date-only ISO so downstream prompt-builders don't see noise from
+ * midnight-UTC timestamps. Shared by search rows and frozen-hit rows.
+ */
+export function applyEffectiveDate(result: SearchResult, row: Record<string, unknown>): void {
   if ('effective_date' in row) {
     const raw = row.effective_date;
     if (raw === null) {
@@ -498,6 +497,29 @@ export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
       result.effective_date_source = raw;
     }
   }
+}
+
+export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
+  const result: SearchResult = {
+    slug: row.slug as string,
+    page_id: row.page_id as number,
+    title: row.title as string,
+    type: row.type as string,
+    chunk_text: row.chunk_text as string,
+    chunk_source: row.chunk_source as 'compiled_truth' | 'timeline',
+    chunk_id: row.chunk_id as number,
+    chunk_index: row.chunk_index as number,
+    score: Number(row.score),
+    stale: Boolean(row.stale),
+  };
+  // v0.17.0: source_id comes from the p.source_id column in search
+  // SELECTs. Keep the field optional so pre-v0.17 engines that didn't
+  // join sources don't crash on the absent column — rowToSearchResult
+  // is shared by both paths.
+  if (typeof row.source_id === 'string') {
+    result.source_id = row.source_id;
+  }
+  applyEffectiveDate(result, row);
   if (typeof row.message_id === 'string' && row.message_id.trim().length > 0) {
     result.message_id = row.message_id;
   }

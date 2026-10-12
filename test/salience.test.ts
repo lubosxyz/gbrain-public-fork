@@ -1,5 +1,4 @@
 import { describe, expect, test } from 'bun:test';
-import { computeAnomaliesFromBuckets } from '../src/core/cycle/anomaly.ts';
 
 /**
  * Unit-level salience checks. The full Garry-test fixture lives in
@@ -32,13 +31,5 @@ describe('v0.29 — salience SQL shape pinned via type contract', () => {
     // v0.42.x — the real read signal (migration v79); see last-retrieved.ts.
     void sample.last_retrieved_at;
     expect(typeof mod).toBe('object');
-  });
-});
-
-describe('v0.29 — anomaly cohort buckets connect to the engine', () => {
-  test('computeAnomaliesFromBuckets is exported and pure', () => {
-    // Smoke that the import path engines use is wired. The behavior is
-    // covered exhaustively in test/anomalies.test.ts.
-    expect(typeof computeAnomaliesFromBuckets).toBe('function');
   });
 });

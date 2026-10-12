@@ -28,15 +28,24 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { randomUUID } from 'node:crypto';
 import { importFromContent } from '../import-file.ts';
+import type { OperationContext } from '../ops/contract.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { submitPageMutation } from '../persistence/page-mutations.ts';
 import { canonicalJson } from '../remediation-step.ts';
-import type { TranscriptAdapter, TranscriptFormat } from './types.ts';
+import type { FileDiagnostics, TranscriptAdapter, TranscriptFormat } from './types.ts';
 import { detectAdapter } from './detect.ts';
 import {
   loadImportRedactionPatterns,
   redactSession,
+  renderPartContent,
   renderSessionParts,
+  type RenderedPart,
+  type RenderSessionResult,
 } from './render.ts';
+import { RECONCILE_SAFETY_KEYS } from '../persistence/reconcile-safety.ts';
+import { ATOMS_SCAN_HASH_KEY } from '../utils.ts';
 
 export interface IngestActivePack {
   page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }>;
@@ -65,6 +74,12 @@ export interface TranscriptsIngestOpts {
    */
   maxBytes?: number;
   activePack?: IngestActivePack;
+  /**
+   * The CLI's trusted-local operation context. On a writer-claimed brain each
+   * rendered part is submitted as a `put_page` write request through it; the
+   * direct importer is refused there. Without it the direct importer runs.
+   */
+  context?: OperationContext;
   /** Test seam for the redaction user-pattern file. */
   userPatternsPath?: string;
   /** Adapter registry override (tests). */
@@ -88,6 +103,8 @@ export interface IngestSessionOutcome {
   redactions: number;
   imperatives: number;
   error?: string;
+  /** C-19: a session with no timestamps is skipped (never fabricated), not errored. */
+  skipped?: 'no_timestamp';
 }
 
 export interface IngestFileOutcome {
@@ -96,6 +113,8 @@ export interface IngestFileOutcome {
   sessions: IngestSessionOutcome[];
   skippedLines: number;
   drift: boolean;
+  /** E-N4: assistant turns parsed with zero user turns (counted in driftFiles). */
+  userTurnsMissing?: boolean;
   /** Adapter degraded to a bounded read (e.g. codex head+tail) — part of the file was never scanned. */
   truncated: boolean;
   error?: string;
@@ -108,6 +127,8 @@ export interface TranscriptsIngestResult {
   sessionsImported: number;
   sessionsFiltered: number;
   sessionsErrored: number;
+  /** Sessions with no timestamps at all: reported, not imported, not an error (C-19). */
+  sessionsSkippedNoTimestamp: number;
   redactions: number;
   imperatives: number;
   partsDeleted: number;
@@ -162,6 +183,7 @@ export async function runTranscriptsIngest(
     sessionsImported: 0,
     sessionsFiltered: 0,
     sessionsErrored: 0,
+    sessionsSkippedNoTimestamp: 0,
     redactions: 0,
     imperatives: 0,
     partsDeleted: 0,
@@ -178,6 +200,7 @@ export async function runTranscriptsIngest(
   // recompiles the pattern file on every call, which a bulk import would
   // otherwise repeat thousands of times.
   const redactionPatterns = loadImportRedactionPatterns(opts.userPatternsPath);
+  const coordinator = !opts.dryRun && opts.context && await managedPersistenceEnabled(engine) ? opts.context : null;
 
   const total = opts.paths.length;
   let done = 0;
@@ -257,6 +280,16 @@ export async function runTranscriptsIngest(
         };
         fileOutcome.sessions.push(outcome);
 
+        // C-19: a session with no timestamps can never render (provenance is
+        // never fabricated), so retrying it is pointless; report the skip and
+        // keep the scan clean instead of freezing the --since checkpoint.
+        if (!session.meta.startedAt && !session.messages.some(m => m.timestamp)) {
+          outcome.skipped = 'no_timestamp';
+          result.sessionsSkippedNoTimestamp++;
+          step = await gen.next();
+          continue;
+        }
+
         try {
           const redacted = redactSession(session, {
             userPatternsPath: opts.userPatternsPath,
@@ -283,17 +316,21 @@ export async function runTranscriptsIngest(
             // title or corrected start date) — raw-data writes and stale-part
             // reconciliation must follow the page that actually exists, or
             // every re-run aborts on a nonexistent slug.
+            await adoptExistingBaseSlug(engine, opts.sourceId ?? 'default', rendered);
+            outcome.baseSlug = rendered.baseSlug;
             let resolvedBaseSlug = rendered.baseSlug;
             for (const part of rendered.parts) {
               try {
-                const r = await importFromContent(engine, part.slug, part.content, {
-                  noEmbed: !opts.embed,
-                  sourceId: opts.sourceId,
-                  activePack: opts.activePack,
-                  source_kind: `transcript:${session.meta.harness}`,
-                  source_uri: path,
-                  ingested_via: 'cli:transcripts-ingest',
-                });
+                await preserveForeignFrontmatter(engine, opts.sourceId ?? 'default', part);
+                const provenance = { source_kind: `transcript:${session.meta.harness}`, source_uri: path, ingested_via: 'cli:transcripts-ingest' };
+                const r = coordinator
+                  ? await submitTranscriptPart(coordinator, engine, opts.sourceId, part, provenance)
+                  : await importFromContent(engine, part.slug, part.content, {
+                    noEmbed: !opts.embed,
+                    sourceId: opts.sourceId,
+                    activePack: opts.activePack,
+                    ...provenance,
+                  });
                 outcome.statuses.push(r.status);
                 if (r.status === 'imported') result.pages.imported++;
                 else if (r.status === 'skipped') result.pages.skipped++;
@@ -395,7 +432,10 @@ export async function runTranscriptsIngest(
               const m = /^-p(\d+)$/.exec(suffix);
               const num = m ? Number(m[1]) : NaN;
               if (Number.isFinite(num) && num > rendered.parts.length) {
-                await engine.deletePage(row.slug, { sourceId: opts.sourceId });
+                // #5235: on a managed brain the stale part goes through the coordinator like the parts
+                // themselves, bound to its revision; the direct delete is refused there.
+                if (coordinator) await deleteStaleTranscriptPart(coordinator, engine, opts.sourceId, row.slug);
+                else await engine.deletePage(row.slug, { sourceId: opts.sourceId });
                 result.partsDeleted++;
               }
             }
@@ -412,34 +452,7 @@ export async function runTranscriptsIngest(
 
         step = await gen.next();
       }
-      if (step.done && step.value) {
-        const diag = step.value;
-        fileOutcome.skippedLines = diag.skippedLines;
-        if (diag.bytesRead > 0 && diag.sessions === 0 && !diag.expectedEmpty) {
-          fileOutcome.drift = true;
-          result.driftFiles++;
-          // A drifting file may hold sessions a fixed parser will surface
-          // later (torn hermes copy, transient format break) — the shared
-          // watermark must not advance past it. expectedEmpty (a grok
-          // tool/reasoning-only session) is understood, not drifted.
-          result.cleanScan = false;
-        }
-        if (diag.skippedLines > 0) {
-          // Malformed lines can be DROPPED RECORDS (an actively-appended
-          // file read mid-write, corruption) — freeze the watermark so a
-          // later repair with an older timestamp is still picked up.
-          // Re-scans stay cheap via content-hash skip.
-          result.cleanScan = false;
-        }
-        if (diag.truncated) {
-          // A bounded read (codex head+tail over an over-budget rollout)
-          // skipped a window of the file — advancing the since-watermark
-          // over that unscanned window would drop its sessions permanently.
-          fileOutcome.truncated = true;
-          result.truncatedFiles++;
-          result.cleanScan = false;
-        }
-      }
+      if (step.done && step.value) applyFileDiagnostics(step.value, fileOutcome, result);
     } catch (err) {
       if (err instanceof Error && err.message.startsWith(RUN_ABORT_MARKER)) throw err;
       fileOutcome.error = err instanceof Error ? err.message : String(err);
@@ -453,4 +466,111 @@ export async function runTranscriptsIngest(
 
   if (opts.dryRun) result.cleanScan = false; // dry-runs never advance watermarks
   return result;
+}
+
+/**
+ * A writer-claimed brain refuses the direct importer, so a rendered part is
+ * submitted as a `put_page` write request: the same importer runs behind the
+ * coordinator, naming the current revision so a replacement is never a blind
+ * overwrite (no revision means create-only). Embedding is deferred there, as
+ * for every coordinated page write.
+ */
+async function submitTranscriptPart(
+  ctx: OperationContext,
+  engine: BrainEngine,
+  sourceId: string,
+  part: RenderedPart,
+  provenance: { source_kind: string; source_uri: string; ingested_via: string },
+): Promise<{ slug: string; status: 'imported' | 'skipped' | 'error' }> {
+  const snapshot = await engine.readPageSnapshot(part.slug, { sourceId, includeDeleted: true });
+  const receipt = await submitPageMutation(ctx, {
+    operation: 'put_page',
+    params: { slug: part.slug, content: part.content, source_id: sourceId, ...provenance,
+      ...(snapshot?.revision ? { expected_revision: snapshot.revision } : {}) },
+  });
+  const slug = typeof receipt.slug === 'string' && receipt.slug ? receipt.slug : part.slug;
+  if (receipt.state !== 'committed') return { slug, status: 'error' };
+  return { slug, status: receipt.noop === true || receipt.status === 'skipped' ? 'skipped' : 'imported' };
+}
+
+/** A stale higher-numbered part on a managed brain: a revision-bound `delete_page` write request (soft delete, recoverable). */
+async function deleteStaleTranscriptPart(ctx: OperationContext, engine: BrainEngine, sourceId: string, slug: string): Promise<void> {
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId });
+  if (!snapshot) return;
+  const receipt = await submitPageMutation(ctx, { operation: 'delete_page', params: { slug, source_id: sourceId, expected_revision: snapshot.revision, request_id: randomUUID() } });
+  if (receipt.state !== 'committed') {
+    throw new Error(`stale part ${slug} was not deleted: the coordinator returned ${String(receipt.state)}${receipt.error_code ? ` (${String(receipt.error_code)})` : ''}`);
+  }
+}
+
+/**
+ * The slug embeds the title (and start day) for export formats, so a rename
+ * renders a new slug for the same session. Import at the slug the session's
+ * pages already live at: the content is then an in-place update. At a new
+ * slug, the importer's cross-slug identity dedup skipped it as a duplicate
+ * and every message added since the last import was silently dropped.
+ */
+/**
+ * Re-ingest replaces only what the collector renders (#5431): keys another
+ * tool or the operator added to an imported conversation page (a review flag,
+ * say) are carried onto the re-rendered part. Gate- and phase-owned markers
+ * are re-derived from the new content, so they are never carried.
+ */
+async function preserveForeignFrontmatter(engine: BrainEngine, sourceId: string, part: RenderedPart): Promise<void> {
+  const existing = await engine.getPage(part.slug, { sourceId });
+  const foreign = Object.entries(existing?.frontmatter ?? {})
+    .filter(([key]) => !Object.hasOwn(part.frontmatter, key) && !RE_DERIVED_KEYS.has(key));
+  if (foreign.length === 0) return;
+  part.content = renderPartContent({ ...part.frontmatter, ...Object.fromEntries(foreign) }, part.body);
+}
+
+const RE_DERIVED_KEYS = new Set([...RECONCILE_SAFETY_KEYS, ATOMS_SCAN_HASH_KEY]);
+
+async function adoptExistingBaseSlug(engine: BrainEngine, sourceId: string, rendered: RenderSessionResult): Promise<void> {
+  const [existing] = await engine.executeRaw<{ slug: string }>(
+    `SELECT slug FROM pages WHERE source_id = $1 AND deleted_at IS NULL AND frontmatter->>'id' = $2 ORDER BY id LIMIT 1`,
+    [sourceId, rendered.parts[0].frontmatterId],
+  );
+  if (!existing || existing.slug === rendered.baseSlug) return;
+  rendered.baseSlug = existing.slug;
+  for (const part of rendered.parts) part.slug = part.part === 1 ? existing.slug : `${existing.slug}-p${part.part}`;
+}
+
+/** Fold one file's adapter diagnostics into its outcome and the run result (drift, skipped lines, truncation). */
+function applyFileDiagnostics(diag: FileDiagnostics, fileOutcome: IngestFileOutcome, result: TranscriptsIngestResult): void {
+  fileOutcome.skippedLines = diag.skippedLines;
+  if (diag.bytesRead > 0 && diag.sessions === 0 && !diag.expectedEmpty) {
+    fileOutcome.drift = true;
+    result.driftFiles++;
+    // A drifting file may hold sessions a fixed parser will surface
+    // later (torn hermes copy, transient format break) — the shared
+    // watermark must not advance past it. expectedEmpty (a grok
+    // tool/reasoning-only session) is understood, not drifted.
+    result.cleanScan = false;
+  }
+  if (diag.userTurnsMissing && !fileOutcome.drift) {
+    // E-N4: assistant turns parsed but not one user turn — the shape
+    // #5163 hid behind (a host renamed its user-turn record). The
+    // session still imports, but the file is drift: the watermark holds
+    // so a fixed parser re-reads it.
+    fileOutcome.drift = true;
+    fileOutcome.userTurnsMissing = true;
+    result.driftFiles++;
+    result.cleanScan = false;
+  }
+  if (diag.skippedLines > 0) {
+    // Malformed lines can be DROPPED RECORDS (an actively-appended
+    // file read mid-write, corruption) — freeze the watermark so a
+    // later repair with an older timestamp is still picked up.
+    // Re-scans stay cheap via content-hash skip.
+    result.cleanScan = false;
+  }
+  if (diag.truncated) {
+    // A bounded read (codex head+tail over an over-budget rollout)
+    // skipped a window of the file — advancing the since-watermark
+    // over that unscanned window would drop its sessions permanently.
+    fileOutcome.truncated = true;
+    result.truncatedFiles++;
+    result.cleanScan = false;
+  }
 }

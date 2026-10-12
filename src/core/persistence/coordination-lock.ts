@@ -16,7 +16,7 @@ function userCoordinationLocks(): string {
   const override = process.env.GBRAIN_COORDINATION_HOME?.trim();
   if (override) {
     if (!isAbsolute(override) || override.split(/[\\/]/).includes('..')) {
-      throw new OperationError('invalid_params', 'GBRAIN_COORDINATION_HOME must be an absolute path without ".." segments.');
+      throw new OperationError('invalid_params', 'GBRAIN_COORDINATION_HOME must be an absolute path without ".." segments.', 'Set GBRAIN_COORDINATION_HOME to an absolute private directory outside the source root.');
     }
     return join(override, 'locks');
   }

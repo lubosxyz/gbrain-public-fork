@@ -19,7 +19,10 @@
  * Split pages: bodies over PART_TARGET_BYTES split at message boundaries
  * with OVERLAP_MESSAGES carried into the next part (cross-boundary
  * decision/answer pairs can still ground facts; extraction dedup absorbs the
- * duplicates). Splitting exists because pages over the ~500KB embed_skip
+ * duplicates). No message is truncated (#6388): one too large for a part
+ * becomes continuation blocks that repeat its speaker and timestamp anchor,
+ * cut only at code-point boundaries, after redaction and escaping ran over
+ * the whole message; continuation blocks are never repeated as overlap. Splitting exists because pages over the ~500KB embed_skip
  * threshold import as zero-chunk, unsearchable pages — the 5MB import cap is
  * NOT the binding limit, embed-skip is. Part slugs: part 1 keeps the base
  * slug (stable when a session later grows into more parts); parts 2..N get
@@ -27,17 +30,17 @@
  * per-session id would make parts 2..N skip as cross-slug duplicates.
  */
 
-import { safeDump } from 'js-yaml';
+import { dumpFrontmatterYaml } from '../data-frontmatter.ts';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { DEFAULT_BYTES_BLOCK } from '../content-sanity.ts';
+import { DEFAULT_BYTES_WARN } from '../content-sanity.ts';
 import { applyRedaction, planRedaction, type EchoDictionary, type RedactionPlan } from '../secret-scan.ts';
 import { loadPatterns } from '../skillpack/harvest-lint.ts';
 import { sanitizeForJsonb } from '../batch-rows.ts';
-import { ensureWellFormed, truncateUtf8 } from '../text-safe.ts';
+import { ensureWellFormed } from '../text-safe.ts';
 import { BUILTIN_PATTERNS } from '../conversation-parser/builtins.ts';
 import type { ParsedSession, TranscriptMessage } from './types.ts';
-import { buildTranscriptSlug, transcriptFullId } from './types.ts';
+import { buildTranscriptSlug, transcriptFullId, utcTimestamp } from './types.ts';
 
 // ── Shared line format (imessage-slack builtin) ─────────────────────────────
 
@@ -51,17 +54,24 @@ export const MESSAGE_ANCHOR_RE: RegExp = IMESSAGE_SLACK.regex;
 /** Date-heading shapes some builtins treat as day boundaries — escaped too. */
 const DATE_HEADING_RE = /^#{1,6}\s*\d{4}-\d{2}-\d{2}\b/;
 
-/** ~4K chars per message keeps pages readable; full text stays in source_uri. */
-export const MESSAGE_CHAR_CAP = 4000;
-
 /**
  * Part bodies target well under the embed-skip/block threshold — the tie is
  * CODE, not prose: a part page at or above the content-sanity block line
  * would import as a zero-chunk, unsearchable page, defeating the split.
  * (Operators can lower the threshold via config; the 0.6 factor leaves
  * headroom for frontmatter overhead and modest overrides.)
+ *
+ * #5427: with the prior `min(300KB, floor(BLOCK * 0.6))` shape, the target
+ * landed at 300KB — six times the content-sanity WARN line (50KB). Every
+ * transcript-import part between 50KB and 300KB therefore took the
+ * content-sanity warn branch (`oversize_warn` audit row + stderr
+ * `exceeds warn threshold, consider splitting` — pointing at the very
+ * splitter that produced the page) on every re-ingest, drowning the doctor
+ * recent-events signal. The block tier stays untouched (the hard floor for
+ * the no-zero-chunk invariant). The 0.9 headroom against WARN gives the
+ * part header + OVERLAP_MESSAGES duplicates room to breathe.
  */
-export const PART_TARGET_BYTES = Math.min(300 * 1024, Math.floor(DEFAULT_BYTES_BLOCK * 0.6));
+export const PART_TARGET_BYTES = Math.floor(DEFAULT_BYTES_WARN * 0.9);
 /** Messages repeated at each part boundary for cross-part fact grounding. */
 export const OVERLAP_MESSAGES = 2;
 
@@ -79,9 +89,10 @@ export function defaultUserPatternsPath(): string {
  * Agent-directed imperative shapes. Detection only STAMPS A COUNT into the
  * page's transcript_import frontmatter (hash-covered, idempotent) so readers
  * and future triage can see the page carries instruction-shaped content —
- * it never hides or rewrites the text.
+ * it never hides or rewrites the text. The write gate
+ * (`src/core/write-gate-patterns.ts`) reuses them as `override` patterns.
  */
-const IMPERATIVE_RES: readonly RegExp[] = [
+export const IMPERATIVE_RES: readonly RegExp[] = [
   /\b(ignore|disregard|forget)\s+(all\s+|any\s+)?(previous|prior|above|earlier)\s+(instructions|context|rules)\b/i,
   /\byou\s+(must|should)\s+now\s+(act|behave|respond)\b/i,
   /\bnew\s+system\s+prompt\b/i,
@@ -123,6 +134,11 @@ export function loadImportRedactionPatterns(userPatternsPath?: string): ImportRe
  * carry a digit and clear the entropy gate). Transcripts are the corpus where
  * a pasted `.env` line is most likely, so recall wins over the false-positive
  * cost here; the push gate and compiled-context scan keep the heuristic off.
+ * Also opted in for this lane only: the `labeled_credential` detector
+ * (`secret-scan-labeled.ts`), which claims a low-entropy value typed after a
+ * password / login / credentials label (`password: hunter2`, `login alice /
+ * hunter2`); a claimed value of 8+ characters that is not a stoplisted word
+ * joins the echo dictionary below.
  * Every match becomes `<REDACTED:pattern>`; user patterns become
  * `<REDACTED:user-pattern>`.
  *
@@ -151,9 +167,10 @@ export function redactSession(
     // sanitizeForJsonb (NUL-strip + well-form): transcripts capture raw tool
     // output that legitimately carries U+0000, which Postgres text/jsonb
     // reject at the write boundary (#4392).
-    // highEntropy: transcripts opt into the assignment heuristic (see doc
-    // comment above) — the shared scanner keeps it off by default.
-    planRedaction(sanitizeForJsonb(text), { highEntropy: true, echoValues });
+    // highEntropy + labeledCredentials: transcripts opt into the assignment
+    // heuristic and the labeled-credential detector (see doc comment above);
+    // the shared scanner keeps both off by default.
+    planRedaction(sanitizeForJsonb(text), { highEntropy: true, labeledCredentials: true, echoValues });
 
   const apply = (p: RedactionPlan): string => {
     redactionCount += p.redactions.length;
@@ -217,7 +234,7 @@ export function redactSession(
 /** `2026-08-01T10:00:05.000Z` → `(2026-08-01 10:00 AM)` (UTC), matching the builtin. */
 function anchorTimestamp(iso: string): string {
   const d = new Date(iso);
-  const day = iso.slice(0, 10);
+  const day = Number.isNaN(d.getTime()) ? iso.slice(0, 10) : d.toISOString().slice(0, 10);
   let h = d.getUTCHours();
   const ampm = h >= 12 ? 'PM' : 'AM';
   h = h % 12 || 12;
@@ -242,8 +259,8 @@ export function escapeAnchorLines(text: string): string {
  * Neutralize QUOTED facts/takes fence markers in a message body:
  * `gbrain:facts:begin` → `gbrain\:facts:begin`. A session that read another
  * page (context pack, get_page) quotes that page's `<!--- gbrain:facts:begin -->`
- * verbatim, and the per-message char cap routinely keeps the begin marker
- * while dropping the end — a live, unbalanced fence on a transcript page that
+ * verbatim, often the begin marker without the end (a partial quote) — a
+ * live, unbalanced fence on a transcript page that
  * has no fence (FACTS_FENCE_UNBALANCED on every dream cycle), or a quoted
  * fence indexed as the transcript's own facts. Every fence consumer is an
  * exact-substring matcher on the marker token, so the backslash lands INSIDE
@@ -262,6 +279,13 @@ export interface RenderedPart {
   frontmatterId: string;
   part: number;
   of: number;
+  /** The keys this collector renders (and so owns on re-ingest), and the body. */
+  frontmatter: Record<string, unknown>;
+  body: string;
+}
+
+export function renderPartContent(frontmatter: Record<string, unknown>, body: string): string {
+  return `---\n${dumpFrontmatterYaml(frontmatter, { lineWidth: 1000 })}---\n\n${body}\n`;
 }
 
 export interface RenderSessionResult {
@@ -284,6 +308,54 @@ function speakerLabel(m: TranscriptMessage): string {
   return cleaned || (m.role === 'user' ? 'User' : 'Assistant');
 }
 
+const utf8Bytes = (cp: number): number => (cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4);
+
+/**
+ * One escaped message → 1..N blocks of at most `maxBytes` UTF-8 bytes, each
+ * starting with `anchor` (#6388: no message text is dropped). Fragments break
+ * at line breaks when a line fits, and inside an over-long line only at a
+ * code-point boundary. A cut piece of a line is always a fragment's FIRST
+ * line, which sits on the generated anchor line, so every body line is a
+ * whole line that escapeAnchorLines already saw.
+ */
+function messageBlocks(anchor: string, text: string, maxBytes: number): string[] {
+  const whole = `${anchor}${text}`;
+  if (Buffer.byteLength(whole, 'utf8') <= maxBytes) return [whole];
+  const room = maxBytes - Buffer.byteLength(anchor, 'utf8');
+  if (room < 4) {
+    throw new Error(`renderSessionParts: partTargetBytes ${maxBytes + 2} leaves no room for message text after its ${anchor.length}-character anchor`);
+  }
+  const fragments: string[] = [];
+  let current: string | null = null;
+  let currentBytes = 0;
+  for (const line of text.split('\n')) {
+    const lineBytes = Buffer.byteLength(line, 'utf8');
+    if (current !== null && currentBytes + 1 + lineBytes <= room) {
+      current += `\n${line}`;
+      currentBytes += 1 + lineBytes;
+      continue;
+    }
+    if (current !== null) fragments.push(current);
+    let start = 0;
+    let bytes = 0;
+    for (let i = 0; i < line.length;) {
+      const cp = line.codePointAt(i)!;
+      const b = utf8Bytes(cp);
+      if (bytes + b > room) {
+        fragments.push(line.slice(start, i));
+        start = i;
+        bytes = 0;
+      }
+      bytes += b;
+      i += cp > 0xffff ? 2 : 1;
+    }
+    current = line.slice(start);
+    currentBytes = bytes;
+  }
+  if (current !== null) fragments.push(current);
+  return fragments.map((f) => `${anchor}${f}`);
+}
+
 /**
  * Render one redacted session into 1..N part pages. Timestamps: each message
  * uses its own REAL timestamp; a message missing one carries the previous
@@ -293,8 +365,12 @@ function speakerLabel(m: TranscriptMessage): string {
  */
 export function renderSessionParts(
   redacted: RedactedSession,
-  opts: { sourcePath: string } = { sourcePath: '' },
+  opts: { sourcePath: string; partTargetBytes?: number } = { sourcePath: '' },
 ): RenderSessionResult {
+  const partTargetBytes = opts.partTargetBytes ?? PART_TARGET_BYTES;
+  if (!Number.isSafeInteger(partTargetBytes) || partTargetBytes <= 0) {
+    throw new Error(`renderSessionParts: partTargetBytes must be a positive integer (got ${partTargetBytes})`);
+  }
   const { session, imperativesFlagged } = redacted;
   const { meta, messages } = session;
   if (!messages.length) throw new Error('renderSessionParts: session has no messages');
@@ -305,7 +381,7 @@ export function renderSessionParts(
       `session ${meta.sessionId} carries no timestamps — refusing to fabricate provenance`,
     );
   }
-  const dateIso = firstTs;
+  const dateIso = utcTimestamp(firstTs);
   const baseSlug = buildTranscriptSlug(meta.harness, dateIso, {
     sessionId: meta.sessionId,
     title: meta.title,
@@ -315,34 +391,34 @@ export function renderSessionParts(
   // collision-proof across harnesses, days, and fallback session ids).
   const identityBase = `${meta.harness}-${transcriptFullId(meta.sessionId)}`;
 
-  // One rendered block per message (anchor line + escaped continuation).
+  // One or more rendered blocks per message: the whole message is escaped,
+  // then split into continuation blocks (same anchor) when it cannot fit a part.
   let lastTs = firstTs;
-  const blocks: string[] = messages.map((m) => {
+  const blocks: Array<{ text: string; bytes: number; continued: boolean }> = messages.flatMap((m) => {
     const ts = m.timestamp || lastTs;
     lastTs = ts;
-    const text = escapeFenceMarkers(escapeAnchorLines(truncateUtf8(m.text, MESSAGE_CHAR_CAP)));
-    const [head, ...rest] = text.split('\n');
-    const anchor = `**${speakerLabel(m)}** (${anchorTimestamp(ts)}): ${head}`;
-    return rest.length ? `${anchor}\n${rest.join('\n')}` : anchor;
+    const text = escapeFenceMarkers(escapeAnchorLines(m.text));
+    const fragments = messageBlocks(`**${speakerLabel(m)}** (${anchorTimestamp(ts)}): `, text, partTargetBytes - 2);
+    return fragments.map((f) => ({ text: f, bytes: Buffer.byteLength(f, 'utf8') + 2, continued: fragments.length > 1 }));
   });
 
-  // Split at message boundaries under the part target, with overlap.
+  // Split at block boundaries under the part target. Overlap repeats up to
+  // OVERLAP_MESSAGES whole messages, never a continuation block, and only
+  // as many as still fit beside the next block.
   const groups: string[][] = [];
-  let current: string[] = [];
+  let current: typeof blocks = [];
   let currentBytes = 0;
-  for (let i = 0; i < blocks.length; i++) {
-    const b = blocks[i];
-    const bytes = Buffer.byteLength(b, 'utf8') + 2;
-    if (current.length > 0 && currentBytes + bytes > PART_TARGET_BYTES) {
-      groups.push(current);
-      const overlap = current.slice(-OVERLAP_MESSAGES);
-      current = [...overlap];
-      currentBytes = overlap.reduce((n, s) => n + Buffer.byteLength(s, 'utf8') + 2, 0);
+  for (const b of blocks) {
+    if (current.length > 0 && currentBytes + b.bytes > partTargetBytes) {
+      groups.push(current.map((c) => c.text));
+      current = current.slice(-OVERLAP_MESSAGES).filter((c) => !c.continued);
+      currentBytes = current.reduce((n, c) => n + c.bytes, 0);
+      while (current.length > 0 && currentBytes + b.bytes > partTargetBytes) currentBytes -= current.shift()!.bytes;
     }
     current.push(b);
-    currentBytes += bytes;
+    currentBytes += b.bytes;
   }
-  if (current.length) groups.push(current);
+  if (current.length) groups.push(current.map((c) => c.text));
 
   const of = groups.length;
   const title = meta.title?.trim() || `${meta.harness} session ${meta.sessionId.slice(0, 12)}`;
@@ -366,8 +442,7 @@ export function renderSessionParts(
       },
     };
     const body = group.join('\n\n');
-    const content = `---\n${safeDump(fm, { lineWidth: 1000 })}---\n\n${body}\n`;
-    return { slug, content, frontmatterId, part, of };
+    return { slug, content: renderPartContent(fm, body), frontmatterId, part, of, frontmatter: fm, body };
   });
 
   return { parts, baseSlug, dateIso };

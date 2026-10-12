@@ -1,8 +1,9 @@
 # RLS and you
 
 Short version: every table in your gbrain's `public` schema needs Row Level
-Security enabled. If one doesn't, `gbrain doctor` now fails, not warns, and the
-process exits 1.
+Security enabled. If one doesn't and the schema may be reachable with an anon
+key (Supabase, or PostgREST roles on the database), `gbrain doctor` fails and
+the process exits 1. On a plain Postgres with no such exposure it warns.
 
 This guide explains why, what to do when you hit the check, and the escape hatch
 for the cases where you really do want a table to stay readable by the anon key.
@@ -120,8 +121,8 @@ CREATE EVENT TRIGGER auto_rls_on_create_table
   EXECUTE FUNCTION auto_enable_rls();
 ```
 
-(This is the same DDL migration v35 runs — the canonical copy lives in the
-`MIGRATIONS` array in `src/core/migrate.ts`. There's no CLI shortcut:
+(This is the same DDL migration v35 runs — the canonical copy lives in
+`src/core/schema-migrations/v035-auto-rls-event-trigger.ts`, one file per schema migration. There's no CLI shortcut:
 `gbrain apply-migrations --force-retry` targets the vX.Y.Z orchestrator
 registry, not numeric schema migrations like v35.)
 
@@ -227,6 +228,31 @@ COMMENT ON TABLE public.expenses_ramp IS NULL;
 `gbrain doctor` stops listing the table as exempt and goes back to checking
 it like any other.
 
+## Adding a gbrain table (contributors)
+
+A new gbrain-owned table gets RLS in both places a brain can receive it. For
+fresh installs, add `ALTER TABLE <table> ENABLE ROW LEVEL SECURITY;` to the
+BYPASSRLS-guarded RLS block in `src/schema.sql`, then run
+`bun run build:schema`; the generator keeps that block out of the PGLite
+template by an explicit rule (PGLite has no role system). For existing
+brains, the schema migration that creates the table
+(`bun run new:migration <name>`, one file in `src/core/schema-migrations/`)
+enables RLS too, with a `sqlFor: { pglite: ... }` variant that leaves it out.
+The auto-RLS event trigger and doctor's `rls` check backstop a table that
+slips through on Postgres, but they are the safety net, not the plan.
+
+## Function search_path
+
+Every plpgsql function gbrain installs pins `search_path = pg_catalog, public`,
+so a same-named object in another schema can never change what the function
+reads or writes. The three fact-fingerprint functions
+(`gbrain_fact_fingerprint`, `gbrain_fact_fingerprint_v1`,
+`gbrain_fact_normalize`) are SQL functions that an index expression uses, so
+they call `pg_catalog.`-qualified built-ins instead of pinning a setting (a
+pinned setting would stop Postgres inlining them). Supabase's database linter
+still reports those three under "Function Search Path Mutable"; that warning
+is expected and safe to dismiss for them.
+
 ## PGLite
 
 If you're on PGLite (the zero-config default), doctor skips this check
@@ -243,14 +269,21 @@ running and will flag any table that came over without RLS.
 ## Self-hosted Postgres
 
 If you're running Postgres without PostgREST in front, the anon-key exposure
-doesn't apply. But gbrain still fails the check on missing RLS, because:
+doesn't apply. Doctor looks for an exposure signal before it fails the check:
+the PostgREST role names (`anon`, `authenticated`, `authenticator`,
+`service_role`) in `pg_roles`, or a Supabase database URL. With neither, a
+table without RLS is a `warn`:
 
-- The framing is "RLS on all public tables" is a gbrain security invariant,
-  not a Supabase-specific workaround.
-- The `ALTER TABLE ... ENABLE RLS` fix is harmless on any Postgres: it only
-  constrains non-bypass roles, which gbrain doesn't use.
-- If you ever put PostgREST or a similar tool in front later, the guard is
-  already in place.
+```
+rls: warn — 1 table(s) WITHOUT Row Level Security: local_notes. No PostgREST
+exposure detected (...), so this is a warning: enable RLS before putting
+PostgREST or a similar API in front of the public schema. Fix: ALTER TABLE ...
+```
 
-If this framing doesn't fit your deployment, file an issue with the specifics
-so we can decide whether a self-hosted-exempt mode is justified.
+The fix is still worth running: `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` is
+harmless on any Postgres (it only constrains non-bypass roles, which gbrain
+doesn't use), and the guard is in place if you add PostgREST later. Once one
+of those roles exists, the same table fails the check.
+
+**Say to your agent:** *"Check whether my brain's database tables are protected
+before I expose it."*

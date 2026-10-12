@@ -1,4 +1,10 @@
+import { searchAnswerFeedback } from '../feedback/record.ts';
+import { parseRelationalPlan } from '../search/relational-plan.ts';
+import { loadSearchModeConfig, resolveSearchMode } from '../search/mode.ts';
 import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
+import { parseWriteRequestId } from '../persistence/preconditions.ts';
+import { deliverEvidence, effectivePlan, resolveEvidencePlan, type DeliveryMeta, type EvidencePlan } from '../search/evidence-delivery.ts';
+import { withFactDateHeaders } from '../search/evidence-date.ts';
 import { randomUUID } from 'node:crypto';
 import { readHolders } from './context.ts';
 /**
@@ -15,14 +21,17 @@ import { readHolders } from './context.ts';
  * from '../operations.ts' here (cycle).
  */
 
-import type { Operation } from './contract.ts';
-import { OperationError, verbError } from './contract.ts';
-import { federatedSearchScope, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
+import type { Operation, OperationContext } from './contract.ts';
+import type { Notice } from '../agent-output.ts';
+import { OperationError, opError, verbError } from './contract.ts';
+import { invalidParam, paramUse } from './op-fix.ts';
+import { assertExplicitSourceLive, federatedSearchScope, parseSourceIdParam, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { hybridSearchCached, stampContentFlags } from '../search/hybrid.ts';
 import { dedupResults } from '../search/dedup.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { packToBudget, estimateTokens, resultTokens } from '../search/token-budget.ts';
+import { redactRetrievalOutput } from '../search/output-redaction.ts';
 import { isAvailable } from '../ai/gateway.ts';
 // #4209: the named entity-hints cap — surfaced in the extract_facts param
 // description and the entity_hints_used/_dropped response fields.
@@ -30,7 +39,17 @@ import { ENTITY_HINTS_CAP } from '../facts/extract.ts';
 import { parseTtlShorthand } from '../facts/ttl-parse.ts';
 import { MEMORY_VERBS_VERSION } from '../verbs.ts';
 import type { SearchResult } from '../types.ts';
+import type { BrainEngine, FactRow } from '../engine.ts';
+import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
+import { hasScope } from '../scope.ts';
+import { renderTrustedText } from '../eligibility/labels.ts';
+import { MEMORY_CONFIRM_SCOPE } from '../trust/confirm.ts';
+import { proactiveEligibility } from '../eligibility/registry.ts';
+import { activationSuppressionNotice, suppressionSummary } from '../eligibility/activation.ts';
+import { stampPageTrust, stampRowTrust } from '../eligibility/stamp.ts';
+import type { TrustTier } from '../trust/tier.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
+import { parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
 
 // ============================================================
 // v0.31 — Hot memory ops: extract_facts / recall / forget_fact
@@ -38,8 +57,10 @@ import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 
 const extract_facts: Operation = {
   name: 'extract_facts',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description:
-    'v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls the configured extraction model (key-aware: any servable provider — OpenAI or Anthropic key both work), runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. With NO servable chat model, returns skipped: extraction_unavailable + an agent_action telling YOU to extract and write via `remember` (visibility: "private"). Skips extraction when the turn is dream-generated content (anti-loop). For agent memory writes of a SINGLE already-formed fact, prefer the `remember` verb (zero LLM, mandatory provenance).',
+    'Extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls the configured extraction model (key-aware: any servable provider — OpenAI or Anthropic key both work), runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. With NO servable chat model, returns skipped: extraction_unavailable + an agent_action telling YOU to extract and write via `remember` (visibility: "private"). Skips extraction when the turn is dream-generated content (anti-loop). For agent memory writes of a SINGLE already-formed fact, prefer the `remember` verb (zero LLM, mandatory provenance).',
   params: {
     request_id: { ...WRITE_REQUEST_PARAM, description: `${WRITE_REQUEST_PARAM.description} Managed extraction returns durable receipts; when omitted, each call gets a new UUID. Unmanaged extraction retains its legacy non-journaled behavior.` },
     turn_text: { type: 'string', required: true, description: 'The user message or page body to extract facts from. Sanitized via INJECTION_PATTERNS before the LLM call.' },
@@ -96,10 +117,9 @@ const extract_facts: Operation = {
     if (p.valid_from !== undefined && p.valid_from !== null) {
       const d = new Date(p.valid_from as string);
       if (!Number.isFinite(d.getTime())) {
-        throw new OperationError(
-          'invalid_params',
+        throw invalidParam(ctx, 'extract_facts', 'valid_from',
           `invalid valid_from: "${String(p.valid_from)}" — expected a parseable ISO 8601 datetime`,
-        );
+          { def: extract_facts.params.valid_from, example: '2026-08-11T00:00:00Z' });
       }
       validFrom = d;
     }
@@ -111,7 +131,7 @@ const extract_facts: Operation = {
     const r = await runFactsPipeline(p.turn_text as string, {
       engine: ctx.engine,
       operationContext: ctx,
-      requestId: typeof p.request_id === 'string' ? p.request_id : randomUUID(),
+      requestId: parseWriteRequestId(p.request_id) ?? randomUUID(),
       requestIntent: { ...p, request_id: undefined },
       sourceId,
       sessionId: typeof p.session_id === 'string' ? p.session_id : null,
@@ -176,21 +196,68 @@ const extract_facts: Operation = {
   },
 };
 
+/** One arm of recall's budget_packing accounting. */
+function packingArm<T>(candidates: T[], kept: T[], cost: (item: T) => number) {
+  return { candidates: candidates.length, kept: kept.length, dropped: candidates.length - kept.length, used: kept.reduce((sum, r) => sum + cost(r), 0) };
+}
+
+/** recall's budget_packing meta: only policy-supplied calls carry it. */
+function recallBudgetPacking<F extends { fact: string }>(policy: unknown, queryText: string | null, budgetTokens: number | null,
+  arms: { rows: F[]; packedFacts: F[]; searchResults: SearchResult[]; packedResults: SearchResult[] }) {
+  if (policy !== 'facts_first' && policy !== 'query_first') return undefined;
+  const queryFirst = policy === 'query_first' && queryText !== null && budgetTokens !== null;
+  const { rows, packedFacts, searchResults, packedResults } = arms;
+  return {
+    policy: queryFirst ? 'query_first' : 'facts_first',
+    applied: budgetTokens !== null && (queryFirst || (policy === 'facts_first' && budgetTokens > 0)),
+    reason: policy === 'query_first' && !queryText ? 'no_query'
+      : budgetTokens === null ? 'no_positive_finite_budget'
+        : budgetTokens === 0 ? 'budget_below_one'
+          : rows.length + searchResults.length === 0 ? 'no_candidates'
+            : packedFacts.length + packedResults.length === 0 ? 'first_items_exceed_budget'
+              : 'packed',
+    facts: packingArm(rows, packedFacts, r => estimateTokens(r.fact)),
+    results: packingArm(searchResults, packedResults, resultTokens),
+  };
+}
+
+/**
+ * recall's evidence plan: budget_tokens budgets the delivered blocks before
+ * recall's own packing. Without return_unit, budget_tokens or budget_policy
+ * keeps legacy chunk packing (facts pack first, so a whole session would
+ * otherwise lose to them).
+ */
+function recallEvidencePlan(ctx: OperationContext, p: Record<string, unknown>): Promise<EvidencePlan | null> {
+  return resolveEvidencePlan(ctx.engine, {
+    legacyBudget: p.budget_policy !== undefined || (typeof p.budget_tokens === 'number' && Number.isFinite(p.budget_tokens) && p.budget_tokens > 0),
+    remote: ctx.remote, viaSubagent: ctx.viaSubagent, returnUnit: p.return_unit, returnWindow: p.return_window,
+    budget: p.budget_tokens, snippetChars: undefined, snippetCap: 0, op: 'recall',
+  });
+}
+
 const recall: Operation = {
   name: 'recall',
-  description:
-    'MEMORY VERB (v1): retrieve saved facts/snippets — the protocol read verb. Filters hot-memory facts by entity / since / session_id; pass `query` to ALSO run hybrid search over pages (results[] arm); pass `budget_tokens` for server-side packing (response reports budget_used + dropped_count — never trims client-side). Remote callers see visibility=world facts only. Routing: for ONE known person/company/project card use `entity` (zero LLM); for broad questions needing reasoning use `synthesize` (expensive). Branch on structured fields (status/kind/evidence), never on prose. Every response carries protocol_version.',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: { retrieval: { localVerbatim: ['facts'] } },
+  description: 'MEMORY VERB (v1): read saved facts by entity, since or session_id; `query` also searches pages. Remote callers see world facts only. One card: entity; reasoning: synthesize.',
   params: {
-    entity: { type: 'string', description: 'Entity slug (canonical). Returns facts about this entity newest first.' },
-    query: { type: 'string', description: 'MEMORY_VERBS v1: free-text retrieval over pages (hybrid search arm). Response adds results[] (slug, title, chunk, evidence, create_safety, provenance). Combinable with entity (both arms run). Degrades to keyword-only search when no embedding provider is configured (search_degraded notes it; never an error).' },
-    budget_tokens: { type: 'number', description: 'MEMORY_VERBS v1: server-side token budget (char/4 estimate). Facts pack first, then results. Response adds budget_tokens, budget_used, dropped_count.' },
-    since: { type: 'string', description: 'ISO 8601 datetime or duration shorthand (e.g. "8 hours ago"). Filters the FACTS arm only, on event time (valid_from, falling back to created_at); composes with `entity` and `session_id`. An unparseable value is rejected (invalid_params).' },
-    session_id: { type: 'string', description: 'Source session id (e.g. topic-A). Returns facts captured in that session.' },
-    include_expired: { type: 'boolean', description: 'When true, include expired_at IS NOT NULL rows. Default false.' },
-    supersessions: { type: 'boolean', description: 'When true, return only the supersession audit log (facts with superseded_by set), newest first by COALESCE(expired_at, valid_until).' },
-    limit: { type: 'number', description: 'Per-arm cap: max fact rows AND max search results. Default 50, cap 100.' },
-    grep: { type: 'string', description: 'Substring filter on fact text (case-insensitive). Applied in SQL before the limit, so matches on high-cardinality entities are found even outside the newest-N window.' },
-    include_pending: { type: 'boolean', description: 'v0.32: when true, response includes pending_consolidation_count (facts not yet promoted to takes by the dream-cycle consolidate phase). One round trip; backward-compatible (field omitted when false).' },
+    entity: { type: 'string', description: 'Entity slug; its facts.' },
+    question: { type: 'string', description: 'Rank facts by relevance to it.' },
+    query: { type: 'string', description: 'Also search pages (results[]).' },
+    budget_tokens: { type: 'number', description: 'Token budget; facts pack first.' },
+    budget_policy: { type: 'string', enum: ['facts_first', 'query_first'], description: 'Default facts_first.' },
+    source_id: { type: 'string', description: 'One source you may read.' },
+    since: { type: 'string', description: 'ISO 8601 or "8 hours ago".' },
+    session_id: { type: 'string', description: "This session's facts." },
+    include_expired: { type: 'boolean', description: 'Include expired.' },
+    supersessions: { type: 'boolean', description: 'Supersession log only.' },
+    limit: { type: 'number', description: 'Per-arm max (default 50, cap 100).' },
+    grep: { type: 'string', description: 'Text substring.' },
+    include_pending: { type: 'boolean', description: 'Pending count.' },
+    return_unit: { type: 'string', enum: ['chunk', 'window', 'section', 'page', 'auto'], description: 'results[] unit (see search).' },
+    return_window: { type: 'number', description: 'Window size 1-3.' },
+    min_trust: MIN_TRUST_PARAM,
   },
   scope: 'read',
   verb: true,
@@ -203,12 +270,29 @@ const recall: Operation = {
 
     // Federated grants (cathedral-6): the fact arms honor the SAME scope
     // ladder as every other read-side op — federated array > scalar >
-    // default — via sourceScopeOpts, never a hand-rolled filter. The engine
+    // default — via federatedSearchScope, never a hand-rolled filter. The engine
     // fact APIs are scalar-source, so a federated grant fans out per granted
     // source and merges newest-first; a single-source caller takes exactly
     // the pre-v1 single-query path. A trusted-local `__all__` ({}) has no
     // enumerable grant and keeps the resolved-scalar behavior.
-    const scope = sourceScopeOpts(ctx);
+    let sourceIdParam: string | undefined;
+    let scope: ReturnType<typeof sourceScopeOpts>;
+    try {
+      sourceIdParam = parseSourceIdParam(p.source_id, 'recall');
+      // The facts arms widen an unqualified no-grant caller across the transport-computed
+      // federated set, exactly like the page-search arm below and every sibling read op.
+      scope = federatedSearchScope(ctx, sourceIdParam);
+      await assertExplicitSourceLive(ctx, sourceIdParam);
+    } catch (error) {
+      if (!(error instanceof OperationError) || p.source_id === undefined || p.source_id === null) throw error;
+      const code = error.code === 'permission_denied' ? 'scope_denied'
+        : error.code === 'unknown_source' ? 'not_found'
+          : error.code === 'invalid_params' ? 'invalid_params' : null;
+      if (code === null) throw error;
+      throw Object.assign(verbError(code, error.message,
+        error.suggestion ?? 'Choose a permitted active source, or omit source_id to use your existing scope.',
+        error.detail ?? error.code), error.fix ? { fix: error.fix } : {});
+    }
     // Set-dedupe: a grant carrying a repeated id (or the scalar source again)
     // must not fan out the same source twice into the merge.
     const factSources: string[] = [...new Set(
@@ -216,6 +300,7 @@ const recall: Operation = {
         : scope.sourceId ? [scope.sourceId]
           : [sourceId],
     )];
+    const scalarSource = factSources.length === 1 ? factSources[0] : undefined;
 
     // Visibility filter: remote callers see world-only unless their token
     // grants elevated visibility (future-proofing; v0.31 ships world-only
@@ -224,6 +309,9 @@ const recall: Operation = {
       ctx.remote === false
         ? undefined
         : ['world'] as ('private' | 'world')[];
+    const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+    const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote); // #4352: fact and page arms alike
+    const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust }); // #5575 floor + quarantine/rederive hiding
 
     type FactRows = Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>>;
     type FactRowItem = FactRows[number];
@@ -254,6 +342,7 @@ const recall: Operation = {
     const byEventTime = (rec: Record<string, unknown>) => rec.valid_from ?? rec.created_at;
 
     let rows: FactRows = [];
+    let ambiguousEntity: EntityCandidate[] | null = null;
 
     // `since` is parsed once, up front, and a value that does not parse is
     // rejected instead of silently widening the window: a caller that asked
@@ -267,26 +356,33 @@ const recall: Operation = {
         'Pass an ISO 8601 datetime (e.g. "2026-08-11T00:00:00Z"), Unix epoch millis, or a duration such as "8 hours ago" / "2d".',
       );
     }
+    const question = parseQuestionParam(p);
     const entityParam = typeof p.entity === 'string' && p.entity.length > 0 ? (p.entity as string) : null;
     const sessionParam = typeof p.session_id === 'string' && p.session_id.length > 0 ? (p.session_id as string) : null;
+    let ranking: QuestionRecall | null = null;
     // Shared per-source opts for the fact-list arms (visibility, grep and the
     // audit exclusion all filter at the ENGINE level, before each source's
     // LIMIT, so a hidden newest row never consumes a slot).
     const listOpts = {
       activeOnly: !includeExpired,
       limit,
-      visibility,
+      visibility, excludePrivate,
       grep: grep ?? undefined,
-      excludeAuditRows: true,
+      excludeAuditRows: true, eligibility,
     };
 
-    if (p.supersessions === true) {
+    if (question !== null) {
+      ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep,
+        scope: { sourceIds: factSources, remote: ctx.remote !== false, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
+      ({ rows, ambiguousEntity } = ranking);
+      for (const notice of questionRecallNotices(ranking)) ctx.emitNotice?.(notice);
+    } else if (p.supersessions === true) {
       // Visibility filters at the ENGINE level (before each source's LIMIT),
       // same as the sibling fact-list arms — a post-merge filter would let a
       // private newest row consume a limit slot and hide an older world row.
       rows = mergeNewest(
         await Promise.all(factSources.map(src =>
-          ctx.engine.listSupersessions(src, { since: since ?? undefined, limit, visibility }),
+          ctx.engine.listSupersessions(src, { since: since ?? undefined, limit, visibility, excludePrivate, eligibility }),
         )),
         // v0.46 (#3014): matches the engine's ORDER BY COALESCE(expired_at,
         // valid_until) — ontology supersessions carry valid_until only.
@@ -300,29 +396,22 @@ const recall: Operation = {
       // in this session) since T" is a question about when the underlying
       // events occurred, not about when a batch extraction wrote the rows.
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
-      rows = mergeNewest(
-        await Promise.all(factSources.map(async (src) => {
-          const entitySlug = entityParam
-            ? ((await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam)
-            : undefined;
-          return ctx.engine.listFactsSince(src, since, {
-            ...listOpts,
-            eventTime: true,
-            entitySlug,
-            sessionId: sessionParam ?? undefined,
-          });
-        })),
-        byEventTime,
-      );
+      const resolvedLists = await Promise.all(factSources.map(async (src) => {
+        const entitySlug = entityParam ? ((await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam) : undefined;
+        const rows = await readEntityFacts(ctx, src, entitySlug, limit,
+          s => ctx.engine.listFactsSince(src, since, { ...listOpts, eventTime: true, entitySlug: s, sessionId: sessionParam ?? undefined }));
+        return { slug: entitySlug, rows };
+      }));
+      ambiguousEntity = entityParam ? await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug ?? r.entity_slug })))) : null;
+      rows = ambiguousEntity ? [] : mergeNewest(resolvedLists.map(l => l.rows), byEventTime);
     } else if (entityParam) {
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
-      rows = mergeNewest(
-        await Promise.all(factSources.map(async (src) => {
-          const slug = (await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam;
-          return ctx.engine.listFactsByEntity(src, slug, listOpts);
-        })),
-        (rec) => rec.valid_from ?? rec.created_at,
-      );
+      const resolvedLists = await Promise.all(factSources.map(async (src) => {
+        const slug = (await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam;
+        return { slug, rows: await readEntityFacts(ctx, src, slug, limit, s => ctx.engine.listFactsByEntity(src, s!, listOpts)) };
+      }));
+      ambiguousEntity = await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug }))));
+      rows = ambiguousEntity ? [] : mergeNewest(resolvedLists.map(l => l.rows), (rec) => rec.valid_from ?? rec.created_at);
     } else if (sessionParam) {
       rows = mergeNewest(
         await Promise.all(factSources.map(src =>
@@ -385,27 +474,24 @@ const recall: Operation = {
         ? Math.floor(p.budget_tokens)
         : null;
 
+    if (queryText && question === null && !entityParam && !sessionParam && !since && p.supersessions !== true) ctx.emitNotice?.(recallHintNotice(p, queryText));
     let searchResults: SearchResult[] = [];
     let searchDegraded: string | undefined;
+    let delivery: DeliveryMeta | undefined;
+    const evidencePlan = queryText ? await recallEvidencePlan(ctx, p) : null;
     if (queryText) {
       // #3242 parity (#4707): the page-search arm widens an unqualified
       // no-grant caller across the transport-computed federated set, exactly
       // like search/query/get_page/list_pages/resolve_slugs. sourceScopeOpts
       // alone pinned this arm to the scalar source, so a `federated: true`
       // source was invisible to recall while visible to every sibling read op.
-      const searchScope = federatedSearchScope(ctx);
+      const searchScope = { ...federatedSearchScope(ctx, sourceIdParam), ...(eligibility.floor ? { minTrust: eligibility.floor } : {}) };
       // #4352 — recall's page-search arm enforces `visibility: private` for
-      // untrusted callers (matches the facts arms' world-only filter above).
-      const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
-      const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
-      if (!isAvailable('embedding')) {
-        const raw = await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope });
-        searchResults = dedupResults(raw);
-        // #3783 — direct FTS path: every row is a keyword hit by construction.
-        markKeywordHits(searchResults);
-        stampEvidenceSafe(searchResults);
-        await stampContentFlags(ctx.engine, searchResults, { ...searchScope, excludePrivate });
-        searchDegraded = 'keyword_only_no_embedding_provider';
+      // untrusted callers with the excludePrivate resolved above.
+      const keywordOnly = await recallKeywordOnlyReason(ctx);
+      if (keywordOnly) {
+        searchResults = await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope);
+        searchDegraded = keywordOnly;
       } else {
         searchResults = await hybridSearchCached(ctx.engine, queryText, {
           limit,
@@ -417,17 +503,34 @@ const recall: Operation = {
         });
       }
       bumpLastRetrievedAt(ctx.engine, searchResults.map(r => r.page_id));
+      const applied = effectivePlan(evidencePlan, searchResults);
+      if (applied) ({ results: searchResults, delivery } = await deliverEvidence(ctx.engine, searchResults, applied, { ...searchScope, excludePrivate, requireSafeChunks: ctx.remote !== false }));
+      searchResults = await stampPageTrust(ctx.engine, searchResults, eligibility.floor);
     }
 
-    // ── MEMORY_VERBS v1 — server-side budget packing. Facts pack first (cheap,
-    // high-precision one-liners, per-arm limit-capped so starvation is bounded),
-    // then search results take the remainder. packToBudget treats budget<=0 as
-    // a no-op, so an exhausted remainder must drop explicitly.
+    // Pack what is delivered: results redacted for all; facts for remote only (localVerbatim).
+    const view = redactRetrievalOutput([{ facts: rows.map(r => ({ fact: r.fact, context: r.context, source: r.source })), results: searchResults }], {}).results[0];
+    searchResults = view.results;
+    if (ctx.remote !== false) rows = rows.map((r, i) => ({ ...r, ...view.facts[i] }));
+
     let packedFacts = rows;
     let packedResults = searchResults;
     let budgetUsed: number | undefined;
     let droppedCount: number | undefined;
-    if (budgetTokens !== null) {
+    const queryFirst = p.budget_policy === 'query_first' && queryText !== null && budgetTokens !== null;
+    if (queryFirst) {
+      const resultsPack = budgetTokens > 0
+        ? packToBudget(searchResults, resultTokens, budgetTokens)
+        : { items: [] as SearchResult[], meta: { used: 0, dropped: searchResults.length } };
+      packedResults = resultsPack.items;
+      const remaining = budgetTokens - resultsPack.meta.used;
+      const factsPack = remaining > 0
+        ? packToBudget(rows, r => estimateTokens(r.fact), remaining)
+        : { items: [] as FactRows, meta: { used: 0, dropped: rows.length } };
+      packedFacts = factsPack.items;
+      budgetUsed = resultsPack.meta.used + factsPack.meta.used;
+      droppedCount = resultsPack.meta.dropped + factsPack.meta.dropped;
+    } else if (budgetTokens !== null) {
       const factsPack = packToBudget(rows, r => estimateTokens(r.fact), budgetTokens);
       packedFacts = factsPack.items;
       const remaining = budgetTokens - factsPack.meta.used;
@@ -440,12 +543,15 @@ const recall: Operation = {
       droppedCount = factsPack.meta.dropped + resultsPack.meta.dropped;
     }
 
+    const budgetPacking = recallBudgetPacking(p.budget_policy, queryText, budgetTokens, { rows, packedFacts, searchResults, packedResults });
+
     return {
-      facts: packedFacts.map(r => ({
+      facts: await withFactDateHeaders(ctx.engine, await stampRowTrust(ctx.engine, 'facts', packedFacts.map(r => ({ // #5575 A6: + trust_tier, origin, unconfirmed
         id: r.id,
         fact: r.fact,
         kind: r.kind,
         entity_slug: r.entity_slug,
+        source_id: r.source_id,
         visibility: r.visibility,
         // v0.31.2: notability surfaced to recall consumers (CLI, MCP, admin).
         // Pre-v46 brains return 'medium' via the row mapper's fallback so the
@@ -469,9 +575,13 @@ const recall: Operation = {
         // pre-v1 consumers — legacy fields are frozen byte-equal). `provenance`
         // is the protocol name for the stored source attribution.
         fact_id: String(r.id),
-        provenance: r.source,
-      })),
+        provenance: r.source, ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}),
+        ...(ranking ? { relevance: ranking.relevance.get(r.id) } : {}),
+      })), f => f.id)),
       total: packedFacts.length,
+      facts_order: ranking ? 'relevance' : 'newest',
+      ...(ranking?.degraded ? { facts_degraded: ranking.degraded } : {}),
+      ...(ambiguousEntity ? { ambiguous_entity: { candidates: ambiguousEntity, suggestion: AMBIGUOUS_ENTITY_SUGGESTION } } : {}),
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
       // MEMORY_VERBS v1 envelope (G1B superset — additive on every response).
       protocol_version: MEMORY_VERBS_VERSION,
@@ -484,16 +594,39 @@ const recall: Operation = {
               evidence: r.evidence,
               create_safety: r.create_safety,
               provenance: r.slug,
+              // #4830: a row without a source takes the scope's single source; a federated read leaves it absent.
+              ...((r.source_id ?? scalarSource) ? { source_id: r.source_id ?? scalarSource } : {}),
+              ...(r.delivered ? { delivered: r.delivered } : {}),
+              ...(r.relational ? { relational: r.relational } : {}),
+              ...(r.trust_tier ? { trust_tier: r.trust_tier, origin: r.origin, ...(r.unconfirmed ? { unconfirmed: true } : {}) } : {}),
             })),
             ...(searchDegraded ? { search_degraded: searchDegraded } : {}),
+            ...(searchDegraded ? {} : await searchAnswerFeedback(ctx, 'recall', packedResults)),
           }
         : {}),
       ...(budgetTokens !== null
         ? { budget_tokens: budgetTokens, budget_used: budgetUsed, dropped_count: droppedCount }
         : {}),
+      ...(budgetPacking ? { budget_packing: budgetPacking } : {}),
+      ...(delivery ? { delivery } : {}),
     };
   },
 };
+
+/**
+ * One source's facts about an entity, read under every slug they may be saved
+ * under (the page, its identity siblings and its bare subject slug,
+ * mentions/siblings.ts), newest event first, cut at `limit`.
+ */
+async function readEntityFacts<R extends { valid_from?: Date | string | null; created_at?: Date | string | null }>(ctx: OperationContext, src: string,
+  slug: string | undefined, limit: number, read: (slug: string | undefined) => Promise<R[]>): Promise<R[]> {
+  const { factEntitySlugs } = await import('../mentions/siblings.ts');
+  const slugs = slug ? await factEntitySlugs(ctx.engine, src, slug, { excludePrivate: ctx.remote !== false }).catch(() => [slug]) : [undefined];
+  const time = (r: R) => { const v = r.valid_from ?? r.created_at; return (v instanceof Date ? v.getTime() : v ? Date.parse(String(v)) : 0) || 0; };
+  return (await Promise.all(slugs.map(read))).flat().sort((a, b) => time(b) - time(a)).slice(0, limit);
+}
+
+const AMBIGUOUS_ENTITY_SUGGESTION = 'These are different entities in different sources. Pass source_id to read one, or link them with entity_identity_link if they are the same.';
 
 /** Parse an `entities` param (comma-string or array) to a trimmed name list. */
 function parseEntityList(v: unknown): string[] {
@@ -508,31 +641,51 @@ function parseEntityList(v: unknown): string[] {
 const lineCost = (line: string) => estimateTokens(line + '\n');
 const dropAll = <T>(items: T[]) => ({ items: [] as T[], meta: { budget: 0, used: 0, dropped: items.length, kept: 0 } });
 
+/**
+ * #6146: the stored provenance (`facts.source`, what `remember --provenance`
+ * wrote) of the facts a pack or delta delivers, in one batched read keyed by
+ * the facts' own ids, so hot memory (and every MCP `_meta`) stays unchanged.
+ * Fail-soft like the rest of the pack: a failed read leaves `provenance` null.
+ */
+async function withProvenance<T extends { id: number }>(engine: BrainEngine, sourceId: string, facts: T[]): Promise<Array<T & { provenance: string | null }>> {
+  if (facts.length === 0) return [];
+  const rows = await engine.executeRaw<{ id: number | string; source: string | null }>(
+    'SELECT id, source FROM facts WHERE source_id = $1 AND id = ANY($2::bigint[])', [sourceId, facts.map((f) => f.id)],
+  ).catch(() => []);
+  const byId = new Map(rows.map((r) => [Number(r.id), r.source]));
+  return facts.map((f) => ({ ...f, provenance: byId.get(f.id) ?? null }));
+}
+
 const context_pack: Operation = {
   name: 'context_pack',
-  description:
-    'MEMORY VERB (v1): budget-packed session-boundary bundle for a set of standing entities — entity cards + open threads + hot facts, zero-LLM, sub-second. Call at session start (warm cold context) and after compaction (rehydrate what the summary lost). WORLD-ONLY by default; pass include_private (honored for LOCAL trusted callers only) to widen all arms. budget_tokens packs server-side (response reports budget_used + dropped_count; cards pack first, then facts). Branch on structured fields, never prose. protocol_version rides every response.',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: { retrieval: { localVerbatim: ['facts'] } },
+  description: 'MEMORY VERB (v1): core memory, budget-packed cards, open threads and hot facts for up to 8 entities, zero LLM. Call at session start and after compaction.',
   params: {
-    entities: { type: 'string', required: true, description: 'Comma-separated entity names/slugs to bundle. Capped at 8.' },
-    budget_tokens: { type: 'number', description: 'Server-side token budget (char/4). Cards pack first, then facts; each item costs its rendered line and the envelope + section headers are reserved, so `text` fits the budget. Response adds budget_tokens, budget_used (tokens of `text`), dropped_count.' },
-    since: { type: 'string', description: 'ISO 8601 datetime. When set, open-thread events are filtered to those after this cursor.' },
-    session_id: { type: 'string', description: 'Opaque session id; keys the hot-memory cache and (on the push path) the session cursor.' },
-    include_private: { type: 'boolean', description: 'Local trusted callers only: widen ALL arms to include private facts. Ignored (world-only) for remote callers. Default false.' },
+    entities: { type: 'string', description: 'Comma-separated names or slugs (max 8).' },
+    budget_tokens: { type: 'number', description: 'Token budget; cards pack first.' },
+    since: { type: 'string', description: 'Only open-thread events after this ISO time.' },
+    session_id: { type: 'string', description: 'Opaque session id.' },
+    include_private: { type: 'boolean', description: 'Local trusted callers only.' },
+    min_trust: MIN_TRUST_PARAM,
+    include_quarantined: { type: 'boolean', description: 'Admin or memory_confirm: quarantined cards.', fullSurfaceOnly: true },
   },
   scope: 'read',
   verb: true,
   cliHints: { name: 'context-pack' },
   annotations: { title: 'context_pack (boundary bundle)', readOnlyHint: true },
   handler: async (ctx, p) => {
-    const { assembleContextPack, renderPack, isAfter, PACK_DEFAULT_MAX_ENTITIES, renderCardLine, renderThreadLine, renderFactLine, packHeaderCost } =
-      await import('../context/turn-context.ts');
+    const { assembleContextPack, renderPack, isAfter, PACK_DEFAULT_MAX_ENTITIES, renderCardLine, renderThreadLine, renderFactLine, packHeaderCost,
+      renderNewerMentionLines } = await import('../context/turn-context.ts');
+    const { NEWER_MENTIONS_HEADER } = await import('../mentions/newer-mentions.ts');
     const sourceId = ctx.sourceId ?? 'default';
     const rawSince = typeof p.since === 'string' && p.since.trim() ? p.since : undefined;
     if (rawSince !== undefined && !Number.isFinite(Date.parse(rawSince))) {
       throw verbError(
         'invalid_params',
         `context_pack: since is not a parseable timestamp: "${rawSince.slice(0, 60)}"`,
-        'Pass an ISO 8601 datetime, e.g. since: "2026-08-11T00:00:00Z".',
+        `Pass an ISO 8601 datetime, e.g. ${paramUse(ctx, 'since', '2026-08-11T00:00:00Z')}.`,
       );
     }
     // Normalize to ISO (red-team F4): the filter + rendered text use it.
@@ -548,17 +701,39 @@ const context_pack: Operation = {
       typeof p.budget_tokens === 'number' && Number.isFinite(p.budget_tokens) && p.budget_tokens > 0
         ? Math.floor(p.budget_tokens)
         : null;
-    const res = await assembleContextPack(ctx.engine, {
-      sourceId,
-      entities,
-      since,
-      sessionId: typeof p.session_id === 'string' ? p.session_id : undefined,
-      includePrivate,
-      maxEntities: PACK_DEFAULT_MAX_ENTITIES,
-    });
+    // #5575 (CEO-20, CEO-18): a proactive surface under the connection's floor.
+    const eligibility = await proactiveEligibility(ctx, 'context_pack', { minTrust: p.min_trust });
+    const res = entities.length === 0
+      ? { cards: [], facts: [], text: '', pointers: [], factsCount: 0 } as unknown as Awaited<ReturnType<typeof assembleContextPack>>
+      : await assembleContextPack(ctx.engine, {
+        sourceId,
+        entities,
+        since,
+        sessionId: typeof p.session_id === 'string' ? p.session_id : undefined,
+        includePrivate,
+        maxEntities: PACK_DEFAULT_MAX_ENTITIES,
+        eligibility,
+        // #5575 ENG-15: same rule as get_page: quarantined cards only on an authorized explicit ask.
+        includeQuarantined: p.include_quarantined === true && (ctx.remote === false || hasScope(ctx.auth?.scopes ?? [], 'admin') || hasScope(ctx.auth?.scopes ?? [], MEMORY_CONFIRM_SCOPE)),
+      });
+    // Always-loaded core tier (core-memory.ts): owner-designated pages of
+    // `default` plus this source, inside the caller's grant; it packs first.
+    const { loadCoreBlock } = await import('../core-memory.ts');
+    const allowed = ctx.auth?.allowedSources?.length ? ctx.auth.allowedSources : null;
+    const core = await loadCoreBlock(ctx.engine, { sessionSourceId: sourceId, allowedSources: allowed, excludePrivate: !includePrivate, eligibility })
+      .catch(() => null);
+    const coreText = core?.text ?? '';
+    const coreTokens = estimateTokens(coreText);
+    const withheld = (res.suppressed?.withheld ?? 0) + (core?.activation_withheld ?? 0);
+    const suppressionNotice = activationSuppressionNotice(withheld, 'this context pack');
+    if (suppressionNotice) ctx.emitNotice?.(suppressionNotice);
 
-    let cards = res.cards ?? [];
-    let facts = res.facts ?? [];
+    // Pack, price and render the redacted presentation sets (one echo
+    // dictionary); local callers get the delivered facts back raw below.
+    const rawFacts = await withProvenance(ctx.engine, sourceId, res.facts ?? []);
+    const view = redactRetrievalOutput([{ cards: res.cards ?? [], facts: rawFacts }], {}).results[0];
+    let cards = view.cards;
+    let facts = view.facts;
     // The SAME since filter the assembler applied (pre-landing review: the raw
     // flatMap silently dropped the documented `since` contract from the
     // structured array whenever budget packing ran) — shared with the card
@@ -569,7 +744,7 @@ const context_pack: Operation = {
     if (budgetTokens !== null) {
       // #4761: reserve the envelope + headers, then price each card as its
       // rendered line plus its rendered (since-filtered) thread lines.
-      const itemBudget = budgetTokens - packHeaderCost();
+      const itemBudget = budgetTokens - packHeaderCost() - coreTokens;
       const cardCost = (c: (typeof cards)[number]) =>
         lineCost(renderCardLine(c)) + threadsOf(c).reduce((n, t) => n + lineCost(renderThreadLine(t)), 0);
       const cardPack = itemBudget > 0 ? packToBudget(cards, cardCost, itemBudget) : dropAll(cards);
@@ -577,6 +752,14 @@ const context_pack: Operation = {
       const remaining = itemBudget - cardPack.meta.used;
       const factPack = remaining > 0 ? packToBudget(facts, (f) => lineCost(renderFactLine(f)), remaining) : dropAll(facts);
       facts = factPack.items;
+      // Newer mentions pack last, into what cards and facts left; a card whose block does not fit keeps its card line.
+      const mentionBudget = remaining - factPack.meta.used - lineCost('') - lineCost(NEWER_MENTIONS_HEADER);
+      const withMentions = cards.filter((c) => c.newer_mentions);
+      const mentionPack = mentionBudget > 0
+        ? packToBudget(withMentions, (c) => renderNewerMentionLines(c).reduce((n, l) => n + lineCost(l), 0), mentionBudget)
+        : dropAll(withMentions);
+      const keptMentions = new Set(mentionPack.items);
+      cards = cards.map((c) => (c.newer_mentions && !keptMentions.has(c) ? { ...c, newer_mentions: undefined } : c));
       droppedCount = cardPack.meta.dropped + factPack.meta.dropped;
     }
     const open_threads = cards.flatMap(threadsOf);
@@ -584,7 +767,8 @@ const context_pack: Operation = {
     // `text` is what harnesses inject, so it must honor the same budget the
     // structured arrays report — the assembler's pre-budget rendering would
     // overrun the declared budget_tokens. budget_used reports that text.
-    const text = budgetTokens !== null ? renderPack(cards, open_threads, facts) : res.text;
+    const packText = entities.length === 0 ? '' : budgetTokens !== null ? renderPack(cards, open_threads, facts) : res.text;
+    const text = [coreText, packText].filter(Boolean).join('\n\n');
     const budgetUsed = budgetTokens !== null ? estimateTokens(text) : undefined;
 
     return {
@@ -594,13 +778,18 @@ const context_pack: Operation = {
         slug: c.entity.slug,
         title: c.entity.title,
         type: c.entity.type,
-        summary: c.summary,
+        summary: c.quarantined && c.summary ? renderTrustedText(c.summary, { trust_tier: 'external_untrusted', origin: 'quarantined' }) : c.summary,
         open_threads: c.open_threads,
         edges: c.edges,
         backlink_count: c.backlink_count,
+        ...(c.relationship_note ? { relationship_note: c.relationship_note } : {}),
+        ...(c.trust_tier ? { trust_tier: c.trust_tier, origin: c.origin } : {}),
+        ...(c.quarantined ? { quarantined: true } : {}),
+        ...(c.unconfirmed ? { unconfirmed: true } : {}),
+        ...(c.newer_mentions ? { newer_mentions: c.newer_mentions } : {}),
       })),
       open_threads,
-      facts: facts.map((f) => ({
+      facts: (ctx.remote === false ? rawFacts.slice(0, facts.length) : facts).map((f) => ({
         fact: f.fact,
         kind: f.kind,
         entity_slug: f.entity_slug,
@@ -608,27 +797,41 @@ const context_pack: Operation = {
         // #4206: provenance context (parity with the recall projection).
         context: f.context ?? null,
         confidence: f.confidence,
+        // #6146: recall's v1 names, so a packed fact traces back to its record.
+        fact_id: String(f.id),
+        provenance: f.provenance,
+        ...(f.trust_tier ? { trust_tier: f.trust_tier, origin: f.origin } : {}),
       })),
       text,
+      ...(withheld ? { suppressed: suppressionSummary(withheld) } : {}),
+      ...(core && core.enabled ? { core: { text: core.text, chars_used: core.chars_used, chars_limit: core.chars_limit, pages: core.pages,
+        truncated: core.truncated, revision: core.revision } } : {}),
       ...(res.degradedReason ? { degraded_reason: res.degradedReason } : {}),
       ...(budgetTokens !== null
         ? { budget_tokens: budgetTokens, budget_used: budgetUsed, dropped_count: droppedCount }
         : {}),
+      // C4: optional pinned answers (fresh sentences) and the withheld count (src/core/questions/service.ts).
+      ...(await (await import('../questions/service.ts')).pinnedAnswersForPack(ctx, [...new Set([...(res.cards ?? []).map((c) => c.entity.slug), ...entities])])
+        .catch(() => null)),
     };
   },
 };
 
 const delta: Operation = {
   name: 'delta',
-  description:
-    'MEMORY VERB (v1): "what changed since T" for heartbeats — pages updated after `since` + hot facts newer than `since` + open-thread events after `since`, zero-LLM. Lets a periodic wake maintain warm state in O(changes) instead of re-deriving. Optionally scope thread deltas to `entities`. WORLD-ONLY by default; include_private honored for local trusted callers only. budget_tokens packs server-side (pages first, then facts; threads are never dropped). protocol_version rides every response.',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: { retrieval: { localVerbatim: ['facts'] } },
+  description: 'MEMORY VERB (v1): pages, facts, thread events changed since a cursor, zero LLM. Pass session_id, cursor or since.',
   params: {
-    since: { type: 'string', description: 'ISO 8601 cursor. Returns pages/facts/thread-events newer than this timestamp. Optional when session_id carries an established cursor.' },
-    since_slug: { type: 'string', description: 'Stateless keyset resume: pass back `next_cursor.slug` from the previous response (paired with `since`=next_cursor.since) to page through pages sharing one timestamp. Ignored when session_id is set (the session cursor carries it).' },
-    entities: { type: 'string', description: 'Optional comma-separated entity scope for thread-event deltas. Capped at 8.' },
-    budget_tokens: { type: 'number', description: 'Server-side token budget (char/4). Pages pack first, then facts; each item costs its rendered line and the envelope + section headers + every thread line are reserved, so `text` fits the budget. Threads are never dropped (budget_used can exceed the budget only when the header + threads alone do). Response adds budget_tokens, budget_used (tokens of `text`), dropped_count.' },
-    session_id: { type: 'string', description: 'Opaque session id. Drives the per-session cursor: the first call establishes it, each call advances it to the newest DELIVERED change (at-least-once — with has_more:true the undelivered tail returns on the next wake). Without it, pass an explicit `since` for a stateless delta.' },
-    include_private: { type: 'boolean', description: 'Local trusted callers only: widen ALL arms to include private facts. Ignored (world-only) for remote callers. Default false.' },
+    since: { type: 'string', description: 'ISO 8601 start time.' },
+    since_slug: { type: 'string', description: 'Legacy: next_cursor.slug.' },
+    cursor: { type: 'string', description: 'next_cursor.cursor (exact).' },
+    entities: { type: 'string', description: 'Entities for thread events (max 8).' },
+    budget_tokens: { type: 'number', description: 'Token budget; pages pack first.' },
+    session_id: { type: 'string', description: 'Session id; keeps a cursor.' },
+    include_private: { type: 'boolean', description: 'Local trusted callers only.' },
+    min_trust: MIN_TRUST_PARAM,
   },
   scope: 'read',
   verb: true,
@@ -637,42 +840,48 @@ const delta: Operation = {
   handler: async (ctx, p) => {
     const { assembleDeltaContext, renderDelta, PACK_DEFAULT_MAX_ENTITIES, renderPageLine, renderFactLine, renderThreadLine, deltaHeaderCost } =
       await import('../context/turn-context.ts');
-    const { getSessionContextState, upsertSessionContextState } = await import('../context/session-state.ts');
+    const { readDeltaSessionState, upsertSessionContextState, gcSessionContextState } = await import('../context/session-state.ts');
+    const cur = await import('../context/delta-cursor.ts');
     const sourceId = ctx.sourceId ?? 'default';
     const rawSince = typeof p.since === 'string' && p.since.trim() ? p.since : null;
-    if (rawSince !== null && !Number.isFinite(Date.parse(rawSince))) {
-      throw verbError(
-        'invalid_params',
-        `delta: since is not a parseable timestamp: "${rawSince.slice(0, 60)}"`,
-        'Pass an ISO 8601 datetime, e.g. since: "2026-08-11T00:00:00Z".',
-      );
-    }
     // NORMALIZE to ISO immediately (red-team F4): the raw string is echoed
     // into the injectable `text` block, so an attacker-shaped-but-parseable
     // `since` must never reach rendering verbatim. A value already in the
     // canonical microsecond shape `listPages` projects (`next_cursor.since`
-    // passed back) is kept verbatim: rounding it through a JS Date would
-    // re-select every same-millisecond row on the resumed wake.
-    // The verbatim passthrough must round-trip: a calendar-invalid but
-    // Date.parse-able value (2026-02-31T…) would otherwise reach the
-    // ::timestamptz cast raw and surface as an engine error, not invalid_params.
-    if (
-      rawSince !== null &&
-      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(rawSince) &&
-      new Date(rawSince).toISOString().slice(0, 19) !== rawSince.slice(0, 19)
-    ) {
-      throw verbError(
-        'invalid_params',
-        `delta: since is not a valid ISO 8601 calendar timestamp: "${rawSince.slice(0, 60)}"`,
-        'Pass a real calendar datetime, e.g. since: "2026-08-11T00:00:00Z".',
-      );
+    // passed back) is kept verbatim. Date.parse normalizes Feb 31 into March
+    // and accepts years 0 and 10000+ that Postgres timestamptz refuses, so the
+    // calendar date and the 0001-9999 range are checked on the parsed value.
+    let explicitSince: string | null = null;
+    if (rawSince !== null) {
+      const checked = cur.checkDeltaTimestamp(rawSince);
+      if (!checked.ok) {
+        throw verbError(
+          'invalid_params',
+          checked.why === 'unparseable'
+            ? `delta: since is not a parseable timestamp: "${rawSince.slice(0, 60)}"`
+            : checked.why === 'calendar'
+              ? `delta: since is not a valid ISO 8601 calendar timestamp: "${rawSince.slice(0, 60)}"`
+              : `delta: since is outside the accepted range ${cur.DELTA_TIMESTAMP_RANGE}: "${rawSince.slice(0, 60)}"`,
+          checked.why === 'unparseable'
+            ? `Pass an ISO 8601 datetime, e.g. ${paramUse(ctx, 'since', '2026-08-11T00:00:00Z')}.`
+            : `Pass a real calendar datetime between years 0001 and 9999, e.g. ${paramUse(ctx, 'since', '2026-08-11T00:00:00Z')}.`,
+        );
+      }
+      explicitSince = checked.value;
     }
-    const explicitSince =
-      rawSince === null
-        ? null
-        : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(rawSince)
-          ? rawSince
-          : new Date(Date.parse(rawSince)).toISOString();
+    const rawCursor = typeof p.cursor === 'string' && p.cursor.trim() ? p.cursor.trim() : null;
+    let cursorPos: import('../context/delta-cursor.ts').DeltaPosition | null = null;
+    if (rawCursor !== null) {
+      const decoded = cur.decodeDeltaCursor(rawCursor);
+      if (!decoded.ok) {
+        throw verbError(
+          'invalid_params',
+          `delta: cursor is invalid: ${decoded.why}`,
+          `Pass next_cursor.cursor from a previous delta response unchanged, or omit cursor and pass ${paramUse(ctx, 'since', '2026-08-11T00:00:00Z')}.`,
+        );
+      }
+      cursorPos = decoded.pos;
+    }
     const sessionId = typeof p.session_id === 'string' && p.session_id.trim() ? p.session_id : null;
     // Cursor namespace (pre-landing review, fail-closed): 'local' is RESERVED
     // for the trusted CLI/hook lane, gated on STRICT ctx.remote === false —
@@ -685,80 +894,102 @@ const delta: Operation = {
       typeof p.budget_tokens === 'number' && Number.isFinite(p.budget_tokens) && p.budget_tokens > 0
         ? Math.floor(p.budget_tokens)
         : null;
+    const explicitSlug = typeof p.since_slug === 'string' ? p.since_slug : undefined;
+    const read = sessionId ? await readDeltaSessionState(ctx.engine, sourceId, clientId, sessionId) : null;
 
-    const state = sessionId ? await getSessionContextState(ctx.engine, sourceId, clientId, sessionId) : null;
-    const effectiveSince = explicitSince ?? state?.last_wake_at ?? null;
+    // Start position. Explicit overrides replace WHOLE tuples: `cursor` sets
+    // both arms; `since` sets both arms to "strictly after since" with only the
+    // slug the caller supplied (never the session's slug for another time).
+    type Pos = import('../context/delta-cursor.ts').DeltaPosition;
+    const start: Pos | null = cur.resolveDeltaStart({ cursorPos, explicitSince, explicitSlug, session: read?.status === 'loaded' ? read.state : null });
+    const stateful = sessionId !== null;
+    const retryArgs: Record<string, unknown> = {
+      ...(stateful ? { session_id: sessionId } : { cursor: start ? cur.encodeDeltaCursor(start) : undefined }),
+      ...(typeof p.entities === 'string' ? { entities: p.entities } : {}),
+      ...(budgetTokens !== null ? { budget_tokens: budgetTokens } : {}),
+      ...(includePrivate ? { include_private: true } : {}),
+    };
+    const emitIncomplete = (reason: string, consecutive: number) =>
+      ctx.emitNotice?.(incompleteNotice(reason, stateful && consecutive >= DELTA_ESCALATE_AFTER, consecutive, retryArgs));
 
-    if (!effectiveSince) {
+    if (!start) {
       if (!sessionId) {
         throw verbError(
           'invalid_params',
-          'delta requires `since` (ISO 8601) or a `session_id` with an established cursor.',
-          'Pass since ("2026-08-11T00:00:00Z") for a stateless delta, or a stable session_id — the first call establishes the cursor and later calls return only newer changes.',
+          'delta requires `since` (ISO 8601), a `cursor`, or a `session_id` with an established cursor.',
+          `Pass ${paramUse(ctx, 'since', '2026-08-11T00:00:00Z')} for a stateless delta, or a stable ${paramUse(ctx, 'session_id', 'agent-main')} — the first call establishes the cursor and later calls return only newer changes.`,
         );
       }
-      // First wake for this session: establish the cursor at now and report an
-      // empty delta (there is no prior point to diff against yet). Opportunistic
-      // GC on row creation bounds session-row accumulation on serve-less CLI
-      // lanes and remote read callers minting session ids (pre-landing review).
-      // AWAITED (v0.45.7): a floating engine promise here races the CLI lane's
-      // engine teardown and wedges the process — `gbrain delta --session-id`
-      // printed its response but never exited (the exact command the shipped
-      // HEARTBEAT.md ambient-delta row tells agents to run). GC is two fast
-      // DELETEs on a capped table and internally fail-open, so awaiting costs
-      // one first-wake round-trip, never an error. The serve-boot call site
-      // (src/mcp/server.ts) stays fire-and-forget — that process is long-lived.
+      if (read?.status === 'unavailable') {
+        // A failed state read is NOT a first wake: initializing at now would
+        // drop everything since the session's checkpoint. With no position
+        // there is nothing to deliver, so refuse retryably and move nothing.
+        throw sessionUnavailableError(ctx, bumpLocalDegraded(sourceId, clientId, sessionId, true) >= DELTA_ESCALATE_AFTER, retryArgs);
+      }
+      // First wake (no row, including a GC-expired session): establish the
+      // cursor at now and report an empty delta. Opportunistic GC on row
+      // creation bounds session-row accumulation. AWAITED (v0.45.7): a
+      // floating engine promise races the CLI lane's engine teardown.
       const now = new Date().toISOString();
-      const { gcSessionContextState } = await import('../context/session-state.ts');
-      await upsertSessionContextState(ctx.engine, sourceId, clientId, sessionId, { lastWakeAt: now });
+      const first: Pos = { pages: { since: now }, facts: { at: now, id: null } };
+      const wrote = await upsertSessionContextState(ctx.engine, sourceId, clientId, sessionId, {
+        lastWakeAt: now, factsCursor: { at: now, id: null }, degradedWakes: 'reset',
+      });
       await gcSessionContextState(ctx.engine);
+      ctx.emitNotice?.({
+        code: 'empty_retrieval',
+        kind: 'info',
+        why: `delta started this session's cursor now (${now}); this call and later calls return only changes after it. To read earlier changes, replay statelessly with since (no session_id), which leaves this cursor alone.`,
+        fix: { argv: ['gbrain', 'delta', '--since', '<since>'], mcp: { tool: 'delta', arguments: { since: '<since>' } },
+          inputs: [{ name: 'since', how: 'the ISO 8601 time to read changes from, e.g. 24 hours ago' }],
+          consent: [], actor: 'agent', requires_exclusive: false, why: 'Reads the changes before this session started without moving its cursor.', docs: DELTA_REPLAY_DOCS },
+      });
+      if (!wrote.ok) emitIncomplete('session_state', bumpLocalDegraded(sourceId, clientId, sessionId, true));
       return {
         protocol_version: MEMORY_VERBS_VERSION,
         since: now, pages: [], facts: [], threads: [], text: '', has_more: false,
-        next_cursor: { since: now, slug: '' },
-        ...(budgetTokens !== null
-          ? { budget_tokens: budgetTokens, budget_used: 0, dropped_count: 0 }
-          : {}),
+        next_cursor: { since: now, slug: '', cursor: cur.encodeDeltaCursor(first) },
+        ...(wrote.ok ? {} : { degraded_reason: 'session_state' }),
+        ...(budgetTokens !== null ? { budget_tokens: budgetTokens, budget_used: 0, dropped_count: 0 } : {}),
       };
     }
 
-    // Keyset cursor (red-team F1/F2 fix): pages page by (updated_at, slug), so
-    // a >limit cluster at one timestamp is reachable and a delivered page never
-    // re-appears unless it changes. The keyset slug lives in the session row
-    // (surfaced_slugs[0]); an explicit-`since` caller has no stored slug and
-    // resumes via the returned `next_cursor`.
-    const cursorSlug = sessionId ? state?.surfaced_slugs?.[0] : undefined;
-    const explicitSlug = typeof p.since_slug === 'string' ? p.since_slug : undefined;
-    const sinceSlug = explicitSlug ?? cursorSlug;
-
+    const effectiveSince = start.pages.since;
     const res = await assembleDeltaContext(ctx.engine, {
       sourceId,
       since: effectiveSince,
-      ...(sinceSlug !== undefined ? { sinceSlug } : {}),
+      ...(start.pages.slug !== undefined ? { sinceSlug: start.pages.slug } : {}),
+      factsAfter: start.facts,
       entities: parseEntityList(p.entities),
       sessionId: sessionId ?? undefined,
       includePrivate,
       maxEntities: PACK_DEFAULT_MAX_ENTITIES,
+      eligibility: await resolveReadEligibility(ctx, { minTrust: p.min_trust }),
     });
 
-    // Pages arrive OLDEST first by (updated_at, slug) — no client-side dedup
-    // needed; the keyset already excludes everything at/before the cursor.
-    let pages = res.deltaPages ?? [];
-    let facts = res.facts ?? [];
+    // Pages arrive OLDEST first by (updated_at, slug), facts OLDEST first by
+    // (created_at, id). Pack, price and render the redacted presentation sets
+    // (one echo dictionary). The cursors read the raw rows at the delivered
+    // index and local callers get the delivered facts back raw below.
+    const rawPages = res.deltaPages ?? [];
+    const rawFacts = await withProvenance(ctx.engine, sourceId, res.facts ?? []);
+    const view = redactRetrievalOutput([{ pages: rawPages, facts: rawFacts, threads: res.openThreads ?? [] }], {}).results[0];
+    let pages = view.pages;
+    let facts = view.facts;
     // Threads are NEVER budget-dropped: they are the commitments a heartbeat
     // must not miss, and they have no keyset of their own to resume from.
-    const threads = res.openThreads ?? [];
+    const threads = view.threads;
     let droppedCount: number | undefined;
     let factsDropped = 0;
+    let itemBudget = 0;
     const fetchedPages = pages.length;
+    const fetchedFacts = facts.length;
     if (budgetTokens !== null) {
       // packToBudget keeps a contiguous PREFIX (order-preserving, stops at the
-      // first overflow) — with oldest-first pages the kept set stays contiguous
-      // from the cursor, which the advance logic below depends on.
-      // #4761: reserve the envelope + headers (they embed `since`, so price per
-      // call) AND every thread line, then cost each page/fact as its rendered
-      // line — `text` fits the budget whenever the reserved part alone does.
-      const itemBudget =
+      // first overflow), which both arms' delivered-prefix cursors depend on.
+      // #4761: reserve the envelope + headers and every thread line, then cost
+      // each page/fact as its rendered line.
+      itemBudget =
         budgetTokens - deltaHeaderCost(effectiveSince) - threads.reduce((n, t) => n + lineCost(renderThreadLine(t)), 0);
       const pagePack = itemBudget > 0 ? packToBudget(pages, (pg) => lineCost(renderPageLine(pg)), itemBudget) : dropAll(pages);
       pages = pagePack.items;
@@ -769,45 +1000,96 @@ const delta: Operation = {
       factsDropped = factPack.meta.dropped;
     }
     const pagesDropped = fetchedPages - pages.length;
-    // has_more covers ALL undelivered content — fetch-limit overflow, budget-
-    // dropped pages, AND budget-dropped facts (pre-landing review: facts were
-    // silently lost when pages fit but facts overflowed).
-    // ponytail: dropped facts keep the pre-existing ceiling — the cursor still
-    // advances past delivered pages, so they re-surface only if their
-    // created_at is after the new cursor; a per-arm cursor would fix it.
-    const hasMore = res.deltaOverflow === true || pagesDropped > 0 || factsDropped > 0;
+    const factsOverflowRow = res.deltaFactsOverflowRow ?? null;
+    // has_more: more content is waiting (fetch-limit overflow on either arm or
+    // a budget drop). Failure is signalled by degraded_reason + the notice.
+    const hasMore = res.deltaOverflow === true || factsOverflowRow !== null || pagesDropped > 0 || factsDropped > 0;
 
-    // Cursor advance (keyset, at-least-once): advance to the last DELIVERED
-    // (updated_at, slug). The keyset's strict `>` means the next wake starts
-    // exactly after it — a >limit same-timestamp cluster drains one page at a
-    // time across wakes (F1), and a delivered page never re-appears (F2). On a
-    // page-less wake with nothing dropped, advance the TIME cursor to now()
-    // minus a safety lag (in-flight write txns stamp updated_at at txn START)
-    // and clear the keyset slug. If nothing delivered but something dropped, do
-    // NOT advance (deliver-before-advance; a too-small budget must not eat it).
-    const nextCursor =
-      pages.length > 0
-        ? { since: pages[pages.length - 1].updated_at, slug: pages[pages.length - 1].slug }
-        : { since: effectiveSince, slug: sinceSlug ?? '' };
+    // Per-arm advance (at-least-once): each arm moves through the prefix it
+    // DELIVERED and never past now() - lag; an arm whose read failed or never
+    // finished holds. Thread events follow the pages' time cursor, so an
+    // incomplete threads arm holds the pages arm too.
+    const arms = res.deltaArms ?? { pages: 'unknown', facts: 'unknown', threads: 'unknown' };
+    const horizon = cur.horizonIso();
+    const pagesNext = cur.nextPagesPos({
+      start: start.pages,
+      complete: arms.pages === 'ok' && arms.threads === 'ok',
+      delivered: rawPages.slice(0, pages.length),
+      undelivered: res.deltaOverflow === true || pagesDropped > 0,
+      horizon,
+      advanceOnEmpty: stateful,
+    });
+    const deliveredRepIds = new Set(rawFacts.slice(0, facts.length).map((f) => f.id));
+    const { next: factsNext, oldestUndelivered } = cur.nextFactsPos({
+      start: start.facts,
+      complete: arms.facts === 'ok',
+      raw: res.deltaFactsRaw ?? [],
+      overflowRow: factsOverflowRow,
+      deliveredRepIds,
+      horizon,
+      advanceOnEmpty: stateful,
+    });
+    const next: Pos = { pages: pagesNext, facts: factsNext };
+
+    // Conservative legacy `since`/`slug` for clients that do not send `cursor`.
+    const incomplete = res.degradedReason !== undefined;
+    const { legacy, clamped } = cur.legacyDeltaCursor({
+      start, pagesNext, factsNext, oldestUndelivered, incomplete,
+      pagesDelivered: pages.length, factsDelivered: facts.length,
+      pagesQuiet: res.deltaOverflow !== true && pagesDropped === 0,
+    });
+    if (clamped && !stateful && cursorPos === null && cur.comparePages(legacy, start.pages) <= 0) {
+      // A legacy stateless caller at a boundary it cannot page (more undelivered
+      // facts at one timestamp than the fetch limit): advancing would skip
+      // them and holding would loop forever. Only the opaque cursor can page it.
+      const exact = cur.encodeDeltaCursor(next);
+      const e = opError(
+        'delta_cursor_upgrade_required',
+        'delta: more undelivered facts share one timestamp than a since/since_slug cursor can page.',
+        `Repeat the call with ${paramUse(ctx, 'cursor', exact)} instead of since/since_slug.`,
+        {
+          why: 'The legacy cursor is a single timestamp; facts that share it can only be paged by fact id, which the opaque cursor carries. Nothing was skipped and no cursor moved.',
+          fix: { argv: deltaArgv({ cursor: exact }), mcp: { tool: 'delta', arguments: { cursor: exact } }, consent: [], actor: 'agent', requires_exclusive: false,
+            why: 'Resumes both arms exactly; keep passing next_cursor.cursor on later calls.', docs: DELTA_REPLAY_DOCS },
+        },
+      );
+      e.protocolVersion = MEMORY_VERBS_VERSION;
+      throw e;
+    }
+
+    let degradedReason = res.degradedReason;
     if (sessionId) {
-      if (pages.length > 0) {
-        await upsertSessionContextState(ctx.engine, sourceId, clientId, sessionId, {
-          lastWakeAt: nextCursor.since,
-          cursorSlug: nextCursor.slug,
-        });
-      } else if (!hasMore) {
-        await upsertSessionContextState(ctx.engine, sourceId, clientId, sessionId, {
-          lastWakeAt: new Date(Date.now() - 2000).toISOString(),
-          cursorSlug: '',
-        });
-      }
+      const wrote = await upsertSessionContextState(ctx.engine, sourceId, clientId, sessionId, {
+        lastWakeAt: pagesNext.since,
+        cursorSlug: pagesNext.slug ?? '',
+        factsCursor: { at: factsNext.at, id: factsNext.id },
+        degradedWakes: incomplete ? 'increment' : 'reset',
+      });
+      if (!wrote.ok) degradedReason = degradedReason ? `${degradedReason},session_state` : 'session_state';
+      const consecutive = wrote.ok ? (bumpLocalDegraded(sourceId, clientId, sessionId, false), wrote.degradedWakes) : bumpLocalDegraded(sourceId, clientId, sessionId, true);
+      if (degradedReason) emitIncomplete(degradedReason, consecutive);
+    } else if (degradedReason) {
+      emitIncomplete(degradedReason, 1);
+    }
+
+    // A budget too small for even ONE waiting item would return has_more
+    // forever; say so with the budget that fits the next item.
+    if (budgetTokens !== null && pages.length === 0 && facts.length === 0 && (pagesDropped > 0 || factsDropped > 0)) {
+      const nextItem = fetchedPages > 0 ? lineCost(renderPageLine(view.pages[0])) : fetchedFacts > 0 ? lineCost(renderFactLine(view.facts[0])) : 0;
+      const needed = budgetTokens - itemBudget + nextItem;
+      const bigger = { ...retryArgs, budget_tokens: needed };
+      ctx.emitNotice?.({
+        code: 'delta_incomplete',
+        kind: 'degraded',
+        why: `budget_tokens ${budgetTokens} cannot fit even one waiting item (the next one needs ${needed}); repeating the call with the same budget returns has_more forever.`,
+        fix: { argv: deltaArgv(bigger), mcp: { tool: 'delta', arguments: bigger }, consent: [], actor: 'agent', requires_exclusive: false,
+          why: `Repeat with budget_tokens ${needed} or more; nothing was skipped and no cursor moved.` },
+      });
     }
 
     // Re-render the injectable block from the FINAL sets (adversarial review):
     // `text` must honor the budget AND the boundary-tie exclusion the
     // structured arrays reflect — the assembler's render predates both.
-    // budget_used reports that text; it exceeds budget_tokens only when the
-    // header + the never-truncated threads alone do.
     const text = renderDelta(pages, facts, threads, effectiveSince);
     const budgetUsed = budgetTokens !== null ? estimateTokens(text) : undefined;
 
@@ -815,7 +1097,8 @@ const delta: Operation = {
       protocol_version: MEMORY_VERBS_VERSION,
       since: effectiveSince,
       pages,
-      facts: facts.map((f) => ({
+      facts: (ctx.remote === false ? rawFacts.slice(0, facts.length) : facts).map((f) => ({
+        id: f.id,
         fact: f.fact,
         kind: f.kind,
         entity_slug: f.entity_slug,
@@ -823,14 +1106,23 @@ const delta: Operation = {
         // #4206: provenance context (parity with the recall projection).
         context: f.context ?? null,
         confidence: f.confidence,
+        // #6146: recall's v1 names, so a packed fact traces back to its record.
+        fact_id: String(f.id),
+        provenance: f.provenance,
+        ...(f.trust_tier ? { trust_tier: f.trust_tier, origin: f.origin } : {}),
       })),
       threads,
       text,
       has_more: hasMore,
-      // Stateless resume: a caller with no session_id passes these back as
-      // `since` + `since_slug` on the next call to page deterministically.
-      next_cursor: nextCursor,
-      ...(res.degradedReason ? { degraded_reason: res.degradedReason } : {}),
+      // Stateless resume: pass `cursor` back (exact, both arms). Older clients
+      // pass `since` + `since_slug` (conservative: may re-see, never skips).
+      next_cursor: { since: legacy.since, slug: legacy.slug ?? '', cursor: cur.encodeDeltaCursor(next) },
+      // Replay audit trail: where each arm started and where it resumes.
+      cursor_arms: {
+        pages: { start: { since: start.pages.since, slug: start.pages.slug ?? null }, next: { since: pagesNext.since, slug: pagesNext.slug ?? null } },
+        facts: { start: { since: start.facts.at, id: start.facts.id }, next: { since: factsNext.at, id: factsNext.id } },
+      },
+      ...(degradedReason ? { degraded_reason: degradedReason } : {}),
       ...(budgetTokens !== null
         ? { budget_tokens: budgetTokens, budget_used: budgetUsed, dropped_count: droppedCount }
         : {}),
@@ -838,8 +1130,84 @@ const delta: Operation = {
   },
 };
 
+/** delta: consecutive incomplete wakes before the notice escalates from `wait` to `report`. */
+const DELTA_ESCALATE_AFTER = 3;
+const DELTA_RETRY_SECONDS = 30;
+const DELTA_REPLAY_DOCS = 'docs/guides/ambient-recall.md#replay-after-a-degraded-wake';
+
+/** The delta_incomplete notice: retry the same call after a short wait, or report once it keeps failing. */
+function incompleteNotice(reason: string, escalate: boolean, consecutive: number, retryArgs: Record<string, unknown>): Notice {
+  return {
+    code: 'delta_incomplete',
+    kind: 'degraded',
+    why: escalate
+      ? `delta has been incomplete on ${consecutive} consecutive wakes (${reason}); no cursor moved past content it did not deliver, but the store is not recovering on its own.`
+      : `delta could not complete this read (${reason}); no cursor moved past content it did not deliver. Retry the same call in about ${DELTA_RETRY_SECONDS} seconds and the held cursor re-reads the same window.`,
+    fix: escalate
+      ? { consent: [], actor: 'agent', requires_exclusive: false,
+          why: 'Tell the user delta keeps failing, then run gbrain doctor --json to find the failing store.',
+          verify: { argv: ['gbrain', 'doctor', '--json'] }, docs: DELTA_REPLAY_DOCS }
+      : { argv: deltaArgv(retryArgs), mcp: { tool: 'delta', arguments: retryArgs }, consent: [], actor: 'provider', requires_exclusive: false,
+          why: `Retry the same read after about ${DELTA_RETRY_SECONDS} seconds; nothing was skipped.`, docs: DELTA_REPLAY_DOCS },
+  };
+}
+
+/** A failed session-state read is NOT a first wake: refuse retryably, move nothing. */
+function sessionUnavailableError(ctx: OperationContext, escalate: boolean, retryArgs: Record<string, unknown>): OperationError {
+  const e = opError(
+    'unavailable',
+    'delta: the session cursor could not be read, so this wake delivered nothing and moved nothing.',
+    escalate
+      ? 'The session store has failed on several consecutive wakes: tell the user and run `gbrain doctor --json`.'
+      : `Retry the same call in about ${DELTA_RETRY_SECONDS} seconds, or replay statelessly with ${paramUse(ctx, 'since', '2026-08-11T00:00:00Z')}.`,
+    {
+      reason: 'session_state',
+      why: 'Treating a failed read as a new session would restart the cursor at now and silently skip everything since its checkpoint.',
+      fix: escalate
+        ? { consent: [], actor: 'agent', requires_exclusive: false, why: 'Tell the user the session store keeps failing, then run gbrain doctor --json.', verify: { argv: ['gbrain', 'doctor', '--json'] }, docs: DELTA_REPLAY_DOCS }
+        : { argv: deltaArgv(retryArgs), mcp: { tool: 'delta', arguments: retryArgs }, consent: [], actor: 'provider', requires_exclusive: false,
+            why: `Retry the same read after about ${DELTA_RETRY_SECONDS} seconds; the checkpoint is intact.`, docs: DELTA_REPLAY_DOCS },
+    },
+  );
+  e.protocolVersion = MEMORY_VERBS_VERSION;
+  return e;
+}
+
+/** CLI form of a delta call (flags mirror the params). */
+function deltaArgv(args: Record<string, unknown>): string[] {
+  const argv = ['gbrain', 'delta'];
+  for (const [k, v] of Object.entries(args)) {
+    if (v === undefined) continue;
+    const flag = `--${k.replace(/_/g, '-')}`;
+    if (v === true) argv.push(flag);
+    else argv.push(flag, String(v));
+  }
+  return argv;
+}
+
+/**
+ * In-process consecutive-incomplete counter: the fallback when the session
+ * store itself is down (the durable counter lives in session_context_state).
+ * Bounded; returns the count after the update.
+ */
+const localDegraded = new Map<string, number>();
+function bumpLocalDegraded(sourceId: string, clientId: string | null, sessionId: string, incomplete: boolean): number {
+  const key = `${sourceId}|${clientId ?? 'local'}|${sessionId}`;
+  if (!incomplete) {
+    localDegraded.delete(key);
+    return 0;
+  }
+  const n = (localDegraded.get(key) ?? 0) + 1;
+  localDegraded.delete(key);
+  localDegraded.set(key, n);
+  if (localDegraded.size > 1_000) localDegraded.delete(localDegraded.keys().next().value!);
+  return n;
+}
+
 const forget_fact: Operation = {
   name: 'forget_fact',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description: 'Forget a fact by recording a durable withdrawal in its source and visibility. Strikes the Markdown facts fence when writable; otherwise keeps the withdrawal in the database. Stale imports cannot reactivate the same normalized claim. This retracts memory; original prose, files and backups may retain the text. Idempotent on already-expired or unknown ids.',
   params: {
     request_id: WRITE_REQUEST_PARAM,
@@ -946,3 +1314,40 @@ export function parseTtlParam(raw: unknown): Date | null {
 export const factsOperations: Operation[] = [
   extract_facts, recall, context_pack, delta, forget_fact,
 ];
+
+/** Why recall's page-search arm runs keyword-only, or null: the brain opted out (no query text sent), or no provider. */
+async function recallKeywordOnlyReason(ctx: OperationContext): Promise<string | null> {
+  const { factEmbeddingDisabled } = await import('../embedding-disabled.ts');
+  if (await factEmbeddingDisabled(ctx.engine, ctx.config)) return (await import('../interop-notices.ts')).RECALL_KEYWORD_ONLY_OPTED_OUT;
+  return isAvailable('embedding') ? null : 'keyword_only_no_embedding_provider';
+}
+
+/**
+ * Keyless recall's page arm: direct keyword FTS, except that a planned
+ * multi-relation question (planner on) goes through hybridSearch's keyless
+ * path, which runs keyword + title + the relational chain (zero LLM).
+ */
+async function keylessRecallRows(
+  ctx: OperationContext, queryText: string, limit: number, excludePrivate: boolean,
+  searchScope: { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier },
+): Promise<SearchResult[]> {
+  if (await keylessChainQuestion(ctx, queryText)) {
+    return hybridSearchCached(ctx.engine, queryText, {
+      limit, expansion: false, excludePrivate, requireSafeChunks: ctx.remote !== false,
+      takesHoldersAllowList: readHolders(ctx), ...searchScope,
+    });
+  }
+  const rows = dedupResults(await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope }));
+  // #3783 — direct FTS path: every row is a keyword hit by construction.
+  markKeywordHits(rows);
+  stampEvidenceSafe(rows);
+  await stampContentFlags(ctx.engine, rows, { ...searchScope, excludePrivate });
+  return rows;
+}
+
+/** Keyless recall routes a planned multi-relation question through the relational chain when the planner is on. */
+async function keylessChainQuestion(ctx: OperationContext, queryText: string): Promise<boolean> {
+  if (parseRelationalPlan(queryText).kind !== 'plan') return false;
+  const modeInput = await loadSearchModeConfig(ctx.engine);
+  return resolveSearchMode({ mode: modeInput.mode, overrides: modeInput.overrides }).relational_planner;
+}

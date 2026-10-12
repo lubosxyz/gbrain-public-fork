@@ -1,7 +1,9 @@
 import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { viewedEngine } from '../persistence/switches.ts';
 import { fileURLToPath } from 'node:url';
 import { OperationError } from '../ops/contract.ts';
-import { resolveSourceLocalFilePath } from '../markdown.ts';
+import { isRelativeFileUri, resolveSourceLocalFilePath, sourceGitScope } from '../markdown.ts';
+import { screeningPath } from '../persistence/screening-paths.ts';
 import { localHostId } from '../persistence/identity.ts';
 import type { SqlEngine, WriteRequest } from '../persistence/model.ts';
 import { canonicalFilesystemPath } from '../persistence/root-registry.ts';
@@ -27,26 +29,52 @@ function reject(): never {
     'Use put_skill with the catalog expected_revision and complete approved file bundle; an existing pack requires host-authorized adoptSharedSkillpack adoption. Imported skill text remains knowledge data, not published instructions.');
 }
 
+const packsInTransaction = new WeakMap<object, Promise<PackRoot[]>>();
+/** Engines (the connection owner, not a transaction view of it) whose schema has shared_skill_packs; migrations never drop it. */
+const packTablePresent = new WeakSet<object>();
+function connectionOwner(engine: object): object {
+  let owner = viewedEngine(engine);
+  while (Object.hasOwn(owner, '_pageTransaction') && (owner as { _pageTransaction?: boolean })._pageTransaction === true) owner = Object.getPrototypeOf(owner);
+  return owner;
+}
+/** The shared skillpack roots; #5984: read once per transaction engine. */
+function sharedPacks(engine: SqlEngine): Promise<PackRoot[]> {
+  const read = async () => {
+    const owner = connectionOwner(engine);
+    if (!packTablePresent.has(owner)) {
+      const [schema] = await engine.executeRaw<{ present: boolean }>("SELECT to_regclass('shared_skill_packs') IS NOT NULL AS present");
+      if (!schema?.present) return [];
+      packTablePresent.add(owner);
+    }
+    return engine.executeRaw<PackRoot>(`SELECT p.source_id,p.source_incarnation,s.local_path AS source_root,
+      h.local_path AS worktree_root,b.relative_path FROM shared_skill_packs p
+      JOIN sources s ON s.id=p.source_id AND s.incarnation=p.source_incarnation
+      LEFT JOIN persistence_source_bindings b ON b.source_id=p.source_id AND b.source_incarnation=p.source_incarnation
+      LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid`, [localHostId()]);
+  };
+  if ((engine as { _pageTransaction?: boolean })._pageTransaction !== true) return read();
+  let cached = packsInTransaction.get(engine);
+  if (!cached) { cached = read(); packsInTransaction.set(engine, cached); }
+  return cached;
+}
+
+/** A transaction that changes shared_skill_packs re-reads them for its later knowledge writes. */
+export function forgetSharedPacks(engine: SqlEngine): void { packsInTransaction.delete(engine); }
+
 export async function assertKnowledgePublicationAllowed(
   engine: SqlEngine,
   row: KnowledgePublicationTarget,
   preparedFile?: KnowledgePublicationFile,
 ): Promise<void> {
   if (row.target_kind === 'skill_bundle') return;
-  const [schema] = await engine.executeRaw<{ present: boolean }>("SELECT to_regclass('shared_skill_packs') IS NOT NULL AS present");
-  if (!schema?.present) return;
-  const packs = await engine.executeRaw<PackRoot>(`SELECT p.source_id,p.source_incarnation,s.local_path AS source_root,
-    h.local_path AS worktree_root,b.relative_path FROM shared_skill_packs p
-    JOIN sources s ON s.id=p.source_id AND s.incarnation=p.source_incarnation
-    LEFT JOIN persistence_source_bindings b ON b.source_id=p.source_id AND b.source_incarnation=p.source_incarnation
-    LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid`, [localHostId()]);
+  const packs = await sharedPacks(engine);
   if (!packs.length) return;
   const ownPack = packs.find(pack => pack.source_id === row.source_id && pack.source_incarnation === row.source_incarnation);
   if (ownPack && reserved(row.slug)) reject();
   const roots = [...new Set(packs.flatMap(pack => [
     ...(pack.source_root ? [pack.source_root] : []),
     ...(pack.worktree_root !== null && pack.relative_path !== null ? [resolve(pack.worktree_root, pack.relative_path)] : []),
-  ]))].map(root => canonicalFilesystemPath(root));
+  ]))].map(root => screeningPath(`pack-root\0${root}`, () => canonicalFilesystemPath(root)));
   const paths = preparedFile ? [preparedFile.path] : [];
   const [source] = await engine.executeRaw<{ local_path: string | null }>('SELECT local_path FROM sources WHERE id=$1 AND incarnation=$2::uuid', [row.source_id, row.source_incarnation]);
   const sourceRoots = [...new Set([...(source?.local_path ? [source.local_path] : []), ...(preparedFile ? [preparedFile.root] : []),
@@ -59,11 +87,19 @@ export async function assertKnowledgePublicationAllowed(
     for (const alias of aliases) {
       if (alias.source_path) {
         paths.push(resolve(root, alias.source_path));
-        const recorded = resolveSourceLocalFilePath(root, alias.source_path, row.slug);
+        const recorded = resolveSourceLocalFilePath(root, alias.source_path, row.slug, undefined, screeningPath(`git-scope\0${root}`, () => sourceGitScope(root)));
         if (recorded) paths.push(recorded);
       }
-      if (alias.source_uri?.startsWith('file:')) {
-        try { paths.push(fileURLToPath(alias.source_uri)); } catch { reject(); }
+      if (alias.source_uri?.startsWith('file:') && !isRelativeFileUri(alias.source_uri)) {
+        try { paths.push(fileURLToPath(alias.source_uri)); } catch {
+          // An unresolved alias must still fail closed, but it does not prove
+          // that this ordinary page is part of a shared skillpack.
+          const error = new OperationError('invalid_source_uri',
+            'The page has a stored file source_uri that cannot be resolved to a local filesystem path. Have the source owner inspect and repair the stored source_uri before retrying.',
+            `On the brain host, inspect the stored source_uri of page ${row.slug} in source ${row.source_id} and replace it with an absolute file URI or clear it, then retry the knowledge write with a new request_id. Shared skillpack protection remains enabled.`);
+          error.detail = 'invalid_source_uri';
+          throw error;
+        }
       }
     }
   }

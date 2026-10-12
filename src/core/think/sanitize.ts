@@ -1,4 +1,6 @@
-/**
+
+import type { TrustTier } from '../trust/tier.ts';
+import { trustAttributes } from '../eligibility/labels.ts';/**
  * v0.28: prompt-injection defense for take claims fed into `gbrain think`.
  *
  * The threat: a claim row in the takes table contains attacker-supplied text.
@@ -13,7 +15,8 @@
  *      We don't pretend this is bulletproof — frontier models still drift on
  *      adversarial inputs. But we cut the volume of trivial injections by ~95%.
  *
- * Test fixtures in test/think-sanitize.test.ts pin 30+ known attack strings.
+ * Test fixtures in test/think-pipeline.test.ts, test/think-sanitize-trajectory.test.ts
+ * and test/longmemeval-sanitize.test.ts pin known attack strings.
  */
 
 // v0.28.8: exported so the longmemeval benchmark harness can reuse the same
@@ -27,7 +30,11 @@ export const INJECTION_PATTERNS: Array<{ name: string; rx: RegExp; replacement: 
   { name: 'new-instructions', rx: /(?:new|updated|revised)\s+instructions?:/gi, replacement: '[redacted]:' },
   { name: 'system-prompt',    rx: /system\s*:\s*(?:you\s+are|you\s+must|never|always)/gi, replacement: '[redacted]' },
   { name: 'role-jailbreak',   rx: /you\s+are\s+(?:now|actually|really)\s+(?:a|an)\s+\w+/gi, replacement: '[redacted]' },
-  { name: 'do-anything-now',  rx: /\b(?:DAN|do\s+anything\s+now|developer\s+mode\s+enabled?)\b/gi, replacement: '[redacted]' },
+  // The acronym is case-sensitive: "Dan" is a common name and "dan" a common
+  // word in Spanish and Indonesian (#5910).
+  { name: 'do-anything-now',  rx: /\bDAN\b/g, replacement: '[redacted]' },
+  { name: 'do-anything-now-phrase', rx: /\b(?:do\s+anything\s+now|developer\s+mode\s+enabled?)\b/gi, replacement: '[redacted]' },
+  { name: 'dan-mode',         rx: /\bdan\s+mode\b/gi, replacement: '[redacted]' },
   // Tag injection — try to close the structural <take> wrapper
   { name: 'close-take',       rx: /<\s*\/\s*take\s*>/gi, replacement: '&lt;/take&gt;' },
   { name: 'open-system',      rx: /<\s*system\s*>/gi, replacement: '&lt;system&gt;' },
@@ -50,6 +57,23 @@ export const INJECTION_PATTERNS: Array<{ name: string; rx: RegExp; replacement: 
   // Code-execution-style hooks
   { name: 'eval-shell',       rx: /\b(?:eval|exec|system|shell)\s*\(/gi, replacement: '[redacted](' },
 ];
+
+/**
+ * #5575 write gate: non-global clones of the detection-grade subset
+ * (instruction overrides and output exfiltration), so `.test()` keeps no
+ * `lastIndex` state. Tag breakouts, the case-sensitive acronym, `verbatim` and
+ * `eval-shell` are render safety or too broad for a detector and stay
+ * rewrite-only. `src/core/write-gate-patterns.ts` bounds their quantifiers.
+ */
+const DETECTION_FAMILY: Readonly<Record<string, 'override' | 'exfiltration'>> = {
+  'ignore-prior': 'override', 'forget-everything': 'override', disregard: 'override', 'new-instructions': 'override',
+  'system-prompt': 'override', 'role-jailbreak': 'override', 'do-anything-now-phrase': 'override', 'dan-mode': 'override',
+  'print-system': 'exfiltration',
+};
+export const INJECTION_DETECTION_PATTERNS: ReadonlyArray<{ name: string; family: 'override' | 'exfiltration'; rx: RegExp }> = INJECTION_PATTERNS
+  .filter(p => DETECTION_FAMILY[p.name])
+  // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- non-global copies of this module's own literal INJECTION_PATTERNS
+  .map(p => ({ name: p.name, family: DETECTION_FAMILY[p.name], rx: new RegExp(p.rx.source, p.rx.flags.replace('g', '')) }));
 
 /**
  * Sanitize a single take claim before embedding into a model prompt.
@@ -87,6 +111,9 @@ export interface TakeForPrompt {
   weight: number;
   source?: string | null;
   since_date?: string | null;
+  /** #5575 A6: the take's trust tier and short origin, rendered as attributes. */
+  trust_tier?: TrustTier;
+  origin?: string;
 }
 
 export function renderTakesBlock(takes: TakeForPrompt[]): { rendered: string; sanitizedCount: number } {
@@ -98,6 +125,7 @@ export function renderTakesBlock(takes: TakeForPrompt[]): { rendered: string; sa
     const meta = [`kind=${t.kind}`, `who=${t.holder}`, `weight=${t.weight.toFixed(2)}`];
     if (t.since_date) meta.push(`since=${t.since_date}`);
     if (t.source) meta.push(`source="${String(t.source).replace(/"/g, '\\"').slice(0, 80)}"`);
+    if (t.trust_tier) meta.push(trustAttributes({ trust_tier: t.trust_tier, origin: t.origin ?? 'legacy' }));
     lines.push(
       `<take id="${t.page_slug}#${t.row_num}" ${meta.join(' ')}>\n${text}\n</take>`,
     );

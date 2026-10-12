@@ -37,12 +37,13 @@ import {
   dcrScopeViolation,
 } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
-import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions, normalizeTokenScopes, parseLegacyOperationGrant } from './legacy-token-scope.ts';
+import { TOKEN_TTL_MAX_SECONDS, authSourcesFromGrant, grantFromTokenRow, grantFromRow, normalizeGrantBrain, intersectGrantedScopes, type GrantPatch } from './grants/model.ts';
 import { writeAuthAudit } from './auth-audit.ts';
-import { grantFromRow, normalizeGrantBrain, intersectGrantedScopes, type GrantPatch } from './grants/model.ts';
 import { assertValidSlugPrefixes, pgArray } from './grants/encoding.ts';
 import { rescopeOAuthClient, type RescopeClientOptions, type RescopeClientResult } from './grants/rescope.ts';
 import { grantValidationContext, validateClientGrant, insertClientGrant, assertGrantPatch } from './grants/service.ts';
+import { resolveTokenGrant, touchTokenLastUsed } from './grants/legacy-token.ts';
+import { NO_SOURCES } from './source-id.ts';
 
 /**
  * A slug-prefix write binding is only meaningful if every entry actually
@@ -54,6 +55,7 @@ import { grantValidationContext, validateClientGrant, insertClientGrant, assertG
 export { assertValidSlugPrefixes } from './grants/encoding.ts';
 
 import type { SqlQuery, SqlValue } from './sql-query.ts';
+import { storedMinTrust } from './trust/tier.ts';
 export type { SqlQuery, SqlValue };
 
 export interface AgentClientBindings {
@@ -240,6 +242,8 @@ interface GBrainOAuthProviderOptions {
    * before mcpAuthRouter ran).
    */
   dcrDisabled?: boolean;
+  /** #5222: the canonical /mcp resource from the configured public URL; grants canonicalize `resource` against it. */
+  resourceUrl?: URL;
   /**
    * Allow the consent-bypassing `client_credentials` grant on the unauthenticated
    * Dynamic Client Registration path. Default false (#1353): a self-registered
@@ -440,60 +444,81 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
     // == write scope). Operators who need narrower / wider scope rescope
     // via the CLI later. Pre-v60/v61 brain falls through to the legacy
     // projection (no source_id / federated_read column yet).
-    try {
-      await this.sql`
-        INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
-                                    grant_types, scope, token_endpoint_auth_method,
-                                    client_id_issued_at, source_id, federated_read)
-        VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
-                ${pgArray((client.redirect_uris || []).map(String))},
-                ${pgArray(grantTypes)},
-                ${registeredScope}, ${authMethod},
-                ${now}, ${'default'}, ${pgArray(['default'])})
-      `;
-    } catch (err) {
-      if (isUndefinedColumnError(err, 'federated_read')) {
-        try {
-          await this.sql`
-            INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
-                                        grant_types, scope, token_endpoint_auth_method,
-                                        client_id_issued_at, source_id)
-            VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
-                    ${pgArray((client.redirect_uris || []).map(String))},
-                    ${pgArray(grantTypes)},
-                    ${registeredScope}, ${authMethod},
-                    ${now}, ${'default'})
-          `;
-        } catch (err2) {
-          if (isUndefinedColumnError(err2, 'source_id')) {
-            await this.sql`
-              INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
-                                          grant_types, scope, token_endpoint_auth_method,
-                                          client_id_issued_at)
-              VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
-                      ${pgArray((client.redirect_uris || []).map(String))},
-                      ${pgArray(grantTypes)},
-                      ${registeredScope}, ${authMethod},
-                      ${now})
-            `;
-          } else {
-            throw err2;
-          }
-        }
-      } else if (isUndefinedColumnError(err, 'source_id')) {
+    // #6202: registered_via='dcr' marks the client as self-registered, so its
+    // owner picks its source at the first consent (OAuthGrants.begin). A brain
+    // without the column yet (new server before the migration) falls through to
+    // the unmarked ladder: the client keeps today's read-only consent.
+    const insertUnmarked = async (): Promise<void> => {
+      try {
         await this.sql`
           INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
                                       grant_types, scope, token_endpoint_auth_method,
-                                      client_id_issued_at)
+                                      client_id_issued_at, source_id, federated_read)
           VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
                   ${pgArray((client.redirect_uris || []).map(String))},
                   ${pgArray(grantTypes)},
                   ${registeredScope}, ${authMethod},
-                  ${now})
+                  ${now}, ${'default'}, ${pgArray(['default'])})
         `;
-      } else {
-        throw err;
+      } catch (err) {
+        if (isUndefinedColumnError(err, 'federated_read')) {
+          try {
+            await this.sql`
+              INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
+                                          grant_types, scope, token_endpoint_auth_method,
+                                          client_id_issued_at, source_id)
+              VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
+                      ${pgArray((client.redirect_uris || []).map(String))},
+                      ${pgArray(grantTypes)},
+                      ${registeredScope}, ${authMethod},
+                      ${now}, ${'default'})
+            `;
+          } catch (err2) {
+            if (isUndefinedColumnError(err2, 'source_id')) {
+              await this.sql`
+                INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
+                                            grant_types, scope, token_endpoint_auth_method,
+                                            client_id_issued_at)
+                VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
+                        ${pgArray((client.redirect_uris || []).map(String))},
+                        ${pgArray(grantTypes)},
+                        ${registeredScope}, ${authMethod},
+                        ${now})
+              `;
+            } else {
+              throw err2;
+            }
+          }
+        } else if (isUndefinedColumnError(err, 'source_id')) {
+          await this.sql`
+            INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
+                                        grant_types, scope, token_endpoint_auth_method,
+                                        client_id_issued_at)
+            VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
+                    ${pgArray((client.redirect_uris || []).map(String))},
+                    ${pgArray(grantTypes)},
+                    ${registeredScope}, ${authMethod},
+                    ${now})
+          `;
+        } else {
+          throw err;
+        }
       }
+    };
+    try {
+      await this.sql`
+        INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
+                                    grant_types, scope, token_endpoint_auth_method,
+                                    client_id_issued_at, source_id, federated_read, registered_via)
+        VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
+                ${pgArray((client.redirect_uris || []).map(String))},
+                ${pgArray(grantTypes)},
+                ${registeredScope}, ${authMethod},
+                ${now}, ${'default'}, ${pgArray(['default'])}, ${'dcr'})
+      `;
+    } catch (err) {
+      if (!isUndefinedColumnError(err, 'registered_via')) throw err;
+      await insertUnmarked();
     }
 
     // #2179: optional `token_ttl_seconds` hint from the DCR request body,
@@ -559,13 +584,13 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     this.dcrDisabled = options.dcrDisabled === true;
     this.tokenTtl = options.tokenTtl || 3600;
     this.refreshTtl = options.refreshTtl || 30 * 24 * 3600;
-    this.grants = new OAuthGrants({ sql: this.sql, transaction: options.transaction, tokenTtl: this.tokenTtl, refreshTtl: this.refreshTtl });
+    this.grants = new OAuthGrants({ sql: this.sql, transaction: options.transaction, tokenTtl: this.tokenTtl, refreshTtl: this.refreshTtl, resourceUrl: options.resourceUrl });
     // #2179 fail-closed: an unset DCR max is bounded by the operator's own
     // token TTL — never a fixed permissive ceiling — so a self-registering
     // client cannot elect a longer-lived token than the server default
     // unless the admin explicitly configured a wider window.
-    const dcrTtlMin = options.dcrTtlMinSeconds ?? DEFAULT_DCR_TTL_MIN_SECONDS;
-    const dcrTtlMax = options.dcrTtlMaxSeconds ?? Math.max(this.tokenTtl, dcrTtlMin);
+    const dcrTtlMin = Math.min(options.dcrTtlMinSeconds ?? DEFAULT_DCR_TTL_MIN_SECONDS, TOKEN_TTL_MAX_SECONDS);
+    const dcrTtlMax = Math.min(options.dcrTtlMaxSeconds ?? Math.max(this.tokenTtl, dcrTtlMin), TOKEN_TTL_MAX_SECONDS);
     this._clientsStore = new GBrainClientsStore(
       this.sql,
       options.allowClientCredentialsDcr === true,
@@ -850,6 +875,11 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       // fail-open by design: the server ceiling still bounds every request.
       const rowSurface = typeof row.surface === 'string' ? row.surface : undefined;
       const rowSurfaceSetBy = typeof row.surface_set_by === 'string' ? row.surface_set_by : undefined;
+      // The explicit no-source grant: every read and write refuses
+      // (NO_SOURCES, the same sentinel a `--sources none` token carries).
+      const sourcesNone = currentGrant.source_grant === 'none';
+      const clientHolders = Array.isArray(currentGrant.takes_holders)
+        ? (currentGrant.takes_holders as unknown[]).filter((h): h is string => typeof h === 'string') : undefined;
       return {
         token,
         clientId: row.client_id as string,
@@ -862,6 +892,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         grantRevision: Number(row.grant_revision ?? 0),
         grantProfile: typeof row.grant_profile === 'string' ? row.grant_profile : null,
         grantRepairReasons: Array.isArray(row.grant_repair_reasons) ? row.grant_repair_reasons as string[] : [],
+        tokenTtlSeconds: currentGrant.token_ttl == null ? null : Number(currentGrant.token_ttl),
         boundTools: Array.isArray(row.bound_tools) ? row.bound_tools as string[] : null,
         boundSourceId: typeof row.bound_source_id === 'string' ? row.bound_source_id : null,
         boundBrainId: typeof row.bound_brain_id === 'string' ? row.bound_brain_id : null,
@@ -877,11 +908,14 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // v0.34.1 (#861, D2): source-isolation scope from oauth_clients.
         // Undefined when the row predates v60 or when the brain itself
         // predates v60 (fell through to the legacy projection above).
-        sourceId: rowSourceId,
+        sourceId: sourcesNone ? NO_SOURCES : rowSourceId,
         // v0.34.1 (#876): federated read scope. sourceScopeOpts in
         // operations.ts prefers this array over scalar sourceId when set
         // and non-empty.
-        allowedSources,
+        allowedSources: sourcesNone ? [] : allowedSources,
+        ...(sourcesNone ? { hasSourceGrant: true } : {}),
+        // Per-client takes holders; undefined → the /mcp dispatch site's fail-closed ['world'].
+        ...(clientHolders ? { takesHoldersAllowList: clientHolders } : {}),
         // v0.42.72.0: write fence — consumed by enforceClientSlugFence in
         // operations.ts on every direct slug-mutating write op.
         boundSlugPrefixes,
@@ -889,65 +923,24 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // WP4: per-client surface + operator-lock marker (amendment 19).
         ...(rowSurface !== undefined ? { surface: rowSurface } : {}),
         ...(rowSurfaceSetBy !== undefined ? { surfaceSetBy: rowSurfaceSetBy } : {}),
+        // #5575 (CEO-18): the client's read floor; current_grant is the whole row, so no projection rung needs it.
+        ...(storedMinTrust(currentGrant.min_trust) ? { minTrust: storedMinTrust(currentGrant.min_trust) } : {}),
       } as CoreAuthInfo as SdkAuthInfo;
     }
 
-    // Fallback: legacy access_tokens table (backward compat). Modern legacy
-    // rows may carry permissions.source_id from the pre-OAuth bearer-token
-    // path; OAuth transport must preserve that same source grant instead of
-    // pinning every legacy token to `default`.
-    //
-    // v132 tenant-remediation lane: the projection also reads id +
-    // company_slug + expires_at + minted_by. A row carrying tenant/mint
-    // metadata is a tenant-scoped short-TTL token: its expiry is enforced
-    // here against server time (fail-closed, audited), and company_slug is
-    // threaded into AuthInfo as the ONLY tenant source whoami may report.
-    // Pre-v132 brains hit the new degrade rung and keep the historical
-    // grandfathered semantics.
-    let legacyRows: Record<string, unknown>[];
-    try {
-      legacyRows = await this.sql`
-        SELECT id, name, permissions, scopes, company_slug, expires_at, minted_by FROM access_tokens
-        WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
-      `;
-    } catch (errT) {
-      const missingLegacyColumn = (e: unknown): boolean =>
-        isUndefinedColumnError(e, 'company_slug') ||
-        isUndefinedColumnError(e, 'expires_at') ||
-        isUndefinedColumnError(e, 'minted_by') ||
-        isUndefinedColumnError(e, 'permissions') ||
-        isUndefinedColumnError(e, 'scopes');
-      if (!missingLegacyColumn(errT)) throw errT;
-      try {
-        // Pre-v132 rung: no tenant/mint columns. Tokens verify with the
-        // historical grandfathered semantics (no expiry, no tenant).
-        legacyRows = await this.sql`
-          SELECT id, name, permissions, scopes FROM access_tokens
-          WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
-        `;
-      } catch (err) {
-        if (!missingLegacyColumn(err)) throw err;
-        // Pre-v38 brain: no permissions column. scopes is ORIGINAL schema, so
-        // it must stay in the degraded SELECT — dropping it here would route
-        // normalizeTokenScopes(undefined) into the grandfather branch and
-        // silently promote a scoped token to full admin on any brain whose
-        // permissions projection fails (ship-review P1). Only if scopes
-        // ITSELF is missing (out-of-tree schema) does the ladder fall to
-        // name-only — and that brain predates scoped minting entirely.
-        try {
-          legacyRows = await this.sql`
-            SELECT id, name, scopes FROM access_tokens
-            WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
-          `;
-        } catch (err2) {
-          if (!isUndefinedColumnError(err2, 'scopes')) throw err2;
-          legacyRows = await this.sql`
-            SELECT id, name FROM access_tokens
-            WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
-          `;
-        }
-      }
-    }
+    return this.verifyLegacyAccessToken(token, tokenHash, now);
+  }
+
+  private async verifyLegacyAccessToken(token: string, tokenHash: string, now: number): Promise<SdkAuthInfo> {
+    // Fallback: legacy access_tokens table (backward compat). SELECT * keeps
+    // every schema generation readable: pre-v38 rows have no permissions,
+    // pre-F3 rows no grant columns, and `scopes` (original schema) must never
+    // drop out of the projection, or normalizeTokenScopes(undefined) would
+    // grandfather a scoped token to full admin (ship-review P1).
+    const legacyRows: Record<string, unknown>[] = await this.sql`
+      SELECT * FROM access_tokens
+      WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
+    `;
 
     if (legacyRows.length > 0) {
       const row = legacyRows[0];
@@ -981,60 +974,22 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         });
         throw new InvalidTokenError('Token expired');
       }
-      // Update last_used_at — grandfathered tokens only. Tenant-scoped
-      // tokens skip it entirely: a later gate deny (e.g. a write attempt)
-      // must leave zero non-audit writes behind, and the short-TTL rows
-      // don't need the observability nicety.
-      // #2833: debounced fire-and-forget last_used_at update — only writes
-      // once per token per 60s, and NEVER blocks or fails verification (a
-      // slow/broken UPDATE used to hang or 401 every legacy-token request).
-      // Mirrors src/mcp/http-transport.ts validateToken; the SQL-level WHERE
-      // keeps the debounce race-tolerant under concurrent requests.
-      if (!tenantScoped) {
-        this.sql`
-          UPDATE access_tokens
-          SET last_used_at = now()
-          WHERE token_hash = ${tokenHash}
-            AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')
-        `.catch(() => { /* fire-and-forget */ });
-      }
-      const permissions = coerceLegacyPermissions(row.permissions);
-      const { sourceId, allowedSources } = parseLegacyTokenScope(permissions?.source_id);
-      // #2529: thread the stored takes-holders grant, mirroring the legacy
-      // HTTP transport's validateToken (both decode via coerceLegacyPermissions
-      // + parseTakesHoldersAllowList so they cannot drift). Undefined (no array
-      // grant, or the pre-v29 no-permissions-column fallback above) → the /mcp
-      // dispatch site defaults to the fail-closed ['world']. An explicit []
-      // grant is preserved as deny-all.
-      const takesHoldersAllowList = parseTakesHoldersAllowList(permissions?.takes_holders);
-      // #4043 least-privilege: the original-schema `scopes TEXT[]` column is
-      // the scope store. NULL/absent (every token minted before this feature)
-      // → grandfathered full access, byte-identical behavior. An array is
-      // filtered to known scopes and honored as-is — including [] as deny.
-      const grantedScopes = normalizeTokenScopes(row.scopes);
+      if (!tenantScoped) void touchTokenLastUsed(this.sql, row);
+      const grant = tenantScoped ? grantFromTokenRow(row) : await resolveTokenGrant(this.sql, row);
       return {
         token,
         clientId: name,
         principal: { kind: 'legacy_token', id: String(legacyRows[0].id) },
         clientName: name,
-        // v132: server-derived token kind (this is the access_tokens branch)
-        // — a legacy token NAMED 'gbrain_cl_*' still reports as legacy.
         tokenKind: 'legacy',
-        scopes: grantedScopes ?? ['read', 'write', 'admin'],
-        ...(permissions?.allowed_operations === undefined ? {} : { allowedOperations: parseLegacyOperationGrant(permissions.allowed_operations) }),
-        // v132: tenant-scoped tokens carry their REAL server-side expiry;
-        // grandfathered tokens keep the historical synthetic 1yr-future value
-        // (they never expire; the SDK requires a numeric expiresAt).
+        scopes: grant.scopes,
+        ...(grant.allowedOperations === null ? {} : { allowedOperations: grant.allowedOperations }),
         expiresAt: expiryEpoch ?? Math.floor(Date.now() / 1000) + 365 * 24 * 3600,
-        // Legacy tokens without an explicit permissions.source_id grant keep
-        // the historical 'default' source floor. Array grants become
-        // allowedSources for federated reads, matching legacy HTTP transport.
-        sourceId,
-        allowedSources,
-        // #3242 parity with src/mcp/http-transport.ts: only the historical
-        // no-grant floor may widen unqualified reads to the federated set.
-        hasSourceGrant: permissions?.source_id != null,
-        takesHoldersAllowList,
+        // #3242 parity: hasSourceGrant=false only on the historical no-grant
+        // floor, the one case that may widen unqualified reads.
+        ...authSourcesFromGrant(grant),
+        takesHoldersAllowList: grant.takesHolders ?? undefined,
+        ...(storedMinTrust(legacyRows[0].min_trust) ? { minTrust: storedMinTrust(legacyRows[0].min_trust) } : {}),
         ...(companySlug !== undefined ? { companySlug } : {}),
         ...(tokenId !== undefined ? { tokenId } : {}),
         ...(tenantScoped ? { tenantScoped: true } : {}),

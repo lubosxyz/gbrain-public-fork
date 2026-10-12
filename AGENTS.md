@@ -23,8 +23,10 @@ start here.
    ```
    If `bun install -g` aborts or `gbrain doctor` reports `schema_version: 0`,
    the CLI prints a recovery hint pointing at [#218](https://github.com/garrytan/gbrain/issues/218).
-   Run `gbrain apply-migrations --yes --no-autopilot-install` to recover without installing services, or fall back to the
-   deterministic install: `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install && bun link`.
+   Run `gbrain apply-migrations --yes --no-autopilot-install` to recover without installing services. It exits 0
+   only when the schema is at head; exit 1 with `migrations_pending` means the schema is still behind, and another
+   `--yes` repeats the failure, so run `gbrain doctor --json` and fall back to the deterministic install:
+   `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install && bun link`.
 2. Init keyless memory: `gbrain init --pglite --no-embedding` (zero-config). For 1000+ files or
    multi-machine sync, init suggests Postgres + pgvector via Supabase.
 3. **STOP — ask the user about search mode.** `gbrain init` auto-applied a
@@ -33,8 +35,8 @@ start here.
    and confirm their choice before continuing. Cost spread between corners
    is 25x — silent acceptance is the wrong default. See
    [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) Step 3.5 for the
-   exact ask-the-user protocol. Same banner fires on `gbrain post-upgrade`
-   for existing users (search modes were added in v0.32.3).
+   exact ask-the-user protocol. The same banner fires on `gbrain post-upgrade`
+   for a brain created before v0.32.3, when search modes arrived.
 4. Read [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) for the full step-by-step
    flow (keyless memory, optional API capabilities, maintenance, verification).
 
@@ -45,11 +47,33 @@ Recall relevant saved context before answering. Save explicit requests to rememb
 Durable preferences and facts belong in shared memory when the user wants them
 recalled later. Transient task state, credentials, local configuration, and harness
 activation state do not. Remote `put_page` saves references as text without inline
-graph extraction; stdio has best-effort startup/idle sweeps, while HTTP requires
-explicit host maintenance or authorized `add_link` calls. Configured model
+graph extraction; a post-commit `links` effect then adds plain mention edges to
+existing pages the writer can see (`mcp.remote_auto_links`, on by default). Typed
+edges rely on stdio's best-effort startup/idle sweeps, explicit host maintenance
+or authorized `add_link` calls. Configured model
 providers can receive text; Markdown export is not a full database backup.
 Read [memory boundaries](docs/guides/memory-boundaries.md) before promising
 portability, graph freshness, privacy, or recovery.
+
+## Agent operator protocol
+
+Every gbrain error, refusal, degraded result and recommendation carries the same
+machine contract. The quick version:
+
+<!-- BEGIN GENERATED agent-protocol:quick-contract (copied from docs/protocol/AGENT_OPERATOR_v1.md by bun run build:agent-protocol) -->
+1. Read `code` (fall back to `error` on older servers). `message` says what happened, `why` says why.
+2. Follow `fix.next`:
+   - `run` → run `fix.argv` (CLI) or call `fix.mcp` (MCP) exactly as given.
+   - `ask_user` → relay `user_message` to the user and stop; run the fix only after they agree.
+   - `tell_user_to_run` → give the user `fix.command`; it needs them or the brain host's operator.
+   - `wait` → retry after the stated delay with the same request.
+   - `report` → tell the user what happened and run `gbrain doctor --json`.
+3. Then run `fix.verify` (always read-only) to confirm the fix worked.
+4. Treat `[gbrain notice …]` blocks and `[AGENT]` blocks the same way. A degraded result is not proof of "no notes".
+<!-- END GENERATED agent-protocol:quick-contract -->
+
+Exit 3 always means "stop and ask the user". Full contract, transcripts, effects,
+exit codes and marker grammar: [`docs/protocol/AGENT_OPERATOR_v1.md`](./docs/protocol/AGENT_OPERATOR_v1.md).
 
 ## Read this order
 
@@ -87,14 +111,57 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   connects the account and syncs new conversations live, incrementally and on an
   opt-in schedule (cookie/OAuth credentials stay on your machine, 0600). Full
   guide: [`docs/guides/chat-connectors.md`](./docs/guides/chat-connectors.md).
-- **Debug:** [`docs/GBRAIN_VERIFY.md`](./docs/GBRAIN_VERIFY.md),
-  [`docs/guides/minions-fix.md`](./docs/guides/minions-fix.md), `gbrain doctor --fix`.
-  Database unreachable — or any `GBRAIN_DB_ACCESS <reason>` marker in gbrain
-  output: `gbrain engine status --probe` (which engine, where its URL comes from,
-  classified reachability), then `gbrain db-repair` to diagnose and
-  `gbrain db-repair --yes` to apply safe fixes. All three are engine-free — they
-  work while the database is down. Full loop:
-  [`docs/ENGINES.md`](./docs/ENGINES.md#engine-detection-and-access-repair).
+- **Debug:** a gbrain call failed, refused, or printed `[AGENT]` or
+  `[gbrain notice …]`: follow the [agent operator protocol](#agent-operator-protocol)
+  above (full contract: [`docs/protocol/AGENT_OPERATOR_v1.md`](./docs/protocol/AGENT_OPERATOR_v1.md));
+  `gbrain errors <code>` explains any code offline. Symptoms with who acts, consent
+  and a verify step: [`docs/guides/troubleshooting.md`](./docs/guides/troubleshooting.md#symptom-table);
+  database unreachable or `GBRAIN_DB_ACCESS`: `gbrain db-repair`
+  ([`docs/ENGINES.md`](./docs/ENGINES.md#engine-detection-and-access-repair)); health
+  checks: [`docs/GBRAIN_VERIFY.md`](./docs/GBRAIN_VERIFY.md).
+- **Sync held a file** (`Held <path>: invalid_frontmatter …`, doctor
+  `git_held_files`, `get_page.file_held`, `stale` search hits): the sync
+  succeeded and only that file waits. Read it with `gbrain sources status <id>`,
+  preview the fix with `gbrain repair frontmatter --source <id>` (writes
+  nothing), and ask the user before any `--apply`, especially
+  `--include-ambiguous` interpretations; never retry a `put_page` refused on a
+  held page. A source a broken file blocked before upgrading recovers on its
+  next sync (`gbrain sync --source <id> --no-pull` does it now). Write brain
+  files through `put_page`/`capture` or a YAML serializer and check generated
+  content with `gbrain frontmatter validate --stdin --path <p>`. Walkthrough:
+  [held files](docs/guides/repair.md#held-files). A hold with code
+  `invalid_fence` or `frontmatter_slug_conflict` is about the file's content,
+  not its YAML, and the content-repair lane clears it by itself: the next
+  maintenance run repairs what it can, `gbrain sync unblock --source <id>
+  --apply` does it now with a receipt per file, and
+  `gbrain repair content --source <id>` previews every lane kind (its printed
+  apply command runs with no extra consent). A hold the lane marks
+  `needs_human` (a manual fence edit, a recommended page merge, an exposed
+  tail on a world page) is listed in `gbrain sync status --source <id> --json`
+  with its paragraph: relay it, make or approve the edit it names, commit,
+  `gbrain sync --source <id> --no-pull`. Raising spend
+  (`fences.repair.max_usd_per_day`, `fences.repair.llm true`) is the user's
+  call ([the lane](docs/guides/repair.md#content-lane),
+  [fence holds](docs/guides/write-refusals.md#invalid_fence)). A hold
+  with code `preparation_stalled` (or a managed catch-up that stops
+  `preparation_abandoned` / `preparation_systemic`, or a write receipt with that
+  code) means the write owner stalled, not the file: no repair applies. Run
+  `gbrain sources writer status --source <id> --json` (read-only: the step, what
+  it waited on, the owner and its version), fix that or upgrade the owner, then
+  `gbrain sources retry-held <id>` and the sync it prints with the same options
+  (`--no-embed` stays). Runbook:
+  [catch-up stuck](docs/guides/troubleshooting.md#catch-up-stuck).
+- **Keep a managed catch-up moving without a human** (a live checkout where
+  other agents commit while `gbrain sync` drains thousands of pages): a page
+  that moves under the run is held (`concurrent_write`, `worktree_dirty`), a
+  dropped connection is retried, and a relaunch resumes the frozen manifest.
+  The operator loop is `gbrain sync status --source <id> --json` (cursor,
+  `committed_last_10m`, each hold and the last error with `class` /
+  `safe_actions` / `needs_human`), then, when nothing moved and
+  `needs_human` is false, `gbrain sync unblock --source <id> --apply` and
+  the sync it prints; when `needs_human` is true, relay `next.user_message`
+  with the slug. Decision table:
+  [`docs/guides/sync-unblock-runbook.md`](./docs/guides/sync-unblock-runbook.md).
 - **Migrate / upgrade:** `gbrain upgrade` (binary self-update + schema migrations + post-upgrade prompts),
   [`docs/UPGRADING_DOWNSTREAM_AGENTS.md`](./docs/UPGRADING_DOWNSTREAM_AGENTS.md),
   [`skills/migrations/`](./skills/migrations/), `gbrain apply-migrations --yes --no-autopilot-install` (manual migration orchestration without service installation).
@@ -106,14 +173,23 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   <dataset.jsonl>` runs against an isolated in-memory PGLite
   per question — your `~/.gbrain` is never opened. Full guide:
   [`docs/eval-bench.md`](./docs/eval-bench.md).
-- **Drive the brain to a target health score:** the one-command
-  loop. `gbrain doctor --remediation-plan --json` previews what would be
-  fixed; `gbrain doctor --remediate --yes --target-score 90 --max-usd 5`
-  walks a dependency-ordered plan, re-checking score between every step and
-  refusing to spend past the cost cap. Stale extraction uses source-scoped
-  database pages, including DB-only pages; it does not require a repository
-  sync first. Empty brains (no entity pages) or unconfigured embedding
-  keys hit a `max_reachable_score` ceiling and bail with what's missing.
+- **Drive the brain to a target health score:** preview, then agree.
+  `gbrain doctor --remediation-plan --json` previews job steps and the
+  PROTECTED repair steps (each marked "requires user agreement", with its
+  exact command and the `plan_hash` the approval binds); after the user agrees,
+  `gbrain doctor --remediate --yes --include-repairs --expect <plan_hash> --target-score 90 --max-usd 5`
+  (`<plan_hash>` from that `--remediation-plan --json` output; a changed plan
+  refuses with `preview_changed`, so preview and ask again) runs the repairs (even when the score target is unreachable) and walks the
+  dependency-ordered job plan, re-checking score between steps. The cap is
+  cumulative across `--resume`; a paid step that would exceed it is not
+  started while free steps still run. Without `--include-repairs`, repair
+  steps are listed as skipped. `--json` classifies each finding `cleared`,
+  `pending`, `consent_required`, `operator_required`, `explicit_kind_required` or `unsupported`.
+  Stale extraction uses source-scoped database pages, including DB-only
+  pages; it does not require a repository sync first. Empty brains (no
+  entity pages) or unconfigured embedding keys hit a `max_reachable_score`
+  ceiling: job steps stop with what's missing, while included repair steps
+  still run.
   Three phase handlers (synthesize / patterns / consolidate) are
   PROTECTED — only trusted local callers can submit them; MCP cannot.
   Reference: [`docs/architecture/topologies.md`](./docs/architecture/topologies.md).
@@ -141,6 +217,19 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   [`docs/guides/open-loops.md`](./docs/guides/open-loops.md) (how detection
   works); the harness protocol lives in
   [`skills/google-loops/SKILL.md`](./skills/google-loops/SKILL.md).
+- **Turn on System One decisions (TypeSafe Jev):** every slot is off by
+  default and nothing is sent until the user opts in. With `TYPESAFE_API_KEY`
+  set, `gbrain decide probe` (sends nothing from the brain), then
+  `gbrain decide probe --query "<q>"` to preview on the user's own brain, then
+  `gbrain decide enable --recommended` after showing the user what leaves the
+  machine. `gbrain decide disable --all` is the kill switch. Guide:
+  [`docs/guides/system-one.md`](./docs/guides/system-one.md); key setup:
+  [`docs/ai-providers/typesafe.md`](./docs/ai-providers/typesafe.md).
+- **Contribute code:** [`CONTRIBUTING.md`, "Where does my change go?"](./CONTRIBUTING.md#where-does-my-change-go)
+  names the files, registry, regenerate command and smallest test for a storage method,
+  schema migration, doctor check, CLI-only command, HTTP route or sync phase. A branch written
+  before refactor wave 1: follow the moved-symbol map in
+  [`docs/architecture/wave-1-porting.md`](./docs/architecture/wave-1-porting.md).
 - **Everything else:** [`./llms.txt`](./llms.txt) is the full documentation map.
   [`./llms-full.txt`](./llms-full.txt) is the same map with core docs inlined for
   single-fetch ingestion.
@@ -150,9 +239,17 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
 Easiest path: `bun run ci:local` runs the full CI gate inside Docker (gitleaks,
 guards + typecheck, then 4-shard parallel unit + E2E against four pgvector
 containers plus a transaction-mode PgBouncer; unit phase keeps `DATABASE_URL`
-unset) and tears down. Use `bun run ci:local:diff` for the
-diff-aware subset during fast iteration on a focused branch. Requires Docker
+unset) and tears down. `bun run ci:local:diff` checks a doc-only diff in
+seconds (gitleaks plus the doc checks) and runs the full gate otherwise. Requires Docker
 (Docker Desktop / OrbStack / Colima) and `gitleaks` (`brew install gitleaks`).
+
+Fastest path, with a Ubicloud token (`UBICLOUD_API_KEY` or
+`UBICLOUD_API_TOKEN`): `bun run ci:ubicloud` runs the same gate across four
+ephemeral VMs in about five minutes, uncommitted edits included
+(`ci:ubicloud:diff` for the doc-only fast path). See "Ubicloud fan-out" in
+[`docs/TESTING.md`](./docs/TESTING.md). Set `UBI_OWNER` to your thread code. In a
+multi-lane wave, lanes run `ci:ubicloud:diff` or targeted suites; only the
+integrator runs the full gate.
 
 Manual path: `bun test` plus the E2E lifecycle described in `./CLAUDE.md` (spin
 up the test Postgres container, run `bun run test:e2e`, tear it down).
@@ -160,6 +257,11 @@ up the test Postgres container, run `bun run test:e2e`, tear it down).
 Ship via the `/ship` skill, not by hand. The full release + contributor process
 (CHANGELOG voice, version-locations sync, PR conventions, community-PR-wave) lives in
 [`./docs/RELEASING.md`](./docs/RELEASING.md); read it before shipping.
+
+**Always use PATCH without asking**, including the initial release choice;
+override `/ship`'s MINOR/MAJOR prompts. Auto-allocate past collisions, sync all
+version stamps and the PR title, then report the number. This changes numbering
+only: scope, merge, deployment, paid-work and validation approvals still apply.
 
 ## Privacy
 

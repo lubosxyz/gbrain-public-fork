@@ -19,13 +19,18 @@ import { readManagedSyncFailures } from '../src/core/persistence/sync-failures.t
 import { checkSyncFailures } from '../src/commands/doctor/checks/sync-failures.ts';
 import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { OperationError } from '../src/core/ops/contract.ts';
 import { admitWrite, completeWrite, claimNextWrite, markRecovering } from '../src/core/persistence/journal.ts';
 import { localHostId } from '../src/core/persistence/identity.ts';
 import { currentExitCode, _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
 import { prepareRemoteJob, withSubmissionAuthority } from '../src/core/minions/submission-authority.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
+import { testBackends } from './helpers/test-backends.ts';
+import { recordFactWithdrawal } from '../src/core/facts/withdrawal.ts';
+import { renderFactsTable, parseFactsFence } from '../src/core/facts-fence.ts';
 
+const backends = testBackends();
 const home = mkdtempSync(join(tmpdir(), 'gbrain-sync-failures-'));
 const engines: BrainEngine[] = [];
 let closePostgres: (() => Promise<void>) | undefined;
@@ -44,9 +49,40 @@ async function fixture(engine: BrainEngine, files: Record<string, string>) {
   return { id, root, head };
 }
 beforeAll(async () => {
-  const lite = new PGLiteEngine(); await lite.connect({}); await lite.initSchema(); engines.push(lite);
-  if (process.env.DATABASE_URL) { const pg = await isolatedPersistencePostgres(process.env.DATABASE_URL); engines.push(pg.engine); closePostgres = pg.close; }
+  if (backends.includes('pglite')) {
+    const lite = new PGLiteEngine(); await lite.connect({}); await lite.initSchema(); engines.push(lite);
+  }
+  if (backends.includes('postgres')) { const pg = await isolatedPersistencePostgres(process.env.DATABASE_URL!); engines.push(pg.engine); closePostgres = pg.close; }
+  // #5988: these fixtures force failed receipts with unreadable YAML, which sync now holds by default; sync.holds=fail keeps them fail-closed.
+  for (const engine of engines) await engine.setConfig('sync.holds', 'fail');
 }, 120_000);
+
+test('withdrawal-conflicted sync resumes only through explicit guarded rediscovery and cannot restore the fact', async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    const body = renderFactsTable([{ rowNum: 1, claim: 'synthetic sync withdrawal', visibility: 'world', kind: 'fact', confidence: 1,
+      notability: 'medium', active: true }]);
+    const f = await fixture(engine, { 'a.md': 'First stable observation.\n', 'z.md': body });
+    const options = { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true };
+    expect((await performManagedSync(engine, options)).status).toBe('first_sync');
+    const fact = await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () =>
+      tx.insertFact({ fact: 'synthetic sync withdrawal', source: 'synthetic', visibility: 'world' }, { source_id: f.id }), TEST_WRITE_ATTRIBUTION));
+    writeFileSync(join(f.root, 'a.md'), 'First updated observation.\n');
+    writeFileSync(join(f.root, 'z.md'), `Preserve this new prose.\n${body}`); commit(f.root);
+    expect((await performManagedSync(engine, options, { maxPages: 1, maxMs: 1000 })).status).toBe('partial');
+    await disposePersistenceConsumer(engine);
+    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => recordFactWithdrawal(tx, fact.id, f.id), TEST_WRITE_ATTRIBUTION));
+    await expect(performManagedSync(engine, options)).rejects.toMatchObject({ code: 'revision_conflict' });
+    expect(await readManagedSyncFailures(engine, [f.id])).toEqual([expect.objectContaining({ phase: 'freeze', path: 'z.md', code: 'revision_conflict' })]);
+    await expect(performManagedSync(engine, options)).rejects.toMatchObject({ code: 'revision_conflict' });
+    const repaired = await performManagedSync(engine, { ...options, retryFailed: true });
+    expect(repaired.status).toBe('synced');
+    const current = (await engine.readPageSnapshot('z', { sourceId: f.id }))!;
+    expect(current.page.compiled_truth).toContain('Preserve this new prose.');
+    expect(parseFactsFence(current.page.compiled_truth).facts[0].forgotten).toBe(true);
+    expect(parseFactsFence(readFileSync(join(f.root, 'z.md'), 'utf8')).facts[0].forgotten).toBe(true);
+    expect(await readManagedSyncFailures(engine, [f.id])).toHaveLength(0);
+  }
+}), 120_000);
 afterAll(async () => {
   for (const engine of engines) { await disposePersistenceConsumer(engine); await engine.disconnect(); }
   await closePostgres?.(); rmSync(home, { recursive: true, force: true });
@@ -185,12 +221,88 @@ test('full sync cannot hide an older failed incremental cursor or repeat its com
   }
 }), 120_000);
 
+const QUOTED_EXCLUDE = "it's a dir/**";
+async function captureCli(fn: () => unknown): Promise<string> {
+  const originalLog = console.log, originalWrite = process.stdout.write, originalErr = process.stderr.write, originalExit = process.exit;
+  let out = '';
+  console.log = (...args: unknown[]) => { out += args.join(' ') + '\n'; };
+  process.stdout.write = ((value: unknown) => { out += String(value); return true; }) as typeof process.stdout.write;
+  process.stderr.write = ((value: unknown) => { out += String(value); return true; }) as typeof process.stderr.write;
+  process.exit = ((code?: number) => { throw new Error(`fixture-cli-exit ${code}`); }) as typeof process.exit;
+  try { await fn(); } catch (error) { if (!String((error as Error).message).startsWith('fixture-cli-exit')) throw error; }
+  finally {
+    console.log = originalLog; process.stdout.write = originalWrite; process.stderr.write = originalErr; process.exit = originalExit;
+    _resetCliExitVerdictForTests(); process.exitCode = 0;
+  }
+  return out;
+}
+
+test('managed failure retry hints name the failed cursor options locally, shell-quoted, and stay redacted remotely', async () => withEnv({ ...env, GBRAIN_BACKUP_CHECK: 'off', GBRAIN_SYNC_NO_EXTRACT_NUDGE: '1' }, async () => {
+  for (const engine of engines) {
+    const f = await fixture(engine, { 'bad.md': '---\ntitle: [broken\n---\nRetry hint fixture.\n' });
+    const blocked = await performManagedSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, full: true, exclude: [QUOTED_EXCLUDE] });
+    expect(blocked.status).toBe('blocked_by_failures');
+    const recorded = { full: true, workingTree: false, srcSubpath: null, exclude: [QUOTED_EXCLUDE], includeHidden: [], strategy: null };
+    expect(blocked.failures).toEqual([expect.objectContaining({ syncOptions: recorded, processingOptions: expect.objectContaining({ noEmbed: true }) })]);
+    expect(await readManagedSyncFailures(engine, [f.id])).toEqual([expect.objectContaining({ syncOptions: recorded })]);
+    const retry = `gbrain sync --source ${f.id} --no-pull --retry-failed --no-embed --full --exclude 'it'\\''s a dir/**'`;
+
+    const local = await checkSyncFailures(engine, { sourceIds: [f.id], remote: false });
+    expect(local?.message).toContain(`Fix the cause, then run ${retry}.`);
+    expect(local?.message).not.toContain('with the same source and options');
+    const remote = await checkSyncFailures(engine, { sourceIds: [f.id], remote: true });
+    expect(remote?.message).not.toContain(QUOTED_EXCLUDE);
+    expect(remote?.message).not.toContain('--exclude');
+
+    const printed = await captureCli(() => printSyncResult(blocked));
+    expect(printed).toContain(`After repair, run ${retry} to start a new request.`);
+    const { managedWrite: _diagnostic, ...bare } = blocked;
+    const printedBare = await captureCli(() => printSyncResult(bare));
+    expect(printedBare).toContain(`Fix the cause, then run: ${retry} (this admits a fresh run after active work drains).`);
+
+    const legacy = { ...blocked.failures![0] };
+    delete legacy.syncOptions; delete legacy.processingOptions;
+    const printedLegacy = await captureCli(() => printSyncResult({ ...bare, failures: [legacy] }));
+    expect(printedLegacy).toContain(`Fix the cause, then run: gbrain sync --source ${f.id} --no-pull --retry-failed with the same options as the failed run (this receipt no longer records them)`);
+
+    const d = await fixture(engine, { 'note.md': 'A stable discovery observation.\n' });
+    const execute = engine.executeRaw;
+    engine.executeRaw = function (this: BrainEngine, sql: string, params?: unknown[]) {
+      if (sql.includes('SELECT id,slug,source_path,knowledge_revision FROM pages') && params?.[0] === d.id) throw new OperationError('storage_error', 'Synthetic discovery failure');
+      return execute.call(this, sql, params);
+    } as BrainEngine['executeRaw'];
+    let thrown: Error | undefined;
+    try { await performManagedSync(engine, { sourceId: d.id, noPull: true, exclude: [QUOTED_EXCLUDE] }); }
+    catch (error) { thrown = error as Error; }
+    finally { engine.executeRaw = execute; }
+    expect(thrown?.message).toContain(`Fix the cause, then run: gbrain sync --source ${d.id} --no-pull --retry-failed --exclude 'it'\\''s a dir/**'`);
+  }
+}), 120_000);
+
+test('--retry-failed counts only the failures of the cursor its own options select and names the others', async () => withEnv({ ...env, GBRAIN_BACKUP_CHECK: 'off', GBRAIN_SYNC_NO_EXTRACT_NUDGE: '1' }, async () => {
+  for (const engine of engines) {
+    const f = await fixture(engine, { 'bad.md': '---\ntitle: [broken\n---\nRetry count fixture.\n' });
+    await engine.executeRaw("UPDATE sources SET config=jsonb_set(config,'{syncEnabled}','false'::jsonb) WHERE id<>$1", [f.id]);
+    const flags = ['--no-pull', '--no-embed', '--no-extract', '--no-auto-embed', '--no-schema-pack', '--source', f.id];
+    await captureCli(() => runSync(engine, [...flags, '--exclude', QUOTED_EXCLUDE]));
+    expect(await readManagedSyncFailures(engine, [f.id])).toHaveLength(1);
+
+    const other = await captureCli(() => runSync(engine, [...flags, '--retry-failed']));
+    expect(other).toContain('1 previously-failed file(s) of this source belong to a run with different sync options and are not retried by this invocation.');
+    expect(other).toContain(`gbrain sync --source ${f.id} --no-pull --retry-failed --no-embed --no-extract --no-schema-pack --exclude 'it'\\''s a dir/**'`);
+    expect(other).not.toContain('Retrying 1 previously-failed file(s)');
+
+    const same = await captureCli(() => runSync(engine, [...flags, '--exclude', QUOTED_EXCLUDE, '--retry-failed']));
+    expect(same).toContain('Retrying 1 previously-failed file(s)...');
+  }
+}), 120_000);
+
 test('checkpoint, discovery, and freeze failures remain diagnosable without a file receipt', async () => withEnv(env, async () => {
   for (const engine of engines) {
     const f = await fixture(engine, { 'note.md': 'A stable observation before checkpoint.\n' });
     const options = { sourceId: f.id, noPull: true };
     expect((await performManagedSync(engine, options, { maxPages: 1, maxMs: 1000 })).status).toBe('partial');
-    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [f.id, f.head])));
+    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [f.id, f.head]), TEST_WRITE_ATTRIBUTION));
     const blocked = await performManagedSync(engine, options);
     expect(blocked).toEqual(expect.objectContaining({ status: 'blocked_by_failures', failures: [expect.objectContaining({ path: '<checkpoint>', phase: 'checkpoint', code: 'revision_conflict' })] }));
     expect(await performManagedSync(engine, options)).toEqual(blocked);
@@ -215,7 +327,7 @@ test('checkpoint, discovery, and freeze failures remain diagnosable without a fi
     await performManagedSync(engine, { sourceId: c.id, noPull: true }, { maxPages: 1, maxMs: 1000 });
     await engine.transaction(tx => withCoordinatedWrite(tx, [c.id], () => tx.putPage('b', {
       type: 'note', title: 'b', compiled_truth: 'A newer accepted database observation.', timeline: '', frontmatter: {}, content_hash: 'newer',
-    }, { sourceId: c.id })));
+    }, { sourceId: c.id }), TEST_WRITE_ATTRIBUTION));
     await expect(performManagedSync(engine, { sourceId: c.id, noPull: true })).rejects.toMatchObject({ code: 'revision_conflict' });
     expect(await readManagedSyncFailures(engine, [c.id])).toEqual([expect.objectContaining({ phase: 'freeze', path: 'b.md', request_id: null, target: c.head })]);
     expect((await engine.getPage('b', { sourceId: c.id }))?.compiled_truth).toContain('newer accepted');
@@ -273,9 +385,10 @@ test('local single and all-source CLI JSON carry durable diagnostics and fail th
   }
 }), 120_000);
 
-test('a new process reads the same failed receipt from a persisted PGLite brain', async () => withEnv(env, async () => {
+test.skipIf(!backends.includes('pglite'))('a new process reads the same failed receipt from a persisted PGLite brain', async () => withEnv(env, async () => {
   const database = join(home, 'restart-db');
   const engine = new PGLiteEngine(); await engine.connect({ database_path: database }); await engine.initSchema();
+  await engine.setConfig('sync.holds', 'fail');
   let expected: Awaited<ReturnType<typeof performManagedSync>>, sourceId: string;
   try {
     const f = await fixture(engine, { 'bad.md': '---\ntitle: [broken\n---\nRestart failure fixture.\n' });

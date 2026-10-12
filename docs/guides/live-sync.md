@@ -13,6 +13,170 @@ results erode trust. The brain becomes unreliable.
 With this: edits show up in search within minutes. The vector DB stays current
 with the brain repo automatically. You never have to remember to run sync.
 
+## Catching up a large backlog on managed Postgres
+
+On a managed brain (managed persistence on, Postgres), every changed file
+publishes through its own durable write request, in manifest order. One
+command drains the whole backlog:
+
+```bash
+gbrain sync --source <id> --no-pull --json
+```
+
+`--no-pull` is required on managed brains: the checkout is fast-forwarded by
+`gbrain sources refresh <id>`, never by sync. Sync then catches the index up
+to whatever the checkout holds.
+
+The run prints one line before the first write and a progress line about
+every 10 seconds on stderr:
+
+```
+[sync] managed catch-up: 9382 entries frozen, 9382 remaining; publishing in bulk groups (each page keeps its own request).
+[sync] 1240/9382 processed (1200 written, 40 waived this run) · 42.1 pages/min · indexing ETA 3h13m
+```
+
+When nothing commits for 10 seconds while a write is unfinished, the line names
+the stall instead of an ETA: the head write's step, what it waits on, and how
+long a preparation is allowed. It reads the head's claim while the pass runs, so
+it prints during a stall inside a bulk group too:
+
+```
+[sync] 1240/9382 processed · stalled 95s on origin_check (waiting on db) · allowed 2m30s
+```
+
+On Postgres the drain publishes in **bulk groups** of up to 16 page imports and
+deletes, each admitted with the cursor step that records it and published in one
+transaction. Every page still gets its own write request, receipt, attribution
+and failure report; if one page fails, the pages before it commit, that page is
+reported, and the pages after it are cancelled and re-frozen once it is fixed.
+The first group is one or two pages; later groups hold about 5 s of measured
+apply time with lanes (2 s while foreground writes are recent), else
+`sync.bulk_max_txn_ms` (default 15 s).
+
+Up to 16 groups publish at once in **lanes**, each on its own connection
+(`--lanes N`, `--no-lanes`, `sync.lanes` or `GBRAIN_SYNC_LANES`), capped by the
+pool: the default pool of 10 runs 6, `GBRAIN_POOL_SIZE=20` runs 16. Lanes apply pages at the same time but commit in file order, so a reader never
+sees a later page without the earlier ones. While lanes publish, the drain keeps
+freezing and admitting the next groups. A page write goes ahead of
+queued groups that do not name its page (lanes finish their groups, then one
+group runs between writes); `sync.foreground_priority false` restores FIFO. Groups after a failed page are cancelled ("An earlier
+page of the same sync did not commit") and re-frozen once it is fixed. A lock or statement timeout in a lane costs one lane for
+the rest of the run.
+
+A lane drain ends with a `[sync] lanes:` line naming what limited it and what
+setting, if any, raises it. Turn bulk off with
+`--no-bulk`, `GBRAIN_SYNC_BULK=0` or `gbrain config set sync.bulk false`. The
+final JSON reports `drain.bulk` (`enabled`, `reason` when off, `groups`,
+`largest_group`, `admitted_ahead`, and `lanes`: `maximum`, `configured`,
+`effective`, `reason` when fewer, `step_down`, `overlapped_groups`,
+`fallbacks`, `busy`, `apply_ms_per_page`, `turn_wait_share` and `limited_by`). Finish a drain before downgrading gbrain: an older
+version refuses a group this version admitted ahead, and the sync stops there
+instead of publishing a page twice. PGLite publishes without network round
+trips and does not use bulk groups.
+
+*Written* pages published a change. *Waived* entries needed no write (an
+unchanged file, or a delete of a page that is already deleted) and advanced
+the cursor without a request. The ETA covers indexing only; embeddings and
+extraction queued by the run drain afterwards. Measured throughput by database
+distance is in [`docs/eval/managed-sync-catchup.md`](../eval/managed-sync-catchup.md).
+
+The run ends in exactly one outcome:
+
+| Outcome | Exit | Meaning | What to do |
+| --- | --- | --- | --- |
+| `synced` | 0 | The cursor reached its target. | Nothing. |
+| `resumable` | 0 | A deadline, `--timeout` or Ctrl-C stopped it; the cursor and accepted writes are intact. | Rerun `next.command`; safe in a loop. |
+| `resumable` / `preparation_abandoned` | 0 | A write this process's own writer holds was still preparing past its allowance (its budget plus 30 s) and cannot be cancelled in-process, so the sync exited to end it; `drain.stall.step` says where. | Rerun `next.command`; safe in a loop. The next pass holds the entry if it stalls again. |
+| `blocked` | 1 | A page failed or the writer needs intervention. | Follow `next.why`, then run `next.command`. See [drain stops](write-refusals.md#managed-sync-drain-stops). |
+| `blocked` / `drain_stalled` | 1 | The head write made no progress (no commit, no step advance) for the whole window. With a live owner on this host the drain waits until the 600 s ceiling (printing `stalled <N>s on <step>` with the owner's pid and kind meanwhile) and stops with `cause: owner_wedged_here`, the owner `{kind, pid, nonce}` and `retry_after_ms` to the ceiling; a lapsed claim stops at once as `owner_missing`. | Before the ceiling: wait `retry_after_ms`, then rerun `next.command` (`safe_to_loop` is true). Past it, or with a wedged owner: restart the named owner process, `gbrain sources retry-held <id>`, then the same sync. `gbrain sources writer status --source <id> --json` ends the claim in a `next_action` that says which. See [drain stops](write-refusals.md#drain-stalled). |
+| `blocked` / `write_capacity` | 1 | Other writers' requests held the sync writer's outstanding-request cap (`persistence.limits.principal_outstanding`) for the whole no-progress window, so no sync write could be admitted; the drain waited and printed `waiting for write capacity (N outstanding of M)` first. Nothing failed; the cursor is intact. | `gbrain sources writer status --source <id> --json`, let the outstanding requests finish or raise the cap, then rerun the same sync. See [drain stops](write-refusals.md#drain-write-capacity). |
+| `blocked` / `preparation_systemic` | 1 | Too many writes stalled while preparing in one run (the hold-escalation rule, or five in a row with no commit between), so the run stopped with one diagnostic instead of holding every file. | `gbrain sources writer status --source <id> --json`, fix what it names, then rerun the same sync. Runbook: [catch-up stuck](troubleshooting.md#catch-up-stuck). |
+
+**Say to your agent:** *"Catch up my managed brain's sync backlog and tell me
+how long it will take."* or *"My managed sync stopped. Is it safe to rerun?"*
+
+Timing knobs the drain uses:
+
+| Knob | Scope | Default | At expiry |
+| --- | --- | --- | --- |
+| `--timeout <dur>` | Whole drain (per source under `--all`). Never extended by progress. | none | Stops as `resumable`. |
+| `--hard-deadline <dur>` | Whole process, enforced out of band. | none | The drain stops itself about 15 s early as `resumable`; the watchdog stops a hung process. |
+| `GBRAIN_SYNC_MAX_RUNTIME_SECONDS` | Whole process, non-interactive runs. Extends while pages keep committing. | 3600 (non-TTY) | Stops only after `GBRAIN_SYNC_STALL_ABORT_SECONDS` without progress. |
+| `GBRAIN_SYNC_STALL_ABORT_SECONDS` | Progress window for the deadline above. | 900 | The watchdog stops the run and prints the resume command. |
+| No-progress detector | Awaited write and checkout head unchanged (state, blocked reason and the head claim's phase/step; a lease renewal is not a change). A live preparation is allowed its budget plus 30 s. | 30 s and 3 passes; with a live owner on this host, the exit waits for `persistence.preparation_ceiling_ms` | Stops as `blocked` / `drain_stalled` with `stall.step`, `stall.waiting_on`, `stall.cause` and the owner; a live same-host owner is given until the ceiling (`cause: owner_wedged_here`, `retry_after_ms`) unless its heartbeat row reads wedged; a preparation this process owns past its allowance stops as `resumable` / `preparation_abandoned`. The progress line prints `stalled <N>s on <step>` with the owner's pid and kind meanwhile. |
+| `persistence.sync_preparation_ms` | One sync member's preparation. | 120000 | The claim is released and retried once; the second expiry finishes the request `preparation_stalled` and the sync holds the file. |
+| `persistence.maintenance_preparation_ms` | One maintenance write's preparation (fact-fence adoption, maintenance page writes). | 120000 | As above; a maintenance write gets a terminal `preparation_stalled` receipt (no hold). |
+| `persistence.preparation_ceiling_ms` | Hard ceiling for a preparation that ignores cancellation (any kind), from claim start. | 600000 (60000–3600000, at least the largest budget plus 30 s) | The owner frees the root, sets the request's attempts to the limit (its next claim finishes it `preparation_stalled`), and stops claiming once it holds one such stuck preparation (`restart_required` in its log line). |
+| `persistence.max_preparation_attempts` | Deadline releases (and reclaims after a kill while preparing) one request may spend. | 2 (1–10) | The next claim finishes it `preparation_stalled` without preparing again. |
+| `preparation_deadlines` write switch (`persistence.preparation_deadlines`, `GBRAIN_PREPARATION_DEADLINES`) | Kill switch for the four keys above and the attempt counter. `remember`, `put_page` and `edit_page` keep their own 30 s budget either way. | on | `gbrain config set persistence.preparation_deadlines false` (or `GBRAIN_PREPARATION_DEADLINES=0`) restores the previous behaviour exactly: no deadline on sync or maintenance writes, no counter, no `preparation_stalled` holds. A running `serve` picks the change up within 5 seconds. |
+| Page write wait | One page's (or group's) publication before the drain re-checks. | 30 s inside a drain (5 s, checkpoint 8 s, for a single pass) | The drain re-enters; this is not a stop. |
+| `sync.bulk_max_txn_ms` / `GBRAIN_SYNC_BULK_MAX_TXN_MS` | Target time per bulk group; sizes the next group from the last one's time per page. | 15000 | A smaller next group. |
+| `sync.bulk_size` / `GBRAIN_SYNC_BULK_SIZE` | Largest bulk group. | 16 | — |
+
+### One consumer per host
+
+Every gbrain process that waits on a managed write starts a *persistence
+consumer*, the loop that claims queued writes and publishes them: `gbrain serve`,
+the sync CLI, the jobs worker (its adoption writes), autopilot and the MCP server
+all qualify. Two full consumers on one host claim the same roots, and every
+`preparing` wedge observed so far had at least two alive. On Postgres, gbrain
+therefore prefers one full consumer per host:
+
+- A `gbrain serve` always runs a full consumer. Every other resident kind
+  (`sync`, `jobs`, `autopilot`, `mcp`) probes the `persistence_consumers`
+  heartbeat table when it starts and on every tick: while a live, full,
+  not-wedged consumer of this host exists, the process runs *waiter-only* (it
+  submits writes and waits on their receipts, claims nothing, writes no row) and
+  promotes itself to a full consumer when that owner's row lapses (60 s without
+  renewal), reads wedged (`restart_required`, or a root barrier older than the
+  ceiling), stops being full or disappears. A consumer promoted this way drains
+  back to waiter-only once the owner has been live and healthy for three ticks.
+- Short-lived foreground commands (`put`, `import`, `dream`, `cycle`,
+  `sources`, `cli`) keep their own consumer for the life of their write, because
+  the owner's wake is in-process only and a waiter-only `gbrain put` would often
+  return `writer_pending`.
+- This is a preference, not a fenced role. Two processes that start within one
+  heartbeat of each other can both start full, and a sync CLI that took its
+  consumer before the `serve` started keeps it for that run; doctor reports the
+  overlap as `two_consumers_on_host` until one of them exits. An older `serve`
+  writes no heartbeat row, so a new CLI beside it starts full and says so on its
+  start line (`owner row missing: older serve or no serve; running own consumer`);
+  doctor lists such owners under `consumers_without_heartbeat`.
+- PGLite is unchanged: its single-writer lock already allows one process, and a
+  sync beside a live `serve` delegates the run to it over the IPC socket.
+
+The managed catch-up on Postgres follows the same rule: `gbrain sync` beside a
+live `serve` hands the drain to the serve (the serve-delegated sync family,
+`sync_start` / `sync_status` / `sync_abort`, with the CLI's own verified writer
+registration so grants and revocations still apply) and prints progress from
+`sync_status`; the serve's consumer publishes, and only its pid appears in the
+members' `claim_phase.owner`.
+
+Two switches restore the previous behavior:
+
+| Switch | Scope | Effect |
+| --- | --- | --- |
+| `gbrain sync --no-delegate` (or `GBRAIN_SYNC_NO_DELEGATE=1`) | One run, either engine | The run keeps its own full consumer and publishes itself. On PGLite it also opts out of delegating to a live `serve` (the run then fails fast if a live serve holds the brain). |
+| `persistence.single_consumer` (`gbrain config set persistence.single_consumer false`, or `GBRAIN_SINGLE_CONSUMER=0`) | Brain-wide | Every process keeps its own consumer, as before the preference; a supervisor running several gbrain processes restores the old behavior in one place. `two_consumers_on_host` then describes the configured behavior. A running `serve` picks the change up within 5 seconds. |
+
+When no live full resident consumer exists, or the probe cannot be answered
+(one log line), the process behaves as before. `gbrain sources writer status
+--json` lists the consumers alive on this host under `host.consumers` (pid,
+kind, mode, age, pool), and `gbrain doctor` warns `two_consumers_on_host`
+only for two resident kinds both alive for longer than 30 s.
+
+Two more tips:
+
+- **Run the catch-up near the database.** Each page costs several database
+  round trips, so a host in the database's region drains far faster than a
+  laptop across the internet.
+- **Triage.** `gbrain sources writer status <id>` shows the oldest unfinished
+  request and why it waits. `gbrain doctor` reports a managed cursor's
+  remaining entries and ETA from any process.
+
+A shell loop around `gbrain sync --source <id> --no-pull` until it prints
+`synced` also works; each run drains as far as its deadline allows.
+
 ## Implementation
 
 ### Prerequisite: a reachable direct connection
@@ -131,6 +295,26 @@ agent runs `gbrain config set sync.include_hidden '.github/'`.
 Everything else is ordinary synced content — including `ops/` (the bundled
 daily-task-manager skill files its canonical page under `ops/tasks`).
 
+### Renaming a page
+
+A page's slug is its file path, so a rename is a file move (#5915). In the
+source's checkout, `git mv old/path.md new/path.md`, commit, and run
+`gbrain sync --source <id>` (`--no-pull` on a managed source). Sync pairs the
+vanished origin with the new file through the page's own origin and
+`frontmatter.id`, so the move is imported onto the same page row: its links,
+facts, timeline and version history survive, and nothing is deleted and
+re-created. On a managed source the import is prepared against the moved page
+and refuses `revision_conflict` if that page changed after the sync admitted
+it; the Git projection is the sync's own commit. Keep `frontmatter.id` as it
+is; a changed id is a different page.
+
+`put_page` at a new slug is not a rename. A content-only write cannot prove the
+old file is gone, so a create-only `put_page` whose `frontmatter.id` and
+content match an existing page resolves to that page (`duplicate`: the receipt
+names the existing slug), and the same id with different content indexes both
+pages (`shared_id`). There is no `rename_page` operation; a write-side rename
+would need the moved file as evidence, which is what the sync route provides.
+
 ### Sync is Idempotent — and Resumable
 
 Concurrent runs are safe. Two syncs on the same commit no-op because content
@@ -162,20 +346,82 @@ vars — incident-time escape hatches, not everyday knobs.
    server is down when a push happens, that sync is missed. Pair webhooks
    with a cron fallback that catches anything the webhook missed.
 
-4. **A single un-parseable file can't wedge legacy indexing.** When a file fails
-   to import (malformed YAML frontmatter, an unquoted colon, etc.), sync holds
-   the bookmark and tells you exactly which file broke — a *fresh* failure
-   fails closed so nothing is silently dropped. But a file that fails the same
-   way `GBRAIN_SYNC_AUTOSKIP_AFTER` consecutive syncs (default 3, set `0` to
-   disable) is auto-skipped so the rest of the brain keeps indexing past it.
-   Skipped files don't disappear: `gbrain doctor` keeps warning until you fix
-   or delete them, and fixing the file clears it on the next sync. A repository
+<a id="held-files"></a>
+4. **One broken file never blocks a sync: it is held.** When a file's content
+   refuses deterministically (frontmatter gbrain cannot read without guessing,
+   a frontmatter `slug:` naming another page, a file over the size limit,
+   content the operator's `content_sanity.junk_disposition=reject` refuses, or
+   on managed sync a facts or takes fence that cannot be imported without
+   dropping rows), sync holds that file and keeps going: every other file imports, the
+   checkpoint advances, and the run reports the hold (`Held <path>: <code> …
+   Next: <command>`; JSON `held`, `held_count`, `holds_outstanding`). Files
+   gbrain can read exactly after quoting an unquoted value (`author: a (b)
+   (original: https://…)`) import and are counted under
+   `recovered_frontmatter`, so the generator that writes them can be fixed.
+   Holds are durable and visible everywhere an agent looks: `gbrain sources
+   status <source>`, doctor `git_held_files`, `get_page` (`file_held`) and
+   search (`stale` hits, the `held_files` notice). A held file's page keeps its
+   last good revision and is read-only for `put_page` until the file is
+   repaired. A hold clears when the file changes, is deleted, or a newer
+   gbrain can read it; `gbrain sync --dry-run` lists would-be holds
+   (`would_hold`) without writing anything. The backlog fix is one previewed,
+   hash-bound command per kind of hold:
+
+   ```bash
+   gbrain sources status <source-id>                 # what is held and why
+   gbrain repair frontmatter --source <source-id>    # frontmatter holds: preview; writes nothing
+   gbrain repair fences --source <source-id>         # fence holds: preview; writes nothing, no model call
+   ```
+
+   A fence whose meaning is unambiguous (a missing end marker after the
+   table, duplicate row numbers, an invented kind, an assistant holder, ...)
+   is not held: managed sync rewrites it losslessly, commits the file and
+   reports `fences_normalized` (`gbrain sync --dry-run` lists
+   `would_normalize`; `gbrain config set fences.normalize false` turns it off).
+   A fence hold (`invalid_fence`) names the fence, section, reason and row
+   numbers, never a cell, and clears by itself: the maintenance run's
+   `fence_repair` phase repairs it on the owner host (exact rules first, then
+   the configured chat model for rows only a rewrite can realign, within
+   the daily spend cap) and commits the file.
+   `gbrain repair fences --source <source-id>` previews the same repair and
+   prints its apply command, which needs no extra consent; frontmatter repair
+   does not touch fences. A hold whose reason is `manual` needs a person: read
+   the page (`gbrain get --source <source-id> -- <slug>`), edit that fence in
+   the file, commit, and run `gbrain sync --source <source-id> --no-pull`. A
+   fence refused only while being prepared against the stored page (for
+   example a takes row number a stored take already uses) is held in the same
+   run as `prepare_time`. See [fence holds](write-refusals.md#invalid_fence)
+   and [fence repair](repair.md#fences).
+
+   Walkthrough with real output: [held files](repair.md#held-files); codes:
+   [content refusals](write-refusals.md#held-files-and-content-refusals).
+   Managed and legacy sync behave the same for frontmatter, size and content
+   holds; for fences, legacy sync stores the normalized fence in the database
+   (it never rewrites the file), keeps importing a page whose fence cannot be
+   normalized with its bad rows skipped (reported in `fence_issues`), and
+   never holds it. The fence repair still repairs such a file: on a legacy
+   source it re-reads the file, backs it up under `~/.gbrain/backups/`,
+   writes and imports it, and leaves the change for you to commit
+   (`gbrain sources status` names the `git add`/`git commit` command until
+   you do). Holds never count toward the
+   legacy auto-skip streak below. A source blocked by such a file before this
+   release recovers on its next sync, or now with
+   `gbrain sync --source <source-id> --no-pull`. Teams that want fail-closed
+   blocking set `gbrain config set sync.holds fail` (a fence refusal then
+   blocks with its typed `invalid_fence` text). Company-brain profile
+   sources never hold: their approved manifest keeps blocking, and a fence
+   refusal there is fixed in the repository and committed.
+
+   Other failures still fail closed. In legacy sync a file that fails the
+   same way `GBRAIN_SYNC_AUTOSKIP_AFTER` consecutive syncs (default 3, set `0`
+   to disable) is auto-skipped so the rest of the brain keeps indexing past
+   it; `gbrain doctor` keeps warning until you fix or delete it. A repository
    history rewrite still hard-blocks even with `--skip-failed`. For legacy
    sync only, `gbrain sync --skip-failed` acknowledges a known-bad set.
    **Managed sync never acknowledges or auto-skips failed cursors.** Its
-   durable failed receipt remains immutable on ordinary replay. Correct and
-   commit the source, inspect local `gbrain doctor`, then explicitly retry an
-   idle ordinary-source cursor with the same full/working-tree/filter options:
+   durable failed receipt remains immutable on ordinary replay. Correct the
+   cause, inspect local `gbrain doctor`, then explicitly retry an idle
+   ordinary-source cursor with the same full/working-tree/filter options:
 
    ```bash
    gbrain sync --source <source-id> --no-pull --retry-failed
@@ -187,6 +433,9 @@ vars — incident-time escape hatches, not everyday knobs.
    include source/path/code/request/run/target. Counts are cumulative for the
    run, not evidence of repeated deletions. Remote doctor exposes only
    source-scoped aggregate diagnostics, not paths or receipt identifiers.
+
+   **Say to your agent:** *"Some files in my notes source are held. Show me
+   why and preview the fix."*
 
 5. **Staleness can't read "fresh" forever.** A source whose content stopped
    moving (or whose local clone vanished) would otherwise report fresh
@@ -206,7 +455,18 @@ vars — incident-time escape hatches, not everyday knobs.
    re-derived from the process working directory. Checkpoints written by
    gbrain include `schema_version: 1`, `owner: "gbrain"`, and
    `kind: "import"` so downstream tools can validate the contract before
-   deciding whether to resume.
+   deciding whether to resume. For ordinary imports, completed paths record
+   progress, not the revision imported: the next run re-reads current files
+   and compares their content hashes with the database, including paths listed
+   as completed.
+   Unchanged files avoid re-import, but resuming a large import still pays
+   the directory-walk, file-read, and hash-comparison cost. Checkpoint timestamps
+   and file mtimes are not used as proof that content is unchanged.
+
+   [Company-brain ingestion](company-brain-ingestion.md) uses a separate
+   protected database checkpoint tied to an immutable approved committed
+   manifest. It can skip paths completed for that admission receipt; it does
+   not treat the ordinary import checkpoint as approval to read changed files.
 
 7. **Sync imports commits, not your working tree.** Files written into the
    brain repo but never committed are invisible to incremental sync. Sync
@@ -223,6 +483,52 @@ vars — incident-time escape hatches, not everyday knobs.
    untracked — unignored scratch files and secrets included — so review
    `git status` first. Gitignored files stay excluded either way (use
    `--include-gitignored` for those).
+
+8. **A managed brain pulls only through `gbrain sources refresh`.** Managed
+   sync refuses to pull (`gbrain sync` needs `--no-pull`) and a cycle asked to
+   pull syncs the checkout as it is, because a Git merge rewrites files that
+   accepted writes may be publishing into. To take new upstream commits, run
+   on the owner host:
+
+   ```bash
+   gbrain sources refresh <source-id>
+   ```
+
+   It fetches, refuses new writes to every source that shares the checkout
+   (`worktree_refreshing`, retryable) until queued ones finish, fast-forwards
+   with `git merge --ff-only` and runs the managed `--no-pull` sync for each of
+   those sources. `--dry-run` fetches and previews. Uncommitted files the
+   upstream does not touch are kept and listed; dirty files it does touch, a
+   diverged branch or an unfinished sync cursor refuse with the command to run
+   ([refusal reference](write-refusals.md#worktree-refresh-refusals)). Bounds:
+   `--wait-drain <seconds>` (default 60; `sources.refresh_drain_wait_ms`,
+   `GBRAIN_REFRESH_DRAIN_WAIT_MS`) and `--fetch-timeout-ms` (default 120000;
+   `sources.refresh_fetch_timeout_ms`, `GBRAIN_REFRESH_FETCH_TIMEOUT_MS`).
+   A refresh interrupted by a crash is finished by the restarted owner or by
+   `gbrain sources refresh <source-id> --resume`. A cron that keeps a managed
+   brain current runs the refresh instead of `git pull`.
+
+   **Say to your agent:** *"Bring my notes source up to date with its remote."*
+
+9. **Turn automatic pulls off for every source.** On an unmanaged brain,
+   autopilot's freshness sync and its per-source cycle run `git pull` for a
+   source that has a remote URL. A checkout you keep current yourself (a
+   deploy script, a mirror, a branch you rebase by hand) should not be
+   pulled behind your back:
+
+   ```bash
+   gbrain config set autopilot.git_pull false   # default: true
+   ```
+
+   Automatic syncs then index the local checkout as it is (`pull: false` on
+   every queued sync job), and the daemon prints `git_pull: off
+   (autopilot.git_pull=false)` once per tick (`{"event":"git_pull_disabled"}`
+   under `--json`). Per-source `syncEnabled: false` still removes a source from
+   automatic sync entirely; an explicit `gbrain sync --source <id>` keeps its
+   own `--pull`/`--no-pull` choice. Managed brains never pull automatically
+   whatever this key says (item 8).
+
+   **Say to your agent:** *"Stop autopilot from git-pulling my sources; I update the checkouts myself."*
 
 ## How to Verify
 
@@ -249,6 +555,38 @@ vars — incident-time escape hatches, not everyday knobs.
    `--json` emits the full report, including `heartbeat_age_seconds`. Status
    reads only the filesystem — no database connection — so it keeps working
    during the exact outages it exists to diagnose.
+
+## Several brains on one host
+
+Each brain gets its own autopilot job. The default brain (`~/.gbrain`, that
+is `GBRAIN_HOME` unset or set to your home directory) keeps the shared names:
+launchd label `com.gbrain.autopilot`, systemd unit `gbrain-autopilot.service`,
+start script `~/.gbrain/start-autopilot.sh`, and an unmarked crontab line.
+Any other brain gets names with a suffix: `com.gbrain.autopilot.<suffix>`,
+`gbrain-autopilot-<suffix>.service`, `<brain>/.gbrain/start-autopilot-<suffix>.sh`,
+and a crontab line ending in `# gbrain-autopilot:<suffix>`. The suffix is the
+first 8 hex characters of a random id that `--install` records in
+`<brain>/.gbrain/autopilot-install-id`. Every brain logs to its own
+`<brain>/.gbrain/autopilot.log`.
+
+`gbrain autopilot --status [--json]` prints the brain's job name, suffix,
+install-id path, wrapper path and log path (`job` in `--json`). `--status`
+and `--uninstall` act only on that brain's job.
+
+- **Moving a brain** keeps its id and job. `--status` reports
+  `needs_reinstall: wrapper_missing` until you run
+  `GBRAIN_HOME=<new parent> gbrain autopilot --install`, which repoints the
+  same job.
+- **Copying a brain** (`cp -r`) gives the copy a new id on its first
+  `--install`, so the original brain keeps its job.
+- **Upgrading from an older gbrain**: a non-default brain installed before
+  per-brain names ran under the shared names. `--status` reports
+  `needs_reinstall: legacy_shared_job`; `GBRAIN_HOME=<parent> gbrain autopilot --install`
+  replaces that shared job with the brain's own job and says so.
+- **`autopilot_job_owned_by_other_brain`**: installing the default brain
+  refuses when the shared job still runs another brain. Run the printed
+  `GBRAIN_HOME=<parent> gbrain autopilot --install` for that brain first, then
+  install the default brain again.
 
 ---
 

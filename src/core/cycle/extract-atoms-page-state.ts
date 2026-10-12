@@ -2,6 +2,15 @@ import type { SqlEngine } from '../persistence/model.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { stableJson } from '../persistence/digest.ts';
 import type { BrainEngine } from '../engine.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
+
+/**
+ * gbrain#4148: consecutive same-content failures of a content-deterministic
+ * class (malformed model output or provider content block) before the page is tombstoned so the
+ * backlog floor can clear. A content edit resets the streak. #6325: a managed
+ * page or transcript settles held_failed at the same bound.
+ */
+export const MAX_DETERMINISTIC_FAILURES = 3;
 
 export interface AtomPageIdentity {
   pageId: number;
@@ -65,7 +74,7 @@ export async function writeAtomPageState(
 export async function completeAtomReceipts(
   engine: BrainEngine, sourceId: string, importedSlugs: string[], hash16: string, page?: AtomPageInput,
 ): Promise<void> {
-  await engine.transaction(async tx => {
+  await maintenanceTransaction(engine, async tx => {
     const completed = await tx.executeRaw(
       `UPDATE pages
           SET frontmatter = frontmatter || jsonb_build_object('source_hash', $1::text)
@@ -110,7 +119,8 @@ export async function transferLegacyAtomPageState(engine: SqlEngine, before: Pag
     for (const key of LEGACY_KEYS) delete frontmatter[key];
     return { sourceId: snapshot.page.source_id, slug: snapshot.page.slug, type: snapshot.page.type,
       title: snapshot.page.title, body: snapshot.page.compiled_truth,
-      timeline: snapshot.page.timeline, frontmatter, tags: [...snapshot.tags].sort(), withdrawals: snapshot.withdrawals };
+      timeline: snapshot.page.timeline, frontmatter, tags: [...snapshot.tags].sort(), withdrawals: snapshot.withdrawals,
+      global_purges: snapshot.globalPurges ?? null };
   };
   if (stableJson(canonical(before)) !== stableJson(canonical(after))) return false;
   const [existing] = await engine.executeRaw<{ fail_count: number; tombstoned: boolean }>(

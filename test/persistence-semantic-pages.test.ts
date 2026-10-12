@@ -37,6 +37,23 @@ test('concurrent semantic tag mutations preserve every accepted tag and coherent
   expect(replay.revision).toBe(revision);
 });
 
+test('#5251 a tag change defers embedding: no embedding effect is queued and chunks keep their text', async () => {
+  const before = (await engine.readPageSnapshot('page', { sourceId }))!;
+  const chunksBefore = (await engine.getChunks('page', { sourceId })).map(chunk => chunk.chunk_text);
+  const result = await submit('add_tag', { slug: 'page', tag: 'deferred-example' }) as { state: string; embedding_state?: string; persistence?: { embedding_state?: string }; id?: string; request_id?: string };
+  expect(result.state).toBe('committed');
+  expect(result.embedding_state ?? result.persistence?.embedding_state).toBe('deferred');
+  const [request] = await engine.executeRaw<{ id: string }>(
+    "SELECT id::text AS id FROM persistence_requests WHERE source_id=$1 AND slug='page' AND operation='add_tag' ORDER BY sequence DESC LIMIT 1", [sourceId]);
+  expect(await engine.executeRaw("SELECT kind FROM persistence_effects WHERE request_id=$1::uuid AND kind='embedding'", [request.id])).toEqual([]);
+  const after = (await engine.readPageSnapshot('page', { sourceId }))!;
+  expect(after.revision).not.toBe(before.revision);
+  expect(after.tags).toContain('deferred-example');
+  expect((await engine.getChunks('page', { sourceId })).map(chunk => chunk.chunk_text)).toEqual(chunksBefore);
+  const removed = await submit('remove_tag', { slug: 'page', tag: 'deferred-example' }) as { embedding_state?: string; persistence?: { embedding_state?: string } };
+  expect(removed.embedding_state ?? removed.persistence?.embedding_state).toBe('deferred');
+});
+
 test('timeline replay is an exact no-op in Markdown, revision, versions and structured rows', async () => {
   const params = { slug: 'page', date: '2026-09-15', summary: 'Example milestone', detail: 'Example detail', source: 'example-source' };
   await submit('add_timeline_entry', params);
@@ -95,8 +112,11 @@ test('canonical replacement and revert restore facts, takes and timeline from co
   expect(await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1 AND source_markdown_slug=$2 AND expired_at IS NULL',[sourceId,'projections'])).toHaveLength(2);
   expect(await engine.executeRaw('SELECT id FROM takes WHERE page_id=$1',[before.page.id])).toHaveLength(2);
   expect(await engine.getTimeline('projections',{sourceId})).toHaveLength(1);
-  const invalid=content.replace('Second fact','Conflicting fact').replace('| 2 | Conflicting fact','| 1 | Conflicting fact');
-  await expect(submit('put_page',{slug:'projections',content:invalid,expected_revision:restored.revision})).rejects.toMatchObject({code:'invalid_params'});
+  // #6188: a fence Tier 1 cannot fix exactly (a visibility no synonym maps) still refuses typed and changes nothing;
+  // a duplicate row number, which Tier 1 renumbers, is covered in test/fence-write-verbs.test.ts.
+  const invalid=content.replace('Second fact','Conflicting fact').replace(/(\| 2 \| Conflicting fact \| fact \| [^|]+ \| )world( \|)/,'$1nonvisible$2');
+  expect(invalid).toContain('| nonvisible |');
+  await expect(submit('put_page',{slug:'projections',content:invalid,expected_revision:restored.revision})).rejects.toMatchObject({code:'invalid_params',canonicalCode:'invalid_fence'});
   expect((await engine.readPageSnapshot('projections',{sourceId}))!.revision).toBe(restored.revision);
 });
 

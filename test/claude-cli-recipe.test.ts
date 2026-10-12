@@ -159,6 +159,8 @@ describe('claude-cli LanguageModel — text-only round trip', () => {
       } as LanguageModelV2CallOptions);
 
       expect(result.usage.cachedInputTokens).toBe(9001);
+      // AI SDK convention: the input total contains the cache read (12 uncached + 9001 read).
+      expect(result.usage.inputTokens).toBe(12 + 9001);
     });
   });
 
@@ -766,6 +768,9 @@ describe('claude-cli LanguageModel — context isolation', () => {
       // Agent-isolation hardening: no built-in tools, no inherited MCP servers.
       expect(argv).toContain('--tools');
       expect(argv).toContain('--strict-mcp-config');
+      // #5820: user/project hooks never run in the child (gbrain's own Stop
+      // hook would bank this call as a conversation).
+      expect(argv[argv.indexOf('--settings') + 1]).toBe('{"disableAllHooks":true}');
       expect(argv).toContain('--system-prompt');
       expect(argv).toContain('You are gbrain subagent.');
       expect(cwd).toMatch(/gbrain-claude-cli-cwd-\d+$/);
@@ -833,6 +838,59 @@ describe('claude-cli LanguageModel — context isolation', () => {
           }
         },
       );
+    });
+  });
+});
+
+describe('claude-cli LanguageModel — output cap (#6424)', () => {
+  async function runWithCap(maxOutputTokens: number | undefined): Promise<{ env: string; settings: string }> {
+    const envLog = join(stubDir, 'cap-env.log');
+    const argvLog = join(stubDir, 'cap-argv.log');
+    const capStub = [
+      '#!/bin/sh',
+      `printf "cap=%s\\n" "\${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-UNSET}" > "${envLog}"`,
+      `printf "%s\\n" "$@" > "${argvLog}"`,
+      'cat > /dev/null',
+      `cat "${stubResponsePath}"`,
+    ].join('\n');
+    writeFileSync(stubBin, capStub);
+    chmodSync(stubBin, 0o755);
+    stageResponse(baseEnvelope('ok'));
+    try {
+      const { ClaudeCliLanguageModel } = await import('../src/core/ai/providers/claude-cli-language-model.ts');
+      const model = new ClaudeCliLanguageModel('claude-sonnet-4-6');
+      await model.doGenerate({
+        prompt: [userMessage('hi')],
+        ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
+      } as LanguageModelV2CallOptions);
+      const argv = readFileSync(argvLog, 'utf8').split('\n').filter(Boolean);
+      return { env: readFileSync(envLog, 'utf8').trim(), settings: argv[argv.indexOf('--settings') + 1] };
+    } finally {
+      writeFileSync(stubBin, ['#!/bin/sh', 'cat > /dev/null', `cat "${stubResponsePath}"`].join('\n'));
+      chmodSync(stubBin, 0o755);
+    }
+  }
+
+  test('forwards maxOutputTokens as CLAUDE_CODE_MAX_OUTPUT_TOKENS in the child env and the inline --settings env', async () => {
+    await withStubEnv(async () => {
+      await withEnv({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: undefined }, async () => {
+        const seen = await runWithCap(16384);
+        expect(seen.env).toBe('cap=16384');
+        expect(JSON.parse(seen.settings)).toEqual({
+          disableAllHooks: true,
+          env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: '16384' },
+        });
+      });
+    });
+  });
+
+  test('sets no cap when the call passes none', async () => {
+    await withStubEnv(async () => {
+      await withEnv({ CLAUDE_CODE_MAX_OUTPUT_TOKENS: undefined }, async () => {
+        const seen = await runWithCap(undefined);
+        expect(seen.env).toBe('cap=UNSET');
+        expect(seen.settings).toBe('{"disableAllHooks":true}');
+      });
     });
   });
 });
@@ -1158,5 +1216,48 @@ describe('claude-cli LanguageModel — abort + error envelopes', () => {
     const { ClaudeCliLanguageModel } = await import('../src/core/ai/providers/claude-cli-language-model.ts');
     const model = new ClaudeCliLanguageModel('claude-sonnet-4-6');
     await expect(model.doStream()).rejects.toThrow(/does not support streaming/);
+  });
+});
+
+describe('claude-cli LanguageModel — CLI too old for the provider flags', () => {
+  const fixture = (v: string) => readFileSync(join(import.meta.dir, 'fixtures', 'claude-cli-stderr', `unknown-option-${v}.stderr`), 'utf8');
+
+  test('unknown-option detection matches stderr captured from two real CLI versions', async () => {
+    const { isUnknownOptionError } = await import('../src/core/ai/providers/claude-cli-language-model.ts');
+    expect(isUnknownOptionError(fixture('1.0.30'))).toBe(true);
+    expect(isUnknownOptionError(fixture('2.0.59'))).toBe(true);
+    expect(isUnknownOptionError('API Error: 500 {"type":"error","error":{"type":"api_error"}}')).toBe(false);
+  });
+
+  test('an old CLI fails with the upgrade message naming the probed minimum and the installed version', async () => {
+    await withStubEnv(async () => {
+      const oldStub = [
+        '#!/bin/sh',
+        'if [ "$1" = "--version" ]; then echo "2.0.59 (Claude Code)"; exit 0; fi',
+        'cat > /dev/null',
+        `cat "${join(import.meta.dir, 'fixtures', 'claude-cli-stderr', 'unknown-option-2.0.59.stderr')}" >&2`,
+        'exit 1',
+      ].join('\n');
+      writeFileSync(stubBin, oldStub);
+      chmodSync(stubBin, 0o755);
+      try {
+        const { ClaudeCliLanguageModel, ClaudeCliProcessError, MIN_CLAUDE_CLI_VERSION } = await import('../src/core/ai/providers/claude-cli-language-model.ts');
+        expect(MIN_CLAUDE_CLI_VERSION).toBe('2.0.60');
+        const model = new ClaudeCliLanguageModel('claude-sonnet-4-6');
+        let caught: unknown;
+        try {
+          await model.doGenerate({ prompt: [userMessage('x')] } as LanguageModelV2CallOptions);
+        } catch (e) {
+          caught = e;
+        }
+        expect(caught).toBeInstanceOf(ClaudeCliProcessError);
+        const message = (caught as Error).message;
+        expect(message.split('\n--- raw ---\n')[0]).toBe('claude CLI 2.0.60 or newer required (found 2.0.59); upgrade Claude Code');
+        expect(message).toContain("unknown option '--disable-slash-commands'");
+      } finally {
+        writeFileSync(stubBin, ['#!/bin/sh', 'cat > /dev/null', `cat "${stubResponsePath}"`].join('\n'));
+        chmodSync(stubBin, 0o755);
+      }
+    });
   });
 });

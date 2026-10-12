@@ -10,14 +10,17 @@ import { redactFindings } from './secret-scan.ts';
 import { currentVerifiedLocalWriter } from './persistence/identity.ts';
 import { submissionAuthority, authorizeWrite } from './persistence/authority.ts';
 import type { OperationContext } from './ops/contract.ts';
-import { OperationError } from './ops/contract.ts';
+import { OperationError, opError } from './ops/contract.ts';
+import { readFix } from './ops/op-fix.ts';
 import { validateEmbedFactsOptions, type EmbedFactsOptions } from './embed-facts-options.ts';
 import { AUDIT_ROW_SOURCES } from './facts/audit-sources.ts';
 import { resolveMaxChunkTokens } from './embedding-input-limit.ts';
 import { estimateTokens } from './chunkers/token-estimate.ts';
+import { eligibleFactEmbedding, staleFactEmbedding } from './facts/embedding-identity.ts';
 
 export interface EmbedFactsOpts extends EmbedFactsOptions {
   signal?: AbortSignal;
+  assertOwned?: (tx: BrainEngine) => Promise<void>;
 }
 
 export interface EmbedFactsResult {
@@ -41,16 +44,11 @@ interface PendingFact {
   version: string;
 }
 
-const eligible = `f.source_id = $1 AND f.embedding IS NULL AND f.expired_at IS NULL
-  AND f.superseded_by IS NULL AND NOT (f.source = ANY($2::text[]))
-  AND NOT EXISTS (SELECT 1 FROM fact_withdrawals w WHERE w.source_id=f.source_id
-    AND w.visibility=f.visibility AND w.fact_hash=gbrain_fact_fingerprint(f.fact))
-  AND NOT EXISTS (SELECT 1 FROM pages p WHERE p.source_id=f.source_id
-    AND p.slug=f.source_markdown_slug AND p.deleted_at IS NOT NULL)`;
+const eligible = `f.source_id = $1 AND ${eligibleFactEmbedding} AND ${staleFactEmbedding}`;
 
 export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts, selectedConfig: GBrainConfig | null = null): Promise<EmbedFactsResult> {
-  const { signal: externalSignal, ...wireOptions } = opts;
-  opts = { ...validateEmbedFactsOptions(wireOptions), signal: externalSignal };
+  const { signal: externalSignal, assertOwned, ...wireOptions } = opts;
+  opts = { ...validateEmbedFactsOptions(wireOptions), signal: externalSignal, assertOwned };
   const maxFacts = opts.maxFacts ?? 100;
   const batchSize = opts.batchSize ?? 100;
   const budgetMs = opts.budgetMs ?? 60_000;
@@ -58,7 +56,9 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
   const verified = currentVerifiedLocalWriter();
   if (verified && (verified.remote || verified.principal.kind !== 'local_cli' || verified.grant.slugPrefixes !== null
     || !verified.grant.sourceIds.includes('*') && !verified.grant.sourceIds.includes(opts.sourceId))) {
-    throw new OperationError('permission_denied', 'Fact backfill requires a trusted source-wide CLI grant');
+    throw opError('permission_denied', 'Fact backfill requires a trusted source-wide CLI grant',
+      `The registered CLI writer cannot repair every fact of source ${opts.sourceId}: fact repair needs the local CLI lane with no slug prefixes and a grant covering that source. Show the grant to the user; widening it (gbrain auth local-writer register cli --replace) is their decision.`,
+      { fix: readFix('Shows the local writer registrations and their grants, read-only.', { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'] }) });
   }
   const [source] = await engine.executeRaw<{ incarnation: string }>(
     'SELECT incarnation::text FROM sources WHERE id=$1 AND archived=false', [opts.sourceId]);
@@ -71,10 +71,14 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
     const [row] = await target.executeRaw<{ unrestricted_slugs: boolean }>(
       `SELECT grant_ceiling->'slugPrefixes' = 'null'::jsonb AS unrestricted_slugs
        FROM persistence_local_writers WHERE id=$1::uuid`, [authority.principal.id]);
-    if (row?.unrestricted_slugs !== true) throw new OperationError('permission_denied', 'Fact backfill requires a current source-wide CLI grant');
+    if (row?.unrestricted_slugs !== true) throw opError('permission_denied', 'Fact backfill requires a current source-wide CLI grant',
+      `The current CLI writer registration has slug prefixes, so it cannot repair every fact of source ${opts.sourceId}. Show the grant to the user; replacing it with an unprefixed grant is their decision.`,
+      { fix: readFix('Shows the local writer registrations and their grants, read-only.', { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'] }) });
   };
   await authorize(engine);
-  const params = [opts.sourceId, [...AUDIT_ROW_SOURCES]];
+  const model = getEmbeddingModel();
+  const dims = getEmbeddingDimensions();
+  const params = [opts.sourceId, [...AUDIT_ROW_SOURCES], model, dims];
   const census = async () => {
     const [row] = await engine.executeRaw<{ count: string; last_id: string }>(
       `SELECT count(*)::text AS count, COALESCE(max(f.id),0)::text AS last_id FROM facts f WHERE ${eligible}`, params);
@@ -94,11 +98,9 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
     if (disabled !== null && disabled !== 'true' && disabled !== 'false') {
       throw new Error('Selected brain embedding_disabled must be true or false');
     }
-    assertEmbeddingEnabled({ embedding_disabled: disabled === 'true' });
+    assertEmbeddingEnabled({ engine: target.kind, ...selectedConfig, embedding_disabled: disabled === 'true' });
   };
   await assertEnabled(engine);
-  const model = getEmbeddingModel();
-  const dims = getEmbeddingDimensions();
   const shape = await readFactsEmbeddingDim(engine);
   if (!shape.exists || shape.dims !== dims || !shape.columnType) {
     throw new Error('Facts embedding dimensions differ from the configured model; inspect migrate embeddings --status first');
@@ -121,8 +123,8 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
     if (signal.aborted) { result.stopped = 'aborted'; result.failures++; break; }
     const batch = await engine.executeRaw<PendingFact>(
       `SELECT f.id::text, f.fact, f.xmin::text AS version FROM facts f
-       WHERE ${eligible} AND f.id > $3::bigint AND f.id <= $4::bigint
-       ORDER BY f.id LIMIT $5`, [...params, afterId, initial.lastId, Math.min(batchSize, maxFacts - result.attempted)]);
+       WHERE ${eligible} AND f.id > $5::bigint AND f.id <= $6::bigint
+       ORDER BY f.id LIMIT $7`, [...params, afterId, initial.lastId, Math.min(batchSize, maxFacts - result.attempted)]);
     if (!batch.length) break;
     result.attempted += batch.length;
     try {
@@ -142,20 +144,21 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
         if (await engine.getConfig('embedding_model') !== dbModel || await engine.getConfig('embedding_dimensions') !== dbDims) {
           throw new Error('Embedding model changed during fact backfill; rerun the scoped preview');
         }
-        tracker.reserve({ modelId: call.model, kind: 'embed', estimatedInputTokens: inputCeiling, maxOutputTokens: 0 });
+        const reservation = tracker.reserve({ modelId: call.model, kind: 'embed', estimatedInputTokens: inputCeiling, maxOutputTokens: 0 });
         return { settle: async usage => {
           if (!usage) result.cost_estimated = true;
-          tracker.record({ modelId: call.model, kind: 'embed', inputTokens: usage?.inputTokens ?? inputCeiling, outputTokens: 0 });
+          tracker.record({ modelId: call.model, reservation, kind: 'embed', inputTokens: usage?.inputTokens ?? inputCeiling, outputTokens: 0 });
         } };
       }, () => embed(batch.map(row => row.fact), {
-        abortSignal: signal, embeddingModel: model, dimensions: dims,
-      }));
+        abortSignal: signal, embeddingModel: model, dimensions: dims, inputType: 'document',
+      }), { inherit: true });
       signal.throwIfAborted();
       if (vectors.length !== batch.length || vectors.some(vector =>
         vector.length !== dims || !vector.every(Number.isFinite))) {
         throw new Error('Embedding provider returned an incomplete or invalid fact batch');
       }
       const installed = await engine.transaction(async tx => {
+        await opts.assertOwned?.(tx);
         const current = await tx.executeRaw('SELECT id FROM sources WHERE id=$1 AND incarnation=$2::uuid AND archived=false FOR SHARE',
           [opts.sourceId, source.incarnation]);
         if (!current.length) throw new Error('Source identity changed during fact backfill; rerun the scoped preview');
@@ -169,8 +172,9 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
         for (let i = 0; i < batch.length; i++) {
           signal.throwIfAborted();
           const rows = await tx.executeRaw(
-            `UPDATE facts f SET embedding=$5::${shape.columnType}, embedded_at=now()
-             WHERE ${eligible} AND f.id=$3::bigint AND f.xmin::text=$4 RETURNING f.id::text`,
+            `UPDATE facts f SET embedding=$7::${shape.columnType}, embedded_at=now(),
+             embedding_model=$3,embedded_text_hash=md5(f.fact)
+             WHERE ${eligible} AND f.id=$5::bigint AND f.xmin::text=$6 RETURNING f.id::text`,
             [...params, batch[i].id, batch[i].version, `[${Array.from(vectors[i]).join(',')}]`]);
           count += rows.length;
         }

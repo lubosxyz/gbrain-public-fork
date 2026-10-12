@@ -34,7 +34,7 @@
  *   - try/finally ALWAYS releases the per-source lock. Aborted runs leave
  *     the next call free to claim.
  */
-import { tryAcquireDbLock } from '../../db-lock.ts';
+import { tryAcquireDbLock, LockStolenError } from '../../db-lock.ts';
 import {
   BudgetTracker,
   BudgetExhausted,
@@ -42,6 +42,7 @@ import {
   loadPricingOverrides,
   type PricingOverrides,
 } from '../../budget/budget-tracker.ts';
+import { pricingSetCommand } from '../../budget/no-pricing.ts';
 import { getEmbeddingModel, withBudgetTracker } from '../../ai/gateway.ts';
 import { embedStaleForSource } from '../../embed-stale.ts';
 import { createEmbedStallWatchdog, resolveEmbedStallAbortSeconds } from '../../embed-stall.ts';
@@ -187,7 +188,8 @@ function capForModel(
   if (cap.defaulted && modelId && !isModelPriceable(modelId, 'embed', pricingOverrides)) {
     console.error(
       `[embed-backfill] model "${modelId}" is not in the pricing maps; ` +
-        `running without the default per-job cost gate. Add pricing.overrides ` +
+        `running without the default per-job cost gate. Look up its price and register it ` +
+        `(${pricingSetCommand(modelId, 'embed')}) ` +
         `or set embed.backfill_max_usd to an explicit numeric cap to fail closed.`,
     );
     return undefined;
@@ -281,6 +283,18 @@ export function makeEmbedBackfillHandler(
         runStale(engine, sourceId, {
           batchSize,
           signal: drainAbort.signal,
+          deadline: job.deadlineAtMs ?? undefined,
+          assertOwned: async tx => {
+            const owned = tx
+              ? (await tx.executeRaw(`SELECT id FROM gbrain_cycle_locks
+                  WHERE id=$1 AND acquisition_token=$2::uuid AND ttl_expires_at>now() FOR SHARE`, [lock.id, lock.acquisitionToken])).length === 1
+              : await lock.refresh({ signal: drainAbort.signal });
+            if (!owned) {
+              const error = new LockStolenError(lock.id);
+              drainAbort.abort(error);
+              throw error;
+            }
+          },
           pacer,
           ...(concurrency !== undefined && { concurrency }),
           // v0.41.31: re-embed pages whose model signature drifted + stamp
@@ -330,6 +344,9 @@ export function makeEmbedBackfillHandler(
       // failed — pre-fix this shape reported `status: "success"` twelve runs
       // in a row while an entire corpus sat stripped. NULLed chunks stay NULL
       // for the next (fixed-config) run to pick up.
+      if ((result.remaining ?? 0) > 0 || (result.blocked ?? 0) > 0) {
+        throw new Error(`embed-backfill: incomplete; ${result.remaining ?? 0} chunks remain and ${result.blocked ?? 0} projections are blocked. Durable progress is retained; inspect provider and projection readiness before retrying.`);
+      }
       if (result.embedded === 0 && (result.invalidated > 0 || result.chunksProcessed > 0)) {
         throw new Error(
           `embed-backfill: embedded 0 of ${result.chunksProcessed} processed chunk(s) ` +

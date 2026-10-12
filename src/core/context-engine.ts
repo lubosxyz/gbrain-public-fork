@@ -13,10 +13,12 @@
  * @see https://docs.openclaw.ai/concepts/context-engine
  */
 
+import type { OpenclawBoundaryTail } from './context/corpus-segments.ts';
 import { readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { buildReflexAddition, warmReflex, type ResolveEntitiesFn as ReflexResolveEntitiesFn } from './context/reflex.ts';
 import { backupNagReadOnlyConsult, backupNoticeText, loadBackupStatus } from './backup/status-file.ts';
+import { estimateMessageTokens, openClawCoreLane } from './context/openclaw-core.ts';
 // Types inlined from openclaw/plugin-sdk to avoid hard dependency during development.
 // At runtime inside OpenClaw, the real SDK is available; these types ensure build compat.
 
@@ -66,7 +68,9 @@ export interface ContextEngine {
   }): Promise<AssembleResult>;
   compact(params: {
     sessionId: string;
-    sessionFile: string;
+    /** Older hosts; OpenClaw 2026.9.x passes `sessionTarget` instead (#6316). */
+    sessionFile?: string;
+    sessionTarget?: { agentId?: string; sessionId: string; sessionKey?: string; storePath?: string; threadId?: string };
     tokenBudget?: number;
     force?: boolean;
     [key: string]: unknown;
@@ -95,6 +99,36 @@ async function ensureSdkLoaded(): Promise<void> {
     _delegateCompactionToRuntime = async () => ({ ok: true, compacted: false, reason: 'no-runtime' });
     _buildMemorySystemPromptAddition = () => undefined;
   }
+}
+
+/** #6316: the host SDK surface that reads a transcript by session identity (OpenClaw 2026.9.x). */
+type TranscriptRuntime = { readSessionTranscriptEvents: (target: Record<string, unknown>) => Promise<unknown[]> | unknown[] };
+let _transcriptRuntimeLoader: (() => Promise<unknown>) | undefined;
+
+async function loadTranscriptRuntime(): Promise<TranscriptRuntime | null> {
+  try {
+    // @ts-ignore — resolved at runtime by the OpenClaw host; not a build-time dep.
+    const mod = (await (_transcriptRuntimeLoader ? _transcriptRuntimeLoader() : import('openclaw/plugin-sdk/session-transcript-runtime'))) as Partial<TranscriptRuntime> | null;
+    return typeof mod?.readSessionTranscriptEvents === 'function' ? (mod as TranscriptRuntime) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Test-only: replace the host transcript-runtime import (undefined restores the real one). */
+export function __setTranscriptRuntimeLoaderForTests(loader: (() => Promise<unknown>) | undefined): void {
+  _transcriptRuntimeLoader = loader;
+}
+
+/** The host's session target, reduced to the identity fields its transcript runtime reads. */
+function hostSessionTarget(raw: unknown): Record<string, string> | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const target: Record<string, string> = {};
+  for (const key of ['agentId', 'sessionId', 'sessionKey', 'storePath', 'threadId']) {
+    const value = (raw as Record<string, unknown>)[key];
+    if (typeof value === 'string' && value) target[key] = value;
+  }
+  return target.sessionId ? target : null;
 }
 
 /** Test-only: reset the lazy-load state so a test can re-exercise the load path. */
@@ -780,6 +814,106 @@ export function sanitizeEngineSessionId(raw: unknown): string | null {
   return s && !/^\.+$/.test(s) ? s : null;
 }
 
+async function engineCorpusDir(cfg: { dream?: { synthesize?: Record<string, unknown> } } | null): Promise<string> {
+  const configured = cfg?.dream?.synthesize?.session_corpus_dir;
+  const { ensureGbrainHome, resolveGbrainHome } = await import('./gbrain-home.ts');
+  const { mkdirSync } = await import('node:fs');
+  const { isAbsolute, join: joinPath } = await import('node:path');
+  let dir: string;
+  if (typeof configured === 'string' && configured && isAbsolute(configured)) {
+    dir = configured;
+  } else {
+    let home: string;
+    try {
+      home = ensureGbrainHome();
+    } catch {
+      home = resolveGbrainHome();
+    }
+    dir = joinPath(home, 'transcripts', 'corpus');
+  }
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+/** #6268: the session's frozen corpus source, or undefined while unresolved / unknown. */
+async function sessionSourceFor(cfg: { dream?: { synthesize?: Record<string, unknown> } } | null, sessionId: string): Promise<string | undefined> {
+  const { corpusSpoolDir } = await import('./context/corpus-segments.ts');
+  const { readSessionSource } = await import('./context/corpus-source.ts');
+  return readSessionSource(corpusSpoolDir(await engineCorpusDir(cfg)), sessionId)?.source_id ?? undefined;
+}
+
+/**
+ * #6316: the compaction window's source transcript: the JSONL `sessionFile`
+ * on older hosts, otherwise the host's session-transcript-runtime read by
+ * `sessionTarget`. A typed skip reason when neither yields mapped events.
+ */
+async function readCompactTail(
+  sessionFile: string | null,
+  target: Record<string, string> | null,
+  deadlineHit: () => boolean,
+): Promise<{ tail: OpenclawBoundaryTail } | { skip: string }> {
+  const segs = await import('./context/corpus-segments.ts');
+  let tail: OpenclawBoundaryTail | null = null;
+  if (sessionFile) {
+    tail = segs.readOpenclawBoundaryTail(sessionFile, { maxBytes: 2 * 1024 * 1024 });
+  } else if (target) {
+    const runtime = await loadTranscriptRuntime();
+    if (!runtime) return { skip: 'transcript_runtime_unavailable' };
+    let events: unknown;
+    try {
+      events = await runtime.readSessionTranscriptEvents(target);
+    } catch {
+      return { skip: 'transcript_read_failed' };
+    }
+    if (deadlineHit()) return { skip: 'deadline' };
+    tail = Array.isArray(events) ? segs.readOpenclawEventsTail(events, { maxBytes: 2 * 1024 * 1024 }) : null;
+  }
+  return tail ? { tail } : { skip: 'unparseable' };
+}
+
+/**
+ * #6316: one heartbeat per OpenClaw compaction (status and reason codes only),
+ * so doctor can tell a compaction lane that never banks (`no_session`,
+ * `transcript_runtime_unavailable`) from one that was never called.
+ */
+async function recordOpenclawCompact(checkpoint: Record<string, unknown>, durationMs: number): Promise<void> {
+  try {
+    const { OPENCLAW_COMPACT_EVENT, writeHeartbeat } = await import('./context/hook-heartbeat.ts');
+    const status = typeof checkpoint.status === 'string' ? checkpoint.status : 'unknown';
+    const reason = typeof checkpoint.reason === 'string' ? checkpoint.reason : undefined;
+    await writeHeartbeat({
+      ts: new Date().toISOString(), event: OPENCLAW_COMPACT_EVENT, outcome: status === 'skipped' ? 'degraded' : 'ok',
+      ...(reason ? { reason } : {}), segment: status, duration_ms: durationMs,
+    }, { trim: false });
+  } catch { /* telemetry never fails the compaction */ }
+}
+
+/**
+ * #4618: record the session's seat before its segment is spooled (the hook
+ * lane's ordering), keyed to the OpenClaw agent dir holding `sessions/`.
+ * Additive provenance: a failure never fails the checkpoint, but a seat
+ * reason (write failure, conflict, invalid label) lands in the hook
+ * heartbeat as a degraded `compact` entry with its fixed recovery hint, the
+ * way the hook lane reports it.
+ */
+async function recordOpenclawSeat(dir: string, sessionId: string, sessionFile: string | null): Promise<void> {
+  try {
+    const { resolveSeat, writeSeatSidecar } = await import('./context/seat.ts');
+    let reasons: string[];
+    try {
+      const seat = resolveSeat({ env: process.env, harness: 'openclaw', transcriptPath: sessionFile });
+      reasons = seat ? writeSeatSidecar(dir, sessionId, seat, { harness: 'openclaw', hookLane: 'context-engine' }) : [];
+    } catch {
+      reasons = ['seat_write_failed'];
+    }
+    const reason = reasons[0];
+    if (!reason) return;
+    const { writeHeartbeat } = await import('./context/hook-heartbeat.ts');
+    // trim:false: the gateway process is long-lived; only short-lived hooks trim the heartbeat file. The entry gets the reason's hint.
+    await writeHeartbeat({ ts: new Date().toISOString(), event: 'compact', outcome: 'degraded', reason, duration_ms: 0 }, { trim: false });
+  } catch { /* provenance and telemetry never fail the checkpoint */ }
+}
+
 // ── Engine Implementation ───────────────────────────────────────────────
 
 export function createGBrainContextEngine(ctx: {
@@ -856,8 +990,9 @@ export function createGBrainContextEngine(ctx: {
           // silently eats that session's next delta window. With bankOnly the
           // old serve takes the banking arm (no assembly, no cursor advance,
           // and with no window/entities in this request, no banking either).
+          const source = await sessionSourceFor(cfg, sessionId);
           const res = await ipc.requestContextPack(ipc.resolveSocketPath(cfg.database_path), {
-            secret, sessionId, manifestOnly: true, bankOnly: true,
+            secret, sessionId, manifestOnly: true, bankOnly: true, ...(source ? { sourceId: source } : {}),
           });
           if (res === ipc.IPC_UNAVAILABLE || !('ok' in res) || !res.ok || !res.block) return null;
           // Old-serve capability probe: a response WITHOUT the checkpointLinks
@@ -871,7 +1006,7 @@ export function createGBrainContextEngine(ctx: {
         const pg = await getDirectPostgresEngine(cfg);
         if (!pg) return null;
         const { resolveSourceId } = await import('./source-resolver.ts');
-        const sourceId = await resolveSourceId(pg, null, workspaceDir);
+        const sourceId = (await sessionSourceFor(cfg, sessionId)) ?? await resolveSourceId(pg, null, workspaceDir);
         const ss = await import('./context/session-state.ts');
         return await ss.getCheckpointManifest(pg, sourceId, null, sessionId);
       } catch {
@@ -888,6 +1023,7 @@ export function createGBrainContextEngine(ctx: {
       }),
     ]);
   }
+
 
   /** assemble()-side: memo-first, hash-keyed polls, settle-and-render. */
   async function getCheckpointBlock(sessionId: string): Promise<string | null> {
@@ -920,7 +1056,7 @@ export function createGBrainContextEngine(ctx: {
 
   /** compact()-side: spool-first checkpoint over the ladder. Never throws. */
   async function runCompactCheckpoint(params: {
-    sessionId?: unknown; sessionFile?: unknown;
+    sessionId?: unknown; sessionFile?: unknown; sessionTarget?: unknown;
   }, deadlineHit: () => boolean = () => false): Promise<Record<string, unknown>> {
     // Host-supplied id, sanitized to the hook lane's charset before ANY
     // filename/key use (pre-landing review, security: OpenClaw session keys
@@ -934,12 +1070,16 @@ export function createGBrainContextEngine(ctx: {
     // equivalent root for OpenClaw's session store. Content is sniffed
     // structurally: a non-JSONL/boundary-less file is a typed skip below.
     const sessionFile = typeof params.sessionFile === 'string' && params.sessionFile ? params.sessionFile : null;
-    if (!sessionId || !sessionFile) return { status: 'skipped', reason: 'no_session' };
+    // #6316: OpenClaw 2026.9.x passes no sessionFile; it passes a sessionTarget
+    // its session-transcript-runtime reads from the host's SQLite store.
+    const target = sessionFile ? null : hostSessionTarget(params.sessionTarget);
+    if (!sessionId || (!sessionFile && !target)) return { status: 'skipped', reason: 'no_session' };
 
     const segs = await import('./context/corpus-segments.ts');
     if (deadlineHit()) return { status: 'skipped', reason: 'deadline' };
-    const tail = segs.readOpenclawBoundaryTail(sessionFile, { maxBytes: 2 * 1024 * 1024 });
-    if (!tail) return { status: 'skipped', reason: 'unparseable' };
+    const read = await readCompactTail(sessionFile, target, deadlineHit);
+    if ('skip' in read) return { status: 'skipped', reason: read.skip };
+    const tail = read.tail;
     const windowTurns = segs.sliceBoundaryWindow(tail.turns, tail.boundaryTurnIndexes, {
       maxTurns: OPENCLAW_SEGMENT_MAX_TURNS,
     });
@@ -951,8 +1091,12 @@ export function createGBrainContextEngine(ctx: {
     // Spool FIRST (durability is engine-independent; the sweep is the backstop).
     const { loadConfig } = await import('./config.ts');
     const cfg = loadConfig();
-    const dir = await engineCorpusDir(cfg);
-    const w = segs.writeSegment(dir, sessionId, rendered.text);
+    // #6268: the session's frozen source rides in the segment NAME, inside the spool.
+    const { root, dir, stamp, source } = await (await import('./context/corpus-source.ts')).openSessionCorpus(await engineCorpusDir(cfg), sessionId, { cwd: workspaceDir, harness: 'openclaw' });
+    const segName = (hash: string) => segs.segmentFileName(sessionId, hash, stamp);
+    await recordOpenclawSeat(dir, sessionId, sessionFile ?? target?.storePath ?? null);
+    (await import('./context/capture-consent.ts')).recordCaptureIfOff(cfg, `${dir}/${segName(segs.segmentHash(rendered.text))}`, rendered.text, source);
+    const w = segs.writeSegment(dir, sessionId, rendered.text, stamp);
     const ordinal = segs.appendSegmentLedger(dir, sessionId, w.hash);
     const memo = checkpointMemo.get(sessionId) ?? { links: [], polls: 0, expectSeg: null, settled: false };
     memo.expectSeg = w.hash;
@@ -981,14 +1125,14 @@ export function createGBrainContextEngine(ctx: {
     try {
       const hb = await import('./context/hook-heartbeat.ts');
       if (!deadlineHit() && (await hb.memorableGateAllowed(cfg)).allowed) {
-        // Entropy parity with the hook lane [red-team]: the segment file was
-        // vendor-scanned only — its rendering feeds the Cathedral-5 ledger
-        // hash and cannot change — but the relay child derives its egress
-        // task line from that text. Re-scan with highEntropy and REFUSE the
-        // relay when it finds anything the vendor pass missed (fail-closed;
-        // the next compaction window re-evaluates).
+        // Entropy parity with the hook lane [red-team]: the segment file was vendor-scanned
+        // only (its rendering feeds the Cathedral-5 ledger hash), but the relay child derives
+        // its egress task line from that text. Re-scan with highEntropy and REFUSE the relay on
+        // any hit, logged content-free (fail-closed; the next compaction window re-evaluates).
         const scan = await import('./secret-scan.ts');
-        if (scan.redactFindings(rendered.text, { highEntropy: true }).redactions.length > 0) {
+        const [hit] = scan.redactFindings(rendered.text, { highEntropy: true }).redactions;
+        if (hit) {
+          await hb.writeHeartbeat(hb.relayRefusalHeartbeat(hit), { trim: false });
           throw new Error('entropy_hit'); // caught below — receipt+relay skipped, checkpoint unaffected
         }
         // Same span rule as the hook lane: windowTurns is a suffix of
@@ -998,7 +1142,7 @@ export function createGBrainContextEngine(ctx: {
         await hb.recordAndRelayReceipt({
           session_id: sessionId,
           harness: 'openclaw',
-          corpus_path: `${dir}/${segs.segmentFileName(sessionId, w.hash)}`,
+          corpus_path: `${dir}/${segName(w.hash)}`,
           content_hash: w.hash,
           turn_count: windowTurns.length,
           workspace_root: workspaceDir,
@@ -1032,7 +1176,8 @@ export function createGBrainContextEngine(ctx: {
         window: windowTurns.slice(-COMPACT_BANK_WINDOW_TURNS),
         bankOnly: true,
         trigger: 'compact-bank',
-        flushCorpusFile: segs.segmentFileName(sessionId, w.hash),
+        flushCorpusFile: segName(w.hash),
+        ...(source ? { sourceId: source } : {}),
       });
       if (res === ipc.IPC_UNAVAILABLE) return { status: 'banked', reason: 'ipc_unavailable' };
       return { status: 'banked' };
@@ -1044,7 +1189,7 @@ export function createGBrainContextEngine(ctx: {
     const pg = await getDirectPostgresEngine(cfg);
     if (!pg) return { status: 'banked', reason: 'no_engine' };
     const sweep = await import('./sweep.ts');
-    const fullPath = `${dir}/${segs.segmentFileName(sessionId, w.hash)}`;
+    const fullPath = `${dir}/${segName(w.hash)}`;
     const claimPath = fullPath + sweep.CORPUS_CLAIM_SUFFIX;
     if (!(await sweep.acquireCorpusClaim(claimPath))) return { status: 'banked', reason: 'claimed_elsewhere' };
     try {
@@ -1056,12 +1201,16 @@ export function createGBrainContextEngine(ctx: {
       if (ingested(fullPath + sweep.CORPUS_INGESTED_SUFFIX)) {
         return { status: 'banked', reason: 'already_ingested' };
       }
-      const { detectCapabilities } = await import('./capability.ts');
-      if (!detectCapabilities().extraction.available) return { status: 'banked', reason: 'keyless' };
+      const gate = await (await import('./context/capture-consent.ts')).gateCorpusFile(pg, fullPath, 'compact');
+      if (gate.action !== 'extract') return { status: 'banked', reason: gate.reason };
+      const { extractionAvailableForEngine } = await import('./facts/extraction-availability.ts');
+      if (!(await extractionAvailableForEngine(pg))) return { status: 'banked', reason: 'keyless' };
       const { isFactsExtractionEnabled } = await import('./facts/extract.ts');
       if (!(await isFactsExtractionEnabled(pg))) return { status: 'banked', reason: 'extraction_disabled' };
-      const { resolveSourceId } = await import('./source-resolver.ts');
-      const sourceId = await resolveSourceId(pg, null, workspaceDir);
+      // #6268: the segment's stamp, or (unresolved) the brain's chain for this workspace, frozen into the session record.
+      const fileSource = await (await import('./context/corpus-source.ts')).resolveCorpusFileSource(pg, root, segName(w.hash), 'spool');
+      if (!fileSource.ok) return { status: 'banked', reason: fileSource.reason };
+      const sourceId = fileSource.sourceId;
       if (deadlineHit()) return { status: 'banked', reason: 'deadline' };
       const { runFactsPipeline } = await import('./facts/backstop.ts');
       const abort = new AbortController();
@@ -1122,27 +1271,8 @@ export function createGBrainContextEngine(ctx: {
     }
   }
 
+
   /** Corpus dir from FILE config (hook.ts parity — no engine required). */
-  async function engineCorpusDir(cfg: { dream?: { synthesize?: Record<string, unknown> } } | null): Promise<string> {
-    const configured = cfg?.dream?.synthesize?.session_corpus_dir;
-    const { ensureGbrainHome, resolveGbrainHome } = await import('./gbrain-home.ts');
-    const { mkdirSync } = await import('node:fs');
-    const { isAbsolute, join: joinPath } = await import('node:path');
-    let dir: string;
-    if (typeof configured === 'string' && configured && isAbsolute(configured)) {
-      dir = configured;
-    } else {
-      let home: string;
-      try {
-        home = ensureGbrainHome();
-      } catch {
-        home = resolveGbrainHome();
-      }
-      dir = joinPath(home, 'transcripts', 'corpus');
-    }
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    return dir;
-  }
 
   const engine: ContextEngine = {
     info: {
@@ -1219,7 +1349,9 @@ export function createGBrainContextEngine(ctx: {
       // whether memory/reflex fire) + memory prompt + reflex pointers. No
       // manifest ⇒ parts untouched ⇒ byte-identical to the pre-cathedral-5
       // output (pinned).
-      const parts = [contextBlock];
+      // Always-loaded core + the context-pressure notice right after the live block (context/openclaw-core.ts).
+      const parts = [contextBlock, ...await openClawCoreLane(workspaceDir, CHECKPOINT_POLL_TIMEOUT_MS).additions({
+        sessionId: sanitizeEngineSessionId(sessionId ?? sessionKey ?? null), messages: msgs, tokenBudget, availableTools })];
       if (checkpointBlock) parts.push(checkpointBlock);
       if (memoryAddition) parts.push(memoryAddition);
       if (reflexAddition) parts.push(reflexAddition);
@@ -1243,14 +1375,7 @@ export function createGBrainContextEngine(ctx: {
       // 4. Pass through messages unchanged (legacy assembly)
       return {
         messages: msgs,
-        estimatedTokens: msgs.reduce((sum, m) => {
-          const text = typeof m.content === 'string'
-            ? m.content
-            : JSON.stringify(m.content);
-          // #2880: JSON.stringify(undefined) is undefined, not a string —
-          // a content-less message counts 0 instead of throwing.
-          return sum + (typeof text === 'string' ? Math.ceil(text.length / 4) : 0);
-        }, 0),
+        estimatedTokens: estimateMessageTokens(msgs),
         systemPromptAddition: parts.join('\n\n'),
       };
     },
@@ -1258,6 +1383,7 @@ export function createGBrainContextEngine(ctx: {
     async compact(params) {
       // Lazy SDK load on first method call (was top-level await pre-L0-B).
       await ensureSdkLoaded();
+      openClawCoreLane(workspaceDir, CHECKPOINT_POLL_TIMEOUT_MS).compacted(sanitizeEngineSessionId(params?.sessionId ?? params?.sessionKey ?? null));
       // Cathedral 5 — time-bounded, FAIL-OPEN checkpoint step BEFORE the
       // delegate. A checkpoint failure/timeout must never break compaction.
       // The deadline CANCELS the work (adversarial review): the race alone
@@ -1265,6 +1391,7 @@ export function createGBrainContextEngine(ctx: {
       // delegate; the abort closure stops it at the next step boundary, and
       // the timer is cleared when the work wins.
       let gbrainCheckpoint: Record<string, unknown>;
+      const checkpointStart = Date.now();
       try {
         const deadline = new AbortController();
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1288,6 +1415,7 @@ export function createGBrainContextEngine(ctx: {
       } catch {
         gbrainCheckpoint = { status: 'skipped', reason: 'error' };
       }
+      await recordOpenclawCompact(gbrainCheckpoint, Date.now() - checkpointStart);
       // Delegate to legacy runtime compaction UNCHANGED (ownsCompaction stays
       // false), then ride the additive bag on the existing untyped `result`.
       const delegated =

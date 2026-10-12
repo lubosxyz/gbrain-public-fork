@@ -19,6 +19,7 @@ triggers:
   - "connections"
   - "graph query"
 tools:
+  - recall
   - search
   - query
   - get_page
@@ -27,6 +28,7 @@ tools:
   - traverse_graph
   - get_timeline
 mutating: false
+when_to_use: "Use when the user asks: \"what do we know about\", \"tell me about\", \"who is\", \"what happened\", \"search for\"."
 ---
 
 # Query Skill
@@ -69,7 +71,17 @@ This skill guarantees:
    - List pages in gbrain by type or check backlinks for structural queries
 3. **Read top results.** Read the top 3-5 pages from gbrain to get full context.
 4. **Synthesize answer** with citations. Every claim traces back to a specific page slug.
-5. **Flag gaps.** If the brain doesn't have info, say "the brain doesn't have information on X" rather than hallucinating.
+5. **Flag gaps.** If the brain doesn't have info, say "the brain doesn't have information on X" rather than hallucinating. Read the result's notices first (see "When it fails"): a degraded or truncated result is not a gap.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Check each retrieval result for notices before answering: on MCP, extra text blocks whose first line looks like [gbrain notice empty_retrieval kind=degraded], mirrored in `_meta.gbrain_notices`; on the CLI, the `[AGENT]` block, `search_degraded`, or a `note: search degraded` line.
+- `empty_retrieval` with `kind=degraded` (or `search_degraded: keyword_only_no_embedding_provider`): an empty result is NOT proof the user has no notes. Tell the user "your brain is searching keywords only right now, so I may be missing notes on X", try exact names and synonyms with `gbrain search`, and point to the notice's fix (usually enabling embeddings).
+- `empty_retrieval` with "no retrieval degradation — this is a clean miss": then say "the brain doesn't have information on X".
+- `listing_truncated` or `budget_truncated`: the list was cut off. Say "showing the first N", and page or narrow the query before claiming something is absent.
+- `page_not_found` from `get_page`: the slug is wrong or in another source; search by title (and check `--source`) before reporting the page missing.
 
 ## Anti-Patterns
 
@@ -101,8 +113,53 @@ Answers should include:
 Search returns **chunks**, not full pages. Read the excerpts first before deciding
 whether to load a full page.
 
+For a question about saved **page evidence** with a tight budget, explicitly choose
+`recall` with `budget_policy: "query_first"`. It gives the existing ranked page
+results first use of the budget, then packs recent/filtered facts into what remains.
+This is an opt-in packing choice, not a new relevance model: an irrelevant page can
+displace a useful fact. Keep entity-first, session/event-filtered and fact-focused
+questions on their existing facts-first route. Do not change `context_pack` or
+existing third-party calls.
+
+```bash
+gbrain recall --query 'zebra telescope' --budget-tokens 75 --budget-policy query_first --json
+```
+
+Equivalent MCP request:
+
+```json
+{"name":"recall","arguments":{"query":"zebra telescope","budget_tokens":75,"budget_policy":"query_first"}}
+```
+
+**Say to your agent:** “Recall the saved notes about the zebra telescope using a
+75-token estimated budget and query-first packing. Cite the returned evidence;
+if the first page cannot fit, tell me rather than treating that as missing memory.”
+
+Use the resolved brain and source as usual; the option does not widen permissions.
+`budget_packing` reports the effective policy and per-arm candidate/kept/dropped/used
+counts. Costs estimate `ceil(fact.length/4)` or
+`ceil(title.length/4) + ceil(chunk.length/4)`, not exact tokenizer or JSON-envelope
+size. Packing never skips an oversized prefix item or truncates it; multiple
+required pages may still not fit. With no nonblank query or no positive finite
+budget, the operation keeps legacy behavior. An eligible positive budget below one
+token returns empty arms. See the protocol for fractional-budget compatibility.
+
+This guidance and advertised tool schemas do not prove native-harness adoption.
+Confirm an observed query-first call in a fresh harness conversation before
+claiming activation; otherwise report adoption as unverified.
+
 - `gbrain search` / `gbrain query` return ranked chunks with context snippets.
   These are often enough to answer the question directly.
+- Hits on conversation pages (sessions, transcripts, meetings, chat logs)
+  already come back as the whole session by default (`return_unit: "auto"`,
+  24,000-token default budget). For other multi-page or "when did X change"
+  questions, where the answer depends on the surrounding text rather than one
+  chunk, ask for whole evidence in the same call: `return_unit: "page"` (whole
+  page, budgeted by `token_budget`, default 6,000) or `"window"` (neighbor
+  chunks). `return_unit: "chunk"` opts out.
+  Each result then carries the evidence in `chunk_text` plus a `delivered`
+  block; see [evidence delivery](https://github.com/garrytan/gbrain/blob/master/docs/evidence-delivery.md).
+  `gbrain query "when did the launch move?" --return-unit page --token-budget 6000`
 - Only use `gbrain get <slug>` to load the full page when a chunk confirms the
   page is relevant and you need more context (e.g., compiled truth, timeline).
 - **"Tell me about X"** -- get the full page (the user wants the complete picture).

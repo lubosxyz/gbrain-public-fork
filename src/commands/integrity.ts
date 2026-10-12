@@ -39,6 +39,7 @@ import {
 } from '../core/resolvers/index.ts';
 import { registerBuiltinResolvers } from './resolvers.ts';
 import { tweetCitation } from '../core/output/scaffold.ts';
+import { INTEGRITY_SUBCOMMANDS, ROUTERS, subcommandHelpRequested } from '../cli/subcommands.ts';
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -222,11 +223,13 @@ function ensureDir(path: string): void {
 // CLI entry point
 // ---------------------------------------------------------------------------
 
-export async function runIntegrity(args: string[]): Promise<void> {
-  const sub = args[0];
+export { INTEGRITY_SUBCOMMANDS as SUBCOMMANDS } from '../cli/subcommands.ts';
 
-  if (!sub || sub === '--help' || sub === '-h') {
-    printHelp();
+export async function runIntegrity(args: string[]): Promise<void> {
+  const sub = args[0] as (typeof INTEGRITY_SUBCOMMANDS)[number] | undefined;
+
+  if (!sub || subcommandHelpRequested(args, ROUTERS.integrity)) {
+    printUsage();
     return;
   }
 
@@ -249,7 +252,7 @@ export async function runIntegrity(args: string[]): Promise<void> {
   }
 
   console.error(`Unknown subcommand: ${sub}`);
-  printHelp();
+  printUsage();
   process.exit(1);
 }
 
@@ -401,10 +404,14 @@ async function scanIntegrityBatch(
   // one — that was the bug class. Now batch parity matches the sequential
   // listAllPageRefs() walk: integrity violations in non-default-source pages
   // get reported instead of silently shadowed by their default-source twin.
+  // deleted_at IS NULL: the sequential walk (listAllPageRefs + getPage) never
+  // sees a soft-deleted page, so the batch must not either — otherwise the
+  // sampled doctor check reports hits from tombstones and, once they
+  // outnumber `limit`, stops reaching live pages.
   const rows = await sql`
     SELECT slug, compiled_truth, frontmatter
     FROM pages
-    WHERE 1=1 ${typeCondition} ${validateCondition}
+    WHERE deleted_at IS NULL ${typeCondition} ${validateCondition}
     ORDER BY source_id, slug
     LIMIT ${limit}
   `;
@@ -797,7 +804,7 @@ function truncate(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, n - 3) + '...';
 }
 
-function printHelp(): void {
+export function printUsage(): void {
   console.log(`Usage: gbrain integrity <subcommand> [options]
 
 Subcommands:

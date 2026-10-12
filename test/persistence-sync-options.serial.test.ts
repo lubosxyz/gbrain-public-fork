@@ -588,11 +588,13 @@ async function syncState(engine: BrainEngine, sourceId: string) {
 
 type SyncBarrier = 'discovery' | 'discovery-commit' | 'foreground' | 'freeze' | 'freeze-commit' | 'request-lookup' | 'admission-commit';
 function matchesSyncBarrier(boundary: SyncBarrier, sql: string, params: unknown[] | undefined, transactional: boolean): boolean {
-  if (boundary === 'discovery') return sql.startsWith('SELECT source_path FROM pages WHERE source_id=');
+  if (boundary === 'discovery') return sql.startsWith('SELECT slug,source_path,id FROM pages WHERE source_id=');
   if (boundary === 'foreground') return sql.includes("NOT(COALESCE(intent->>'kind','') LIKE 'managed_sync_%') LIMIT 1");
-  if (boundary === 'freeze') return sql.startsWith('SELECT id,source_path FROM pages WHERE source_id=') && !transactional;
+  if (boundary === 'freeze') return sql.startsWith('SELECT id,slug,source_path FROM pages WHERE source_id=') && !transactional;
   if (boundary === 'request-lookup') return sql.startsWith('SELECT') && sql.includes('FROM persistence_requests') && sql.includes('request_id=') && !transactional;
   if (boundary === 'admission-commit') return sql.includes('UPDATE persistence_counters SET outstanding_count=outstanding_count+1');
+  // A won cursor swap is the saved cursor (#5984 feeder, no read-back): the freeze transaction's last statement is its manifest touch.
+  if (boundary === 'freeze-commit') return transactional && sql === 'UPDATE op_checkpoints SET updated_at=now() WHERE op=$1 AND fingerprint=$2' && params?.[0] === 'managed-sync-manifest';
   return transactional && sql === 'SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2' && params?.[0] === 'managed-sync';
 }
 
@@ -684,7 +686,10 @@ for (const boundary of ['retry-discovery', 'retry-commit', 'missing-manifest', '
   if (boundary !== 'completed-cleanup') {
     writeFileSync(join(f.root, 'records/example-0.md'), '---\ntitle: [broken\n---\nSynthetic invalid document.\n');
     f.git.commitAll('Add synthetic failed import');
-    expect(await performSync(engine, f.opts)).toMatchObject({ status: 'blocked_by_failures' });
+    // #5988: sync holds unreadable YAML by default; sync.holds=fail keeps the failed receipt this retry path needs.
+    await engine.setConfig('sync.holds', 'fail');
+    try { expect(await performSync(engine, f.opts)).toMatchObject({ status: 'blocked_by_failures' }); }
+    finally { await engine.unsetConfig('sync.holds'); }
     writeFileSync(join(f.root, 'records/example-0.md'), body);
     f.git.commitAll('Repair synthetic failed import');
   } else expect(await performSync(engine, f.opts)).toMatchObject({ status: 'first_sync', added: 1 });
@@ -696,7 +701,7 @@ for (const boundary of ['retry-discovery', 'retry-commit', 'missing-manifest', '
   let observed = false;
   engine.executeRaw = async function (this: BrainEngine, sql: string, params?: unknown[]) {
     const rows = await execute.call(this, sql, params);
-    if (!observed && (boundary === 'retry-discovery' ? sql.startsWith('SELECT source_path FROM pages WHERE source_id=')
+    if (!observed && (boundary === 'retry-discovery' ? sql.startsWith('SELECT slug,source_path,id FROM pages WHERE source_id=')
       : boundary === 'completed-cleanup' ? sql.startsWith('DELETE FROM op_checkpoints WHERE op=$1')
       : this !== engine && sql === 'SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2' && params?.[0] === 'managed-sync')) {
       observed = true; abort.abort();

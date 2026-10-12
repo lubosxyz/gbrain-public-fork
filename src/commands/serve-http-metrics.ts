@@ -1,21 +1,29 @@
 /**
- * Request metrics for `gbrain serve --http` (#3893, reimplemented from
- * @y2688's community PR).
+ * Request metrics and health probes for `gbrain serve --http` (#3893,
+ * reimplemented from @y2688's community PR).
  *
  * In-process counters plus a Prometheus text exposition (format 0.0.4).
- * Kept out of serve-http.ts so the module-size ratchet keeps its teeth; the
- * runServeHttp closure wires exactly three seams:
+ * Kept out of serve-http.ts so the module-size ratchet keeps its teeth;
+ * buildServeHttpApp wires exactly three metrics seams:
  *
  *   - `createMetricsCounters()` once per server,
  *   - `app.use(metricsTrackingMiddleware(counters))` BEFORE every route —
  *     Express only applies `app.use` middleware to routes registered after
  *     it (the original PR mounted the tracker after most routes, so they
  *     were never counted),
- *   - `GET /metrics` behind requireAdmin, rendering
+ *   - `GET /metrics` behind requireAdmin (`mountMetrics`), rendering
  *     `renderPrometheusMetrics(counters)` — request/error/latency series
  *     profile a personal brain's usage, so the exposition is not public.
+ *
+ * `mountHealth` serves the public liveness probe; `probeHealth` backs the
+ * admin-only full-stats endpoint.
  */
-import type { NextFunction, Request, RequestHandler, Response } from 'express';
+import type { Express, NextFunction, Request, RequestHandler, Response } from 'express';
+import type { BrainEngine } from '../core/engine.ts';
+import { resolveInflightTimeoutSeconds, resolveSessionTimeouts } from '../core/db.ts';
+import { poolHealthSnapshot, type PoolHealthSnapshot } from '../core/postgres-engine/pool-stats.ts';
+import { VERSION } from '../version.ts';
+import type { ServeHttpContext } from './serve-http.ts';
 
 export interface MetricsCounters {
   requests: number;
@@ -97,4 +105,194 @@ export function renderPrometheusMetrics(
     `gbrain_uptime_seconds ${uptimeSeconds}`,
     '',
   ].join('\n');
+}
+
+/**
+ * /health endpoint timeout. 3s rather than 5s: Fly.io's default
+ * health-check timeout is 5s, so returning 503 right at the orchestrator
+ * deadline races with the orchestrator recording the request as a timeout.
+ * 3s leaves 2s of headroom for TCP, response framing, and clock skew.
+ */
+export const HEALTH_TIMEOUT_MS = 3000;
+
+export type ProbeHealthResult =
+  | { ok: true; status: 200; body: { status: 'ok'; version: string; engine: string; [k: string]: unknown } }
+  | { ok: false; status: 503; body: { error: 'service_unavailable'; error_description: string } };
+
+/**
+ * Pure async health probe. Races `engine.getStats()` against a timeout,
+ * returns a tagged result. No Express coupling — easy to unit-test with a
+ * mock engine. The /health route handler is a thin wrapper around this.
+ */
+export async function probeHealth(
+  engine: BrainEngine,
+  engineName: string,
+  version: string,
+  timeoutMs: number = HEALTH_TIMEOUT_MS,
+): Promise<ProbeHealthResult> {
+  // Capture the handle so we can clearTimeout when getStats() wins. Without
+  // this, every fast /health request leaves a 3s pending timer in the event
+  // loop until it fires — under high probe rates this builds up a rolling
+  // backlog of timers and avoidable wakeups. Both adversarial reviewers
+  // (Claude + Codex) flagged this independently.
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const stats = await Promise.race([
+      engine.getStats(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('health_timeout')), timeoutMs);
+      }),
+    ]);
+    return {
+      ok: true,
+      status: 200,
+      body: { status: 'ok', version, engine: engineName, ...stats },
+    };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'unknown';
+    return {
+      ok: false,
+      status: 503,
+      body: {
+        error: 'service_unavailable',
+        error_description: msg === 'health_timeout'
+          ? 'Health check timed out (database pool may be saturated)'
+          : 'Database connection failed',
+      },
+    };
+  } finally {
+    // Clear the timer regardless of which branch won the race. No-op when
+    // the timer already fired (we're in the timeout-rejection catch block).
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+/**
+ * Races an abortable `SELECT 1` against `probeHealth`'s timeout; Postgres
+ * cancels the losing query while PGLite only discards its eventual result.
+ */
+export async function probeLiveness(
+  engine: BrainEngine,
+  engineName: string,
+  version: string,
+  timeoutMs: number = HEALTH_TIMEOUT_MS,
+): Promise<ProbeHealthResult> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const controller = new AbortController();
+  try {
+    await Promise.race([
+      engine.executeRaw('SELECT 1', undefined, { signal: controller.signal }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error('health_timeout'));
+        }, timeoutMs);
+      }),
+    ]);
+    return {
+      ok: true,
+      status: 200,
+      body: { status: 'ok', version, engine: engineName },
+    };
+  } catch (e: unknown) {
+    const msg = controller.signal.aborted ? 'health_timeout' : (e instanceof Error ? e.message : 'unknown');
+    return {
+      ok: false,
+      status: 503,
+      body: {
+        error: 'service_unavailable',
+        error_description: msg === 'health_timeout'
+          ? 'Health check timed out (database pool may be saturated)'
+          : 'Database connection failed',
+      },
+    };
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+/**
+ * #6383: why `/health` answered 200 through a 50-minute wedge: `probeLiveness`
+ * runs its `SELECT 1` on a reserved connection, and `reserve()` only ever
+ * claims an idle one, while the wedged connections sat in the driver's busy
+ * queue where ordinary handler statements are routed. `/health?deep=1` runs
+ * the probe through that ordinary pooled dispatch (no reservation) and reads
+ * the pool's own numbers; it answers 503 when the probe does not return within
+ * its budget, when a statement has waited past the read pool's in-flight
+ * budget, or when the previous deep probe is still pending. One deep probe is
+ * in flight per engine at a time, so a stuck one is never joined by a pile.
+ */
+export type DeepHealthResult =
+  | { ok: true; status: 200; body: { status: 'ok'; deep: true; version: string; engine: string; probe_ms: number; pool: PoolHealthSnapshot | null } }
+  | { ok: false; status: 503; body: { error: 'service_unavailable'; error_description: string; deep: true; pool: PoolHealthSnapshot | null } };
+
+const pendingDeepProbes = new WeakMap<object, Promise<unknown>>();
+
+/** The read pool's in-flight budget in ms (statement_timeout + grace), or null when the watchdog is off. */
+export function readPoolInflightBudgetMs(): number | null {
+  const seconds = resolveInflightTimeoutSeconds(resolveSessionTimeouts().statement_timeout);
+  return seconds === null ? null : seconds * 1000;
+}
+
+export async function probeDeepHealth(
+  engine: BrainEngine,
+  engineName: string,
+  version: string,
+  timeoutMs: number = HEALTH_TIMEOUT_MS,
+  budgetMs: number | null = readPoolInflightBudgetMs(),
+): Promise<DeepHealthResult> {
+  const pool = () => poolHealthSnapshot(engine);
+  const unavailable = (why: string): DeepHealthResult => ({ ok: false, status: 503, body: { error: 'service_unavailable', error_description: why, deep: true, pool: pool() } });
+  if (pendingDeepProbes.has(engine)) return unavailable('Deep health probe still pending from an earlier request (a pooled SELECT 1 has not answered)');
+  const started = Date.now();
+  const probe = engine.executeRaw('SELECT 1');
+  pendingDeepProbes.set(engine, probe);
+  probe.then(() => pendingDeepProbes.delete(engine), () => pendingDeepProbes.delete(engine));
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      probe,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('health_timeout')), timeoutMs); }),
+    ]);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'unknown';
+    return unavailable(msg === 'health_timeout'
+      ? `Deep health probe timed out: a pooled SELECT 1 did not answer within ${timeoutMs} ms`
+      : `Deep health probe failed: ${msg}`);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+  const snapshot = pool();
+  if (snapshot && budgetMs !== null && snapshot.inflight_oldest_ms > budgetMs) {
+    return unavailable(`A pooled statement has waited ${snapshot.inflight_oldest_ms} ms for the server, past the pool budget of ${budgetMs} ms`);
+  }
+  return { ok: true, status: 200, body: { status: 'ok', deep: true, version, engine: engineName, probe_ms: Date.now() - started, pool: snapshot } };
+}
+
+/** GET /health: liveness only (full stats are the admin-only /admin/api/full-stats); `?deep=1` probes through the ordinary pool. */
+export function mountHealth(app: Express, ctx: ServeHttpContext): void {
+  const { engine, config } = ctx;
+  // ---------------------------------------------------------------------------
+  // Health check — liveness only. Full engine stats live at
+  // /admin/api/full-stats (requireAdmin). See probeLiveness above for the why.
+  // ---------------------------------------------------------------------------
+  app.get('/health', async (req, res) => {
+    const deep = req.query.deep;
+    const result = deep === '1' || deep === 'true'
+      ? await probeDeepHealth(engine, config.engine || 'pglite', VERSION)
+      : await probeLiveness(engine, config.engine || 'pglite', VERSION);
+    res.status(result.status).json(result.body);
+  });
+}
+
+/** GET /metrics behind requireAdmin. */
+export function mountMetrics(app: Express, ctx: ServeHttpContext): void {
+  const { requireAdmin, metricsCounters } = ctx;
+  // #3893 (reimplemented from @y2688): Prometheus exposition. Admin-gated —
+  // request/error/latency series profile a personal brain's usage, so this
+  // is not a public surface (the original PR served it unauthenticated).
+  app.get('/metrics', requireAdmin, (_req: Request, res: Response) => {
+    res.set('Content-Type', 'text/plain; version=0.0.4');
+    res.send(renderPrometheusMetrics(metricsCounters));
+  });
 }

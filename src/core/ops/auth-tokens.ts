@@ -56,6 +56,7 @@ function mintingPrincipal(ctx: {
 
 const token_mint_scoped: Operation = {
   name: 'token_mint_scoped',
+  outputRedaction: 'no_stored_text',
   description:
     'Mint a tenant-scoped short-TTL READ-ONLY bearer token bound to a server-stored ' +
     'company_slug. Allowlisted minting principals only (admin scope or local CLI). ' +
@@ -110,6 +111,7 @@ const token_mint_scoped: Operation = {
       throw new OperationError(
         'permission_denied',
         'token_mint_scoped requires an allowlisted minting principal (admin scope or local CLI).',
+        'Use an authorized local CLI or administrator principal.',
       );
     }
 
@@ -127,7 +129,7 @@ const token_mint_scoped: Operation = {
         // Static message — the submitted value is untrusted input and the
         // transport error path persists this message into logs.
         void e;
-        throw new OperationError('invalid_params', 'invalid source_id (submitted value withheld; see gbrain sources list for valid ids)');
+        throw new OperationError('invalid_params', 'invalid source_id (submitted value withheld; see gbrain sources list for valid ids)', 'Select an existing source ID from gbrain sources list.');
       }
     }
 
@@ -189,7 +191,7 @@ const token_mint_scoped: Operation = {
       throw new OperationError(
         'unavailable',
         'auth audit is unavailable; the minted token was revoked and not issued (fail-closed).',
-        'Restore auth_audit writability (run gbrain apply-migrations / check the database), then retry.',
+        'Restore auth_audit writability (run gbrain apply-migrations / check the database), then inspect token inventory before submitting a new mint request.',
       );
     }
 
@@ -208,6 +210,7 @@ const token_mint_scoped: Operation = {
 
 const token_revoke: Operation = {
   name: 'token_revoke',
+  outputRedaction: 'no_stored_text',
   description:
     'Revoke exactly one bearer token by its row id (UUID — the only safe revocation key; ' +
     'names are not unique). Allowlisted principals only (admin scope or local CLI). ' +
@@ -235,6 +238,7 @@ const token_revoke: Operation = {
       throw new OperationError(
         'permission_denied',
         'token_revoke requires an allowlisted principal (admin scope or local CLI).',
+        'Use an authorized local CLI or administrator principal.',
       );
     }
     const id = String(p.id ?? '');
@@ -248,7 +252,7 @@ const token_revoke: Operation = {
         reason: 'invalid_token_id',
         actor: principal.actor,
       });
-      throw new OperationError('invalid_params', 'not a token id (expected a UUID)');
+      throw new OperationError('invalid_params', 'not a token id (expected a UUID)', 'Use the token UUID returned by the token inventory.');
     }
     // Dry run stops BEFORE the revocation write: `token-revoke --dry-run`
     // must never actually revoke (round-2 P2).

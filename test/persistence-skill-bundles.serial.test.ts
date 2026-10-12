@@ -11,6 +11,7 @@ import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { BUNDLE_FILE_LIMITS } from '../src/core/persistence/bundle-files.ts';
 import { publishMutation, recoverPublication, type PreparedMutation } from '../src/core/persistence/coordinator.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { cancelWriteRequest } from '../src/core/persistence/control.ts';
 import { advanceEffectCursor, claimPersistenceEffect, completeEffect, renewPersistenceEffectClaim } from '../src/core/persistence/effect-journal.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
@@ -25,7 +26,9 @@ import { managedSyncAuthority } from '../src/core/persistence/sync-authority.ts'
 import { SHARED_SKILLS_PERSISTENCE_SCHEMA_STATEMENTS } from '../src/core/shared-skills/persistence-schema.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { makeGitFixture } from './helpers/git-fixture.ts';
+import { testBackends } from './helpers/test-backends.ts';
 
+const backends = testBackends();
 const home = mkdtempSync(join(tmpdir(), 'gbrain-skill-persistence-'));
 const oldHome = process.env.GBRAIN_HOME;
 const fixtures: Array<{ engine: BrainEngine; root: string; binding: WorktreeBinding; close(): Promise<void> }> = [];
@@ -35,10 +38,13 @@ let hostId: string;
 beforeAll(async () => {
   process.env.GBRAIN_HOME = home;
   hostId = localHostId();
-  const local = new PGLiteEngine();
-  await local.connect({}); await local.initSchema();
-  const engines = [{ engine: local as BrainEngine, close: () => local.disconnect() }];
-  if (process.env.DATABASE_URL) engines.push(await isolatedPersistencePostgres(process.env.DATABASE_URL));
+  const engines: Array<{ engine: BrainEngine; close(): Promise<void> }> = [];
+  if (backends.includes('pglite')) {
+    const local = new PGLiteEngine();
+    await local.connect({}); await local.initSchema();
+    engines.push({ engine: local, close: () => local.disconnect() });
+  }
+  if (backends.includes('postgres')) engines.push(await isolatedPersistencePostgres(process.env.DATABASE_URL!));
   for (const item of engines) {
     for (const statement of SHARED_SKILLS_PERSISTENCE_SCHEMA_STATEMENTS) await item.engine.executeRaw(statement);
     const gitRoot = join(home, item.engine.kind); mkdirSync(gitRoot);
@@ -269,15 +275,15 @@ describe('typed skill bundle persistence', () => {
       await expect(f.engine.transaction(async tx => { await declarePersistenceProtocol(tx); await tx.executeRaw(query, params); })).rejects.toThrow('writer_coordinator_required');
       await f.engine.transaction(async tx => {
         await declarePersistenceProtocol(tx);
-        await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(query, params));
+        await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(query, params), TEST_WRITE_ATTRIBUTION);
       });
       await expect(f.engine.transaction(async tx => {
         await declarePersistenceProtocol(tx);
-        await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("DELETE FROM shared_skill_heads WHERE name='guarded-example'"));
+        await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("DELETE FROM shared_skill_heads WHERE name='guarded-example'"), TEST_WRITE_ATTRIBUTION);
       })).rejects.toThrow('writer_coordinator_required');
       await expect(f.engine.transaction(async tx => {
         await declarePersistenceProtocol(tx);
-        await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw("UPDATE shared_skill_heads SET source_id='default' WHERE name='guarded-example'"));
+        await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw("UPDATE shared_skill_heads SET source_id='default' WHERE name='guarded-example'"), TEST_WRITE_ATTRIBUTION);
       })).rejects.toThrow('writer_coordinator_required');
       const [head] = await f.engine.executeRaw<{ source_id: string }>("SELECT source_id FROM shared_skill_heads WHERE name='guarded-example'");
       expect(head.source_id).toBe(sourceId);
@@ -364,7 +370,7 @@ describe('typed skill bundle persistence', () => {
           await tx.executeRaw(`INSERT INTO shared_skill_packs(source_id,source_incarnation,pack_id,revision,manifest,manifest_hash)
             VALUES($1,$2::uuid,'race-example-pack',$3::uuid,$4::text::jsonb,$5)`,
           [sourceId, f.binding.source_incarnation, revision, packBytes, sha256(packBytes)]);
-        });
+        }, TEST_WRITE_ATTRIBUTION);
       });
       const canonical = { bytes: readFileSync(join(f.root, pending.path), 'base64'), manifest: readFileSync(join(f.root, 'skillpack.json'), 'base64'),
         packs: await f.engine.executeRaw('SELECT * FROM shared_skill_packs ORDER BY source_id'),

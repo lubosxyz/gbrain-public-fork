@@ -21,6 +21,7 @@ import { parseMarkdown } from '../markdown.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { contentHash } from '../utils.ts';
 import { recordFactWithdrawal } from './withdrawal.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { withdrawnFact } from './withdrawal-overlay.ts';
 
 export interface ForgetFactResult {
@@ -58,21 +59,30 @@ const FENCE_BEGIN = '<!--- gbrain:facts:begin -->';
 const FENCE_END = '<!--- gbrain:facts:end -->';
 
 /**
- * Strike fence row `rowNum` inside `body`: strikethrough on the claim
- * (already-struck rows stay struck), valid_until = today, `forgotten:
- * <reason>` appended to context (preserving any existing context). Returns
- * the rewritten body, or null when the fence lacks the row (DB drifted from
- * markdown) or its markers — callers fall back to a DB-only expire.
+ * A superseded row is struck like a forgotten one but carries the parser's
+ * `superseded by #N` reference instead of the withdrawal marker, so the next
+ * reconcile links it and it never becomes a durable withdrawal.
  */
-function strikeFenceRow(body: string, rowNum: number, reason: string, today: string): string | null {
+export function supersededFact(fact: ParsedFact, today: string, newRowNum: number | null): ParsedFact {
+  const context = [newRowNum !== null ? `superseded by #${newRowNum}` : 'superseded', fact.context?.trim()].filter(Boolean).join(' | ');
+  const validUntil = fact.validUntil && /^\d{4}-\d{2}-\d{2}$/.test(fact.validUntil) && fact.validUntil < today ? fact.validUntil : today;
+  return { ...fact, active: false, validUntil, context };
+}
+
+/**
+ * Strike fence row `rowNum` inside `body` with `strike` (strikethrough,
+ * valid_until = today, and a withdrawal or supersession marker in context,
+ * preserving existing context). Returns the rewritten body, or null when the
+ * fence lacks the row (DB drifted from markdown), its markers, or does not
+ * parse cleanly (re-rendering it would drop the rows the parser skipped) —
+ * callers fall back to a DB-only expire and the bytes stay as they are.
+ */
+export function strikeFenceRow(body: string, rowNum: number, strike: (fact: ParsedFact) => ParsedFact): string | null {
   const parsed = parseFactsFence(body);
+  if (parsed.warnings.length > 0) return null;
   const target = parsed.facts.find(f => f.rowNum === rowNum);
   if (!target) return null;
-  const updated: ParsedFact[] = parsed.facts.map(f =>
-    f.rowNum === rowNum
-      ? withdrawnFact(f, today, reason)
-      : f,
-  );
+  const updated: ParsedFact[] = parsed.facts.map(f => f.rowNum === rowNum ? strike(f) : f);
   const begin = body.indexOf(FENCE_BEGIN);
   const end = body.indexOf(FENCE_END, begin + 1);
   if (begin === -1 || end === -1) return null;
@@ -109,10 +119,21 @@ export async function forgetFactInFence(
      * could never read (mirrors recall's remote posture).
      */
     worldOnly?: boolean;
+    /**
+     * Supersession, not withdrawal: expire and strike the row with a
+     * `superseded by #N` reference to the replacing fact's fence row. No
+     * durable withdrawal is recorded, so the old claim can be remembered
+     * again and no other page is invalidated.
+     */
+    supersededBy?: { rowNum: number | null };
   } = {},
 ): Promise<ForgetFactResult> {
   const reason = opts.reason ?? 'forgotten';
   const today = todayUtc();
+  const supersession = opts.supersededBy;
+  const strike = (fact: ParsedFact) => supersession
+    ? supersededFact(fact, today, supersession.rowNum)
+    : withdrawnFact(fact, today, reason);
 
   const rows = await engine.executeRaw<FactDbRow>(
     `SELECT id, source_id, entity_slug, row_num, source_markdown_slug, expired_at, visibility
@@ -141,7 +162,13 @@ export async function forgetFactInFence(
 
   // A stale source file or rebuilt index must not silently restore an exact
   // withdrawn claim. Intent commits independently of filesystem availability.
-  await recordFactWithdrawal(engine, factId, row.source_id, opts.worldOnly === true);
+  // A supersession only expires the row.
+  if (supersession) {
+    await maintenanceTransaction(engine, tx => tx.executeRaw(`UPDATE facts SET valid_until = LEAST(COALESCE(valid_until, now()), now()), expired_at = now()
+      WHERE id = $1 AND expired_at IS NULL`, [factId]));
+  } else {
+    await maintenanceTransaction(engine, tx => recordFactWithdrawal(tx, factId, row.source_id, opts.worldOnly === true));
+  }
 
   if (row.expired_at !== null) {
     return { ok: false, path: 'already_expired', reason };
@@ -154,15 +181,15 @@ export async function forgetFactInFence(
     const slug = row.source_markdown_slug;
     const page = await engine.getPage(slug, { sourceId: row.source_id });
     if (!page) return;
-    const struck = strikeFenceRow(page.compiled_truth ?? '', row.row_num, reason, today);
+    const struck = strikeFenceRow(page.compiled_truth ?? '', row.row_num, strike);
     if (struck === null) return;
     // The FILE was not rewritten on this tier, so the row must NOT keep the
     // importer's hash: sync would see file == row and skip, leaving
     // content_chunks with the live claim for good. A row-shaped hash over the
     // struck body can never equal the unchanged file's, so the next sync
     // re-imports + re-chunks through the withdrawal overlay.
-    await engine.refreshPageBody(slug, row.source_id, struck, page.timeline ?? '',
-      contentHash({ ...page, compiled_truth: struck }));
+    await maintenanceTransaction(engine, tx => tx.refreshPageBody(slug, row.source_id, struck, page.timeline ?? '',
+      contentHash({ ...page, compiled_truth: struck })));
   };
 
   // DB-only path: the withdrawal remains authoritative during reimport.
@@ -170,7 +197,7 @@ export async function forgetFactInFence(
   // holds the same per-page lock the fence writers do (`locked` = the fence
   // tier is calling from inside its own withPageLock).
   const legacyExpire = async (locked = false): Promise<ForgetFactResult> => {
-    const ok = row.expired_at === null; // recordFactWithdrawal already committed the expiry.
+    const ok = row.expired_at === null; // the expiry already committed above.
     if (ok && row.source_markdown_slug !== null) {
       const slug = row.source_markdown_slug;
       await (locked ? strikeDbBody() : withPageLock(slug, strikeDbBody, { timeoutMs: 5_000 }))
@@ -223,7 +250,7 @@ export async function forgetFactInFence(
       // Fence missing the row (DB drifted from markdown) or its markers (race /
       // corruption): fall through to legacy expire so the user's intent
       // succeeds; doctor surfaces the drift separately.
-      const newBody = strikeFenceRow(body, targetRowNum, reason, today);
+      const newBody = strikeFenceRow(body, targetRowNum, strike);
       if (newBody === null) return legacyExpire(true);
 
       // Atomic .tmp + parse-validate + rename.
@@ -242,11 +269,11 @@ export async function forgetFactInFence(
       // This keeps DB query patterns (active facts WHERE expired_at IS NULL)
       // accurate the moment the forget commits, without waiting for the
       // next extract_facts cycle phase to reconcile.
-      await engine.executeRaw(
+      await maintenanceTransaction(engine, tx => tx.executeRaw(
         `UPDATE facts SET valid_until = $1, expired_at = now()
          WHERE id = $2 AND expired_at IS NULL`,
         [today, factId],
-      );
+      ));
 
       // #4696: mirror the rewritten file into the DB body, or the reconcile
       // (which reads pages.compiled_truth) resurrects the claim before the
@@ -263,9 +290,9 @@ export async function forgetFactInFence(
         const reparsed = parseMarkdown(tmpBody, `${slug}.md`);
         const page = await engine.getPage(slug, { sourceId: row.source_id });
         if (page) {
-          await engine.refreshPageBody(slug, row.source_id,
+          await maintenanceTransaction(engine, tx => tx.refreshPageBody(slug, row.source_id,
             sanitizeText(reparsed.compiled_truth), sanitizeText(reparsed.timeline),
-            page.content_hash || contentHash(page));
+            page.content_hash || contentHash(page)));
         }
       } catch { /* degrades to the pre-#4696 window (stale until the next sync) */ }
 

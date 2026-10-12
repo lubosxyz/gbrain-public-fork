@@ -1,9 +1,11 @@
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from '../spawn.ts';
 import { createHash } from 'node:crypto';
 import { existsSync, realpathSync, statSync } from 'node:fs';
-import { GIT_ENV } from '../git-remote.ts';
+import { buildGitEnv } from '../git-remote.ts';
 import { pushStatusPathForRoot, readPushStatusForRoot } from '../workspace-push.ts';
 import { readManifest } from '../bootstrap/format.ts';
+import { managedFilesystemRootFor } from '../persistence/filesystem-guard.ts';
+import { withoutPhysicalRootMetadata } from '../persistence/root-metadata.ts';
 import { BACKUP_VERIFICATION_MAX_AGE_MS, type BackupAssetVerdict } from './status-file.ts';
 
 export const BACKUP_REMOTE_PROBE_CAP = 8;
@@ -12,10 +14,40 @@ export const BACKUP_REMOTE_TIMEOUT_MS = 2_000;
 
 export interface RemoteProbeBudget { remaining: number; deadline?: number }
 
+/**
+ * A remote probe starts only when its full `BACKUP_REMOTE_TIMEOUT_MS` slot is
+ * still inside the sweep deadline. A probe started on the leftover sub-slot
+ * would be killed mid-handshake and record a healthy slow remote as
+ * `unavailable` (#6499); deferring it reports `budget_exhausted` instead.
+ */
+export function budgetAllowsProbe(budget: RemoteProbeBudget, nowMs: number = Date.now()): boolean {
+  if (budget.remaining <= 0) return false;
+  return budget.deadline === undefined || budget.deadline - nowMs >= BACKUP_REMOTE_TIMEOUT_MS;
+}
+
+/** Variables that locate the user's own git config, credentials and network path. */
+export const BACKUP_GIT_ENV_ALLOWLIST = ['HOME', 'PATH', 'XDG_CONFIG_HOME', 'SSH_AUTH_SOCK', 'GIT_CONFIG_GLOBAL',
+  'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy'] as const;
+export const BACKUP_GIT_ENV_WINDOWS_ALLOWLIST = ['USERPROFILE', 'APPDATA', 'SystemRoot'] as const;
+
+/**
+ * The probe env passes only the allowlist, so git reads the user's config and
+ * credential helpers (#5794) but never a repository-redirecting variable such
+ * as GIT_DIR or GIT_WORK_TREE; the no-prompt overrides always win.
+ */
+export function backupGitEnv(source: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of [...BACKUP_GIT_ENV_ALLOWLIST, ...(platform === 'win32' ? BACKUP_GIT_ENV_WINDOWS_ALLOWLIST : [])]) {
+    const value = source[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return { ...env, ...buildGitEnv(platform) };
+}
+
 function git(root: string, args: string[]): string {
   return execFileSync('git', ['-C', root, ...args], {
     encoding: 'utf8', timeout: 2_000, maxBuffer: 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'], env: GIT_ENV,
+    stdio: ['ignore', 'pipe', 'pipe'], env: backupGitEnv(),
   }).trim();
 }
 
@@ -42,29 +74,36 @@ export async function assessBackupRepository(
   const asset: BackupAssetVerdict = { kind, id, state: 'unknown', fix_argv: null, verification: { state: 'not_checked' } };
   try {
     const failedPush = readPushStatusForRoot(root)?.ok === false;
-    if (failedPush && kind === 'bootstrap_workspace') asset.fix_argv = ['gbrain', 'sources', 'push', '--path', root];
+    // #6083: a managed canonical worktree is committed and pushed by its persistence owner; `sources push` refuses there.
+    const managed = managedFilesystemRootFor(root);
+    const managedFix = managed ? ['gbrain', 'sources', 'writer', 'status', ...(managed.sourceId ? [managed.sourceId] : []), '--probe', '--json'] : null;
+    if (failedPush && kind === 'bootstrap_workspace') asset.fix_argv = managedFix ?? ['gbrain', 'sources', 'push', '--path', root];
     let origin: string;
     try {
       origin = git(root, ['remote', 'get-url', 'origin']);
       asset.configured_remote = true;
     } catch (error) {
-      if (failedPush) return { ...asset, state: 'failing', detail: 'last_push_failed' };
-      if ((error as { status?: number }).status !== 2) throw error;
+      if ((error as { status?: number }).status !== 2) {
+        if (failedPush) return { ...asset, state: 'failing', detail: 'last_push_failed' };
+        throw error;
+      }
       asset.configured_remote = false;
       asset.state = 'no_remote';
-      asset.detail = 'fix: git remote add origin <url> && git push -u origin <branch>, then gbrain sources harden <id>';
+      asset.fix_argv = null;
+      asset.detail = `${failedPush ? 'the last recorded push failed because there is no origin remote; ' : ''}fix: git remote add origin <url> && git push -u origin <branch>, then gbrain sources harden <id>`;
       try { if (readManifest(root).state === 'initialized') asset.fix_argv = ['gbrain', 'bootstrap', 'repo']; } catch {}
       return asset;
     }
     const branch = git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
     const head = git(root, ['rev-parse', '--verify', 'HEAD']);
-    const dirty = git(root, ['status', '--porcelain']).length > 0;
+    const dirty = withoutPhysicalRootMetadata(git(root, ['status', '--porcelain'])).length > 0;
     let ahead: number | undefined;
     try { ahead = Number(git(root, ['rev-list', '--count', `refs/remotes/origin/${branch}..HEAD`])); } catch {}
     asset.state = ahead && ahead > 0 ? 'unpushed' : dirty ? 'dirty' : 'ok';
     if (ahead && ahead > 0) { asset.ahead = ahead; asset.detail = `${ahead} commit(s) ahead of origin/${branch} (local tracking ref only)`; }
     else if (dirty) asset.detail = 'uncommitted changes';
     if (failedPush) { asset.state = 'failing'; asset.detail = 'last_push_failed'; }
+    if (managedFix && (dirty || (ahead ?? 0) > 0 || failedPush)) asset.fix_argv = managedFix;
     const fingerprint = repositoryFingerprint(root, origin, branch, head);
     asset.verification = { state: 'not_checked', repository_fingerprint: fingerprint };
     if (!budget) {
@@ -87,8 +126,7 @@ export async function assessBackupRepository(
       return asset;
     }
     budget.deadline ??= Date.now() + BACKUP_REMOTE_BUDGET_MS;
-    const remainingMs = budget.deadline - Date.now();
-    if (budget.remaining <= 0 || remainingMs <= 0) {
+    if (!budgetAllowsProbe(budget)) {
       asset.verification = { state: 'budget_exhausted', repository_fingerprint: fingerprint };
       return asset;
     }
@@ -98,11 +136,13 @@ export async function assessBackupRepository(
       execFile('git', ['-C', root, '-c', 'protocol.allow=never', '-c', 'protocol.file.allow=always',
         '-c', 'protocol.https.allow=always', '-c', 'protocol.http.allow=always', '-c', 'protocol.ssh.allow=always',
         '-c', 'http.followRedirects=false', '-c', 'credential.interactive=false', 'ls-remote', '--exit-code', '--refs', 'origin', ref], {
-        encoding: 'utf8', timeout: Math.min(BACKUP_REMOTE_TIMEOUT_MS, remainingMs), maxBuffer: 64 * 1024,
-        env: { ...GIT_ENV, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '', SSH_ASKPASS: '', SSH_ASKPASS_REQUIRE: 'never', GIT_SSH_COMMAND: 'ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=2' },
+        encoding: 'utf8', timeout: BACKUP_REMOTE_TIMEOUT_MS, maxBuffer: 64 * 1024,
+        env: { ...backupGitEnv(), GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '', SSH_ASKPASS: '', SSH_ASKPASS_REQUIRE: 'never', GIT_SSH_COMMAND: 'ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=2' },
       }, (error, stdout) => error ? reject(error) : resolve(stdout));
-    }).catch(error => {
-      asset.verification = { state: error.code === 2 ? 'missing_ref' : 'unavailable', checked_at: now.toISOString(), repository_fingerprint: fingerprint };
+    }).catch((error: { code?: unknown; killed?: boolean }) => {
+      asset.verification = error.code === 2
+        ? { state: 'missing_ref', checked_at: now.toISOString(), repository_fingerprint: fingerprint }
+        : { state: 'unavailable', cause: error.killed ? 'timeout' : 'exit', checked_at: now.toISOString(), repository_fingerprint: fingerprint };
       return null;
     });
     if (output === null) return asset;
@@ -113,7 +153,7 @@ export async function assessBackupRepository(
     }
     const stillClean = git(root, ['rev-parse', '--verify', 'HEAD']) === head
       && git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']) === branch
-      && git(root, ['status', '--porcelain']).length === 0
+      && withoutPhysicalRootMetadata(git(root, ['status', '--porcelain'])).length === 0
       && git(root, ['remote', 'get-url', 'origin']) === origin
       && repositoryFingerprint(root, origin, branch, head) === fingerprint;
     asset.verification = { state: remoteHead === head && stillClean && !dirty ? 'verified' : 'mismatch', checked_at: now.toISOString(), local_commit: head, remote_commit: remoteHead, repository_fingerprint: fingerprint };

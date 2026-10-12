@@ -37,17 +37,26 @@
  * phase can run hermetically in unit tests without touching the gateway.
  */
 
+import { observationDateLine, observationDateRule, resolveObservationDate, type ObservationDate } from '../ai/date-grounding.ts';
+import { isConsumerDateGroundingOn } from '../facts/extract.ts';
 import { randomUUID, createHash } from 'node:crypto';
 import { BaseCyclePhase, CYCLE_DEADLINE_RESERVE_MS, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { defaultTimeoutMsFor } from '../minions/handler-timeouts.ts';
+import {
+  PROPOSE_TAKES_CALL_TIMEOUT_KEY, PROPOSE_TAKES_CALL_TIMEOUT_MAX_MS, PROPOSE_TAKES_CALL_TIMEOUT_MIN_MS, readPhaseConfigNumber,
+} from './phase-config-values.ts';
 import { chat as gatewayChat, getChatModel, probeChatModel } from '../ai/gateway.ts';
 import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
-import { upsertExtractRollup, classifyRunStop } from '../extract/rollup-writer.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { upsertExtractRollup, classifyRunStop, providerHaltReason } from '../extract/rollup-writer.ts';
 import { GBrainError } from '../types.ts';
 import { isConfigTruthy } from '../config.ts';
+import { matchingCloseBracket } from '../llm-json.ts';
 import { TAKE_KIND_VALUES } from '../takes-fence.ts';
+import { attributionChecksEnabled } from './attribution-checks.ts';
+import { downgradeAssistantOnlyHolders } from './propose-takes-attribution.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
@@ -155,6 +164,25 @@ export interface ProposedTake {
   served_model?: string;
 }
 
+/**
+ * #5425 (opt-in, `dream.propose_takes.attribution_rules=true`): speaker and
+ * withdrawal rules for conversation pages, proposed by @clatyceo. Off by
+ * default: a matched cat15-corpus run (Sonnet 4.6, 9 labeled pages x 3)
+ * measured F1 0.896 → 0.876 (recall 0.924 → 0.882) with no attribution error
+ * in either arm to fix. A separate prompt version keeps the two caches apart.
+ */
+export const EXTRACT_TAKES_ATTRIBUTION_RULES = `NOT gradeable either:
+- Claims later withdrawn, corrected, or narrowed in the same page; omit them,
+  or express only the final narrowed scope if it remains gradeable
+
+Attribution: an assistant-authored gradeable judgment may use holder 'brain';
+do not attribute it to the user or another person/company unless that speaker
+explicitly endorses it. Assistant-added plans or deadlines are not user
+commitments by default.
+
+`;
+export const PROPOSE_TAKES_ATTRIBUTION_PROMPT_SUFFIX = '+attribution5425';
+
 /** Extractor function signature — injected for tests; production calls gateway. */
 export type ProposeTakesExtractor = (input: {
   pagePath: string;
@@ -172,6 +200,21 @@ export type ProposeTakesExtractor = (input: {
   /** #4494: escalated cap for the one truncation retry (default
    *  PROPOSE_TAKES_RETRY_MAX_TOKENS; clamped to >= maxTokens). */
   retryMaxTokens?: number;
+  /** #5958: operator-set bound (ms) for each extractor call, base and retry
+   *  alike. The phase reads dream.propose_takes.call_timeout_ms and caps it
+   *  by the phase time left. Absent: extractorCallTimeoutMs(maxTokens). */
+  callBoundMs?: number;
+  /** #5425: include EXTRACT_TAKES_ATTRIBUTION_RULES (opt-in). */
+  attributionRules?: boolean;
+  /**
+   * extraction.date_grounding: resolve relative deadlines ("by Q3", "in 18
+   * months") against the page's observation date. Prompt-only; the
+   * idempotency key (prompt_version) is unchanged so enabling it never
+   * reprocesses pages.
+   */
+  dateGrounding?: boolean;
+  /** The page's observation date (date-grounding.ts), null when undated. */
+  observationDate?: ObservationDate | null;
 }) => Promise<ProposedTake[]>;
 
 export interface ProposeTakesOpts extends BasePhaseOpts {
@@ -251,10 +294,17 @@ async function listCandidatePages(
   engine: BrainEngine,
   scope: ScopedReadOpts,
   limit: number,
+  types: string[] | null = null,
 ): Promise<ProposeTakesPageRow[]> {
   const where = [
     'deleted_at IS NULL',
     "type IS DISTINCT FROM 'extract_receipt'",
+    // #5211: an atom is a fragment of a page that is itself a candidate; a legacy atom carries no writer stamp.
+    "type IS DISTINCT FROM 'atom'",
+    // #5212: never propose takes from the dream cycle's own output.
+    "COALESCE(frontmatter->>'dream_generated', '') <> 'true'",
+    "COALESCE(frontmatter->>'extracted_by', '') NOT LIKE 'extract_atoms%'",
+    "COALESCE(frontmatter->>'synthesized_by', '') NOT LIKE 'synthesize_concepts%'",
   ];
   const params: unknown[] = [];
   if (scope.sourceIds && scope.sourceIds.length > 0) {
@@ -263,6 +313,11 @@ async function listCandidatePages(
   } else if (scope.sourceId) {
     params.push(scope.sourceId);
     where.push(`source_id = $${params.length}`);
+  }
+  // #5213: `cycle.propose_takes.types` narrows candidates to listed page types.
+  if (types) {
+    params.push(types);
+    where.push(`type = ANY($${params.length}::text[])`);
   }
   params.push(limit);
   return engine.executeRaw<ProposeTakesPageRow>(
@@ -273,6 +328,30 @@ async function listCandidatePages(
       LIMIT $${params.length}`,
     params,
   );
+}
+
+export const PROPOSE_TAKES_TYPES_KEY = 'cycle.propose_takes.types';
+
+/**
+ * #5213: the page types propose_takes may scan, from `cycle.propose_takes.types`
+ * (a JSON array of type names, the `cycle.enrich_thin.types` shape). Unset,
+ * empty, unreadable or malformed means every type stays a candidate; a
+ * malformed value also prints one stderr line so a typo is visible.
+ */
+export async function proposeTakesTypes(engine: BrainEngine): Promise<string[] | null> {
+  const raw = await engine.getConfig?.(PROPOSE_TAKES_TYPES_KEY).catch(() => null) ?? null;
+  if (raw == null || raw.trim() === '') return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      const types = parsed.filter((t): t is string => typeof t === 'string' && t.trim().length > 0).map(t => t.trim());
+      if (types.length > 0) return types;
+    }
+  } catch {
+    // reported below
+  }
+  process.stderr.write(`[propose_takes] ignoring ${PROPOSE_TAKES_TYPES_KEY}: expected a JSON array of page types, e.g. gbrain config set ${PROPOSE_TAKES_TYPES_KEY} '["meeting","note"]'\n`);
+  return null;
 }
 
 /**
@@ -329,8 +408,11 @@ export function extractExistingTakesForDedup(pageBody: string): Array<{
   return rows;
 }
 
-/** Per-call wall-clock timeout for the extractor LLM call. */
+/** Per-call wall-clock timeout for the extractor LLM call at the base cap. */
 const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
+/** Ceiling for the scaled timeout: the gateway's own chat default
+ *  (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) bounds the call regardless. */
+const EXTRACTOR_CALL_TIMEOUT_MAX_MS = 300_000;
 
 /**
  * #3763 — output caps for the extractor call. A stopReason 'length' response
@@ -350,6 +432,30 @@ const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
  */
 export const PROPOSE_TAKES_MAX_TOKENS = 2048;
 export const PROPOSE_TAKES_RETRY_MAX_TOKENS = 4096;
+
+/**
+ * Wall-clock timeout for one extractor call, scaled with its output cap
+ * (#5771). A flat 90s sized for the 2048-token base call starved the
+ * truncation retry: at a configured retry_max_tokens of 12000 a dense page's
+ * retry needs well over 90s to generate, so it timed out every cycle and the
+ * page was re-billed (base call + aborted retry) forever with no tombstone.
+ * 90s per PROPOSE_TAKES_MAX_TOKENS of output, floored at 90s, capped at
+ * EXTRACTOR_CALL_TIMEOUT_MAX_MS.
+ */
+function extractorCallTimeoutMs(maxTokens: number): number {
+  const scaled = Math.ceil((EXTRACTOR_CALL_TIMEOUT_MS * maxTokens) / PROPOSE_TAKES_MAX_TOKENS);
+  return Math.min(EXTRACTOR_CALL_TIMEOUT_MAX_MS, Math.max(EXTRACTOR_CALL_TIMEOUT_MS, scaled));
+}
+
+/**
+ * #5958: the configured per-call bound, held to the phase time left so it
+ * never outlasts the phase deadline (never below the default 90s floor, which
+ * the unconfigured path already allows). Unset: no override.
+ */
+function phaseBoundedCallTimeout(configuredMs: number | undefined, phaseRemainingMs: number): { callBoundMs?: number } {
+  if (configuredMs === undefined) return {};
+  return { callBoundMs: Math.min(configuredMs, Math.max(EXTRACTOR_CALL_TIMEOUT_MS, phaseRemainingMs)) };
+}
 
 /**
  * #3763 — halt streak for a dead extractor lane. When EVERY extractor call in
@@ -372,11 +478,22 @@ export const EXTRACTOR_FAILURE_HALT_STREAK = 5;
  * then, the production extractor returns whatever the stub LLM produces —
  * empirically often a sparse list or [].
  */
+/** Prompt flags read once per phase run: #5425 attribution rules and extraction.date_grounding. */
+async function takesPromptFlags(engine: BrainEngine): Promise<{ attributionRules: boolean; dateGrounding: boolean }> {
+  const attributionRules = String(await Promise.resolve(engine.getConfig?.('dream.propose_takes.attribution_rules')).catch(() => null) ?? '').trim() === 'true';
+  return { attributionRules, dateGrounding: await isConsumerDateGroundingOn(engine, 'takes') };
+}
+
 export async function defaultExtractor(
   input: Parameters<ProposeTakesExtractor>[0],
 ): Promise<ProposedTake[]> {
-  const prompt = EXTRACT_TAKES_PROMPT
+  const prompt = (input.attributionRules
+    ? EXTRACT_TAKES_PROMPT.replace('For each gradeable claim,', `${EXTRACT_TAKES_ATTRIBUTION_RULES}For each gradeable claim,`)
+    : EXTRACT_TAKES_PROMPT)
     .replace('{EXISTING_TAKES_JSON}', JSON.stringify(input.existingTakes, null, 2))
+    .replace('PAGE PROSE:\n', input.dateGrounding
+      ? `${observationDateRule()}\n${observationDateLine(input.observationDate ?? resolveObservationDate({ slug: input.pagePath }))}\n\nPAGE PROSE:\n`
+      : 'PAGE PROSE:\n')
     .replace('{PAGE_BODY}', input.pageBody);
 
   // #4494: per-run configurable caps (dream.propose_takes.max_tokens /
@@ -392,12 +509,33 @@ export async function defaultExtractor(
   // Bound each call so one stalled provider socket can't pin the phase for the
   // full gateway default (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) x pageLimit. The
   // caller already catches per-page errors, logs a warning, and continues.
-  const call = (maxTokens: number) => gatewayChat({
-    messages: [{ role: 'user', content: prompt }],
-    ...(input.modelHint ? { model: input.modelHint } : {}),
-    maxTokens,
-    abortSignal: AbortSignal.timeout(EXTRACTOR_CALL_TIMEOUT_MS),
-  });
+  // The bound scales with maxTokens so an escalated or configured larger cap
+  // gets time to generate what it allows. An operator bound (callBoundMs)
+  // takes its place for every call: claude-cli never reports a truncation,
+  // so on that route the retry and its longer scaled bound never happen.
+  const call = (maxTokens: number) => {
+    const boundMs = input.callBoundMs ?? extractorCallTimeoutMs(maxTokens);
+    const ownBound = AbortSignal.timeout(boundMs);
+    return gatewayChat({
+      messages: [{ role: 'user', content: prompt }],
+      ...(input.modelHint ? { model: input.modelHint } : {}),
+      maxTokens,
+      abortSignal: ownBound,
+    }).catch((err: unknown) => {
+      // Reword only what our own bound stopped; any other failure, including
+      // the gateway's shorter chat timeout, keeps its error untouched. The
+      // provider's abort text alone names neither the bound nor the key.
+      if (!ownBound.aborted) throw err;
+      const providerText = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `propose_takes extractor: ${input.pagePath} timed out after ${boundMs} ms, the per-call bound ` +
+        `(${providerText}). To move it, set ${PROPOSE_TAKES_CALL_TIMEOUT_KEY} to whole ms from ` +
+        `${PROPOSE_TAKES_CALL_TIMEOUT_MIN_MS} to ${PROPOSE_TAKES_CALL_TIMEOUT_MAX_MS}. ` +
+        `No tombstone was written; the page is retried next cycle.`,
+        { cause: err },
+      );
+    });
+  };
   let result = await call(baseMaxTokens);
 
   // #3763: a truncated response (stopReason 'length' — e.g. reasoning tokens
@@ -508,19 +646,13 @@ export function parseExtractorOutput(raw: string): ProposedTake[] {
   try {
     parsed = JSON.parse(text.slice(start));
   } catch {
-    // Fallback: truncate at last ] or } to handle trailing noise (e.g. leftover
-    // markdown fences after <think> stripping). Try array-closing first.
-    const sliced = text.slice(start);
-    const lastArr = sliced.lastIndexOf(']');
-    const lastObj = sliced.lastIndexOf('}');
-    const end = Math.max(lastArr, lastObj);
-    if (end > 0) {
-      try {
-        parsed = JSON.parse(sliced.slice(0, end + 1));
-      } catch {
-        return [];
-      }
-    } else {
+    // Trailing noise (a leftover fence, a `[Source: X]` citation): parse only
+    // up to the value's own closing bracket, never the last bracket in the text.
+    const end = matchingCloseBracket(text, start);
+    if (end === -1) return [];
+    try {
+      parsed = JSON.parse(text.slice(start, end + 1));
+    } catch {
       return [];
     }
   }
@@ -658,7 +790,8 @@ class ProposeTakesPhase extends BaseCyclePhase {
     }
 
     const extractor = opts.extractor ?? defaultExtractor;
-    const promptVersion = opts.promptVersion ?? PROPOSE_TAKES_PROMPT_VERSION;
+    const [{ attributionRules, dateGrounding }, attributionChecks] = await Promise.all([takesPromptFlags(engine), attributionChecksEnabled(engine)]);
+    const promptVersion = opts.promptVersion ?? `${PROPOSE_TAKES_PROMPT_VERSION}${attributionRules ? PROPOSE_TAKES_ATTRIBUTION_PROMPT_SUFFIX : ''}`;
     const pageLimit = opts.pageLimit ?? 100;
     const skipPagesWithFence = opts.skipPagesWithFence ?? false;
     // gbrain#4168: explicit test override wins; otherwise the REAL remaining
@@ -696,6 +829,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
       if (retryCap != null) extractorRetryMaxTokens = Math.floor(retryCap);
     } catch { /* keep defaults */ }
     extractorRetryMaxTokens = Math.max(extractorMaxTokens, extractorRetryMaxTokens);
+    const callTimeout = await readPhaseConfigNumber(engine, PROPOSE_TAKES_CALL_TIMEOUT_KEY); // #5874
 
     // With the default (gateway) extractor, skip cheaply when the resolved
     // model's provider can't run — same probe semantics as patterns.ts /
@@ -765,7 +899,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
       budget_exhausted: false,
       llm_calls_succeeded: 0,
       llm_calls_failed: 0,
-      warnings: [],
+      warnings: callTimeout.warning ? [callTimeout.warning] : [],
       deadline_hit: false,
     };
 
@@ -782,8 +916,8 @@ class ProposeTakesPhase extends BaseCyclePhase {
       };
     }
 
-    // Load pages eligible for proposal. Source-scoped per BaseCyclePhase.
-    const pages = await listCandidatePages(engine, scope, pageLimit);
+    // Load pages eligible for proposal. Source-scoped per BaseCyclePhase; #5213 types narrow it.
+    const pages = await listCandidatePages(engine, scope, pageLimit, await proposeTakesTypes(engine));
 
     if (opts.reporter) {
       opts.reporter.start('propose_takes.pages' as never, pages.length);
@@ -863,6 +997,8 @@ class ProposeTakesPhase extends BaseCyclePhase {
           // #4494: configurable output caps (see resolution above).
           maxTokens: extractorMaxTokens,
           retryMaxTokens: extractorRetryMaxTokens,
+          ...phaseBoundedCallTimeout(callTimeout.value, deadlineMs - (Date.now() - phaseStartMs)),
+          attributionRules, dateGrounding,
         });
       } catch (err) {
         result.llm_calls_failed += 1;
@@ -898,6 +1034,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
       }
       result.llm_calls_succeeded += 1;
       llmHalt.reset();
+      if (attributionChecks) proposals = downgradeAssistantOnlyHolders(proposals, body);
 
       // Write proposals to take_proposals. #2138: the idempotency key is
       // per-CLAIM — take_proposals_idempotency_idx folds md5(claim_text) into
@@ -973,7 +1110,9 @@ class ProposeTakesPhase extends BaseCyclePhase {
     // v0.42 Wave B3: receipt + rollup for propose_takes. Source-scoped
     // via the read scope. Receipt only when proposals actually written.
     const sourceIdForReceipt = scope.sourceId ?? 'default';
-    if (result.proposals_inserted > 0) {
+    // Managed brains skip the receipt page (a legacy putPage the coordinator
+    // refuses), like extract_atoms and synthesize_concepts; the rollup stays.
+    if (result.proposals_inserted > 0 && !await managedPersistenceEnabled(engine)) {
       try {
         await writeReceipt(engine, {
           kind: 'takes.proposed',
@@ -1011,8 +1150,8 @@ class ProposeTakesPhase extends BaseCyclePhase {
         budget_exhausted: result.budget_exhausted === true,
         deadline_hit: result.deadline_hit === true,
         error:
-          result.aborted_global_error !== undefined ||
-          result.aborted_failure_streak === true,
+          result.aborted_global_error !== undefined ? providerHaltReason(result.aborted_global_error) ?? 'item_error'
+            : result.aborted_failure_streak === true ? 'item_error' : false,
       }),
     });
 

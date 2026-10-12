@@ -22,6 +22,7 @@ import { CredentialError } from '../creds/errors.ts';
 import type { GoogleAccessProvider } from './access.ts';
 import { apiEnableLink } from '../creds/providers/google.ts';
 import { parseRetryAfterMs } from '../github-source.ts';
+import { readBoundedHttpBody } from '../guarded-http.ts';
 import {
   bareAddress,
   DEFAULT_CALENDAR_ID,
@@ -32,6 +33,8 @@ import {
   type GmailThreadData,
 } from './types.ts';
 import { htmlToText, trimQuotedReply } from './google-render.ts';
+import { truncateUtf8 } from '../text-safe.ts';
+import { GMAIL_MIME_LIMITS, gmailPartHeader, inspectGmailAttachments, walkGmailMime, type GmailMimePart } from './attachment-receipts.ts';
 
 export type FetchImpl = (url: string, init?: RequestInit) => Promise<Response>;
 
@@ -75,6 +78,7 @@ interface GoogleErrorBody {
     status?: string;
     message?: string;
     errors?: Array<{ reason?: string }>;
+    details?: Array<{ '@type'?: string; reason?: string }>;
   };
 }
 
@@ -93,7 +97,7 @@ export class GoogleApiClient {
   async fetchJSON<T>(
     url: string,
     apiHint: ApiHint,
-    opts: { signal?: AbortSignal; retries?: number; rateLimitRetries?: number } = {},
+    opts: { signal?: AbortSignal; retries?: number; rateLimitRetries?: number; maxResponseBytes?: number } = {},
   ): Promise<T> {
     const retries = opts.retries ?? DEFAULT_RETRIES;
     // Rate-limit-class failures get their OWN (larger) retry budget — see
@@ -108,14 +112,18 @@ export class GoogleApiClient {
         headers: { authorization: `Bearer ${token}` },
         ...(opts.signal ? { signal: opts.signal } : {}),
       });
-      if (res.ok) return (await res.json()) as T;
+      const readJSON = () => opts.maxResponseBytes
+        ? readBoundedHttpBody(new Response(res.body), opts.maxResponseBytes, opts.signal ?? new AbortController().signal)
+          .then(bytes => JSON.parse(bytes.toString('utf8')))
+        : res.json();
+      if (res.ok) return (await readJSON()) as T;
 
       if (res.status === 401 && attempt < retries) {
         this.log('[google] HTTP 401; refreshing access token');
         await this.tokens.forceRefresh();
         continue;
       }
-      const body = (await res.json().catch(() => ({}))) as GoogleErrorBody;
+      const body = (await readJSON().catch(() => ({}))) as GoogleErrorBody;
       if (res.status === 403) {
         const reason = body.error?.errors?.[0]?.reason ?? '';
         const msg = body.error?.message ?? '';
@@ -146,6 +154,14 @@ export class GoogleApiClient {
       // 404 / 410 surface to callers — cursor-expiry handling is theirs.
       if (res.status === 404 || res.status === 410) {
         throw new GoogleCursorExpiredError(res.status, url);
+      }
+      if (res.status === 400 && apiHint === 'people' && new URL(url).searchParams.get('syncToken')) {
+        const details = body.error?.details;
+        const expired = (Array.isArray(details) && details.some(detail =>
+          detail?.['@type'] === 'type.googleapis.com/google.rpc.ErrorInfo' && detail.reason === 'EXPIRED_SYNC_TOKEN',
+        )) || /^Sync token (?:is )?expired\b/i.test(body.error?.message ?? '');
+        if (expired) throw new GoogleCursorExpiredError(res.status, url);
+        throw new GoogleSyncTokenRejectedError(url, body.error?.message ?? 'no detail');
       }
       throw new CredentialError('upstream', `: HTTP ${res.status} on ${apiHint} (${body.error?.message ?? 'no detail'})`);
     }
@@ -192,23 +208,26 @@ export class GoogleCursorExpiredError extends Error {
   }
 }
 
+/**
+ * #6324: People answered a syncToken request with a 400 that is NOT the typed
+ * expiry. The People API requires every other parameter of an incremental
+ * request to match the call that minted the token, so a token minted under a
+ * different `personFields` lands here. Still an upstream `CredentialError`
+ * for every caller that does not own a contacts cursor; the contacts sweep
+ * treats it as cursor-invalid and re-lists once.
+ */
+export class GoogleSyncTokenRejectedError extends CredentialError {
+  constructor(url: string, detail: string) {
+    super('upstream', `: HTTP 400 on people (${detail})`);
+    this.name = 'GoogleSyncTokenRejectedError';
+    this.url = url;
+  }
+  readonly url: string;
+}
+
 // ── Gmail ────────────────────────────────────────────────────────────────────
 
-interface RawGmailHeader {
-  name: string;
-  value: string;
-}
-
-interface RawGmailPart {
-  /** BARE media type ('text/calendar') — Gmail strips the Content-Type
-   *  parameters from this field; they live on `headers[]` (format=full). */
-  mimeType?: string;
-  filename?: string;
-  /** Per-part MIME headers (Content-Type with its params, Content-Disposition, …). */
-  headers?: RawGmailHeader[];
-  body?: { data?: string; size?: number };
-  parts?: RawGmailPart[];
-}
+type RawGmailPart = GmailMimePart;
 
 interface RawGmailMessage {
   id: string;
@@ -225,12 +244,22 @@ interface RawGmailThread {
 }
 
 function partHeader(part: RawGmailPart | undefined, name: string): string {
-  const h = part?.headers?.find((x) => x.name.toLowerCase() === name.toLowerCase());
-  return h?.value ?? '';
+  return gmailPartHeader(part, name);
 }
 
 function header(msg: RawGmailMessage, name: string): string {
   return partHeader(msg.payload, name);
+}
+
+/**
+ * RFC 3834 `Auto-Submitted`: any keyword other than `no` (`auto-generated`,
+ * `auto-replied`, `auto-notified`, extensions) marks machine mail, matched
+ * case-insensitively with parameters and comments ignored. An absent or empty
+ * header is human mail.
+ */
+function isAutoSubmittedHeader(value: string): boolean {
+  const keyword = value.replace(/\([^)]*\)/g, ' ').split(';')[0]!.trim().toLowerCase();
+  return keyword !== '' && keyword !== 'no';
 }
 
 /** iCalendar METHOD parameter of a Content-Type value (quoted or bare). */
@@ -247,21 +276,24 @@ function decodeB64Url(data: string): string {
 /** MIME walk: prefer text/plain, fall back to text/html (caller strips). */
 export function extractBody(part: RawGmailPart | undefined): { text: string; isHtml: boolean } {
   if (!part) return { text: '', isHtml: false };
-  const stack: RawGmailPart[] = [part];
   let html: string | null = null;
-  while (stack.length > 0) {
-    const p = stack.shift()!;
+  const attachmentPaths: string[] = [];
+  for (const { part: p, path } of walkGmailMime(part).parts) {
+    if (attachmentPaths.some(parent => path.startsWith(`${parent}.`))) continue;
+    if (p.filename || p.mimeType === 'message/rfc822' || /^attachment\b/i.test(partHeader(p, 'Content-Disposition'))) {
+      attachmentPaths.push(path);
+      continue;
+    }
     if (p.mimeType === 'text/plain' && p.body?.data) {
       return { text: decodeB64Url(p.body.data), isHtml: false };
     }
     if (p.mimeType === 'text/html' && p.body?.data && html === null) {
       html = decodeB64Url(p.body.data);
     }
-    if (p.parts) stack.push(...p.parts);
   }
   if (html !== null) return { text: html, isHtml: true };
   // Single-part messages sometimes carry data at the top level with no mimeType match.
-  if (part.body?.data) return { text: decodeB64Url(part.body.data), isHtml: false };
+  if (!part.mimeType && !part.filename && part.body?.data) return { text: decodeB64Url(part.body.data), isHtml: false };
   return { text: '', isHtml: false };
 }
 
@@ -282,10 +314,8 @@ export function extractBody(part: RawGmailPart | undefined): { text: string; isH
  */
 export function extractCalendarMethod(part: RawGmailPart | undefined): string | null {
   if (!part) return null;
-  const stack: RawGmailPart[] = [part];
-  while (stack.length > 0) {
-    const p = stack.shift()!;
-    const mime = (p.mimeType ?? '').toLowerCase();
+  for (const { part: p } of walkGmailMime(part).parts) {
+    const mime = typeof p.mimeType === 'string' ? p.mimeType.toLowerCase() : '';
     if (mime.startsWith('text/calendar') || mime === 'application/ics') {
       // Gmail's MessagePart.mimeType is the BARE media type; the `method=`
       // parameter lives in the part's own Content-Type header (format=full
@@ -303,7 +333,6 @@ export function extractCalendarMethod(part: RawGmailPart | undefined): string | 
     // mail, and short-circuiting '' here used to suppress the whole message
     // from loop detection. Keep scanning — a real text/calendar part
     // elsewhere in the tree still wins.
-    if (p.parts) stack.push(...p.parts);
   }
   return null;
 }
@@ -311,6 +340,12 @@ export function extractCalendarMethod(part: RawGmailPart | undefined): string | 
 export class GmailClient extends GoogleApiClient {
   async getProfile(opts: { signal?: AbortSignal } = {}): Promise<{ emailAddress: string; historyId: string }> {
     return this.fetchJSON(`${GMAIL_BASE}/users/me/profile`, 'gmail', opts);
+  }
+
+  /** The account's labels (system and user), for resolving `g_loops_exclude_labels` names to ids once per sweep (#5445). */
+  async getLabels(opts: { signal?: AbortSignal } = {}): Promise<Array<{ id: string; name: string; type: string }>> {
+    const body = await this.fetchJSON<{ labels?: Array<{ id?: string; name?: string; type?: string }> }>(`${GMAIL_BASE}/users/me/labels`, 'gmail', opts);
+    return (body.labels ?? []).flatMap((l) => typeof l.id === 'string' && typeof l.name === 'string' ? [{ id: l.id, name: l.name, type: l.type ?? 'user' }] : []);
   }
 
   /** Message ids matching a Gmail search query (includes SENT; excludes SPAM/TRASH). */
@@ -334,61 +369,102 @@ export class GmailClient extends GoogleApiClient {
    * Thread ids touched since the stored historyId. Throws
    * GoogleCursorExpiredError(404) when the cursor is too old (~1 week).
    * Returns the new historyId to store after a successful drain.
+   *
+   * #5581 (fix wave 4): with `maxThreads`, the listing stops before the
+   * history record that would exceed it and returns `truncated: true` with
+   * `newHistoryId` set to the last record fully included, so the caller can
+   * bank that far and resume from there without dropping any change. A
+   * record without an id cannot be bounded safely, so the listing then
+   * drains everything.
    */
   async listHistoryThreadIds(
     startHistoryId: string,
-    opts: { signal?: AbortSignal } = {},
-  ): Promise<{ threadIds: string[]; newHistoryId: string | null }> {
+    opts: { signal?: AbortSignal; maxThreads?: number } = {},
+  ): Promise<{ threadIds: string[]; newHistoryId: string | null; truncated: boolean; versions: Map<string, string> }> {
     const threadIds = new Set<string>();
+    // The latest history record touching each thread: its upstream version for the item holds.
+    const versions = new Map<string, string>();
     let newHistoryId: string | null = null;
+    let lastRecordId: string | null = null;
+    let truncated = false;
     await this.drainPages(
       (t) =>
         `${GMAIL_BASE}/users/me/history?startHistoryId=${encodeURIComponent(startHistoryId)}&maxResults=100${t ? `&pageToken=${encodeURIComponent(t)}` : ''}`,
       (body) => {
-        if (typeof body.historyId === 'string') newHistoryId = body.historyId;
         const records = (body.history as Array<Record<string, unknown>> | undefined) ?? [];
         for (const rec of records) {
+          const touched = new Set<string>();
           for (const key of ['messages', 'messagesAdded', 'messagesDeleted', 'labelsAdded', 'labelsRemoved']) {
             const arr = rec[key] as Array<{ threadId?: string; message?: { threadId?: string } }> | undefined;
             for (const m of arr ?? []) {
               const tid = m.threadId ?? m.message?.threadId;
-              if (tid) threadIds.add(tid);
+              if (tid) touched.add(tid);
             }
           }
+          const fresh = [...touched].filter((tid) => !threadIds.has(tid));
+          const recordId = typeof rec.id === 'string' ? rec.id : null;
+          if (opts.maxThreads !== undefined && lastRecordId && recordId && threadIds.size + fresh.length > opts.maxThreads) {
+            truncated = true;
+            return { items: [], nextPageToken: null };
+          }
+          for (const tid of fresh) threadIds.add(tid);
+          if (recordId) {
+            lastRecordId = recordId;
+            for (const tid of touched) versions.set(tid, recordId);
+          }
         }
+        if (typeof body.historyId === 'string') newHistoryId = body.historyId;
         return { items: [], nextPageToken: (body.nextPageToken as string | undefined) ?? null };
       },
       'gmail',
       opts,
     );
-    return { threadIds: [...threadIds], newHistoryId };
+    return { threadIds: [...threadIds], newHistoryId: truncated ? lastRecordId : newHistoryId, truncated, versions };
   }
 
   async getThread(
     threadId: string,
     account: string,
-    opts: { signal?: AbortSignal; bodyCapChars?: number } = {},
+    opts: { signal?: AbortSignal; bodyCapChars?: number; metadataOnly?: boolean } = {},
   ): Promise<GmailThreadData> {
+    let fields = '';
+    if (opts.metadataOnly) {
+      let payload = 'partId,mimeType';
+      for (let depth = GMAIL_MIME_LIMITS.depth; depth >= 0; depth--) {
+        payload = `partId,mimeType,filename,headers(name,value),body(attachmentId,size),parts(${payload})`;
+      }
+      fields = `&fields=${encodeURIComponent(`id,messages(id,internalDate,labelIds,payload(${payload}))`)}`;
+    }
     const raw = await this.fetchJSON<RawGmailThread>(
-      `${GMAIL_BASE}/users/me/threads/${encodeURIComponent(threadId)}?format=full`,
+      `${GMAIL_BASE}/users/me/threads/${encodeURIComponent(threadId)}?format=full${fields}`,
       'gmail',
-      opts,
+      opts.metadataOnly ? { ...opts, maxResponseBytes: 2 * 1024 * 1024 } : opts,
     );
     const cap = opts.bodyCapChars ?? 8_000;
-    const messages: GmailMessageMeta[] = (raw.messages ?? []).map((m) => {
+    if (opts.metadataOnly && (typeof raw.id !== 'string' || !raw.id || !Array.isArray(raw.messages) || !raw.messages.length ||
+      raw.messages.some(m => !m || typeof m.id !== 'string' || !/^[A-Za-z0-9]{1,128}$/.test(m.id)) ||
+      new Set(raw.messages.map(m => m.id)).size !== raw.messages.length)) {
+      throw new Error('Gmail returned malformed thread identities; historical metadata was preserved.');
+    }
+    const normalizedThreadId = typeof raw.id === 'string' && raw.id ? raw.id : threadId;
+    let receiptBudget: number = GMAIL_MIME_LIMITS.receiptBytes;
+    const messages: GmailMessageMeta[] = (raw.messages ?? []).map((m, index) => {
+      const messageId = typeof m.id === 'string' && m.id ? m.id : `missing:${threadId}:${index}`;
       const fromRaw = header(m, 'From');
-      const { text: rawText, isHtml } = extractBody(m.payload);
+      const { text: rawText, isHtml } = opts.metadataOnly ? { text: '', isHtml: false } : extractBody(m.payload);
       // Pre-truncate before conversion: only the first `cap` output chars
       // survive, so a multi-hundred-KB marketing email must not pay ~15
       // full-body regex passes in htmlToText inside the per-thread hot loop.
-      const text = rawText.length > cap * 16 ? rawText.slice(0, cap * 16) : rawText;
+      const text = truncateUtf8(rawText, cap * 16);
       let bodyText = isHtml ? htmlToText(text) : text;
       bodyText = trimQuotedReply(bodyText);
-      if (bodyText.length > cap) bodyText = bodyText.slice(0, cap) + '\n[truncated]';
+      if (bodyText.length > cap) bodyText = truncateUtf8(bodyText, cap) + '\n[truncated]';
       const internalDateMs = Number(m.internalDate ?? 0);
+      const attachmentInspection = inspectGmailAttachments(m.payload, account, messageId, receiptBudget);
+      receiptBudget -= Buffer.byteLength(JSON.stringify(attachmentInspection));
       return {
-        id: m.id,
-        threadId: raw.id,
+        id: messageId,
+        threadId: normalizedThreadId,
         from: fromRaw,
         fromAddress: bareAddress(fromRaw),
         to: splitAddressList(header(m, 'To')),
@@ -398,12 +474,14 @@ export class GmailClient extends GoogleApiClient {
         internalDateMs,
         labelIds: m.labelIds ?? [],
         listUnsubscribe: header(m, 'List-Unsubscribe') !== '',
+        autoSubmitted: isAutoSubmittedHeader(header(m, 'Auto-Submitted')),
         calendarMethod: extractCalendarMethod(m.payload),
         bodyText,
+        attachmentInspection,
       };
     });
     messages.sort((a, b) => a.internalDateMs - b.internalDateMs);
-    return { threadId: raw.id, account, messages };
+    return { threadId: normalizedThreadId, account, messages };
   }
 }
 
@@ -530,9 +608,34 @@ interface RawPerson {
   resourceName: string;
   names?: Array<{ displayName?: string; metadata?: { primary?: boolean } }>;
   emailAddresses?: Array<{ value?: string }>;
+  phoneNumbers?: Array<{ value?: string; canonicalForm?: string }>;
   organizations?: Array<{ name?: string; title?: string; metadata?: { primary?: boolean } }>;
+  memberships?: Array<{ contactGroupMembership?: { contactGroupResourceName?: string } }>;
   metadata?: { deleted?: boolean };
 }
+
+interface RawContactGroup {
+  resourceName?: string;
+  name?: string;
+  formattedName?: string;
+  groupType?: string;
+}
+
+/**
+ * #6324: the People field mask every contacts request carries. A syncToken is
+ * only valid for requests with the parameters that minted it, so the sweep
+ * records this string next to the token (`contacts_person_fields`) and
+ * re-lists when it changes. Change it here and nowhere else.
+ */
+export const CONTACT_PERSON_FIELDS = 'names,emailAddresses,organizations,phoneNumbers,memberships';
+
+/** Google's built-in groups (`contactGroups/myContacts`, `starred`, …) say nothing a page should carry. */
+const SYSTEM_CONTACT_GROUPS = new Set(
+  ['all', 'myContacts', 'starred', 'blocked', 'chatBuddies', 'friends', 'family', 'coworkers'].map((id) => `contactGroups/${id}`),
+);
+
+/** Bounded directory walk: 1000 groups a page, ten pages; past that the result is explicitly incomplete. */
+const CONTACT_GROUP_PAGES = 10;
 
 export class PeopleClient extends GoogleApiClient {
   /** Incremental with syncToken; full otherwise. 410 → GoogleCursorExpiredError. */
@@ -544,7 +647,7 @@ export class PeopleClient extends GoogleApiClient {
     const raw = await this.drainPages<RawPerson>(
       (t) => {
         const params = new URLSearchParams({
-          personFields: 'names,emailAddresses,organizations',
+          personFields: CONTACT_PERSON_FIELDS,
           pageSize: '200',
           requestSyncToken: 'true',
         });
@@ -571,11 +674,49 @@ export class PeopleClient extends GoogleApiClient {
         emails: (p.emailAddresses ?? [])
           .map((e) => (e.value ?? '').trim().toLowerCase())
           .filter((e) => e.includes('@')),
+        phones: [...new Set((p.phoneNumbers ?? [])
+          .map((n) => (n.canonicalForm ?? n.value ?? '').trim())
+          .filter((n) => n.length > 0))],
         organization: primaryOrg?.name ?? null,
         title: primaryOrg?.title ?? null,
+        groups: [...new Set((p.memberships ?? [])
+          .map((m) => m.contactGroupMembership?.contactGroupResourceName ?? '')
+          .filter((g) => g.startsWith('contactGroups/') && !SYSTEM_CONTACT_GROUPS.has(g)))]
+          .map((id) => ({ id, name: null })),
         deleted: p.metadata?.deleted ?? false,
       };
     });
     return { contacts, nextSyncToken };
+  }
+
+  /**
+   * #6324: the account's user-created contact groups, resource name → display
+   * name. `complete` is false when the directory has more pages than the
+   * bounded walk read; the caller keeps raw ids for whatever is missing
+   * instead of treating one page as the whole directory.
+   */
+  async listContactGroups(opts: { signal?: AbortSignal } = {}): Promise<{ names: Record<string, string>; complete: boolean }> {
+    let morePages = false;
+    const raw = await this.drainPages<RawContactGroup>(
+      (t) => {
+        const params = new URLSearchParams({ pageSize: '1000', groupFields: 'name,groupType' });
+        if (t) params.set('pageToken', t);
+        return `${PEOPLE_BASE}/contactGroups?${params.toString()}`;
+      },
+      (body) => {
+        const nextPageToken = (body.nextPageToken as string | undefined) ?? null;
+        morePages = nextPageToken !== null;
+        return { items: (body.contactGroups as RawContactGroup[] | undefined) ?? [], nextPageToken };
+      },
+      'people',
+      { ...opts, maxPages: CONTACT_GROUP_PAGES, partialOk: true },
+    );
+    const names: Record<string, string> = {};
+    for (const g of raw) {
+      if (!g.resourceName || g.groupType === 'SYSTEM_CONTACT_GROUP' || SYSTEM_CONTACT_GROUPS.has(g.resourceName)) continue;
+      const name = (g.formattedName ?? g.name ?? '').trim();
+      if (name) names[g.resourceName] = name;
+    }
+    return { names, complete: !morePages };
   }
 }

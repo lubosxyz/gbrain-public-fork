@@ -118,6 +118,8 @@ const MATRIX: Row[] = [
   { name: 'leave_brain', mode: 'skip', reason: 'Principal-bound leave/epoch races and foreign installation denial are tested in test/shared-skills-membership.test.ts.' },
   { name: 'list_brain_skillpack', mode: 'skip', reason: 'brain-resident skillpack surface; skillpack suites own it' },
   { name: 'advisor', mode: 'skip', reason: 'aggregate advisory over full stack; advisor suites own it' },
+  { name: 'questions_list', mode: 'skip', reason: 'owner-private (C4): a caller that cannot read private pages is refused question_owner_only; test/helpers/pinned-questions-scenarios.ts owns source confinement and the leakage matrix' },
+  { name: 'questions_status', mode: 'skip', reason: 'owner-private (C4): refused question_owner_only for restricted grants; ids outside the read scope answer question_not_found (test/helpers/pinned-questions-scenarios.ts)' },
   { name: 'open_loops', mode: 'skip', reason: 'loop rows need the Gmail detector pipeline; test/ops-loops.test.ts owns its remote posture (no-scope denial, grant confinement, redacted evidence)' },
   { name: 'list_skills', mode: 'skip', reason: 'bundled skills catalog from the install tree; skills suites own it (throws outside an installed skills dir)' },
 
@@ -151,6 +153,7 @@ const MATRIX: Row[] = [
   { name: 'list_pages', mode: 'isolated', args: { limit: 100 } },
   { name: 'search', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
   { name: 'query', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
+  { name: 'assemble_evidence', mode: 'isolated', args: { hits: [{ source_id: 'srcbeta', slug: 'notes/beta-note', chunk_id: 0 }], return_unit: 'page' } },
   { name: 'get_tags', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_links', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_backlinks', mode: 'isolated', args: { slug: 'people/beta-person' } },
@@ -162,6 +165,7 @@ const MATRIX: Row[] = [
   { name: 'get_chunks', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_ingest_log', mode: 'isolated', args: { limit: 50 } },
   { name: 'find_orphans', mode: 'isolated', args: {} },
+  { name: 'wanted_pages', mode: 'isolated', args: {} },
   { name: 'takes_list', mode: 'isolated', args: { limit: 50 } },
   { name: 'takes_search', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
   { name: 'get_recent_salience', mode: 'isolated', args: { limit: 50 } },
@@ -250,6 +254,10 @@ beforeAll(async () => {
     await engine.addTag(`notes/${name}-note`, `${name}-topic`, { sourceId: src });
     await engine.addTag(`people/${name}-person`, `${name}-topic`, { sourceId: src });
     await engine.addLink(`notes/${name}-note`, `people/${name}-person`, `${MARK} ctx`, 'mentions', 'markdown', undefined, undefined, { fromSourceId: src, toSourceId: src });
+    // Wanted page: an unresolved link from the note to a missing marker-named target.
+    await engine.executeRaw(`INSERT INTO wanted_links (origin_page_id, source_id, producer, ref_kind, target_source_id, target_ref, checked_at)
+      SELECT id, $1, 'body', 'slug', $1, $2, now() FROM pages WHERE slug = $3 AND source_id = $1`,
+    [src, `people/${name}-missing-${MARK.toLowerCase()}`, `notes/${name}-note`]);
     await engine.createVersion(`notes/${name}-note`, { sourceId: src });
     await engine.putRawData(`notes/${name}-note`, 'crm', { owner: MARK }, { sourceId: src });
     await engine.logIngest({
