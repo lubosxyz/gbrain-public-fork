@@ -70,7 +70,10 @@ process.exit(0);
 export function spawnDriver(home: string, driver: string) {
   return Bun.spawn([process.execPath, '--no-env-file', driver], {
     cwd: home,
-    env: { HOME: home, GBRAIN_HOME: home, PATH: process.env.PATH ?? '/usr/bin:/bin', GBRAIN_SKIP_REFERENCE_SWEEP: '1' },
+    env: { HOME: home, GBRAIN_HOME: home, PATH: process.env.PATH ?? '/usr/bin:/bin', GBRAIN_SKIP_REFERENCE_SWEEP: '1',
+      // Isolated SCRAM fixtures keep the password out of database URLs and argv.
+      ...(process.env.PGPASSWORD ? { PGPASSWORD: process.env.PGPASSWORD } : {}),
+    },
     stdout: 'pipe',
     stderr: 'pipe',
   });

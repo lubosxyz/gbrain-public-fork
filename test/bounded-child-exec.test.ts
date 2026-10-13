@@ -20,29 +20,29 @@ mkdirSync(join(dir, 'separate.git', 'hooks'), { recursive: true });
 writeFileSync(join(dir, 'separate.git', 'hooks', 'post-commit'), hook, { mode: 0o755 });
 
 /**
- * Starts short-lived children whose first exit callback re-enters the event
+ * Starts a short-lived child whose exit callback re-enters the event
  * loop the way bun:test `expect().resolves/.rejects` does. Bun drops the other
- * pipe events of the same poll batch (still on 1.4.2) and, before 1.3.14, the
- * exit events too (oven-sh/bun#30301), which is how managed-maintenance, persistence-reconcile
+ * pipe events of the same poll batch (still on 1.4.2), which is how managed-maintenance, persistence-reconcile
  * and google-attachments hung behind a persistence consumer's git probe.
  * It returns only after its nested tick has returned and every one of its
  * children has exited, so the nested tick cannot land in a later test and
  * drop that test's pipe events. Awaiting the exits alone is not enough: the
- * nested tick runs this function's continuation from inside itself.
+ * nested tick runs this function's continuation from inside itself. Use one
+ * trigger: on Darwin 1.4.2 the re-entry also loses sibling trigger exit events,
+ * leaving their `exited` promises pending after the bounded work settles.
+ * The work still launches all 20 concurrent probes; the trigger's own exit
+ * and completed nested tick are both awaited before returning.
  */
 async function nestedTickDuring<T>(work: () => Promise<T>[]): Promise<T[]> {
   const nestedTick = Promise.withResolvers<void>();
-  let nested = false;
-  const children = Array.from({ length: 20 }, () => Bun.spawn(['true'], { stdio: ['ignore', 'ignore', 'ignore'], onExit() {
-    if (nested) return;
-    nested = true;
+  const child = Bun.spawn(['true'], { stdio: ['ignore', 'ignore', 'ignore'], onExit() {
     void expect(Bun.sleep(1)).resolves.toBeUndefined();
     nestedTick.resolve();
-  } }));
+  } });
   try {
     return await Promise.all(work());
   } finally {
-    await Promise.all([nestedTick.promise, ...children.map(child => child.exited)]);
+    await Promise.all([nestedTick.promise, child.exited]);
   }
 }
 

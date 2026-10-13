@@ -46,6 +46,7 @@ describe.skipIf(!databaseUrl)('#5842 export-db-only quiescence on Postgres', () 
     const env: NodeJS.ProcessEnv = {
       PATH: process.env.PATH!, HOME: home, GBRAIN_HOME: home,
       DATABASE_URL: databaseUrl!, GBRAIN_DATABASE_URL: databaseUrl!,
+      ...(process.env.PGPASSWORD ? { PGPASSWORD: process.env.PGPASSWORD } : {}),
       GBRAIN_SKIP_STARTUP_HOOKS: '1', GBRAIN_NO_GITIGNORE: '1',
     };
     const proc = Bun.spawn([process.execPath, cli, ...args], { cwd: home, env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });

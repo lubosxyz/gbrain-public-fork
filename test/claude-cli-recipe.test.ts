@@ -901,8 +901,8 @@ describe('claude-cli LanguageModel — abort + error envelopes', () => {
       const slowStub = [
         '#!/bin/sh',
         'cat > /dev/null',
-        'sleep 30',
-        'echo "{}"',
+        // This test owns one hung CLI process; exec keeps the sleep at that PID.
+        'exec sleep 30',
       ].join('\n');
       writeFileSync(stubBin, slowStub);
       chmodSync(stubBin, 0o755);

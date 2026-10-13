@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -138,6 +138,9 @@ describe('writeCodexHttpServerBlock', () => {
   test('pre-existing group-readable file tightened to 0600 with a note; .bak is 0600', () => {
     const path = tmpConfig();
     writeFileSync(path, 'model = "o5"\n', { mode: 0o644 });
+    // Establish the synthetic loose-permission precondition independently of the caller umask.
+    chmodSync(path, 0o644);
+    expect(statSync(path).mode & 0o777).toBe(0o644);
     const res = writeCodexHttpServerBlock(path, BLOCK);
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(res.notes.join(' ')).toMatch(/tightened to 0600/);

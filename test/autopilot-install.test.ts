@@ -16,7 +16,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync } from 'fs';
+import { chmodSync, mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -385,6 +385,9 @@ describe('autopilot wrapper script — gbrain-owned env file (#2608)', () => {
       mkdirSync(gbrainDir, { recursive: true });
       const envFile = join(gbrainDir, 'env');
       writeFileSync(envFile, 'export USER_KEY=real\n', { mode: 0o644 });
+      // Establish the synthetic loose-permission precondition independently of the caller umask.
+      chmodSync(envFile, 0o644);
+      expect(statSync(envFile).mode & 0o777).toBe(0o644);
 
       writeWrapperScript(repoDir, 'linux-cron');
 

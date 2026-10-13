@@ -93,6 +93,9 @@ describe.skipIf(!url)('authenticated PostgreSQL HTTP accepted-write liveness', (
     mkdirSync(join(home, '.gbrain'), { recursive: true });
     writeFileSync(join(home, '.gbrain', 'config.json'), JSON.stringify({ engine: 'postgres', database_url: pg.databaseUrl, embedding_disabled: true }));
     env = keylessBrainEnv(process.env, home, { DATABASE_URL: pg.databaseUrl, GBRAIN_DATABASE_URL: pg.databaseUrl,
+      // CLI children may auto-migrate; never install host services from a fixture.
+      // The operator preload strips these non-test-prefixed parent settings.
+      GBRAIN_NO_AUTOPILOT_INSTALL: '1', GBRAIN_NO_REEMBED: '1', PGPASSWORD: process.env.PGPASSWORD,
       GBRAIN_ENGINE: 'postgres', GBRAIN_SOURCE: undefined, GBRAIN_BRAIN_ID: undefined, GBRAIN_SKIP_STARTUP_HOOKS: '1',
       GBRAIN_MCP_FORCE_SURFACE: undefined, GBRAIN_REMOTE_CLIENT_SECRET: undefined, GBRAIN_REMOTE_PRIVATE_PAGES: undefined });
     const legacy = cli(['auth', 'create', 'synthetic-http-writer', '--scopes', 'read,write']);

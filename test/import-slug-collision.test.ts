@@ -12,7 +12,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { mkdtempSync, writeFileSync, mkdirSync, appendFileSync, renameSync } from 'fs';
+import { mkdtempSync, writeFileSync, mkdirSync, appendFileSync, renameSync, statSync } from 'fs';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -82,9 +82,12 @@ describe('slug collisions', () => {
     const root = mkdtempSync(join(tmpdir(), 'collide-owner-'));
     mkdirSync(join(root, 'notes'));
     writeFileSync(join(root, 'notes/Quux Note.md'), `---\ntitle: Owner\n---\nOwner body.\n`);
-    writeFileSync(join(root, 'notes/QUUX NOTE.md'), `---\ntitle: Loser\n---\nLoser body.\n`);
+    // Two spaces keep distinct files even on a case-insensitive filesystem;
+    // neither spelling is the canonical slug-named path.
+    writeFileSync(join(root, 'notes/QUUX  NOTE.md'), `---\ntitle: Loser\n---\nLoser body.\n`);
+    expect(statSync(join(root, 'notes/Quux Note.md')).ino).not.toBe(statSync(join(root, 'notes/QUUX  NOTE.md')).ino);
     await importFromFile(engine, join(root, 'notes/Quux Note.md'), 'notes/Quux Note.md', { noEmbed: true });
-    const b = await importFromFile(engine, join(root, 'notes/QUUX NOTE.md'), 'notes/QUUX NOTE.md', { noEmbed: true });
+    const b = await importFromFile(engine, join(root, 'notes/QUUX  NOTE.md'), 'notes/QUUX  NOTE.md', { noEmbed: true });
     expect(b.skip_reason).toBe('slug_collision');
     const [page] = await engine.executeRaw<{ title: string }>(`SELECT title FROM pages WHERE slug = 'notes/quux-note' AND source_id = 'default'`);
     expect(page.title).toBe('Owner');

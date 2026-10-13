@@ -151,7 +151,17 @@ test('a file that replaces its vanished origin at the same slug takes over the p
 
 test('two new files whose paths differ only by case are refused rather than guessed', async () => withEnv({ GBRAIN_HOME: home }, async () => {
   for (const engine of engines) {
-    const f = await fixture(engine, { 'notes/Case.md': note('Upper', 'Upper case spelling.'), 'notes/case.md': note('Lower', 'Lower case spelling.') });
+    const f = await fixture(engine, { 'notes/Case.md': note('Upper', 'Upper case spelling.') });
+    // Git trees can contain both spellings even when the checkout filesystem
+    // cannot. Stage the second blob directly so the fixture never overwrites
+    // its first file on case-insensitive hosts.
+    const lower = note('Lower', 'Lower case spelling.');
+    const blob = execFileSync('git', ['-C', f.root, 'hash-object', '-w', '--stdin'], { input: lower, encoding: 'utf8' }).trim();
+    git(f.root, 'update-index', '--add', '--cacheinfo', `100644,${blob},notes/case.md`);
+    git(f.root, '-c', 'user.name=Example', '-c', 'user.email=example@example.invalid', 'commit', '-qm', 'case collision');
+    expect(git(f.root, 'ls-tree', '-r', '--name-only', 'HEAD', 'notes')).toBe('notes/Case.md\nnotes/case.md');
+    expect(git(f.root, 'show', 'HEAD:notes/Case.md')).toContain('Upper case spelling.');
+    expect(git(f.root, 'show', 'HEAD:notes/case.md')).toContain('Lower case spelling.');
     await expect(performManagedSync(engine, { sourceId: f.id, noPull: true })).rejects.toMatchObject({ code: 'page_identity_changed' });
     expect(await engine.getPage('notes/case', { sourceId: f.id })).toBeNull();
   }

@@ -108,7 +108,8 @@ async function withBrain(kind: Kind, fn: (fixture: {
                 } finally { await engine.disconnect(); }
               `;
               const child = spawnSync(process.execPath, ['--eval', code], {
-                env: { PATH: process.env.PATH, HOME: home, GBRAIN_HOME: home, GBRAIN_NO_AUTO_SYNC: '1' },
+                env: { PATH: process.env.PATH, HOME: home, GBRAIN_HOME: home, GBRAIN_NO_AUTO_SYNC: '1',
+                  ...(process.env.PGPASSWORD ? { PGPASSWORD: process.env.PGPASSWORD } : {}) },
                 encoding: 'utf8', timeout: 30_000,
               });
               expect(child.error).toBeUndefined();

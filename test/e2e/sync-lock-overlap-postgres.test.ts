@@ -31,6 +31,7 @@ describe.skipIf(!databaseUrl)('sync lock overlap on Postgres', () => {
     const env = {
       PATH: process.env.PATH!, HOME: home, GBRAIN_HOME: home,
       DATABASE_URL: databaseUrl!, GBRAIN_DATABASE_URL: databaseUrl!,
+      ...(process.env.PGPASSWORD ? { PGPASSWORD: process.env.PGPASSWORD } : {}),
       GBRAIN_SKIP_STARTUP_HOOKS: '1', GBRAIN_NO_GITIGNORE: '1',
     };
     const spawn = (args: string[]) => {
