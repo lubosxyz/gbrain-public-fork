@@ -308,13 +308,16 @@ for i in $(seq 1 "$N"); do
         > "$SHARD_LOG" 2>&1
       rc=$?
     else
+      # Own the shard's group so its bun/tee pipeline cannot survive the shell.
+      set -m
       env SHARD="$i/$N" GBRAIN_TEST_RECEIPT_DIR="$TEST_RECEIPT_DIR" \
         bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
         > "$SHARD_LOG" 2>&1 &
       pid=$!
+      set +m
       ( sleep "$SHARD_TIMEOUT" && touch "$LOG_DIR/shard-$i.watchdog" && \
-        kill -TERM "$pid" 2>/dev/null && \
-        sleep "$SHARD_KILL_AFTER" && kill -KILL "$pid" 2>/dev/null ) &
+        kill -TERM -- "-$pid" 2>/dev/null && \
+        sleep "$SHARD_KILL_AFTER" && kill -KILL -- "-$pid" 2>/dev/null ) &
       cap_pid=$!
       wait "$pid" 2>/dev/null
       # Capture the shard's exit code from ITS `wait`, before any watchdog
@@ -323,6 +326,9 @@ for i in $(seq 1 "$N"); do
       # sentinel on machines with no gtimeout/timeout: every run "failed"
       # with rc=143 summaries even when all tests passed.
       rc=$?
+      # A terminated leader may leave TERM-resistant descendants. Keep the
+      # original escalation grace armed until the owned group is killed.
+      [ ! -f "$LOG_DIR/shard-$i.watchdog" ] || wait "$cap_pid" 2>/dev/null
       # Reap the watchdog's `sleep` child too (pkill -P), then the watchdog.
       # Killing only the subshell leaves the sleep orphaned until
       # $SHARD_TIMEOUT elapses — same quirk the heartbeat cleanup below works

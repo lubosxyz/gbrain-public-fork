@@ -351,8 +351,10 @@ describe('gbrain claw-test — adversarial-gate regression pins', () => {
   test('phase timeout: a hung gbrain child is killed at GBRAIN_CLAW_PHASE_TIMEOUT_MS instead of wedging the run', () => {
     const tmp = mkdtempSync(join(tmpdir(), 'claw-test-e2e-hang-'));
     const hangBin = join(tmp, 'hang-gbrain');
+    const childPidFile = join(tmp, 'child.pid');
+    let childPid = 0;
     try {
-      writeFileSync(hangBin, `#!/bin/sh\nif [ "$1" = "init" ]; then sleep 45; fi\nexec "${BIN_PATH}" "$@"\n`, 'utf-8');
+      writeFileSync(hangBin, `#!/bin/sh\nif [ "$1" = "init" ]; then sh -c 'trap "" TERM; exec sleep 45' & child=$!; echo "$child" > "${childPidFile}"; wait "$child"; fi\nexec "${BIN_PATH}" "$@"\n`, 'utf-8');
       chmodSync(hangBin, 0o755);
       const result = spawnSync(BIN_PATH, ['claw-test', '--scenario', 'fresh-install'], {
         cwd: REPO_ROOT,
@@ -370,7 +372,13 @@ describe('gbrain claw-test — adversarial-gate regression pins', () => {
       // own kill and status would be null with signal SIGTERM.
       expect(result.signal).toBeNull();
       expect(result.status).toBe(1);
+      childPid = Number(readFileSync(childPidFile, 'utf8').trim());
+      expect(childPid).toBeGreaterThan(0);
+      const state = spawnSync('ps', ['-o', 'stat=', '-p', String(childPid)], { encoding: 'utf8' }).stdout.trim();
+      expect(!state || state.startsWith('Z')).toBe(true);
     } finally {
+      if (!childPid && existsSync(childPidFile)) childPid = Number(readFileSync(childPidFile, 'utf8').trim());
+      if (childPid) { try { process.kill(childPid, 'SIGKILL'); } catch { /* already gone */ } }
       rmSync(tmp, { recursive: true, force: true });
     }
   }, 60_000);

@@ -11,7 +11,7 @@
 // a 4.6 GB one never reached it within 120 s.
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { makeGitFixture } from "../helpers/git-fixture.ts";
@@ -35,6 +35,9 @@ describe("ci:ubicloud teardown", () => {
     const repo = join(dir, "repo");
     mkdirSync(repo);
     await makeGitFixture(repo);
+    // Inventory runs before provisioning, even for the gitleaks-only lane.
+    mkdirSync(join(repo, "test"));
+    writeFileSync(join(repo, "test/inventory.test.ts"), "// Discovery-only fixture; the selected gitleaks lane does not run tests.\n");
     cpSync(join(ROOT, "scripts"), join(repo, "scripts"), { recursive: true });
     cpSync(join(ROOT, "docker-compose.ci.yml"), join(repo, "docker-compose.ci.yml"));
     const api = (mock = startMockUbicloud({ createDelayMs: (name) => (/-ci01/.test(name) ? 0 : 4000) }));

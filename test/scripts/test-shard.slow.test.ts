@@ -281,7 +281,7 @@ exec "$REAL_BUN" "$@"
       const argv = readFileSync(join(root, 'argv.log'), 'utf-8').split('\n').filter((a: string) => a.endsWith('.test.ts'));
       expect(argv).toEqual(planned.map(f => `./${f}`));
       expect(readFileSync(join(root, 'order.log'), 'utf-8').split('\n').filter(Boolean)).toEqual([...names].reverse());
-      // Receipt mode forces the single-invocation xargs tripwire, and the
+      // The runner uses a single invocation, and the
       // receipt `.files` plus Bun's JUnit report keep the canonical bare
       // names in planned order, so the ledger matches assigned to executed.
       const rawArgv = readFileSync(join(root, 'argv.log'), 'utf-8').split('\n');

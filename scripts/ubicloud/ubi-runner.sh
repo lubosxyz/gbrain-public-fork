@@ -12,7 +12,7 @@
 # untracked-unignored files + .git, so uncommitted edits are included), runs an
 # optional setup script and the command, copies requested artifacts back, and
 # destroys the VM on every exit path. Exits with the command's status.
-# Needs only bash, curl, python3, ssh, ssh-keygen, and tar locally, so it works
+# Needs only bash, curl, python3, ssh, ssh-keygen, tar, and gzip locally, so it works
 # from dev boxes, containers, and cloud sandboxes.
 #
 # Ownership: VMs are named ubirun-<owner>-<epoch>-<suffix>. <owner> is UBI_OWNER
@@ -61,12 +61,13 @@ trap 'FAILED=1' ERR
 # is empty, then exits with STATUS.
 finish() {
   local rc=$1
+  trap "" INT TERM HUP QUIT
   [ "$rc" != 2 ] || [ -n "$FAILED" ] || rc=130
   [ -z "$2" ] || cmd_down "$2" || log "WARNING: failed to destroy $2; run: $0 down $2"
   exit "$rc"
 }
 
-for bin in curl python3 ssh ssh-keygen tar; do
+for bin in curl python3 ssh ssh-keygen tar gzip; do
   command -v "$bin" >/dev/null || die "$bin is required"
 done
 UBICLOUD_API_KEY="${UBICLOUD_API_KEY:-${UBICLOUD_API_TOKEN:-}}"
@@ -198,7 +199,7 @@ cmd_usage() {
       vms[o]++; cpu[o] += n; total += n; count++ }
     END {
       printf "%-14s %4s %6s\n", "OWNER", "VMS", "VCPUS"
-      for (o in cpu) printf "%-14s %4d %6d%s\n", o, vms[o], cpu[o], o == me ? "  (you)" : "" | "sort -k3,3nr"
+      for (o in cpu) printf "%-14s %4d %6d%s\n", o, vms[o], cpu[o], (o == me ? "  (you)" : "") | "sort -k3,3nr"
       close("sort -k3,3nr")
       printf "%-14s %4d %6d\n", "total", count, total
     }'
@@ -216,6 +217,15 @@ valid_name() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; }
 
 UP_NAME=""
 UP_READY=""
+# Capture status as a function argument: in Bash 3.2 an assignment at the
+# start of an EXIT trap can inherit the failing status under xtrace and
+# trigger errexit before cleanup. A local declaration returns success.
+finish_up() {
+  local rc=$1
+  trap "" INT TERM HUP QUIT
+  [ -z "$UP_READY" ] || UP_NAME=""
+  finish "$rc" "$UP_NAME"
+}
 cmd_up() {
   local size=$DEFAULT_SIZE location=$DEFAULT_LOCATION name="" storage="" image=ubuntu-noble
   while [ $# -gt 0 ]; do
@@ -250,7 +260,8 @@ cmd_up() {
   # Hold signals until the create answer is recorded, so teardown knows
   # whether the VM exists instead of waiting out UBI_CREATE_GRACE.
   local interrupted="" created=yes refusal need used max
-  trap 'interrupted=1' INT TERM HUP QUIT
+  # A builtin avoids Bash 3.2's assignment-status/xtrace trap interaction.
+  trap 'printf -v interrupted %s 1' INT TERM HUP QUIT
   cli "${args[@]}" >/dev/null 2>"$dir/create.err" || created=no
   write_state "$name" "$location" "$size" "" "$created" "$create_at"
   trap 'exit 130' INT TERM HUP QUIT
@@ -391,7 +402,11 @@ cmd_pack() {
         | while IFS= read -r -d '' f; do
             if { [ -e "$f" ] || [ -L "$f" ]; } && [ "$f" != .git ]; then printf '%s\0' "$f"; fi
           done \
-        | tar --null -T - "${git_from[@]}" -czf -
+        | tar -cf "$tmp/checkout.tar" --null -T -
+      # BSD tar applies -C to names from -T too, regardless of option order.
+      # Append the separately rooted slim .git before compressing the archive.
+      tar -rf "$tmp/checkout.tar" "${git_from[@]}"
+      gzip -c "$tmp/checkout.tar"
     )
     rm -rf "$tmp"
   else
@@ -451,7 +466,7 @@ cmd_run() {
   RUN_VM=$name
   # Armed before the create request: an interrupted `up` still destroys its VM.
   # A second signal must not cut teardown short, so the EXIT handler ignores them.
-  trap 'rc=$?; trap "" INT TERM HUP QUIT; finish "$rc" "$RUN_VM"' EXIT
+  trap 'finish "$?" "$RUN_VM"' EXIT
   trap 'exit 130' INT TERM HUP QUIT
   cmd_up "${up_args[@]}" >/dev/null
   if [ "$keep" = 1 ]; then
@@ -523,7 +538,7 @@ case $cmd in
 esac
 case $cmd in
   run) cmd_run "$@" ;;
-  up) trap 'rc=$?; trap "" INT TERM HUP QUIT; [ -z "$UP_READY" ] || UP_NAME=""; finish "$rc" "$UP_NAME"' EXIT
+  up) trap 'finish_up "$?"' EXIT
       trap 'exit 130' INT TERM HUP QUIT
       cmd_up "$@" ;;
   ssh) name=$1; shift; load "$name"
