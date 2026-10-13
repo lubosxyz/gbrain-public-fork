@@ -83,6 +83,10 @@ async function seedSource(source: BrainEngine): Promise<void> {
     }
     await tx.executeRaw("INSERT INTO sources (id, name, local_path) VALUES ('history-a', 'History A', '/tmp/a'), ('History-B', 'History B', NULL)");
     await tx.executeRaw("UPDATE sources SET name = 'renamed default' WHERE id = 'default'");
+    await tx.executeRaw(`INSERT INTO auth_audit (id, correlation_id, decision, method, reason, token_name, company_slug, actor, created_at)
+      VALUES ('00000000-0000-4000-8000-000000000123', 'synthetic-audit', 'deny', 'bearer', 'revoked', 'fixture-token', 'example-company', 'fixture-agent', '2026-01-02T03:04:05.123456Z')`);
+    await tx.executeRaw(`INSERT INTO mcp_request_log_purged (token_name, purged_requests, purged_last_used_at)
+      VALUES ('fixture-token', 9007199254740993, '2026-01-02T03:04:05.123456Z')`);
     await tx.executeRaw("INSERT INTO facts (id, fact, source, superseded_by) VALUES (1, 'old', 'test', 3), (2, 'other', 'test', NULL), (3, 'new', 'test', NULL)");
     await tx.executeRaw("SELECT setval('facts_id_seq', 3, true)");
     for (let i = 0; i < 4; i++) await tx.executeRaw("SELECT nextval('facts_id_seq')");
@@ -113,12 +117,19 @@ for (const backend of testBackends()) {
         const e = { source, target };
         const runId = randomUUID();
         const [targetVersion] = await target.executeRaw<{ value: string }>("SELECT value FROM config WHERE key = 'version'");
-        const relations = ['config', 'sources', 'graduation_test_types', 'facts', 'minion_jobs'];
+        const relations = ['config', 'sources', 'graduation_test_types', 'facts', 'minion_jobs', 'auth_audit', 'mcp_request_log_purged'];
         const batches: number[] = [];
         for (const relation of relations) {
           const { rows } = await copyTable(e, entry(relation), { bypass, runId, batchBytes: 64, onBatch: n => { batches.push(n); } });
           expect(rows).toBe(await rowCount(source, entry(relation)));
         }
+        for (const relation of ['auth_audit', 'mcp_request_log_purged']) {
+          expect(GRADUATION_INVENTORY.entries.find(e => e.relation === relation)?.class).toBe('carry');
+        }
+        expect(await target.executeRaw("SELECT correlation_id, decision, reason FROM auth_audit WHERE id = '00000000-0000-4000-8000-000000000123'"))
+          .toEqual([{ correlation_id: 'synthetic-audit', decision: 'deny', reason: 'revoked' }]);
+        expect(await target.executeRaw("SELECT purged_requests::text AS total FROM mcp_request_log_purged WHERE token_name = 'fixture-token'"))
+          .toEqual([{ total: '9007199254740993' }]);
         expect(Math.max(...batches)).toBeLessThan(10);
         expect(await digestMismatches(e, relations.map(r => entry(r)))).toEqual([]);
         const keys = (await target.executeRaw<{ k: string }>('SELECT k FROM graduation_test_types ORDER BY k COLLATE "C"')).map(r => r.k);

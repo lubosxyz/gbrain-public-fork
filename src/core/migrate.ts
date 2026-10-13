@@ -390,8 +390,8 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
   // Historical forks used scalar versions 150, 160-161 and 166-169 for
   // different DDL. Repair skipped prerequisites BEFORE newer migrations
   // reference them (v174 already requires v169's withdrawal subject).
-  // No high-water stamp is advanced until every prerequisite succeeds.
-  if (current >= 150 && await engine.getConfig('fork.schema_prerequisites.v060') !== 'complete') {
+  // Replay is only for pre-v240 forks; stamp only after all prerequisites succeed.
+  if (current >= 150 && current < 240 && await engine.getConfig('fork.schema_prerequisites.v060') !== 'complete') {
     const [fork] = await engine.executeRaw<{ present: boolean }>(
       "SELECT to_regclass('public.mcp_request_log_purged') IS NOT NULL AS present");
     if (fork?.present) {

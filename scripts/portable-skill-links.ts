@@ -18,7 +18,7 @@
  * Blob base: derived from `LLMS_REPO_BASE`, the fork override llms.txt uses
  * (a raw base `https://raw.githubusercontent.com/<owner>/<repo>/<ref>` maps to
  * `https://github.com/<owner>/<repo>/blob/<ref>`; any other value is used as
- * given). Unset → `https://github.com/garrytan/gbrain/blob/master`. A fork
+ * given). Unset → the distribution fork URL. A fork
  * re-running with its override also retargets links already written with the
  * default base. `scripts/check-skill-refs.mjs` fails on any outside-root link
  * and names this script as the fix.
@@ -33,7 +33,7 @@ export const PROTOCOL_SOURCE = 'docs/protocol/AGENT_OPERATOR_v1.md';
 export const BUNDLED_PROTOCOL = 'skills/conventions/agent-operator-protocol.md';
 
 export function repoBlobBase(env: Record<string, string | undefined> = process.env): string {
-  if (!env.LLMS_REPO_BASE?.trim()) return DEFAULT_BLOB_BASE;
+  if (!env.LLMS_REPO_BASE?.trim()) return 'https://github.com/lubosxyz/gbrain-public-fork/blob/master';
   const raw = repoBaseOrThrow(env.LLMS_REPO_BASE, DEFAULT_BLOB_BASE);
   const m = raw.match(/^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/(.+)$/);
   return m ? `https://github.com/${m[1]}/${m[2]}/blob/${m[3]}` : raw;

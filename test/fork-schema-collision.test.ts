@@ -27,3 +27,13 @@ test('a fork v169 high-water mark repairs skipped prerequisites before v174 and 
     expect(await engine.executeRaw('SELECT * FROM dream_synthesis_completions LIMIT 1')).toEqual([]);
     expect(await runMigrations(engine)).toEqual({ applied: 0, current: LATEST_VERSION });
 }, 120_000);
+
+test('current fresh schema is unchanged by historical fork prerequisite repair', async () => {
+ const engine = new PGLiteEngine(); await engine.connect({});
+ try {
+  await engine.initSchema();
+  const before = await engine.executeRaw('SELECT key,value FROM config ORDER BY key');
+  expect(await runMigrations(engine)).toEqual({applied:0,current:LATEST_VERSION});
+  expect(await engine.executeRaw('SELECT key,value FROM config ORDER BY key')).toEqual(before);
+ } finally { await engine.disconnect(); }
+},120_000);

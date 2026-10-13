@@ -15,12 +15,12 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { PostgresEngine } from '../src/core/postgres-engine.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import { runPhaseConsolidate } from '../src/core/cycle/phases/consolidate.ts';
 import { claimsDiverge } from '../src/core/facts/capture-dedup.ts';
 import { BEHAVIOR_CHANGES } from '../src/core/behavior-change-notice.ts';
-import { requirePostgresTestDatabase, testBackends } from './helpers/test-backends.ts';
+import { testBackends } from './helpers/test-backends.ts';
+import { setupLegacyEmbeddingDB, teardownDB } from './e2e/helpers.ts';
 
 const oldDate = (hoursAgo: number) => new Date(Date.now() - hoursAgo * 60 * 60 * 1000).toISOString();
 
@@ -61,9 +61,9 @@ for (const backend of testBackends()) {
 
     beforeAll(async () => {
       if (backend === 'postgres') {
-        const pg = new PostgresEngine();
-        await pg.connect({ database_url: requirePostgresTestDatabase() });
-        engine = pg;
+        // Other E2E files can leave the shared database at a different embedding width.
+        // This fixture seeds 1536-dimensional vectors, so establish that shape explicitly.
+        engine = await setupLegacyEmbeddingDB();
       } else {
         const lite = new PGLiteEngine();
         await lite.connect({});
@@ -75,7 +75,8 @@ for (const backend of testBackends()) {
 
     afterAll(async () => {
       resetGateway();
-      await engine.disconnect();
+      if (backend === 'postgres') await teardownDB();
+      else await engine.disconnect();
     });
 
     beforeEach(async () => {

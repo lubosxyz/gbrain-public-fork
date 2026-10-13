@@ -93,8 +93,8 @@ DON'T invoke for "where does THIS note go" (use brain-taxonomist) or
 
 ## Tutorial + vision
 
-- **Why this matters:** [`docs/what-schemas-unlock.md`](https://github.com/garrytan/gbrain/blob/master/docs/what-schemas-unlock.md) — 7 killer use cases (4000 invisible meetings made queryable, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator) plus the structural argument for why types matter at query time. Read this before pitching schema authoring to a user — it's the doc that explains the difference between a pile of notes and a brain with structure.
-- **5-minute walkthrough:** [`docs/schema-author-tutorial.md`](https://github.com/garrytan/gbrain/blob/master/docs/schema-author-tutorial.md) — fork the bundled pack, add a researcher type, sync, prove the T1.5 wiring via `gbrain whoknows`. Use placeholder pages so it runs against any brain without affecting real content.
+- **Why this matters:** [`docs/what-schemas-unlock.md`](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/what-schemas-unlock.md) — 7 killer use cases (4000 invisible meetings made queryable, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator) plus the structural argument for why types matter at query time. Read this before pitching schema authoring to a user — it's the doc that explains the difference between a pile of notes and a brain with structure.
+- **5-minute walkthrough:** [`docs/schema-author-tutorial.md`](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/schema-author-tutorial.md) — fork the bundled pack, add a researcher type, sync, prove the T1.5 wiring via `gbrain whoknows`. Use placeholder pages so it runs against any brain without affecting real content.
 
 ## Workflow
 

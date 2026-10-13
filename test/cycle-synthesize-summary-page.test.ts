@@ -16,6 +16,8 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { __testing } from '../src/core/cycle/synthesize.ts';
 import type { PageInput } from '../src/core/types.ts';
+import { lintContent } from '../src/commands/lint.ts';
+import { parseMarkdown } from '../src/core/markdown.ts';
 
 type SummaryWriter = (
   engine: BrainEngine,
@@ -145,4 +147,10 @@ describe('dream-cycle summary graph bounds (#4337)', () => {
     expect(body.match(/\[\[/g)).toHaveLength(3);
     for (const slug of slugs) expect(body).toContain(`[[${slug}]]`);
   });
+});
+
+test('generated cycle summary carries its cycle date and passes the public lint contract', async () => {
+  const { markdown } = await renderSummary(['wiki/originals/ideas/example-output']);
+  expect(lintContent(markdown, 'dream-cycle-summaries/2026-08-20.md')).toEqual([]);
+  expect(parseMarkdown(markdown).frontmatter.created).toBe('2026-08-20');
 });

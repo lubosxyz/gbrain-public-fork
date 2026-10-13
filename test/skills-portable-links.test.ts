@@ -86,7 +86,7 @@ describe('portableLinks', () => {
   it('derives the blob base from the LLMS_REPO_BASE fork override and retargets default-base links', () => {
     const base = repoBlobBase({ LLMS_REPO_BASE: 'https://raw.githubusercontent.com/fork-org/gbrain/main/' });
     expect(base).toBe('https://github.com/fork-org/gbrain/blob/main');
-    expect(repoBlobBase({})).toBe(DEFAULT_BLOB_BASE);
+    expect(repoBlobBase({})).toBe('https://github.com/lubosxyz/gbrain-public-fork/blob/master');
     expect(repoBlobBase({ LLMS_REPO_BASE: 'https://git.example.com/gbrain/raw' })).toBe('https://git.example.com/gbrain/raw');
     expect(portableLinks(`[a](${DEFAULT_BLOB_BASE}/docs/ENGINES.md) [b](../../INSTALL_FOR_AGENTS.md)`, 'skills/demo/SKILL.md', base))
       .toBe(`[a](${base}/docs/ENGINES.md) [b](${base}/INSTALL_FOR_AGENTS.md)`);

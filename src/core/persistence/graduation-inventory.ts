@@ -30,6 +30,7 @@ export const GRADUATION_INVENTORY: Inventory = {
   version: 1,
   entries: [
     carry('access_tokens', 'security', 'Legacy bearer tokens and their unified grant columns; token hashes keep authorizing on the target.'),
+    carry('auth_audit', 'security', 'Authentication decisions and their correlation trail; retain the fork audit history on the target.'),
     carry('budget_ledger', 'operational', 'Daily resolver spend totals; admission keeps counting today\'s spend.'),
     carry('calibration_profiles', 'user_data', 'Published calibration profiles per holder.'),
     carry('chat_usage_log', 'operational', 'Chat model usage and cost log.'),
@@ -76,6 +77,7 @@ export const GRADUATION_INVENTORY: Inventory = {
     carry('link_transitions', 'user_data', 'Dated start/end evidence for relationships, including manual add_link dates that exist nowhere else.'),
     carry('loop_suppressions', 'user_data', 'Open-loop mutes the user chose.'),
     carry('mcp_request_log', 'operational', 'MCP request log.'),
+    carry('mcp_request_log_purged', 'operational', 'Lifetime request totals retained after log pruning; preserve token usage accounting.'),
     carry('mcp_spend_log', 'operational', 'MCP spend log.'),
     carry('mcp_spend_reservations', 'operational', 'Pending and unresolved MCP charges; admission counts them and late settlement needs them.'),
     carry('mention_gazetteer_entries', 'operational', 'Entity mention index: the linkable names the last mention pass used per source; a name change rescans only affected pages.'),

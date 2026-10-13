@@ -51,6 +51,15 @@ with no inherited provider credentials. Set the brain configuration keys
 not proven environment overrides. Provider-dependent phases may safely skip;
 do not enable paid providers just to make them run.
 
+For built-in synthesis configured with a `claude-cli:` model, the existing
+`agent.use_gateway_loop=true` setting is required for non-Anthropic dispatch.
+This requirement already existed in 0.57; it is not a new migration default.
+Verify the actual model resolver, a synthetic session corpus, a completed minion
+job and committed page readback. A successful triage or an exit-zero dream with
+a skipped synthesis phase does not prove synthesis. Subscription transport does
+not require enabling a paid API provider. External wrapper proposer jobs are a
+separate execution path.
+
 The owner-stamp fix from fork PR #13 follows upstream's native-lock recovery
 for bound macOS roots and additionally accepts device-only drift during a
 first interrupted claim when inode and birth time still match. Other identity

@@ -185,8 +185,9 @@ test('a managed put_page of a tagged page with timeline lines commits on a brain
   }
 }, 120_000);
 
-test('upgrading a v196 brain with the pre-fix guard: v197 unblocks the refused write and is idempotent', async () => {
+test('v197 alone replaces the pre-fix function twice without recreating writer triggers', async () => {
   const v197 = MIGRATIONS.find(migration => migration.version === 197)!;
+  expect(v197.sql).not.toMatch(/\b(TRIGGER|ALTER TABLE|LOCK)\b/);
   for (const engine of engines) {
     await installPre5983Guard(engine);
     const pageId = await pageIn(engine, 'default');
@@ -194,14 +195,37 @@ test('upgrading a v196 brain with the pre-fix guard: v197 unblocks the refused w
     const triggers = `SELECT tgrelid::regclass::text AS tbl, oid FROM pg_trigger WHERE tgname='managed_writer_guard' ORDER BY 1`;
     const before = await engine.executeRaw(triggers);
     for (let run = 0; run < 2; run++) {
-      await engine.setConfig('version', '196');
+      await engine.runMigration(v197.version, v197.sql!);
+      await guarded(engine, ['default'], INSERTS.tags.replace("'probe'", `'v197-${run}'`), [pageId]);
+      await expect(guarded(engine, undefined, INSERTS.tags.replace("'probe'", "'uncoordinated'"), [pageId])).rejects.toThrow(REFUSED);
+      expect(await engine.executeRaw(triggers)).toEqual(before);
+    }
+    expect(await count(engine, 'tags', pageId)).toBe(2);
+  }
+}, 120_000);
+
+test('upgrading a v196 brain unblocks the refused write and rerunning the current schema is idempotent', async () => {
+  for (const engine of engines) {
+    await installPre5983Guard(engine);
+    const pageId = await pageIn(engine, 'default');
+    await expect(guarded(engine, ['default'], INSERTS.tags, [pageId])).rejects.toThrow(REFUSED);
+    const triggers = `SELECT tgrelid::regclass::text AS tbl, oid FROM pg_trigger WHERE tgname='managed_writer_guard' ORDER BY 1`;
+    // The full chain also runs fork v241, which deliberately reconciles triggers.
+    // Pin its completed state; the separate v197 test pins function-only repair.
+    await engine.setConfig('version', '196');
+    let afterUpgrade: Record<string, unknown>[] = [];
+    for (let run = 0; run < 2; run++) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
-      expect((await runMigrations(engine)).current).toBeGreaterThanOrEqual(197);
+      const result = await runMigrations(engine);
+      expect(result.current).toBeGreaterThanOrEqual(197);
+      if (run === 0) afterUpgrade = await engine.executeRaw(triggers);
+      else {
+        expect(result.applied).toBe(0);
+        expect(await engine.executeRaw(triggers)).toEqual(afterUpgrade);
+      }
       await guarded(engine, ['default'], INSERTS.tags.replace("'probe'", `'probe-${run}'`), [pageId]);
       expect(await count(engine, 'tags', pageId)).toBe(run + 1);
       await expect(guarded(engine, undefined, INSERTS.tags.replace("'probe'", "'uncoordinated'"), [pageId])).rejects.toThrow(REFUSED);
     }
-    expect(v197.sql).not.toMatch(/\b(TRIGGER|ALTER TABLE|LOCK)\b/);
-    expect(await engine.executeRaw(triggers)).toEqual(before);
   }
 }, 120_000);

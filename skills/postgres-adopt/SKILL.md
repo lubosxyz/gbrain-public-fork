@@ -89,7 +89,7 @@ one-line note and falls through; nothing is silent.
 
 ## Step 3 — Existing PGLite brain: plan, ask, run
 
-Full reference: [Move a PGLite brain to Postgres](https://github.com/garrytan/gbrain/blob/master/docs/guides/move-to-postgres.md).
+Full reference: [Move a PGLite brain to Postgres](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/guides/move-to-postgres.md).
 
 1. **Target URL.** Ask the user to put the connection string in an
    environment variable without pasting it into the conversation

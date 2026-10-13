@@ -158,7 +158,7 @@ claiming activation; otherwise report adoption as unverified.
   page, budgeted by `token_budget`, default 6,000) or `"window"` (neighbor
   chunks). `return_unit: "chunk"` opts out.
   Each result then carries the evidence in `chunk_text` plus a `delivered`
-  block; see [evidence delivery](https://github.com/garrytan/gbrain/blob/master/docs/evidence-delivery.md).
+  block; see [evidence delivery](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/evidence-delivery.md).
   `gbrain query "when did the launch move?" --return-unit page --token-budget 6000`
 - Only use `gbrain get <slug>` to load the full page when a chunk confirms the
   page is relevant and you need more context (e.g., compiled truth, timeline).

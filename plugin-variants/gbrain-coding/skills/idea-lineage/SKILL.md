@@ -32,7 +32,7 @@ when_to_use: "Use when the user asks: \"idea lineage\", \"trace the lineage of t
 > **Convention:** see [conventions/quality.md](../conventions/quality.md) for
 > citation rules, quote fidelity, and source-backed claims.
 >
-> **Boundary:** see [docs/takes-vs-facts.md](https://github.com/garrytan/gbrain/blob/master/docs/takes-vs-facts.md) for
+> **Boundary:** see [docs/takes-vs-facts.md](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/takes-vs-facts.md) for
 > the distinction between holder-attributed takes and the brain owner's hot
 > facts. Do not collapse those layers when summarizing lineage.
 

@@ -21,9 +21,9 @@ when_to_use: "Use when the user asks: \"GBrain admin login link\", \"open the MC
 
 # MCP access and administration
 
-Use [MCP administration](https://github.com/garrytan/gbrain/blob/master/docs/mcp/ADMIN.md) for the exact commands and
-recovery table, [hosted setup](https://github.com/garrytan/gbrain/blob/master/docs/guides/hosted-harness-access.md) for
-client installation, and [deployment](https://github.com/garrytan/gbrain/blob/master/docs/mcp/DEPLOY.md) for the running
+Use [MCP administration](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/mcp/ADMIN.md) for the exact commands and
+recovery table, [hosted setup](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/guides/hosted-harness-access.md) for
+client installation, and [deployment](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/mcp/DEPLOY.md) for the running
 service. If this skill is loaded remotely without those files, use
 https://raw.githubusercontent.com/garrytan/gbrain/master/docs/mcp/ADMIN.md.
 No local brain initialization or personal-agent bootstrap is required to

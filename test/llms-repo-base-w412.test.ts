@@ -44,6 +44,6 @@ describe('W4.12: LLMS_REPO_BASE must be a plain https URL', () => {
   test('unset or blank falls back to the default', () => {
     expect(parseRepoBase(undefined)).toBeNull();
     expect(parseRepoBase('  ')).toBeNull();
-    expect(repoBlobBase({})).toBe('https://github.com/garrytan/gbrain/blob/master');
+    expect(repoBlobBase({})).toBe('https://github.com/lubosxyz/gbrain-public-fork/blob/master');
   });
 });

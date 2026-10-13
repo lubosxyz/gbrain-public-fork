@@ -15,7 +15,7 @@ import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { hasDatabase } from './helpers.ts';
 import { managedBrain } from '../helpers/managed-brain.ts';
-import { dispatchToolCall } from '../../src/mcp/dispatch.ts';
+import { acceptedPendingReceipt, dispatchToolCall } from '../../src/mcp/dispatch.ts';
 import { registerLocalWriter, withVerifiedLocalRegistration } from '../../src/core/persistence/identity.ts';
 import { runManagedSourceLifecycle } from '../../src/core/persistence/source-lifecycle.ts';
 import { listCorePages } from '../../src/core/core-memory.ts';
@@ -27,9 +27,19 @@ const page = (title: string, body: string, core: boolean) => `---\ntitle: ${titl
 async function writer(engine: BrainEngine) {
   const reg = await registerLocalWriter(engine, 'cli');
   return async (sourceId: string, slug: string, content: string) => {
-    const response = await withVerifiedLocalRegistration(engine, reg, () => dispatchToolCall(engine, 'put_page', { slug, content, request_id: randomUUID(), source_id: sourceId }, {
+    // Accepted-pending writes may commit after the first reply. Retry the same
+    // request before comparing committed rows with terminal write outcomes.
+    const params = { slug, content, request_id: randomUUID(), source_id: sourceId };
+    const dispatch = () => withVerifiedLocalRegistration(engine, reg, () => dispatchToolCall(engine, 'put_page', params, {
       remote: false, config: { engine: 'postgres' }, sourceId, logger: { info() {}, warn() {}, error() {} },
     }));
+    const deadline = performance.now() + 60_000;
+    let response = await dispatch();
+    while (acceptedPendingReceipt(response) && performance.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      response = await dispatch();
+    }
+    expect(acceptedPendingReceipt(response)).toBeNull();
     const text = (response.content[0] as { text: string }).text;
     return { isError: response.isError === true, text };
   };
@@ -73,7 +83,7 @@ describeE2E('core memory ordered source lock (Postgres)', () => {
     const deadlocks = results.filter(r => /deadlock|40P01/i.test(r.text));
     expect(deadlocks).toEqual([]);
     const failed = results.filter(r => r.isError);
-    // Retryable lock-timeout refusals are allowed under contention; every other outcome is a commit.
+    // Retryable lock-timeout refusals are allowed under contention; admitted writes have settled above.
     for (const f of failed) expect(f.text).toMatch(/lock_timeout|lock timeout|write_pending|owner_unavailable|source_changed/i);
     const core = (await listCorePages(engine)).map(p => `${p.source_id}:${p.slug}`);
     const committedCore = results.filter((r, i) => !r.isError && i % 3 !== 2).length;

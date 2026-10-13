@@ -31,7 +31,7 @@ export const PROJECT = {
   summary:
     "GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable engines (PGLite default, Postgres+pgvector for scale), contract-first operations, fat-markdown skills, and one agent operator contract for every error and recommendation. Teaches agents brain ops, ingestion, enrichment, scheduling, identity, and access control.",
   repoUrl: "https://github.com/garrytan/gbrain",
-  rawBaseUrl: repoBaseOrThrow(process.env.LLMS_REPO_BASE, "https://raw.githubusercontent.com/garrytan/gbrain/master"),
+  rawBaseUrl: repoBaseOrThrow(process.env.LLMS_REPO_BASE, "https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master"),
 };
 
 export const SECTIONS: DocSection[] = [
