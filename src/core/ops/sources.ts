@@ -33,18 +33,7 @@ const whoami: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: 'no_stored_text',
-  description:
-    'Introspect the calling identity. Returns one of five transport shapes: ' +
-    '{transport: "oauth", client_id, client_name, scopes, expires_at, source_id, federated_read}, ' +
-    '{transport: "tenant", company_slug, token_name, scopes, expires_at, source_id, federated_read} ' +
-    'for tenant-scoped short-TTL tokens (company_slug is SERVER-verified — derived from the ' +
-    'authenticated token row, never from anything the caller asserts), ' +
-    '{transport: "legacy", token_name, scopes, expires_at: null} for grandfathered bearer ' +
-    'tokens without tenant metadata (never a fabricated slug), ' +
-    '{transport: "local", scopes: []}, or {transport: "stdio", scopes: []} ' +
-    'for the auth-less stdio MCP pipe. Throws unknown_transport when the ' +
-    'context is ambiguous (remote=true without auth and no transport marker) ' +
-    '— fail-closed posture mirroring the v0.26.9 trust-boundary contract.',
+  description: 'Transport, scopes, source_id, federated_read grants and server-verified tenant identity.',
   params: {},
   scope: 'read',
   handler: async (ctx) => {

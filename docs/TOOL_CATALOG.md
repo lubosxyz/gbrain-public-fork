@@ -75,7 +75,7 @@ Every non-localOnly operation on the MCP surface: 151 tools across 25 areas. **S
 | `get_brain_identity` | Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. | read |  |  |
 | `token_mint_scoped` | Mint a tenant-scoped short-TTL READ-ONLY bearer token bound to a server-stored company_slug. | admin |  |  |
 | `token_revoke` | Revoke exactly one bearer token by its row id (UUID — the only safe revocation key; names are not unique). | admin |  |  |
-| `whoami` | Introspect the calling identity. | read | yes |  |
+| `whoami` | Transport, scopes, source_id, federated_read grants and server-verified tenant identity. | read | yes |  |
 
 ## ingest
 

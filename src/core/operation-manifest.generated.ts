@@ -3900,7 +3900,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Introspect the calling identity. Returns one of five transport shapes: {transport: \"oauth\", client_id, client_name, scopes, expires_at, source_id, federated_read}, {transport: \"tenant\", company_slug, token_name, scopes, expires_at, source_id, federated_read} for tenant-scoped short-TTL tokens (company_slug is SERVER-verified — derived from the authenticated token row, never from anything the caller asserts), {transport: \"legacy\", token_name, scopes, expires_at: null} for grandfathered bearer tokens without tenant metadata (never a fabricated slug), {transport: \"local\", scopes: []}, or {transport: \"stdio\", scopes: []} for the auth-less stdio MCP pipe. Throws unknown_transport when the context is ambiguous (remote=true without auth and no transport marker) — fail-closed posture mirroring the v0.26.9 trust-boundary contract.",
+    "description": "Transport, scopes, source_id, federated_read grants and server-verified tenant identity.",
     "params": {},
     "scope": "read",
     "cliHints": {
@@ -4067,6 +4067,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
   },
   {
     "name": "token_mint_scoped",
+    "idempotent": false,
     "outputRedaction": "no_stored_text",
     "description": "Mint a tenant-scoped short-TTL READ-ONLY bearer token bound to a server-stored company_slug. Allowlisted minting principals only (admin scope or local CLI). The grant is exactly [\"read\"] and ttl_seconds is hard-capped at 3600 (60 minutes) — any other scope request or larger TTL is denied before any row is written. Expiry is computed from SERVER time in the database. The decision is written to the durable redacted auth audit; if the audit write fails, the mint is rolled back and the op fails (fail-closed — an unaudited credential never leaves the server). The plaintext token is returned ONCE and never stored or logged; wire it immediately.",
     "params": {
@@ -4114,6 +4115,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
   },
   {
     "name": "token_revoke",
+    "idempotent": false,
     "outputRedaction": "no_stored_text",
     "description": "Revoke exactly one bearer token by its row id (UUID — the only safe revocation key; names are not unique). Allowlisted principals only (admin scope or local CLI). Revocation takes effect on the next verification. The decision is written to the durable redacted auth audit; because revocation only narrows access, an audit-write failure alerts but never un-revokes (`audit_ok: false` in the result).",
     "params": {

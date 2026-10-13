@@ -515,6 +515,7 @@
     {
       "handlers": [
         "withBearerScopeHint(requireBearerAuth({ verifier : resourceVerifier , resourceMetadataUrl }), [ 'read' , 'write' ])",
+        "express.json({ limit : process . env . GBRAIN_HTTP_MAX_BODY_BYTES || '25mb' })",
         "<inline>"
       ],
       "method": "post",

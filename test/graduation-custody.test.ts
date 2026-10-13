@@ -89,6 +89,8 @@ describe('inspectGraduationPath and marker liveness', () => {
     if (processStartTime(process.ppid)) expect(inspectGraduationPath(dir).liveness).toBe('dead');
     writeIntentMarker(dir, marker('run-other-host', 'copying', { pid: process.ppid, bootId: 'another-boot' }));
     expect(inspectGraduationPath(dir).liveness).toBe('unknown');
+    writeIntentMarker(dir, marker('run-other-namespace', 'copying', { pid: process.ppid, pidNs: 'another-namespace' }));
+    expect(inspectGraduationPath(dir).liveness).toBe('unknown');
     writeIntentMarker(dir, marker('run-split', 'tombstoned', { pid: deadPid() }));
     mkdirSync(graduatedPath(dir, 'run-split'));
     expect(inspectGraduationPath(dir)).toMatchObject({ state: 'split_brain', movedTo: graduatedPath(dir, 'run-split') });

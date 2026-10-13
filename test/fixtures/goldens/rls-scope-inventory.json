@@ -2360,6 +2360,17 @@
         ],
         "flagOnScopes": []
       },
+      "markEmbedSkip#source-scoped-jsonb-merge": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
       "markPagesAttendanceBlocked#default": {
         "flagOffLanes": [
           "pool"
@@ -3597,6 +3608,7 @@
         "logEvalCandidate": "none",
         "logEvalCaptureFailure": "none",
         "logIngest": "none",
+        "markEmbedSkip": "none",
         "markPagesAttendanceBlocked": "none",
         "markPagesExtractedBatch": "none",
         "mergeOntologyFact": "none",

@@ -35,7 +35,8 @@ export interface InventoryEntry {
 
 type Row = [table: string, cls: InventoryClass, reason: string, columns: string, probe?: string];
 const ROWS: readonly Row[] = [
-  ['access_tokens', 'out_of_scope', 'secret_material', 'name token_hash scopes permissions source_grant source_id federated_read allowed_operations takes_holders min_trust'],
+  ['access_tokens', 'out_of_scope', 'secret_material', 'name token_hash scopes permissions source_grant source_id federated_read allowed_operations takes_holders min_trust company_slug minted_by'],
+  ['auth_audit', 'out_of_scope', 'no_memory_text', 'correlation_id decision method reason token_id token_name company_slug actor'],
   ['budget_ledger', 'out_of_scope', 'no_memory_text', 'scope resolver_id'],
   ['budget_reservations', 'out_of_scope', 'no_memory_text', 'reservation_id scope resolver_id status'],
   ['calibration_profiles', 'out_of_scope', 'probed_reported', 'source_id holder wave_version domain_scorecards pattern_statements active_bias_tags model_id', 'pattern_statements domain_scorecards'],
@@ -84,6 +85,7 @@ const ROWS: readonly Row[] = [
   ['links', 'out_of_scope', 'probed_reported', 'link_type context link_source link_kind origin_field resolution_type assertion_tense', 'context'],
   ['loop_suppressions', 'out_of_scope', 'no_memory_text', 'source_id kind value'],
   ['mcp_request_log', 'out_of_scope', 'probed_reported', 'token_name agent_name operation status params error_message', 'params error_message'],
+  ['mcp_request_log_purged', 'out_of_scope', 'no_memory_text', 'token_name'],
   ['mcp_spend_log', 'out_of_scope', 'no_memory_text', 'client_id token_name operation provider model budget_key'],
   ['mcp_spend_reservations', 'out_of_scope', 'no_memory_text', 'client_id model provider status usage_unknown_reason budget_key'],
   ['mention_gazetteer_entries', 'out_of_scope', 'no_memory_text', 'source_id name_norm target_slug'],

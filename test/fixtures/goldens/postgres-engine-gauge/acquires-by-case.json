@@ -256,6 +256,7 @@
       "raw": 4,
       "tx": 1
     },
+    "markEmbedSkip#source-scoped-jsonb-merge": {},
     "markPagesAttendanceBlocked#default": {},
     "markPagesExtractedBatch#default": {},
     "mergeOntologyFact#corroborate": {},

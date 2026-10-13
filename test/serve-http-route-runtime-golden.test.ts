@@ -155,7 +155,7 @@ const normalizer = defineNormalizer('serve-http-routes-runtime-v1', (capture: Ru
 // objects keep their identity through `#<ordinal>` (checked separately below).
 const AST_TO_RUNTIME: Array<[RegExp, string]> = [
   [/^cookieParser\(\)$/, 'cookieParser'],
-  [/^express\.json\(\)$/, 'jsonParser'],
+  [/^express\.json\(/, 'jsonParser'],
   [/^express\.urlencoded\(/, 'urlencodedParser'],
   [/^express\.raw\(/, 'rawParser'],
   [/^express\.static\(/, 'serveStatic'],

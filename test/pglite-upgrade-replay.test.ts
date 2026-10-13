@@ -27,7 +27,10 @@
  *     differently indented template literals, so an existing brain's
  *     `prosrc` differs from a fresh brain's in whitespace only. The test pins
  *     that exact function list and proves the bodies are whitespace-equivalent;
- *     every other catalog object must match the live fresh install;
+ *     v240 appends the retained fork tenant columns to this upstream fixture,
+ *     while fresh fork schemas have them inline. The exact ordinal permutation
+ *     is pinned separately; every column definition and other catalog object
+ *     must match the live fresh install;
  *   - corpus row counts and fingerprint match the manifest at every phase;
  *   - the repeat boot after a restart is a no-op: no migrations applied,
  *     schema version and catalog unchanged, OIDs of tables, indexes,
@@ -81,6 +84,13 @@ const WHITESPACE_ONLY_FUNCTION_DRIFT = [
   'bump_page_generation_clock_fn()',
   'bump_page_generation_fn()',
 ];
+/** Fresh fork schema positions vs v240 additions to the pinned upstream brain. */
+const TOKEN_COLUMN_ORDINAL_DRIFT: Record<string, [number, number]> = {
+  company_slug: [8, 16], expires_at: [9, 17], minted_by: [10, 18],
+  permissions: [11, 8], source_grant: [12, 9], source_id: [13, 10],
+  federated_read: [14, 11], allowed_operations: [15, 12], takes_holders: [16, 13],
+  grant_revision: [17, 14], min_trust: [18, 15],
+};
 /** The OID-churn list is already sorted identity keys; nothing volatile to scrub. */
 const recreatedObjectsNormalizer = defineNormalizer<string[]>('oid-churn-keys-v1', (keys) => [...keys].sort());
 const collapseWhitespace = (s: string) => s.replace(/\s+/g, ' ').trim();
@@ -199,13 +209,24 @@ describe('PGLite upgrade replay (EO3)', () => {
     expect(describeCatalogGoldenDrift('pglite-upgrade-replay/catalog-before-boot', requirePhase('beforeBoot').catalog)).toBe('');
   });
 
-  test('upgrade boot succeeds; its catalog is pinned and differs from a fresh install only by function whitespace', async () => {
+  test('upgrade boot succeeds; its catalog pins function whitespace and tenant-column ordinal differences', async () => {
     const first = requirePhase('firstBoot');
     expect(first.version).toBe(LATEST_VERSION);
     expectCatalogGolden('pglite-upgrade-replay/catalog-after-boot', first.catalog);
 
     const fresh = await withCatalogConfig(CATALOG_CONFIGS[0], capturePgliteFreshInstall);
-    const diff = diffCatalogSnapshots(fresh.catalog, first.catalog, { compareOrdinals: true });
+    const allDiffs = diffCatalogSnapshots(fresh.catalog, first.catalog, { compareOrdinals: true });
+    const ordinalKeys = Object.keys(TOKEN_COLUMN_ORDINAL_DRIFT).map(name => `access_tokens.${name}`);
+    const ordinalDiffs = allDiffs.filter(d => d.section === 'tables' && ordinalKeys.includes(d.key));
+    expect(ordinalDiffs.map(d => d.key).sort()).toEqual([...ordinalKeys].sort());
+    for (const d of ordinalDiffs) {
+      expect(d.kind).toBe('changed');
+      const { ordinal: freshOrdinal, ...freshColumn } = d.expected as Record<string, unknown>;
+      const { ordinal: upgradedOrdinal, ...upgradedColumn } = d.actual as Record<string, unknown>;
+      expect([freshOrdinal, upgradedOrdinal]).toEqual(TOKEN_COLUMN_ORDINAL_DRIFT[d.key.slice('access_tokens.'.length)]);
+      expect(upgradedColumn).toEqual(freshColumn);
+    }
+    const diff = allDiffs.filter(d => !ordinalDiffs.includes(d));
     const unexplained = diff.filter((d) => !(d.section === 'functions' && d.kind === 'changed'));
     if (unexplained.length > 0) throw new Error(`upgraded brain differs from a fresh install:\n${formatCatalogDiffForFailure(unexplained)}`);
     expect(diff.map((d) => d.key)).toEqual(WHITESPACE_ONLY_FUNCTION_DRIFT);

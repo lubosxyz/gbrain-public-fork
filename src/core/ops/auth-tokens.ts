@@ -56,6 +56,7 @@ function mintingPrincipal(ctx: {
 
 const token_mint_scoped: Operation = {
   name: 'token_mint_scoped',
+  idempotent: false, // Each invocation can mint a distinct credential and audit decision.
   outputRedaction: 'no_stored_text',
   description:
     'Mint a tenant-scoped short-TTL READ-ONLY bearer token bound to a server-stored ' +
@@ -210,6 +211,7 @@ const token_mint_scoped: Operation = {
 
 const token_revoke: Operation = {
   name: 'token_revoke',
+  idempotent: false, // Repeated revocation still appends an audit decision and correlation ID.
   outputRedaction: 'no_stored_text',
   description:
     'Revoke exactly one bearer token by its row id (UUID — the only safe revocation key; ' +

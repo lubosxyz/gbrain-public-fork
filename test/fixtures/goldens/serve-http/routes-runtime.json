@@ -650,6 +650,7 @@
         {
           "handlers": [
             "<anonymous>",
+            "jsonParser",
             "<anonymous>"
           ],
           "method": "post",
@@ -1366,6 +1367,7 @@
         {
           "handlers": [
             "<anonymous>",
+            "jsonParser",
             "<anonymous>"
           ],
           "method": "post",

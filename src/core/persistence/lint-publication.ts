@@ -30,7 +30,7 @@ export async function resolveManagedLintSource(engine: BrainEngine, target: stri
 export async function managedLintPublisher(engine: BrainEngine, target: string) {
   const { source, sources } = await resolveManagedLintSource(engine, target);
   const authority = await maintenancePreflight(engine, source.id, source.root);
-  if (!authority?.binding) throw new OperationError('source_changed', 'Persistence changed during lint preparation.', 'Inspect gbrain writer status --json before preparing a new lint run.');
+  if (!authority?.binding) throw new OperationError('source_changed', 'Persistence changed during lint preparation.', 'Inspect gbrain sources writer status --json before preparing a new lint run.');
   return async (path: string) => {
     const canonicalPath = canonicalFilesystemPath(path);
     const rel = relative(source.root, canonicalPath);
@@ -49,7 +49,7 @@ export async function managedLintPublisher(engine: BrainEngine, target: string) 
     const content = readSourceFileSync(path, 'utf-8');
     return { content, publish: async (fixed: string) => {
       const receipt = await publishMaintenancePage(engine, authority, page.slug, fixed, { expectedRevision: snapshot.revision });
-      if (receipt.state !== 'committed') throw new OperationError('write_pending', 'The lint repair has not committed; inspect writer status.', 'Run gbrain writer status --json and inspect the existing write receipt.');
+      if (receipt.state !== 'committed') throw new OperationError('write_pending', 'The lint repair has not committed; inspect writer status.', 'Run gbrain sources writer status --json and inspect the existing write receipt.');
     } };
   };
 }

@@ -51,6 +51,19 @@ async function readFrontmatter(slug: string): Promise<Record<string, unknown> | 
 }
 
 describe('markEmbedSkip', () => {
+  test('managed canonical frontmatter refuses an uncoordinated marker without changing the page', async () => {
+    await seedPage('managed-page', { keep: 'canonical' });
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    try {
+      await expect(engine.markEmbedSkip('managed-page', {
+        marker: buildChunkTokenLimitMarker(6057),
+      })).rejects.toThrow('writer_coordinator_required');
+      expect(await readFrontmatter('managed-page')).toEqual({ keep: 'canonical' });
+    } finally {
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    }
+  });
+
   test('writes a marker the shared predicate recognizes', async () => {
     await seedPage('parked-page', {});
     await engine.markEmbedSkip('parked-page', { marker: buildChunkTokenLimitMarker(6057) });
