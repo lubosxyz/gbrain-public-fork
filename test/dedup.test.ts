@@ -126,6 +126,19 @@ describe('compiled truth guarantee', () => {
     expect(hasCompiledTruth).toBe(true);
   });
 
+  test('adds the highest-scoring compiled_truth chunk; first seen wins a tie', () => {
+    const timeline = (id: number, score: number) => makeResult({
+      slug: 'a', chunk_id: id, score, chunk_source: 'timeline', chunk_text: `timeline entry number ${id}`,
+    });
+    const truth = (id: number, score: number) => makeResult({
+      slug: 'a', chunk_id: id, score, chunk_source: 'compiled_truth', chunk_text: `compiled truth variant ${id}`,
+    });
+    const best = dedupResults([timeline(1, 0.9), timeline(2, 0.8), timeline(3, 0.7), truth(4, 0.2), truth(5, 0.4), truth(6, 0.3)]);
+    expect(best.map(r => r.chunk_id)).toEqual([1, 2, 5]);
+    const tie = dedupResults([timeline(1, 0.9), timeline(2, 0.8), timeline(3, 0.7), truth(7, 0.3), truth(8, 0.3)]);
+    expect(tie.map(r => r.chunk_id)).toEqual([1, 2, 7]);
+  });
+
   test('does not swap when page already has compiled_truth', () => {
     const results = [
       makeResult({ slug: 'a', chunk_id: 1, score: 0.9, chunk_source: 'compiled_truth', chunk_text: 'compiled assessment' }),
@@ -271,5 +284,19 @@ describe('dedup — source-aware composite key (v0.18.0)', () => {
     );
     expect(wikiCompiledTruths.length).toBe(1);
     expect(wikiCompiledTruths[0].chunk_id).toBe(2); // wiki's own compiled_truth, NOT gstack's (id=3)
+  });
+});
+
+describe('compiled truth guarantee keeps evidence and score order (read-path audit #11)', () => {
+  test('appends the compiled_truth chunk instead of evicting a matching chunk, output stays score-sorted', () => {
+    const results = [
+      makeResult({ slug: 'a', chunk_id: 1, score: 0.95, chunk_source: 'timeline', chunk_text: 'alpha timeline first match text' }),
+      makeResult({ slug: 'a', chunk_id: 2, score: 0.90, chunk_source: 'timeline', chunk_text: 'second different timeline evidence words' }),
+      makeResult({ slug: 'b', chunk_id: 3, score: 0.80, chunk_source: 'compiled_truth', chunk_text: 'page b compiled truth summary' }),
+      makeResult({ slug: 'a', chunk_id: 4, score: 0.10, chunk_source: 'compiled_truth', chunk_text: 'page a compiled truth summary' }),
+    ];
+    const out = dedupResults(results);
+    expect(out.map(r => r.chunk_id)).toEqual([1, 2, 3, 4]);
+    for (let i = 1; i < out.length; i++) expect(out[i - 1].score).toBeGreaterThanOrEqual(out[i].score);
   });
 });

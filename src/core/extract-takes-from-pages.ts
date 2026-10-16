@@ -13,17 +13,25 @@
 // 100+-case eval suite. v0.42 ships the classifier + CLI; autopilot stays
 // blocked until eval coverage catches up.
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { loadConfig } from './config.ts';
 import type { BrainEngine } from './engine.ts';
 import type { TakeKind } from './engine.ts';
+import type { OperationContext } from './ops/contract.ts';
 import { chat, getChatModel, isAvailable } from './ai/gateway.ts';
 import {
+  appendTakesToPageBody,
   appendTakesToPageMdFirst,
+  materializeTakeResolutions,
   isSafeFenceCellText,
   resolveTakesRepoDir,
   resolveTakesWritePath,
   TakesWriteError,
 } from './takes-write.ts';
+import { managedPersistenceEnabled } from './persistence/ownership.ts';
+import { serializePageToMarkdown } from './markdown.ts';
+import { BudgetMeter, loadPricingOverrides } from './cycle/budget-meter.ts';
+import { parseTakesFence } from './takes-fence.ts';
 
 export const ALLOWED_PAGE_TYPES = [
   'concept', 'atom', 'lore', 'briefing', 'writing', 'originals',
@@ -55,6 +63,12 @@ export interface ExtractTakesFromPagesOpts {
   /** Max pages to classify per run (caps cost). Default 50. */
   maxPages?: number;
   /**
+   * Resume point from an earlier run's `next_before` (#5043): only pages
+   * ordered after it (older `updated_at`, or the same instant and a lower id)
+   * are selected.
+   */
+  before?: { updatedAt: string; id: number };
+  /**
    * Also rescan pages that already hold takes (refresh semantics).
    * Default false: bootstrap runs skip covered pages, so repeated runs
    * PROGRESS through a corpus larger than one run's cap instead of
@@ -65,6 +79,12 @@ export interface ExtractTakesFromPagesOpts {
   holder?: string;
   /** Model override; defaults to facts.extraction_model. */
   model?: string;
+  /**
+   * USD cap for the run's classifier calls. Default: config
+   * `takes.bootstrap_budget_usd`, else 5.0 (the propose_takes default).
+   * 0 disables the cap.
+   */
+  budgetUsd?: number;
   /** Progress hook called per page. */
   onProgress?: (done: number, total: number, claims: number) => void;
 }
@@ -72,6 +92,15 @@ export interface ExtractTakesFromPagesOpts {
 export interface ExtractTakesFromPagesResult {
   pages_scanned: number;
   claims_extracted: number;
+  /**
+   * Where the next run should resume, as `<updated_at text>,<page id>`: the
+   * position of the last page this run finished with, or null if it finished
+   * none. Pages that yield no claims stay uncovered and would otherwise be
+   * selected first forever (#5043); passing this to `--before` moves past
+   * them. A page a budget stop never reached is not counted as finished, and
+   * one skipped on an error stays uncovered for a run without `--before`.
+   */
+  next_before: string | null;
   /** True if the run was a no-op because bootstrapEnabled is false. */
   consent_gate_blocked: boolean;
   /** True if chat gateway is unavailable (no LLM call possible). */
@@ -85,6 +114,22 @@ export interface ExtractTakesFromPagesResult {
   skipped: Array<{ slug: string; reason: string }>;
   /** Count of pages whose md write landed but whose DB mirror warned (reconcile heals). */
   mirror_warnings: number;
+  /** True when the run stopped because the next classifier call would exceed the USD budget. */
+  budget_exhausted: boolean;
+  /** Extracted claims dropped because the page's takes fence already holds them. */
+  duplicates_skipped: number;
+}
+
+/** Duplicate key for a take claim: case, whitespace and trailing punctuation aside. */
+function claimKey(claim: string, holder: string): string {
+  return `${holder}\u0000${claim.toLowerCase().replace(/\s+/g, ' ').trim().replace(/[.!?;:,]+$/, '')}`;
+}
+
+async function resolveBudgetUsd(engine: BrainEngine, explicit: number | undefined): Promise<number> {
+  if (typeof explicit === 'number' && Number.isFinite(explicit) && explicit >= 0) return explicit;
+  const raw = await engine.getConfig('takes.bootstrap_budget_usd').catch(() => null);
+  const parsed = raw == null ? NaN : Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5.0;
 }
 
 interface PageRow {
@@ -94,6 +139,8 @@ interface PageRow {
   type: string;
   compiled_truth: string;
   updated_at: string | Date;
+  /** `<updated_at::text>,<id>`, the value `next_before` reports for this page. */
+  resume_at: string;
 }
 
 /**
@@ -128,7 +175,7 @@ export async function extractTakesFromPages(
   engine: BrainEngine,
   opts: ExtractTakesFromPagesOpts,
 ): Promise<ExtractTakesFromPagesResult> {
-  const emptyTail = { pages_skipped: 0, skipped: [], mirror_warnings: 0 };
+  const emptyTail = { next_before: null, pages_skipped: 0, skipped: [], mirror_warnings: 0, budget_exhausted: false, duplicates_skipped: 0 };
   // A12 consent gate: refuse without bootstrap_enabled even on manual call.
   if (!opts.bootstrapEnabled) {
     return {
@@ -151,10 +198,18 @@ export async function extractTakesFromPages(
   }
 
   const dryRun = opts.dryRun ?? false;
+  const managedJournalWrites = await managedPersistenceEnabled(engine);
   const maxPages = opts.maxPages ?? 50;
   const holder = opts.holder ?? 'system';
-  const sourceFilter = opts.sourceIdFilter ? `AND source_id = $1` : '';
-  const params = opts.sourceIdFilter ? [opts.sourceIdFilter] : [];
+  const params: unknown[] = [];
+  const bind = (value: unknown): string => `$${params.push(value)}`;
+  const scope: string[] = [];
+  if (opts.sourceIdFilter) scope.push(`source_id = ${bind(opts.sourceIdFilter)}`);
+  // Resume strictly after the caller's position in the (updated_at DESC,
+  // id DESC) order. The timestamp is bound as text and cast in SQL so its
+  // microseconds survive; a parameter typed as timestamptz goes through a JS
+  // Date in postgres.js and loses them.
+  if (opts.before) scope.push(`(updated_at, id) < (${bind(opts.before.updatedAt)}::text::timestamptz, ${bind(opts.before.id)})`);
 
   // Fetch eligible pages. Order by updated_at DESC so recently-edited
   // pages get bootstrapped first.
@@ -168,14 +223,14 @@ export async function extractTakesFromPages(
     ? ''
     : `AND NOT EXISTS (SELECT 1 FROM takes t WHERE t.page_id = pages.id)`;
   const pages = await engine.executeRaw<PageRow>(
-    `SELECT id, slug, source_id, type, compiled_truth, updated_at
+    `SELECT id, slug, source_id, type, compiled_truth, updated_at, updated_at::text || ',' || id AS resume_at
        FROM pages
       WHERE type IN (${typesList})
         AND deleted_at IS NULL
         AND length(COALESCE(compiled_truth, '')) > 200
         ${coveredFilter}
-        ${sourceFilter}
-      ORDER BY updated_at DESC
+        ${scope.map((condition) => `AND ${condition}`).join(' ')}
+      ORDER BY updated_at DESC, id DESC
       LIMIT ${maxPages}`,
     params,
   );
@@ -184,7 +239,15 @@ export async function extractTakesFromPages(
   let claimsExtracted = 0;
   let pagesSkipped = 0;
   let mirrorWarnings = 0;
+  let budgetExhausted = false;
+  let duplicatesSkipped = 0;
   const skipped: Array<{ slug: string; reason: string }> = [];
+  const model = opts.model || getChatModel();
+  const meter = new BudgetMeter({
+    budgetUsd: await resolveBudgetUsd(engine, opts.budgetUsd),
+    phase: 'takes_bootstrap',
+    pricingOverrides: await loadPricingOverrides(engine),
+  });
   // #4473: takes are markdown-canonical (takes-write.ts contract), so the
   // bootstrap routes every write through the fence writer instead of minting
   // DB-only rows the next reconcile/extract would clobber.
@@ -204,22 +267,42 @@ export async function extractTakesFromPages(
     // #4473: locate the page's markdown home BEFORE the LLM call — a page the
     // fence writer would refuse must not burn classifier budget (skipped pages
     // hold no takes, so every future run would re-classify them).
+    let mdPath: string | null = null;
     if (!dryRun) {
-      let locatable = false;
       try {
         const { path } = await resolveTakesWritePath(engine, repoDir, page.slug, page.source_id);
-        locatable = existsSync(path);
+        if (existsSync(path)) mdPath = path;
       } catch {
-        locatable = false; // mirror_unavailable (no repo dir + no source local_path)
+        // mirror_unavailable (no repo dir + no source local_path)
       }
-      if (!locatable) {
+      if (!mdPath) {
         skipPage(page.slug, 'mirror_unavailable');
         continue;
       }
     }
 
+    // Pin the selected page before spending time on extraction. A managed
+    // publication with a newer revision must skip the whole page atomically.
+    const managedSnapshot = managedJournalWrites && !dryRun
+      ? await engine.readPageSnapshot(page.slug, { sourceId: page.source_id }) : null;
+    if (managedJournalWrites && !dryRun && (!managedSnapshot || managedSnapshot.page.id !== page.id)) {
+      skipPage(page.slug, 'page_identity_changed');
+      continue;
+    }
+
     // Truncate to keep per-page cost bounded (~20K chars → ~5K input tokens).
-    const text = page.compiled_truth.slice(0, 20_000);
+    const text = (managedSnapshot?.page.compiled_truth ?? page.compiled_truth).slice(0, 20_000);
+
+    const budget = meter.check({
+      modelId: model,
+      estimatedInputTokens: Math.ceil((CLASSIFIER_SYSTEM.length + text.length) / 4) + 50,
+      maxOutputTokens: 2000,
+      label: 'takes_bootstrap',
+    });
+    if (!budget.allowed) {
+      budgetExhausted = true;
+      break;
+    }
 
     let response: { text: string };
     try {
@@ -228,7 +311,7 @@ export async function extractTakesFromPages(
         // config, same idiom as enrich.ts) instead of hardcoded cloud Haiku.
         // On OAuth/local-only installs the hardcoded model made every takes
         // extraction die with llm_unavailable despite a working chat_model.
-        model: opts.model || getChatModel(),
+        model,
         system: CLASSIFIER_SYSTEM,
         messages: [
           {
@@ -238,9 +321,14 @@ export async function extractTakesFromPages(
         ],
         maxTokens: 2000,
       });
-    } catch {
-      // Skip pages whose chat call fails (rate limit, content filter,
-      // transient error). Per-page progress continues.
+    } catch (err) {
+      // Skip pages whose chat call fails (rate limit, content filter, auth,
+      // transient error) with the reason, so an outage is distinguishable
+      // from "nothing to extract". Per-page progress continues.
+      const code = (err as { code?: unknown; status?: unknown } | null)?.code
+        ?? (err as { status?: unknown } | null)?.status
+        ?? (err instanceof Error ? err.name : 'unknown');
+      skipPage(page.slug, `llm_error:${String(code)}`);
       continue;
     }
 
@@ -257,22 +345,63 @@ export async function extractTakesFromPages(
     // collision posture is gone). LLM output is pre-filtered against the
     // fence-cell guards so one garbled claim drops alone instead of sinking
     // the page's other claims.
-    const safeClaims = claims.filter((c) => isSafeFenceCellText(c.claim));
+    // Never append a claim the page's takes fence already holds (a rerun with
+    // includeCovered, or a hand-added take): duplicate gradeable takes skew
+    // calibration. The fence is canonical, so dedupe against its active rows.
+    const duplicateBody = managedJournalWrites
+      ? serializePageToMarkdown(managedSnapshot!.page, managedSnapshot!.tags)
+      : readFileSync(mdPath!, 'utf-8');
+    const held = new Set(parseTakesFence(duplicateBody).takes
+      .filter((t) => t.active).map((t) => claimKey(t.claim, t.holder)));
+    const safeClaims = claims.filter((c) => {
+      if (!isSafeFenceCellText(c.claim)) return false;
+      const key = claimKey(c.claim, holder);
+      if (held.has(key)) {
+        duplicatesSkipped++;
+        return false;
+      }
+      held.add(key);
+      return true;
+    });
     if (safeClaims.length === 0) continue;
     try {
-      const { rowNums, mirror } = await appendTakesToPageMdFirst(
-        { engine, slug: page.slug, brainDir: repoDir, sourceId: page.source_id },
-        safeClaims.map((c) => ({
+      const rows = safeClaims.map((c) => ({
           claim: c.claim,
           kind: c.kind,
           holder,
           weight: c.weight,
           source: 'cli:takes-bootstrap-from-pages',
-        })),
-      );
-      claimsExtracted += rowNums.length;
-      if (mirror.mirror_warning) mirrorWarnings++;
+        }));
+      if (managedJournalWrites) {
+        const body = await materializeTakeResolutions(engine, managedSnapshot!.page.id, serializePageToMarkdown(managedSnapshot!.page, managedSnapshot!.tags));
+        const composed = appendTakesToPageBody(body, rows);
+        const { operations } = await import('./operations.ts');
+        const putPage = operations.filter(operation => !operation.localOnly).find(operation => operation.name === 'put_page');
+        if (!putPage) throw new Error('put_page operation missing (gbrain build issue)');
+        const config = loadConfig() ?? { engine: engine.kind };
+        const ctx: OperationContext = {
+          engine, config, logger: { info: () => {}, warn: () => {}, error: () => {} },
+          dryRun: false, remote: false, sourceId: page.source_id,
+        };
+        await putPage.handler(ctx, {
+          slug: page.slug,
+          content: composed.body,
+          expected_revision: managedSnapshot!.revision,
+        });
+        claimsExtracted += composed.rowNums.length;
+      } else {
+        const { rowNums, mirror } = await appendTakesToPageMdFirst(
+          { engine, slug: page.slug, brainDir: repoDir, sourceId: page.source_id }, rows,
+        );
+        claimsExtracted += rowNums.length;
+        if (mirror.mirror_warning) mirrorWarnings++;
+      }
     } catch (err) {
+      const code = (err as { code?: string; writeError?: string })?.code ?? (err as { writeError?: string })?.writeError;
+      if (managedJournalWrites && (code === 'revision_conflict' || code === 'page_identity_changed' || code === 'source_changed')) {
+        skipPage(page.slug, code);
+        continue;
+      }
       if (err instanceof TakesWriteError) {
         // Skip + count (mirror_unavailable race, fence_unparsed, page_locked,
         // invalid_input) — never fall back to a DB-only write.
@@ -283,13 +412,18 @@ export async function extractTakesFromPages(
     }
   }
 
+  // Every page the loop entered is finished except the one a budget stop broke on.
+  const finished = budgetExhausted ? pagesScanned - 1 : pagesScanned;
   return {
     pages_scanned: pagesScanned,
     claims_extracted: claimsExtracted,
+    next_before: finished > 0 ? pages[finished - 1]!.resume_at : null,
     consent_gate_blocked: false,
     llm_unavailable: false,
     pages_skipped: pagesSkipped,
     skipped,
     mirror_warnings: mirrorWarnings,
+    budget_exhausted: budgetExhausted,
+    duplicates_skipped: duplicatesSkipped,
   };
 }

@@ -7,6 +7,8 @@
 import type { BrainEngine } from '../../../core/engine.ts';
 import { resolveEnvNumber } from '../../../core/env-number.ts';
 import type { Check } from '../../doctor.ts';
+import { checkError, doctorVerify } from '../check-fix.ts';
+import { queueWorkerAlive, runWaitingJobsFix } from '../../../core/minions/no-worker.ts';
 
 /** Local alias; the shared warn-once memo lives in core so it can't fork per module. */
 const _resolveEnvNumber = resolveEnvNumber;
@@ -31,7 +33,7 @@ const _resolveEnvNumber = resolveEnvNumber;
  * startup so bad GBRAIN_BULK_* config fails at doctor time, not first-retry.
  */
 /**
- * queue_health: Postgres Minion queue diagnostics.
+ * queue_health: Minion queue diagnostics (PGLite: waiting rows with no worker, see computePgliteQueueHealth).
  *
  * Includes the original stalled/depth/memory/prompt checks plus the #2557
  * no-worker signal: old `embed-backfill` jobs waiting on a queue with no live
@@ -47,13 +49,7 @@ export async function computeQueueHealthCheck(
     readWorkers?: () => Array<{ queue: string }>;
   } = {},
 ): Promise<Check> {
-  if (engine.kind === 'pglite') {
-    return {
-      name: 'queue_health',
-      status: 'ok',
-      message: 'Skipped (PGLite — no multi-process worker surface)',
-    };
-  }
+  if (engine.kind === 'pglite') return computePgliteQueueHealth(engine, opts.readWorkers);
 
   try {
     // issue #1801: column is `status`, not `state` (schema.sql:780).
@@ -91,15 +87,20 @@ export async function computeQueueHealthCheck(
     );
     const rssKillCount = Number(rssKillRows[0]?.cnt ?? 0);
 
-    const promptTooLongRows: Array<{ cnt: number }> = await engine.executeRaw(
-      `SELECT count(*)::int AS cnt
-         FROM minion_jobs
-        WHERE name = 'subagent'
-          AND status = 'dead'
-          AND finished_at > now() - interval '24 hours'
-          AND error_text LIKE 'prompt_too_long:%'`,
+    const promptTooLongRows: Array<{ phase: 'patterns' | 'synthesize' | 'other'; cnt: number }> = await engine.executeRaw(
+      `SELECT CASE WHEN key LIKE 'dream:patterns:%' THEN 'patterns'
+                   WHEN key LIKE 'dream:synth%' THEN 'synthesize'
+                   ELSE 'other' END AS phase,
+              count(*)::int AS cnt
+         FROM (SELECT COALESCE(idempotency_key, data->>'__released_idempotency_key') AS key
+                 FROM minion_jobs
+                WHERE name = 'subagent'
+                  AND status = 'dead'
+                  AND finished_at > now() - interval '24 hours'
+                  AND error_text LIKE 'prompt_too_long:%') dead
+        GROUP BY 1`,
     );
-    const promptTooLongCount = Number(promptTooLongRows[0]?.cnt ?? 0);
+    const promptTooLong = Object.fromEntries(promptTooLongRows.map(r => [r.phase, Number(r.cnt)]));
 
     const oldWaitingHours = opts.oldWaitingHours
       ?? _resolveEnvNumber('GBRAIN_QUEUE_NO_WORKER_WARN_HOURS', 1);
@@ -257,13 +258,26 @@ export async function computeQueueHealthCheck(
         );
       }
     } catch { /* best-effort — divergence probes never break doctor */ }
-    if (promptTooLongCount > 0) {
+    if (promptTooLong.patterns) {
       problems.push(
-        `${promptTooLongCount} subagent job(s) dead-lettered with prompt_too_long in last 24h. ` +
+        `${promptTooLong.patterns} dream patterns subagent job(s) dead-lettered with prompt_too_long in last 24h. ` +
+        `The reflections batch exceeded the patterns model's input context. ` +
+        `Fix: set a larger-context \`models.dream.patterns\`, or shorten \`dream.patterns.lookback_days\`.`
+      );
+    }
+    if (promptTooLong.synthesize) {
+      problems.push(
+        `${promptTooLong.synthesize} dream synthesize subagent job(s) dead-lettered with prompt_too_long in last 24h. ` +
         `Dream/synthesize transcripts exceeded the model's input context. ` +
         `Fix: \`gbrain dream --phase synthesize --dry-run --json\` to identify fat transcripts; ` +
         `set \`dream.synthesize.max_prompt_tokens\` to bound the per-chunk budget, or use a ` +
         `larger-context model (Opus 4.7 = 1M tokens vs Sonnet 4.6 = 200K).`
+      );
+    }
+    if (promptTooLong.other) {
+      problems.push(
+        `${promptTooLong.other} subagent job(s) dead-lettered with prompt_too_long in last 24h. ` +
+        `The prompt exceeded the model's input context; use a larger-context model or a shorter prompt.`
       );
     }
 
@@ -275,18 +289,48 @@ export async function computeQueueHealthCheck(
         details,
       };
     }
+    const noWorkerQueue = oldWaitingRows.find(r => !liveWorkerQueues.has(r.queue))?.queue;
     return {
       name: 'queue_health',
       status: 'warn',
       message: problems.join(' '),
       details,
+      ...(noWorkerQueue !== undefined
+        ? { fix: { ...runWaitingJobsFix(engine.kind, noWorkerQueue), verify: doctorVerify('queue_health') } }
+        : { fix_unavailable_reason: 'operator_judgement' as const }),
     };
   } catch (e) {
+    return checkError('queue_health', 'scan queue health', e);
+  }
+}
+
+/**
+ * queue_health on PGLite (agent-first operator wave E5): there is no
+ * background worker, so every waiting row (outside parent-owned dream-inline
+ * queues) waits until a foreground `gbrain jobs work` drain runs it. Counted
+ * and reported as `no_worker` with that drain as the fix (it needs the brain
+ * exclusively). A live drain registered for the queue reads as ok.
+ */
+async function computePgliteQueueHealth(engine: BrainEngine, readWorkers?: () => Array<{ queue: string }>): Promise<Check> {
+  try {
+    const rows = await engine.executeRaw<{ queue: string; depth: number | string; oldest_age_seconds: number | string | null }>(
+      `SELECT queue, count(*)::int AS depth, EXTRACT(EPOCH FROM (now() - min(created_at)))::int AS oldest_age_seconds
+         FROM minion_jobs WHERE status = 'waiting' GROUP BY queue ORDER BY count(*) DESC, queue`,
+    );
+    const { isDreamInlinePrivateQueue } = await import('../../../core/minions/queue.ts');
+    const waiting = rows.filter(r => !isDreamInlinePrivateQueue(r.queue) && queueWorkerAlive(r.queue, readWorkers) !== true);
+    const depth = waiting.reduce((n, r) => n + Number(r.depth), 0);
+    const details = { engine: 'pglite', depth, by_queue: Object.fromEntries(waiting.map(r => [r.queue, Number(r.depth)])), worker_alive: depth === 0 };
+    if (depth === 0) return { name: 'queue_health', status: 'ok', message: 'PGLite: no jobs waiting for a worker.', details };
+    const top = waiting[0]!;
+    const hours = Math.floor(Number(top.oldest_age_seconds ?? 0) / 3600);
     return {
-      name: 'queue_health',
-      status: 'warn',
-      message: `queue_health scan skipped: ${e instanceof Error ? e.message : String(e)}`,
+      name: 'queue_health', status: 'warn', details,
+      message: `no_worker: ${depth} job(s) are waiting (${waiting.map(r => `${r.queue}=${Number(r.depth)}`).join(', ')}; oldest ${hours}h) and PGLite has no background worker, so they run only when a \`gbrain jobs work\` drain does.`,
+      fix: { ...runWaitingJobsFix('pglite', top.queue), verify: doctorVerify('queue_health') },
     };
+  } catch (e) {
+    return checkError('queue_health', 'count waiting jobs', e);
   }
 }
 
@@ -348,6 +392,12 @@ export async function computeWedgedQueueCheck(
     }
     if (wedged.length === 0) {
       return { name: 'wedged_queue', status: 'ok', message: 'No wedged queues' };
+    }
+    // The verify-step doctor of an engine graduation runs on the fenced target before any worker may
+    // start, so waiting jobs carried from the quiesced source cannot have progressed yet.
+    if (process.env.GBRAIN_GRADUATION_RUN) {
+      return { name: 'wedged_queue', status: 'warn', message: `Graduation exemption: ${wedged.map(w => w.label).join(', ')} carried from the quiesced source; workers start after cutover.`,
+        details: { graduation_exempt: true, run_id: process.env.GBRAIN_GRADUATION_RUN, queues: wedged.map(w => w.queue) } };
     }
     // #3063: "worker alive but not claiming work" would be a false claim
     // for a queue no worker process was ever subscribed to. Split the
@@ -806,10 +856,6 @@ export async function checkBatchRetryHealth(_engine: BrainEngine): Promise<Check
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return {
-      name: 'batch_retry_health',
-      status: 'warn',
-      message: `Could not check batch_retry audit: ${msg}`,
-    };
+    return checkError('batch_retry_health', 'check batch_retry audit', msg);
   }
 }

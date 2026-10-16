@@ -799,7 +799,17 @@ function invokeGbrain(
 ): Promise<PhaseOutcome> {
   return new Promise((resolvePromise) => {
     const start = Date.now();
-    const child = spawn(bin, argv, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+    const child = spawn(bin, argv, {
+      cwd, env, stdio: ['ignore', 'pipe', 'pipe'], shell: false,
+      // A timed-out CLI phase owns its helpers too, including pipe holders.
+      detached: process.platform !== 'win32',
+    });
+    const killTree = (signal: NodeJS.Signals) => {
+      if (process.platform !== 'win32' && child.pid) {
+        try { process.kill(-child.pid, signal); return; } catch { /* group gone */ }
+      }
+      try { child.kill(signal); } catch { /* already gone */ }
+    };
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     child.stdout?.on('data', (b: Buffer) => stdout.push(b));
@@ -812,9 +822,9 @@ function invokeGbrain(
     let killTimer: ReturnType<typeof setTimeout> | null = null;
     const wallClockTimer = setTimeout(() => {
       timedOut = true;
-      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+      killTree('SIGTERM');
       killTimer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        killTree('SIGKILL');
       }, 10_000);
     }, SUBPROCESS_TIMEOUT_MS);
     const clearTimers = () => {
@@ -827,6 +837,9 @@ function invokeGbrain(
       if (settled) return;
       settled = true;
       clearTimers();
+      // The leader may exit before a TERM-resistant grandchild. Never cancel
+      // escalation while leaving that owned process group alive.
+      if (timedOut) killTree('SIGKILL');
       let stderrText = Buffer.concat(stderr).toString('utf-8');
       if (timedOut) stderrText += `\nharness: killed after ${SUBPROCESS_TIMEOUT_MS}ms phase timeout`;
       const stdoutText = Buffer.concat(stdout).toString('utf-8');

@@ -11,8 +11,10 @@
  *   A. Schema       — assert migration v51 has run.
  *   B. Fence facts  — backfill DB facts → entity-page fences (dry-run
  *                     by default; explicit --write required).
- *   C. Verify       — re-parse each fence-owned page, count rows, compare
- *                     against the DB rows for that page; partial on
+ *   C. Verify       — re-parse each fence-owned page and compare its fence
+ *                     row numbers with the DB rows for that page; a
+ *                     duplicate active fence row may be absent from the
+ *                     index (extract_facts indexes it once). Partial on
  *                     mismatch. Conversation-miner (`cli:`) facts are not
  *                     fence-owned (extract-conversation-facts writes the
  *                     chat log as source of truth) and are excluded.
@@ -20,9 +22,13 @@
  *
  * Idempotency: phase B only touches rows with row_num IS NULL. Re-runs
  * after a partial completion pick up where the previous run stopped.
- * Per-page atomic (.tmp + parse + rename, same primitive as
- * fence-write.ts). Dirty-tree refusal mirrors src/core/dry-fix.ts so
- * the user can review the diff before committing.
+ * Phase B is the shared core pass `src/core/facts/unfenced-facts.ts`, which
+ * the extract_facts cycle phase also runs: managed brains publish each page
+ * through the coordinator (`managed_maintenance_adopt_fact_fence`) and
+ * verify from the database; unmanaged pages are written per page atomically
+ * (.tmp + parse + rename under the page lock, same primitive as
+ * fence-write.ts). The migration adds a dirty-tree refusal that mirrors
+ * src/core/dry-fix.ts so the user can review the diff before committing.
  *
  * Facts with NULL entity_slug are structurally unfenceable (no page to
  * fence onto). They're skipped with a warning; the operator decides
@@ -30,7 +36,7 @@
  * forever; they live in the legacy keyspace permanently.
  */
 
-import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
 import type {
@@ -39,8 +45,13 @@ import type {
 import type { BrainEngine } from '../../core/engine.ts';
 import { loadConfig, toEngineConfig } from '../../core/config.ts';
 import { createEngine } from '../../core/engine-factory.ts';
-import { parseFactsFence, renderFactsTable, replaceOrInsertFactsFence } from '../../core/facts-fence.ts';
+import { parseFactsFence } from '../../core/facts-fence.ts';
+import { duplicateActiveFenceRows } from '../../core/facts/extract-from-fence.ts';
 import { resolvePageWriteTarget } from '../../core/write-through.ts';
+import { serializePageToMarkdown } from '../../core/markdown.ts';
+import { managedPersistenceEnabled } from '../../core/persistence/ownership.ts';
+import { OperationError } from '../../core/ops/contract.ts';
+import { fenceableRowCount, fenceUnfencedFacts, planUnfencedFacts, type UnfencedFactsOutcome } from '../../core/facts/unfenced-facts.ts';
 
 let testEngineOverride: BrainEngine | null = null;
 export function __setTestEngineOverride(engine: BrainEngine | null): void {
@@ -101,37 +112,6 @@ async function phaseASchema(
 
 // ── Phase B — Fence facts ──────────────────────────────────
 
-interface LegacyFactRow {
-  id: string;        // BIGSERIAL — string-typed on the wire for safety
-  source_id: string;
-  entity_slug: string | null;
-  fact: string;
-  kind: 'event' | 'preference' | 'commitment' | 'belief' | 'fact';
-  visibility: 'private' | 'world';
-  notability: 'high' | 'medium' | 'low';
-  context: string | null;
-  valid_from: Date;
-  valid_until: Date | null;
-  source: string;
-  confidence: number;
-  page_exists: boolean;
-}
-
-interface SourceLookup {
-  id: string;
-  local_path: string | null;
-}
-
-interface PhaseBOutcome {
-  scanned: number;
-  fenced: number;
-  skipped_no_entity: number;
-  skipped_no_local_path: number;
-  skipped_no_page: number;
-  pages_touched: number;
-  failed_pages: string[];
-}
-
 /**
  * Dirty-tree refusal: mirror src/core/dry-fix.ts behavior. Refuses to
  * write if any source's local_path has uncommitted changes. Dry-run
@@ -152,6 +132,12 @@ function isLocalPathDirty(localPath: string): boolean {
   }
 }
 
+/**
+ * Fence every unfenced row through the shared core pass
+ * (`src/core/facts/unfenced-facts.ts`, also run by the extract_facts cycle
+ * phase). The migration adds only its dirty-tree refusal on unmanaged
+ * sources, so the user can review the diff before committing.
+ */
 async function phaseBFenceFacts(
   engine: BrainEngine | null,
   opts: OrchestratorOpts,
@@ -161,208 +147,78 @@ async function phaseBFenceFacts(
   }
 
   try {
-    // Look up all sources + their local_paths.
-    const sources = await engine.executeRaw<SourceLookup>(
-      `SELECT id, local_path FROM sources`,
-    );
-    const localPathById = new Map<string, string | null>();
-    for (const s of sources) localPathById.set(s.id, s.local_path);
-
-    // Walk legacy rows in (source_id, entity_slug) groups for per-page
-    // atomic writes.
-    const legacy = await engine.executeRaw<LegacyFactRow>(
-      `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
-              context, valid_from, valid_until, source, confidence,
-              EXISTS (SELECT 1 FROM pages p WHERE p.source_id = f.source_id
-                AND p.slug = f.entity_slug AND p.deleted_at IS NULL) AS page_exists
-         FROM facts f
-        WHERE row_num IS NULL AND expired_at IS NULL
-        ORDER BY source_id, entity_slug, id`,
-    );
-
-    const outcome: PhaseBOutcome = {
-      scanned: legacy.length,
-      fenced: 0,
-      skipped_no_entity: 0,
-      skipped_no_local_path: 0,
-      skipped_no_page: 0,
-      pages_touched: 0,
-      failed_pages: [],
-    };
-
-    // Group by (source_id, entity_slug) so each page's fence is updated
-    // atomically with all its legacy rows.
-    const groups = new Map<string, LegacyFactRow[]>();
-    for (const row of legacy) {
-      if (row.entity_slug === null) {
-        outcome.skipped_no_entity += 1;
-        continue;
-      }
-      const localPath = localPathById.get(row.source_id);
-      if (!localPath) {
-        outcome.skipped_no_local_path += 1;
-        continue;
-      }
-      if (!row.page_exists) {
-        outcome.skipped_no_page += 1;
-        continue;
-      }
-      const key = `${row.source_id}\0${row.entity_slug}`;
-      const list = groups.get(key) ?? [];
-      list.push(row);
-      groups.set(key, list);
-    }
-
-    const filePaths = new Map<string, string>();
-    for (const [key, group] of groups) {
-      const [sourceId, entitySlug] = key.split('\0');
-      const target = await resolvePageWriteTarget(engine, entitySlug, sourceId);
-      if (!target.ok || !existsSync(target.filePath)) {
-        outcome.skipped_no_page += group.length;
-        groups.delete(key);
-        continue;
-      }
-      filePaths.set(key, target.filePath);
-    }
+    const plan = await planUnfencedFacts(engine);
+    const { outcome } = plan;
 
     if (opts.dryRun) {
-      const fenceable = [...groups.values()].reduce((n, group) => n + group.length, 0);
       return {
         name: 'fence_facts', status: 'skipped',
-        detail: `dry-run: would fence ${fenceable} rows; ${outcome.skipped_no_entity} unfenceable (NULL entity_slug); ` +
+        detail: `dry-run: would fence ${fenceableRowCount(plan)} rows; ${outcome.skipped_no_entity} unfenceable (NULL entity_slug); ` +
           `skipped_no_page=${outcome.skipped_no_page} skipped_no_local_path=${outcome.skipped_no_local_path}`,
       };
     }
 
-    // Dirty-tree refusal: check ONLY the sources we are about to write
-    // into. A dirty tree in an unrelated source (or zero fenceable rows
-    // at all) must not block a no-op or a targeted backfill (#927).
-    const targetSourceIds = new Set([...groups.keys()].map(k => k.split('\0')[0]));
-    for (const id of targetSourceIds) {
-      const localPath = localPathById.get(id);
-      if (localPath && isLocalPathDirty(localPath)) {
-        return {
-          name: 'fence_facts',
-          status: 'failed',
-          detail: `source "${id}" has uncommitted changes in ${localPath}. Commit or stash, then re-run.`,
-        };
+    if (!plan.managed) {
+      // Dirty-tree refusal: check ONLY the sources we are about to write
+      // into. A dirty tree in an unrelated source (or zero fenceable rows
+      // at all) must not block a no-op or a targeted backfill (#927).
+      const targetSourceIds = new Set([...plan.groups.keys()].map(k => k.split('\0')[0]));
+      for (const id of targetSourceIds) {
+        const localPath = plan.localPathById.get(id);
+        if (localPath && isLocalPathDirty(localPath)) {
+          return {
+            name: 'fence_facts',
+            status: 'failed',
+            detail: `source "${id}" has uncommitted changes in ${localPath}. Commit or stash, then re-run.`,
+          };
+        }
       }
     }
 
-    for (const [key, group] of groups) {
-      const [sourceId, entitySlug] = key.split('\0');
-      const filePath = filePaths.get(key)!;
-      const tmpPath = `${filePath}.tmp`;
-
-      try {
-        let body = readFileSync(filePath, 'utf-8');
-
-        // Append each legacy row, collecting the assigned row_nums.
-        // Already-fenced rows (row_num already set) are skipped at the
-        // DB-row level by the WHERE clause, but if the SAME (entity,
-        // source, claim, source-text) tuple was previously appended in
-        // a partial-completion re-run, parseFactsFence will see the
-        // existing row and append a duplicate. We dedup on (claim,
-        // source) before append to handle this.
-        const existingFence = parseFactsFence(body);
-        if (existingFence.warnings.length > 0) {
-          outcome.failed_pages.push(`${entitySlug} (${existingFence.warnings.join('; ')})`);
-          continue;
-        }
-        const occupiedRows = await engine.executeRaw<{ row_num: number; fact: string; source: string | null }>(
-          `SELECT row_num, fact, source FROM facts
-            WHERE source_id = $1 AND source_markdown_slug = $2 AND row_num IS NOT NULL`,
-          [sourceId, entitySlug],
-        );
-        const occupied = new Map(occupiedRows.map(row => [Number(row.row_num), row]));
-        let nextRowNum = Math.max(0, ...occupied.keys(), ...existingFence.facts.map(f => f.rowNum)) + 1;
-        const claimed = new Set<number>();
-
-        const assignments: Array<{ id: string; row_num: number }> = [];
-        for (const row of group) {
-          const existing = existingFence.facts.find(f => {
-            const owner = occupied.get(f.rowNum);
-            return f.active && !claimed.has(f.rowNum) && f.claim === row.fact &&
-              (f.source ?? '') === (row.source ?? '') &&
-              (!owner || owner.fact !== f.claim || (owner.source ?? '') !== (f.source ?? ''));
-          });
-          if (existing) {
-            if (occupied.has(existing.rowNum)) existing.rowNum = nextRowNum++;
-            assignments.push({ id: row.id, row_num: existing.rowNum });
-            claimed.add(existing.rowNum);
-            continue;
-          }
-          // Append a new row.
-          const validFromStr = (row.valid_from instanceof Date ? row.valid_from : new Date(row.valid_from))
-            .toISOString().slice(0, 10);
-          const validUntilStr = row.valid_until
-            ? (row.valid_until instanceof Date ? row.valid_until : new Date(row.valid_until))
-                .toISOString().slice(0, 10)
-            : undefined;
-          const rowNum = nextRowNum++;
-          existingFence.facts.push({
-            rowNum,
-            active: true,
-            claim:      row.fact,
-            kind:       row.kind,
-            confidence: row.confidence,
-            visibility: row.visibility,
-            notability: row.notability,
-            validFrom:  validFromStr,
-            validUntil: validUntilStr,
-            source:     row.source,
-            context:    row.context ?? undefined,
-          });
-          assignments.push({ id: row.id, row_num: rowNum });
-          claimed.add(rowNum);
-        }
-        body = replaceOrInsertFactsFence(body, renderFactsTable(existingFence.facts));
-
-        // Atomic write: .tmp + parse + rename.
-        writeFileSync(tmpPath, body, 'utf-8');
-        const tmpBody = readFileSync(tmpPath, 'utf-8');
-        const parsed = parseFactsFence(tmpBody);
-        if (parsed.warnings.length > 0) {
-          outcome.failed_pages.push(`${entitySlug} (${parsed.warnings.join('; ')})`);
-          // .tmp stays for inspection; do NOT rename.
-          continue;
-        }
-        renameSync(tmpPath, filePath);
-
-        // UPDATE the DB rows with their new row_nums + source_markdown_slug.
-        for (const a of assignments) {
-          await engine.executeRaw(
-            `UPDATE facts SET row_num = $1, source_markdown_slug = $2 WHERE id = $3`,
-            [a.row_num, entitySlug, a.id],
-          );
-        }
-        outcome.fenced += assignments.length;
-        outcome.pages_touched += 1;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        outcome.failed_pages.push(`${entitySlug} (${msg})`);
-      }
+    try { await fenceUnfencedFacts(engine, plan); }
+    catch (error) {
+      if (!(error instanceof OperationError) || error.code !== 'queue_capacity') throw error;
+      return { name: 'fence_facts', status: 'failed', detail: `queue_capacity: ${error.message} ${error.suggestion ?? ''}`.trim() };
     }
-
-    const detail = `scanned=${outcome.scanned} fenced=${outcome.fenced} ` +
-      `pages=${outcome.pages_touched} skipped_no_entity=${outcome.skipped_no_entity} ` +
-      `skipped_no_local_path=${outcome.skipped_no_local_path} skipped_no_page=${outcome.skipped_no_page}` +
-      (outcome.failed_pages.length > 0 ? ` failed=${outcome.failed_pages.length}` : '');
-
-    if (outcome.failed_pages.length > 0) {
-      return {
-        name: 'fence_facts',
-        status: 'failed',
-        detail: `${detail} :: ${outcome.failed_pages.slice(0, 3).join(' | ')}${outcome.failed_pages.length > 3 ? '...' : ''}`,
-      };
-    }
-    return { name: 'fence_facts', status: 'complete', detail };
+    return fenceFactsResult(outcome);
   } catch (e) {
     return { name: 'fence_facts', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
   }
 }
 
+function fenceFactsResult(outcome: UnfencedFactsOutcome): OrchestratorPhaseResult {
+  const detail = `scanned=${outcome.scanned} fenced=${outcome.fenced} ` +
+    `pages=${outcome.pages_touched} skipped_no_entity=${outcome.skipped_no_entity} ` +
+    `skipped_no_local_path=${outcome.skipped_no_local_path} skipped_no_page=${outcome.skipped_no_page}` +
+    (outcome.skipped_archived > 0 ? ` skipped_archived=${outcome.skipped_archived}` : '') +
+    (outcome.failed_pages.length > 0 ? ` failed=${outcome.failed_pages.length}` : '');
+  if (outcome.failed_pages.length > 0) {
+    // The same `FACTS_FENCE_FAILED: <slug> (<reason>)` token the extract_facts
+    // cycle phase prints, so an unadoptable row reads the same in both outputs.
+    const failed = outcome.failed_pages.map(page => `FACTS_FENCE_FAILED: ${page}`);
+    return {
+      name: 'fence_facts',
+      status: 'failed',
+      detail: `${detail} :: ${failed.slice(0, 3).join(' | ')}${failed.length > 3 ? '...' : ''}`,
+    };
+  }
+  return { name: 'fence_facts', status: 'complete', detail };
+}
+
+interface SourceLookup {
+  id: string;
+  local_path: string | null;
+}
+
 // ── Phase C — Verify ────────────────────────────────────────
+
+/** Row numbers a drift detail names per side before it summarizes the rest. */
+const DRIFT_ROWS_SHOWN = 5;
+
+function listDriftRows(rows: number[]): string {
+  const shown = rows.slice(0, DRIFT_ROWS_SHOWN).join(', ');
+  return rows.length > DRIFT_ROWS_SHOWN ? `${shown}, +${rows.length - DRIFT_ROWS_SHOWN} more` : shown;
+}
 
 async function phaseCVerify(
   engine: BrainEngine | null,
@@ -373,7 +229,8 @@ async function phaseCVerify(
 
   try {
     // Per touched page (= any page with a fenced row in the DB), re-parse
-    // the fence from disk and compare row counts to the DB.
+    // the fence (the canonical file, or the database copy on a managed
+    // brain) and compare its row numbers to the DB's.
     const sources = await engine.executeRaw<SourceLookup>(
       `SELECT id, local_path FROM sources`,
     );
@@ -384,8 +241,8 @@ async function phaseCVerify(
     // (chat-log shape is the source of truth). Same cli: exclusion as
     // extract_facts reconciliation. Counting them here fails every brain
     // that ran extract-conversation-facts.
-    const groups = await engine.executeRaw<{ source_id: string; source_markdown_slug: string; n: string }>(
-      `SELECT source_id, source_markdown_slug, COUNT(*) AS n
+    const groups = await engine.executeRaw<{ source_id: string; source_markdown_slug: string; row_nums: number[] }>(
+      `SELECT source_id, source_markdown_slug, array_agg(row_num ORDER BY row_num) AS row_nums
          FROM facts
         WHERE row_num IS NOT NULL
           AND COALESCE(source, '') NOT LIKE 'cli:%'
@@ -394,21 +251,45 @@ async function phaseCVerify(
 
     const mismatches: string[] = [];
     let pagesChecked = 0;
+    // Managed brains publish the fence through the coordinator, which writes
+    // the canonical file in the same publication; the database copy is the
+    // one every managed page has, database-only pages included.
+    const managed = await managedPersistenceEnabled(engine);
 
     for (const g of groups) {
-      const localPath = localPathById.get(g.source_id);
-      if (!localPath) continue;
-      const target = await resolvePageWriteTarget(engine, g.source_markdown_slug, g.source_id);
-      if (!target.ok || !existsSync(target.filePath)) {
-        mismatches.push(`${g.source_markdown_slug} (file missing)`);
-        continue;
+      let body: string;
+      if (managed) {
+        const snapshot = await engine.readPageSnapshot(g.source_markdown_slug, { sourceId: g.source_id });
+        if (!snapshot) {
+          mismatches.push(`${g.source_markdown_slug} (page missing)`);
+          continue;
+        }
+        body = serializePageToMarkdown(snapshot.page, snapshot.tags);
+      } else {
+        const localPath = localPathById.get(g.source_id);
+        if (!localPath) continue;
+        const target = await resolvePageWriteTarget(engine, g.source_markdown_slug, g.source_id);
+        if (!target.ok || !existsSync(target.filePath)) {
+          mismatches.push(`${g.source_markdown_slug} (file missing)`);
+          continue;
+        }
+        body = readFileSync(target.filePath, 'utf-8');
       }
-      const body = readFileSync(target.filePath, 'utf-8');
       const parsed = parseFactsFence(body);
-      const fenceCount = parsed.facts.length;
-      const dbCount = parseInt(g.n, 10);
-      if (fenceCount !== dbCount) {
-        mismatches.push(`${g.source_markdown_slug} (fence=${fenceCount}, db=${dbCount})`);
+      const indexed = new Set(g.row_nums.map(Number));
+      const fenced = new Set(parsed.facts.map(f => f.rowNum));
+      // #5814: a duplicate active row may be absent from the index.
+      // extract_facts indexes it once (#1781) while the managed publication
+      // projection indexes every fence row, so both states are in sync.
+      const duplicates = duplicateActiveFenceRows(parsed.facts);
+      const notIndexed = [...fenced].filter(n => !indexed.has(n) && !duplicates.has(n)).sort((a, b) => a - b);
+      const notInFence = [...indexed].filter(n => !fenced.has(n)).sort((a, b) => a - b);
+      if (notIndexed.length > 0 || notInFence.length > 0) {
+        const missing = [
+          notIndexed.length > 0 ? `not indexed: ${listDriftRows(notIndexed)}` : '',
+          notInFence.length > 0 ? `not in fence: ${listDriftRows(notInFence)}` : '',
+        ].filter(Boolean).join('; ');
+        mismatches.push(`${g.source_markdown_slug} (fence=${parsed.facts.length}, db=${indexed.size}; ${missing})`);
       }
       pagesChecked += 1;
     }
@@ -473,6 +354,7 @@ function finalizeResult(
 
 export const v0_32_2: Migration = {
   version: '0.32.2',
+  fresh_install_noop: true,
   featurePitch: {
     headline: 'Facts join the system-of-record — your hot memory now lives in markdown, indexed by the DB',
     description:

@@ -36,6 +36,7 @@ tools:
   - add_link
   - search
 mutating: true
+when_to_use: "Use when the user asks: \"brain health\", \"check backlinks\", \"maintenance\", \"orphan pages\", \"stale pages\"."
 ---
 
 # Maintain Skill
@@ -61,6 +62,9 @@ writer coordination refusal, inspect `gbrain sources writer status --brain <id>
 --json` on the selected host first and report the owner, epoch, enabled state and
 blocked recovery to the operator. Do not claim a checkout, activate managed mode,
 transfer an owner, replace identities, or remove ownership markers as a repair.
+When the status reads `enabled: false` and the refusal says `unbound_source`,
+the brain is in classic mode on purpose: report that writes go through the
+checkout (file, commit, `gbrain sync`) and leave it classic.
 Deliberate administration requires a separately approved topology change and the
 action-specific intent plus reviewed state precondition described in
 `docs/architecture/topologies.md`. Neither a TTY nor `--yes` nor
@@ -69,24 +73,35 @@ ineligible for local writer administration.
 
 ### Autonomous path (v0.36.4.0) — when you want to reach a target score
 
-If the user asks "get my brain to 90/100" or "fix what's broken", prefer the
-one-command loop over walking each dimension by hand:
+If the user asks "get my brain to 90/100" or "fix what's broken", preview first
+and ask before applying anything:
 
 ```bash
-gbrain doctor --remediation-plan --json              # preview what would run
-gbrain doctor --remediate --yes --target-score 90 --max-usd 5
+gbrain doctor --remediation-plan --json              # preview: job steps + repair steps
+# Show the user the repair steps (each "requires user agreement") and the cost.
+# Only after the user agrees (plan_hash from the preview binds the approval):
+gbrain doctor --remediate --yes --include-repairs --expect <plan_hash> --target-score 90 --max-usd 5
 ```
 
-`--remediation-plan` prints a dependency-ordered list (sync before extract,
-embed after consolidate, etc.) with per-step `est_seconds` and `est_usd_cost`.
-`--remediate` walks the plan, submitting each step as a Minion job, re-checking
-score between every step. `--max-usd N` is a hard cost cap — submission refuses
-when the plan would exceed the cap (prevents synthesize loops from burning
-Anthropic credits unattended).
+`--remediation-plan` prints a dependency-ordered list of job steps (sync before
+extract, embed after consolidate, etc.) with per-step `est_seconds` and
+`est_usd_cost`, and, independent of the score target, the PROTECTED repair steps
+for every `gbrain repair` kind with pending items. Each step carries the exact
+command that applies it, and the plan ends with one combined command.
+`--remediate` runs the repair steps only with `--include-repairs` (the user's
+agreement; without it they are listed as skipped), then walks the job plan,
+submitting each step as a Minion job and re-checking score between steps.
+`--max-usd N` is a cumulative cost cap across the run and every `--resume`: a
+paid step that would exceed it is not started, free steps still run, and the run
+stops with a resume command that keeps the cap and the agreement.
 
 When the target score is unreachable for the brain (empty brain with no entity
 pages → `graph_coverage` caps at 70; unconfigured embedding key → caps at 60),
-the command bails with a list of what's missing rather than looping.
+job steps stop with a list of what's missing rather than looping; included repair
+steps still run. `--json` classifies each finding `cleared`, `pending`,
+`consent_required`, `operator_required` (follow its instruction) or
+`unsupported` (report it; nothing clears it yet). After an upgrade, follow the
+recipe in `docs/guides/repair.md#recover-after-upgrading-to-this-release`.
 
 Use the per-dimension walk below (Phase 2 onward) when:
 - The user explicitly asks for a dimension-by-dimension audit
@@ -139,6 +154,16 @@ phases like atoms/concepts/drift slot in between):
 lint -> backlinks -> sync -> synthesize -> extract -> patterns -> embed -> orphans
 ```
 
+`fence_repair` runs right after `sync`, once per maintenance pass: it repairs
+the facts and takes fences sync held or pages store malformed (the same plan
+`gbrain repair fences` previews), for at most 300 s or a third of the job's
+remaining time, and resumes on the next run. `content_repair` runs right after
+it (#6377): the rest of the content-repair lane, today the `slug-conflicts`
+kind that removes a stray frontmatter `slug:` or records a recommended merge
+for a person (`gbrain repair content` previews both kinds), for at most 120 s
+or a third of the remaining time. Pause both with
+`gbrain config set fences.repair.enabled false`.
+
 The two new phases consolidate yesterday's conversations into long-term memory:
 
 **Synthesize phase (two-stage cascade):** reads transcripts from
@@ -179,15 +204,20 @@ scores only) then `gbrain dream retriage --reconcile-queue`; `--force`
 re-judges everything from scratch. Retriage reads the SAME gate the cycle
 does, so a reconcile sweep never cancels a job the rescue admitted.
 
-**Quote verify/repair (post-write, zero LLM):** after slug collection and
+**Claim verification (post-write, zero LLM):** after slug collection and
 before the reverse-write, `dream.synthesize.quote_verify` (default on) checks
-every quoted span on the pages this phase just created against the transcript
-it came from. An exact match is kept; a span that differs only in whitespace,
-curly quotes, dashes, or case is replaced with the verbatim transcript slice;
-a near match is repaired the same way; anything that still can't be grounded
-keeps its TEXT but loses its quotation marks. Nothing is ever fabricated and
-no content is deleted. Numeric and date claims absent from the transcript are
-counted as warnings, not edits. Telemetry lands in
+every page this phase's children wrote against the transcripts that produced
+it. Pages created this run are checked whole; pages that already existed are
+checked only on the sentences this run added. An exact quote is kept; a quote
+that differs only in whitespace, curly quotes, dashes, or case, or a close
+paraphrase inside one speaker's turn, is replaced with the verbatim transcript
+slice. A sentence is quarantined when a quote grounds nowhere or only across
+two speakers, when it attributes a real quote to the wrong speaker, or when it
+states a number or date the transcript lacks. Quarantined sentences leave the
+page body (and the timeline, facts and links derived from it) and are kept
+verbatim in frontmatter `unverified_claims`, which `get_page` shows but search,
+recall and think do not read. Grounded quotes record their source span and
+speaker in `grounding.quotes`. Nothing is ever fabricated. Telemetry lands in
 `details.synthesis.quote_verify`; the config key is the incident off switch.
 
 **Patterns phase:** runs after `extract` (so the graph state is fresh).
@@ -261,6 +291,9 @@ gbrain dream --json                                   # CycleReport JSON
 `git add` / `commit` / `push`. Either commit yourself or let `gbrain autopilot`
 handle it.
 Parses `- **YYYY-MM-DD** | Source — Summary` and `### YYYY-MM-DD — Title` formats.
+The `Source — Summary` dash may be an em dash, an en dash or a spaced hyphen (` - `);
+a colon (`Source: Summary`) is prose, so the row keeps `source: markdown` and the
+whole text as its summary.
 Note: extracted entries improve structured queries (`gbrain timeline`), not vector search.
 
 ### Autopilot check
@@ -370,10 +403,19 @@ Run weekly alongside lint. Surfaces missing embeddings, unused integrations,
 and configuration improvements.
 
 ### Embedding freshness
-Chunks without embeddings, or chunks embedded with an old model.
-- For large embedding refreshes (>1000 chunks), use nohup:
-  `nohup gbrain embed refresh > /tmp/gbrain-embed.log 2>&1 &`
-- Then check progress: `tail -1 /tmp/gbrain-embed.log`
+Chunks without an embedding yet (`--stale` selects exactly those). Embedding
+calls the configured provider, which bills per token, so this is paid work
+that needs the user's approval first:
+1. Preview with no provider calls: `gbrain embed --stale --dry-run`.
+2. Relay the chunk count and cost estimate to the user and wait for an answer.
+3. Only after they agree, run `gbrain embed --stale --yes --max-usd <cap>`
+   with the cap they approved.
+
+Without approval the command stops with exit 3 and an `[AGENT]` block asking
+you to ask the user; relay it and stop. Never pass `--yes` on your own.
+For a long run (>1000 chunks), route the approved command through the
+durable ladder in `skills/minion-orchestrator/SKILL.md` instead of a bare
+background shell, which hides that exit 3 in a log file.
 
 ### Security (RLS verification)
 Run `gbrain doctor --json` and check the RLS status.
@@ -428,11 +470,18 @@ staleness.
 
 ### Weekly maintenance
 
-Run `gbrain embed --stale` to refresh embeddings for pages that have changed since
-their last embedding. For large brains (>5000 pages), run this with nohup:
+Refresh embeddings for chunks that have none yet, with the same consent steps
+as "Embedding freshness" above: `gbrain embed --stale --dry-run`, relay the
+estimate, and after the user agrees `gbrain embed --stale --yes --max-usd <cap>`
+(or a standing approval the user set with
+`consent.preapprove.paid.max_usd_per_run`). For large brains (>5000 pages),
+submit the approved command through the minion-orchestrator durable ladder;
+if you must background it in a shell, keep the exit code:
 ```bash
-nohup gbrain embed --stale > /tmp/gbrain-embed.log 2>&1 &
+(gbrain embed --stale --yes --max-usd <cap>; echo "exit=$?") > /tmp/gbrain-embed.log 2>&1 &
+tail -2 /tmp/gbrain-embed.log   # later: the last line is exit=<code>
 ```
+Exit 3 in that log means the run needs the user's approval: relay it and stop.
 
 ### Monthly backup check
 
@@ -469,6 +518,15 @@ This creates an audit trail for brain health over time.
 - Never delete pages without confirmation
 - Log all changes via timeline entries
 - Check gbrain health before and after to show improvement
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain doctor --remediate` steps marked "requires user agreement" (PROTECTED repairs, paid steps): show the plan and cost, and run with `--yes --include-repairs --expect <plan_hash> --max-usd <n>` (the hash from `--remediation-plan --json`) only after the user agrees; `preview_changed` means the plan moved, so preview and ask again. A step that would exceed the cap is not started.
+- A finding classified `operator_required`: follow its instruction or relay it to the brain host's operator. `consent_required`: ask the user.
+- A writer-coordination refusal (`writer_coordinator_required`, `writer_not_quiesced`, `recovery_required`): inspect `gbrain sources writer status` and hand the blocked recovery to the operator; never claim a checkout or delete a lock.
+- `gbrain dream` stops on a budget (exit 11): run the printed `resume_command` within the agreed budget.
 
 ## Anti-Patterns
 

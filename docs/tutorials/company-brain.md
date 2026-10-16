@@ -48,13 +48,21 @@ It is also **not** a thin-client-everywhere setup. Your personal agent stays as 
 
 The personal-brain install uses Supabase as the embeddings layer but the GBrain runtime itself might be using PGLite (single-machine) depending on which path you took. For a company brain, you want a real Postgres for the runtime too. If your personal-brain install is already on Postgres or Supabase end-to-end, skip to Part 3.
 
-If you're on PGLite, migrate:
+If you're on PGLite, move the brain. Run from the agent host machine, same one you set up in the personal-brain tutorial, with the Supabase transaction-pooler URL in `GBRAIN_TARGET_URL`:
 
 ```bash
-gbrain migrate --to supabase
+gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --json
 ```
 
-This copies every page, chunk, embedding, link, and config over to your Supabase project. Run from the agent host machine, same one you set up in the personal-brain tutorial. Takes a few minutes per 10K pages.
+That prints the plan (what moves, what stays on this machine, estimated time) and exits 3 without changing anything. After you agree, run the command it prints:
+
+```bash
+gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --yes --expect <plan_hash>
+```
+
+Every page, fact, take, version, embedding, link, token and OAuth client moves with its history, and the run verifies every table before switching over. It ends with the target's `gbrain doctor` result. Full walkthrough and recovery: [Move a PGLite brain to Postgres](../guides/move-to-postgres.md).
+
+**Say to your agent:** *"Move my brain to Supabase so the team can share it. Show me the plan first."*
 
 Verify:
 
@@ -267,7 +275,7 @@ Two presets cover the common shapes, with semantics worth knowing honestly:
 - **`daily-driver`** — a personal assistant agent: writes to one source, reads broadly. The read grant is a **snapshot** of all non-archived sources at registration time, excluding other agents' `*-workspace` scratch sources (name one explicitly in `--federated-read` to share it) — a source you add next month is NOT automatically readable; re-grant with `gbrain auth rescope-client <client_id> --federated-read <updated list>`.
 - **`coding-agent`** — a write-isolated project agent: its writes land in an auto-created, DB-only `<name>-workspace` source (so a misbehaving agent can't scribble on your wiki), and it reads only the project sources you name via `--federated-read` (required — a coding agent that can read nothing but its own scratch space is a misconfiguration).
 
-Both presets start the client on the **starter** tool surface (the ~27-op daily set, not the full brain-admin surface). Override at registration with `--surface`, or widen a specific client later with `gbrain auth rescope-client <client_id> --surface full`.
+Both presets start the client on the **full** tool surface; its grant (scopes, sources and write fence) still bounds what it can do. A harness that caps its tool count can register with `--surface starter`, or narrow a specific client later with `gbrain auth rescope-client <client_id> --surface starter`.
 
 A worked example — a coding agent for alice-example's widget project, wired into Claude Code:
 

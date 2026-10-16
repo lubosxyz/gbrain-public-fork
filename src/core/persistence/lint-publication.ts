@@ -8,7 +8,7 @@ import { prepareFileTarget } from './page-prepare.ts';
 import { maintenancePreflight, publishMaintenancePage } from './prepared-maintenance.ts';
 
 /** Lint repairs are ordinary revision-checked maintenance publications. */
-export async function managedLintPublisher(engine: BrainEngine, target: string) {
+export async function resolveManagedLintSource(engine: BrainEngine, target: string, sourceId?: string) {
   const canonical = canonicalFilesystemPath(target);
   const directory = statSync(canonical).isFile() ? dirname(canonical) : canonical;
   const rows = await engine.executeRaw<{ id: string; local_path: string | null }>(
@@ -22,29 +22,34 @@ export async function managedLintPublisher(engine: BrainEngine, target: string) 
     const rel = relative(source.root, directory);
     return !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`);
   }).sort((a, b) => b.root.length - a.root.length);
-  const source = enclosingSources[0];
-  if (!source) throw new OperationError('source_changed', 'Lint requires a registered canonical source directory.');
+  const source = sourceId ? enclosingSources.find(source => source.id === sourceId) : enclosingSources[0];
+  if (!source) throw new OperationError('source_changed', 'Lint requires a registered canonical source directory.', 'Use gbrain sources list to select a registered source root.');
+  return { source, sources };
+}
+
+export async function managedLintPublisher(engine: BrainEngine, target: string) {
+  const { source, sources } = await resolveManagedLintSource(engine, target);
   const authority = await maintenancePreflight(engine, source.id, source.root);
-  if (!authority?.binding) throw new OperationError('source_changed', 'Persistence changed during lint preparation.');
+  if (!authority?.binding) throw new OperationError('source_changed', 'Persistence changed during lint preparation.', 'Inspect gbrain sources writer status --json before preparing a new lint run.');
   return async (path: string) => {
     const canonicalPath = canonicalFilesystemPath(path);
     const rel = relative(source.root, canonicalPath);
     if (isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`) || sources.some(other =>
       other.id !== source.id && other.root.length >= source.root.length &&
       (canonicalPath === other.root || canonicalPath.startsWith(other.root + sep)))) {
-      throw new OperationError('source_changed', 'Lint cannot cross a source boundary.');
+      throw new OperationError('source_changed', 'Lint cannot cross a source boundary.', 'Run lint separately for each registered source.');
     }
     const sourcePath = rel.split(sep).join('/');
     const [page] = await engine.executeRaw<{ slug: string }>(
       'SELECT slug FROM pages WHERE source_id=$1 AND source_path=$2 AND deleted_at IS NULL', [source.id, sourcePath]);
-    if (!page) throw new OperationError('page_not_found', 'Sync this file before applying a managed lint repair.');
+    if (!page) throw new OperationError('page_not_found', 'Sync this file before applying a managed lint repair.', 'Run gbrain sync --source for the owning source, then inspect its page.');
     const snapshot = await engine.readPageSnapshot(page.slug, { sourceId: source.id });
-    if (!snapshot) throw new OperationError('page_not_found', 'The lint target disappeared.');
+    if (!snapshot) throw new OperationError('page_not_found', 'The lint target disappeared.', 'Inspect the source and page before preparing another lint repair.');
     await prepareFileTarget(engine, { source_id: source.id, worktree_id: authority.binding?.worktree_id ?? null, slug: page.slug }, snapshot, null);
     const content = readSourceFileSync(path, 'utf-8');
     return { content, publish: async (fixed: string) => {
       const receipt = await publishMaintenancePage(engine, authority, page.slug, fixed, { expectedRevision: snapshot.revision });
-      if (receipt.state !== 'committed') throw new OperationError('write_pending', 'The lint repair has not committed; inspect writer status.');
+      if (receipt.state !== 'committed') throw new OperationError('write_pending', 'The lint repair has not committed; inspect writer status.', 'Run gbrain sources writer status --json and inspect the existing write receipt.');
     } };
   };
 }

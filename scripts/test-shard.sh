@@ -27,7 +27,8 @@
 # wrong shard until next regen, never silently dropped.
 #
 # Stable partitioning: same `(files, weights, N)` always produces the
-# same assignment, so retries are reproducible.
+# same assignment, so retries are reproducible. Files also run in the
+# planned order (see the `./` prefix at the bun invocation below).
 
 set -euo pipefail
 unset SHARD # Routing belongs to this wrapper, never to nested test runners.
@@ -58,26 +59,24 @@ fi
 cd "$(dirname "$0")/.."
 
 . scripts/lib/test-env.sh
+receipts_init unit
 
 # Collect non-E2E, non-serial unit test files. Slow files INCLUDED — see
 # header comment. Local run-unit-shard.sh excludes slow files (different
 # policy by design).
 #
-# Two test files are pulled out of the matrix and into their own dedicated
-# CI jobs (see .github/workflows/test.yml):
-#   - eval-longmemeval-e2e.slow.test.ts (~200s after TODO #1 engine sharing)
-#     → job: slow-eval-longmemeval
-#   - entity-resolve-perf.slow.test.ts (~159s, single non-subdivisible
-#     perf test)
-#     → job: slow-entity-resolve-perf
-#
-# Removing both heavy atoms from matrix-eligible files keeps the per-shard
-# total bounded. With 10 matrix shards the per-shard total drops to ~272s.
-# Dedicated jobs run in parallel so total CI wallclock = max(matrix ~4.5min,
-# slow-eval ~3.3min, slow-entity-resolve-perf ~2.6min, slow-brainbench ~1.5min)
-# ≈ 4.5min. eval-brainbench-e2e was the matrix's heaviest atom (98s mined —
-# 10% of the whole corpus weight) and capped shard-count scaling; it now rides
-# its own job like the other two outliers.
+# Heavy atoms ride dedicated CI jobs (see .github/workflows/test.yml) so no
+# single file dominates a shard: entity-resolve-perf.slow.test.ts (~159s,
+# non-subdivisible) and entity-card-perf → job slow-entity-resolve-perf;
+# eval-brainbench-e2e (98s mined, 10% of the corpus weight) → job
+# slow-brainbench-e2e. eval-longmemeval-e2e.slow.test.ts is back in the matrix
+# (GBRA-47 E6): engine sharing cut it from ~200s to ~8s, under the ~40s
+# keep-in-matrix bar.
+# export-scale.slow.test.ts (571s at its 100,001-page master scale) rides the
+# slow-entity-resolve-perf job, which sets GBRAIN_TEST_EXPORT_SCALE_PAGES per
+# event. reconcile-crash-*.slow.test.ts (244s) is not duplicated here: the
+# persistence-validation invariants job already runs it on PGLite for every
+# event, before and after activation.
 # evals/ is included: its *.test.ts files (eval-harness unit tests) were
 # previously collected by NO runner — 45+ real tests never executed anywhere.
 # Every collected evals file must be KEYLESS (no API keys, no network) —
@@ -86,10 +85,11 @@ cd "$(dirname "$0")/.."
 # docs/TESTING.md "CI vs local: intentionally divergent file sets").
 ALL_FILES=$(find test evals -name '*.test.ts' \
   -not -name '*.serial.test.ts' \
-  -not -name 'eval-longmemeval-e2e.slow.test.ts' \
   -not -name 'entity-resolve-perf.slow.test.ts' \
   -not -name 'entity-card-perf.slow.test.ts' \
   -not -name 'eval-brainbench-e2e.slow.test.ts' \
+  -not -name 'export-scale.slow.test.ts' \
+  -not -name 'reconcile-crash-*.slow.test.ts' \
   -not -path 'test/e2e/*' | sort)
 
 if [ -z "$ALL_FILES" ]; then
@@ -123,39 +123,39 @@ echo "shard $SHARD_INDEX/$TOTAL_SHARDS: ${SHARD_COUNT}/${ALL_COUNT} files (LPT-b
 
 if [ "$SHARD_COUNT" -eq 0 ]; then
   echo "warning: shard $SHARD_INDEX has no files (total shards may exceed file count)" >&2
+  receipt_empty "s${SHARD_INDEX}of${TOTAL_SHARDS}" "$SHARD_INDEX" "$TOTAL_SHARDS"
   exit 0
 fi
 
-# Convert newline-separated file list to argv. xargs handles the
-# whitespace correctly without word-splitting on spaces in paths.
-#
-# COVERAGE_DIR (opt-in): when set, run under bun's lcov coverage into
-# $COVERAGE_DIR/shard and write a lane manifest on success. xargs -x makes
-# an argv overflow FAIL LOUD instead of silently batching into a second bun
-# process — a second process reusing the same coverage dir OVERWRITES
-# lcov.info, silently losing the first batch's line data. BSD xargs only
-# accepts -x together with -n (GNU accepts both spellings), so we pass
-# -n 100000: far beyond any real shard's file count, it keeps everything in
-# ONE invocation while -x turns "args do not fit" into a hard error.
-# merge-lcov.ts's lcovCount!=1 manifest tripwire is the second line of
-# defense. When COVERAGE_DIR is empty/unset both arrays stay empty and the
-# exec line is byte-identical to the pre-coverage behavior.
+# Pass explicit paths in one Bun invocation. In receipt/coverage mode a
+# second process would overwrite the first process's report. macOS xargs
+# -x can invoke once per input line even with a large -n; a shell array
+# preserves both order and spaces, and argv overflow fails the invocation.
 COVERAGE_ARGS=()
-XARGS_FLAGS=()
 if [ -n "${COVERAGE_DIR:-}" ]; then
   COVERAGE_ARGS=(--coverage --coverage-reporter=lcov --coverage-dir="$COVERAGE_DIR/shard")
-  XARGS_FLAGS=(-n 100000 -x)
 fi
+shard_file_args=()
+while IFS= read -r f; do [ -n "$f" ] && shard_file_args+=("$f"); done <<< "$SHARD_FILES"
+receipt_begin primary "s${SHARD_INDEX}of${TOTAL_SHARDS}" "$SHARD_INDEX" "$TOTAL_SHARDS" "" "${shard_file_args[@]}"
 # --max-concurrency mirrors the local runner: unbounded intra-process
 # concurrency under parallel PGLite boots produced real shard deaths (the
 # 22-minute matrix timeout in test.yml records 13 of them).
+#
+# The `./` prefix makes each argument a path, not a name filter: Bun runs
+# bare `test/x.test.ts` arguments in directory-scan order (filesystem
+# dependent, so CI on ext4 and a Mac disagree), and explicit paths in the
+# order given. Bun still reports them as `test/x.test.ts`, so the log and
+# JUnit parsers see the same names.
 rc=0
-printf '%s\n' "$SHARD_FILES" | xargs ${XARGS_FLAGS[@]+"${XARGS_FLAGS[@]}"} bun test --timeout=60000 --max-concurrency="${GBRAIN_TEST_MAX_CONCURRENCY:-4}" ${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"} || rc=$?
+shard_paths=()
+for f in "${shard_file_args[@]}"; do shard_paths+=("./$f"); done
+bun test --timeout=60000 --max-concurrency="${GBRAIN_TEST_MAX_CONCURRENCY:-4}" ${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"} ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "${shard_paths[@]}" || rc=$?
+receipt_end "$rc"
 
 # Lane manifest: written ONLY on a fully green run (complete:true means the
 # lcov data represents the whole shard). The real exit code is preserved
-# either way. lcovCount != 1 downstream (merge-lcov.ts) means the xargs -x
-# tripwire logic above was defeated somehow — merge marks the run degraded.
+# either way. merge-lcov.ts also rejects a lane with lcovCount != 1.
 if [ -n "${COVERAGE_DIR:-}" ] && [ "$rc" -eq 0 ]; then
   LCOV_COUNT=$(find "$COVERAGE_DIR" -name 'lcov.info' 2>/dev/null | grep -c '^' || true)
   printf '{"lane":"shard-%s","sha":"%s","lcovCount":%s,"complete":true}\n' \

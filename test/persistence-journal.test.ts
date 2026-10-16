@@ -16,6 +16,7 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { preparePageMutation } from '../src/core/persistence/page-prepare.ts';
 import { assertSafeE2eDatabaseUrl } from './helpers/db-guard.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 
 const engines: BrainEngine[] = [];
@@ -83,9 +84,8 @@ describe('durable mutation journal', () => {
     }
   });
 
-  test('Postgres admission survives a real counter lock held beyond one SQL lock deadline', async () => {
-    const engine = engines.find(candidate => candidate.kind === 'postgres');
-    if (!engine) return;
+  test.skipIf(!process.env.DATABASE_URL)('Postgres admission survives a real counter lock held beyond one SQL lock deadline', async () => {
+    const engine = engines.find(candidate => candidate.kind === 'postgres')!;
     const a = await admission(engine, 'admission-counter-contention');
     let held!: () => void;
     const ready = new Promise<void>(resolve => { held = resolve; });
@@ -104,9 +104,8 @@ describe('durable mutation journal', () => {
     } finally { await blocker; }
   });
 
-  test('persistent Postgres contention returns a bounded typed error without inventing an accepted receipt', async () => {
-    const engine = engines.find(candidate => candidate.kind === 'postgres');
-    if (!engine) return;
+  test.skipIf(!process.env.DATABASE_URL)('persistent Postgres contention returns a bounded typed error without inventing an accepted receipt', async () => {
+    const engine = engines.find(candidate => candidate.kind === 'postgres')!;
     const a = await admission(engine, 'admission-bounded-contention');
     let held!: () => void;
     let release!: () => void;
@@ -133,9 +132,46 @@ describe('durable mutation journal', () => {
     await cancelWriteRequest(engine, a.principal, a.requestId!);
   });
 
-  test('contended admissions release PostgreSQL pool capacity for reads before the counter unlocks', async () => {
-    const engine = engines.find(candidate => candidate.kind === 'postgres');
-    if (!engine) return;
+  test.skipIf(!process.env.DATABASE_URL)('Postgres admission progresses while short counter transactions keep the lock queue occupied', async () => {
+    const engine = engines.find(candidate => candidate.kind === 'postgres')!;
+    const a = await admission(engine, 'admission-queue-progress');
+    await engine.executeRaw("INSERT INTO persistence_counters(key) VALUES('brain') ON CONFLICT DO NOTHING");
+    const [before] = await engine.executeRaw<{ lifetime_ids: string }>("SELECT lifetime_ids::text FROM persistence_counters WHERE key='brain'");
+    let stop = false;
+    let cycles = 0;
+    const lockers: Promise<void>[] = [];
+    const ready = Array.from({ length: 2 }, () => {
+      let held!: () => void;
+      const holding = new Promise<void>(resolve => { held = resolve; });
+      lockers.push((async () => {
+        while (!stop) await engine.transaction(async tx => {
+          await tx.executeRaw("SELECT key FROM persistence_counters WHERE key='brain' FOR UPDATE");
+          cycles++;
+          held();
+          await Bun.sleep(40);
+        });
+      })());
+      return holding;
+    });
+    let accepted: Awaited<ReturnType<typeof admitWrite>>;
+    try {
+      await Promise.all(ready);
+      accepted = await admitWrite(engine, a);
+    } finally {
+      stop = true;
+      await Promise.all(lockers);
+    }
+    expect(cycles).toBeGreaterThan(2);
+    expect(accepted.state).toBe('queued');
+    expect(accepted.request_id).toBe(a.requestId!);
+    expect((await admitWrite(engine, a)).id).toBe(accepted.id);
+    const [after] = await engine.executeRaw<{ lifetime_ids: string }>("SELECT lifetime_ids::text FROM persistence_counters WHERE key='brain'");
+    expect(Number(after.lifetime_ids) - Number(before.lifetime_ids)).toBe(1);
+    await cancelWriteRequest(engine, a.principal, a.requestId!);
+  }, 15000);
+
+  test.skipIf(!process.env.DATABASE_URL)('contended admissions release PostgreSQL pool capacity for reads before the counter unlocks', async () => {
+    const engine = engines.find(candidate => candidate.kind === 'postgres')!;
     const inputs = await Promise.all(Array.from({ length: 3 }, (_, i) => admission(engine, `admission-reader-capacity-${i}`)));
     await engine.executeRaw("INSERT INTO persistence_counters(key) VALUES('brain') ON CONFLICT DO NOTHING");
     const [before] = await engine.executeRaw<{ lifetime_ids: string }>("SELECT lifetime_ids::text FROM persistence_counters WHERE key='brain'");
@@ -156,7 +192,7 @@ describe('durable mutation journal', () => {
         const observed = new Proxy(engine, { get(target, property) {
           if (property === 'transaction') return (run: (tx: BrainEngine) => Promise<unknown>) => target.transaction(tx => run(new Proxy(tx, { get(t, p) {
             if (p === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal }) => {
-              if (sql.startsWith('INSERT INTO persistence_counters') && params?.[0] === 'brain') {
+              if (sql.startsWith('INSERT INTO persistence_counters') && (params?.[0] === 'brain' || (Array.isArray(params?.[0]) && params[0].includes('brain')))) {
                 attempts.add(input.requestId!);
                 if (attempts.size === inputs.length) attempted();
               }
@@ -191,7 +227,7 @@ describe('durable mutation journal', () => {
         await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], async () => {
           await tx.putPage('guarded', input('Yes'), { sourceId });
           await tx.addTag('guarded', 'coherent', { sourceId });
-        }));
+        }, TEST_WRITE_ATTRIBUTION));
         expect((await engine.readPageSnapshot('guarded', { sourceId }))!.tags).toEqual(['coherent']);
         await expect(engine.addTag('guarded', 'uncoordinated', { sourceId })).rejects.toThrow('writer_coordinator_required');
       } finally { await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1'); }

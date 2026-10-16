@@ -19,7 +19,7 @@ Different users have different constraints:
 | Researcher | Analytics, bulk exports, embeddings | DuckDBEngine (someday) |
 | Edge/mobile | Offline-first, sync later | PGLiteEngine + sync (someday) |
 
-The engine interface means we don't have to choose. PGLite is the zero-friction default. Supabase is the production scale path. `gbrain migrate --to supabase/pglite` moves between them.
+The engine interface means we don't have to choose. PGLite is the zero-friction default. Supabase is the production scale path. `gbrain migrate --to postgres` moves a PGLite brain to Postgres with its history ([guide](guides/move-to-postgres.md)); `gbrain migrate --to pglite` moves a brain without write history the other way.
 
 ## The interface
 
@@ -28,7 +28,9 @@ The engine interface means we don't have to choose. PGLite is the zero-friction 
 feature — do NOT work from any snapshot of it, including an old copy of
 this doc. Read the interface itself, and let
 `test/e2e/engine-parity.test.ts` + `test/pglite-engine.test.ts` tell you
-whether both engines agree.
+whether both engines agree. A method in a migrated storage domain has its
+SQL once in `src/core/engine-sql/` (see "Storage domains and engine-sql"
+below).
 
 The method families, to orient you before opening the file:
 
@@ -56,9 +58,63 @@ The method families, to orient you before opening the file:
 
 **Chunking is NOT in the engine.** Same logic. `src/core/chunkers/` handles chunking. The engine stores and retrieves chunks. All engines share the same chunkers.
 
-**Search returns `SearchResult[]`, not raw rows.** The engine is responsible for its own search implementation (tsvector vs FTS5, pgvector vs sqlite-vss) but must return a uniform result type. RRF fusion and dedup happen above the engine, in `src/core/search/hybrid.ts`.
+**Search returns `SearchResult[]`, not raw rows.** The engine is responsible for its own search implementation (tsvector vs FTS5, pgvector vs sqlite-vss) but must return a uniform result type. RRF fusion and dedup happen above the engine, in `src/core/search/hybrid.ts` and its stages under `src/core/search/hybrid/`.
 
 **`traverseGraph` exists but is engine-specific.** Postgres uses recursive CTEs. SQLite would use a loop with depth tracking. The interface is the same: give me a slug and max depth, return the graph.
+
+## Storage domains and engine-sql
+
+Both engines speak the same SQL dialect, so a storage domain's SQL is written
+once. `src/core/engine-sql/<domain>.ts` holds it; each engine method in that
+domain is a one-line delegation. The domains migrated so far are the
+`migrated` rows of `scripts/engine-sql-baseline.tsv`; the remaining rows of
+that file are the engine members that still carry their own SQL, and the file
+only shrinks (`check:engine-sql-ratchet` fails on a new SQL-bearing engine
+member).
+
+```
+PGLiteEngine / PostgresEngine   one-line delegations; RLS scoping per method
+      | get engineSql()         fresh adapter per access, never stored
+      v
+engine-sql/<domain>.ts          the domain's SQL once; sqlFragment composition;
+      |                         ScopedRead / LegacyUnscopedRead brands; row kinds
+      v
+engine-sql/executor.ts          SqlExecutor: query / run / executeRaw / unsafe /
+      |                         transaction; results as { rows, affectedRows }
+      +--> dialect-pglite.ts    db.query on the engine's checkpoint-admitted handle
+      +--> dialect-postgres.ts  runUnsafe(conn, sql, params, { prepare: true, simple: false })
+```
+
+The contract, each part pinned by a test listed in
+[docs/TESTING.md, "Engine-sql"](TESTING.md#engine-sql):
+
+- **Lifetime.** `engineSql` reads the engine's current connection on every
+  access. `transaction()` clones the engine with a swapped connection, so a
+  stored executor would write outside the transaction.
+- **Parameters.** Positional only, composed with `sqlFragment` (placeholders
+  are numbered at render time). Arrays bind as `= ANY($n::type[])`, JSONB
+  through `jsonbParam()`, vectors as a text literal with a `::vector` cast.
+  Only constant text may be spliced (`check:engine-sql-dynamic`).
+- **Results and errors.** `{ rows, affectedRows }`; driver errors pass through
+  unchanged. Columns whose decoding differs between drivers are declared once
+  per statement with `compileRowNormalizer`.
+- **Capabilities.** Real engine differences are capabilities on the executor
+  (`maxBindParamsPerStatement`, `transactionAdvisoryLocks`,
+  `probesEmbeddingCast`), never `if (engine === ...)` in domain code.
+- **RLS scope.** Every read declares how it is scoped: `ScopedRead` (runs
+  inside `withScopedReadTransaction` on Postgres, see the RLS section below)
+  or `LegacyUnscopedRead` (runs on the pool, obtained with
+  `unscopedExecutor(executor, reason)`). The brands are unforgeable
+  (`check:engine-sql-brands`).
+- **Layering.** Nothing under `engine-sql/` imports an engine façade
+  (`check:layering`); take the executor as a parameter.
+
+Code that is genuinely dialect-specific stays in the engine or in
+`src/core/pglite-engine/` / `src/core/postgres-engine/`, marked
+`// engine-sql-ok: <reason>`. The forward-reference bootstrap both engines run
+before replaying the schema blob is `engine-sql/bootstrap.ts`. A step-by-step
+read and write example is in
+[CONTRIBUTING.md, "Worked example"](../CONTRIBUTING.md#worked-example-an-engine-sql-read-and-write).
 
 ## How search works across engines
 
@@ -115,6 +171,40 @@ the object is absent. Highly selective queries may correctly choose an exact
 plan. The [retrieval guide](architecture/RETRIEVAL.md#named-thing-retrieval-per-page-pool--title--alias--evidence)
 describes bounded candidate recovery and incomplete-result metadata.
 
+On Postgres the same refresh also analyzes the page columns every search
+filter reads (`deleted_at`, `source_id`, `type`, `slug`) and
+`content_chunks(model, modality, page_id)`, and an embed drain that embedded
+anything analyzes those chunk columns once at its end (each ANALYZE bounded by
+a 30 s statement and 2 s lock timeout). Without those statistics the vector
+candidate statement sorts every eligible chunk instead of walking the HNSW
+index, and at 1M chunks and above that sort runs past the 8 s vector budget,
+so hybrid search falls back to keyword-only results until autovacuum
+analyzes the tables. If a refresh is skipped (a lock, or a role that does not
+own the tables), run `ANALYZE content_chunks(model, modality, page_id)` and
+`ANALYZE pages` as the table owner.
+
+### Vector index sizing
+
+The chunk HNSW index stores each vector beside its graph links, so at 1,024
+dimensions it takes about 7.6 GiB per million chunks as `vector` (about
+9.8 GiB for a 1.28M-chunk brain) and a third of that as `halfvec`. The
+deferred ANN build (`gbrain migrate embeddings`, `gbrain reindex --vectors`)
+runs `CREATE INDEX CONCURRENTLY` with the server's `maintenance_work_mem`.
+When the graph does not fit, pgvector logs `hnsw graph no longer fits into
+maintenance_work_mem` and the build slows several-fold: 4.3x at 250k chunks
+with 256 MB. Before a large build, raise it on the brain host to the index
+size plus about 10% (Supabase: `supabase postgres-config update --config
+maintenance_work_mem=12GB --project-ref <ref> --experimental`, which reloads
+without a restart; self-hosted: `ALTER SYSTEM SET maintenance_work_mem =
+'12GB'` and `SELECT pg_reload_conf()`), and give it
+`max_parallel_maintenance_workers` of about half the cores: a 1M-chunk build
+took 103 s on 16 vCPU with 12 GB and 8 workers. Measured, not shipped:
+`halfvec` gives the same recall with an index a third the size, and
+`ef_construction` 128 adds about 0.02 to 0.03 unfiltered recall@10 for about
+25% more build time. Both need a migration or a rebuild, so the defaults stay
+(m 16, ef_construction 64, `vector`). Measurements and method:
+[`docs/eval/hnsw-scale-bench.md`](eval/hnsw-scale-bench.md).
+
 ### Opt-in RLS source-scope binding (`GBRAIN_RLS_SCOPE_BINDING`)
 
 Defense-in-depth layer for Postgres deployments that want the database itself
@@ -131,7 +221,7 @@ bound params). An RLS policy can then filter rows by
 
 **Default off.** With the env var unset, reads call through on the shared pool
 with no per-read transaction and no pool-slot hold (the search methods keep
-their own transaction for `SET LOCAL statement_timeout`).
+their own transaction for `SET LOCAL statement_timeout` and `jit = off`).
 
 **Enabling it** (operator-managed SQL; gbrain ships no DDL for this):
 
@@ -158,6 +248,15 @@ per-request scope binding — unwrapped paths (writes, admin/maintenance reads)
 run under the role default and are not backstopped per caller. This is layer 2;
 the app-layer source filters remain layer 1 and stay mandatory. Behavioral pins
 live in `test/postgres-engine-rls-scope.test.ts`.
+
+**In engine-sql.** A read in a migrated domain takes a `ScopedRead` when it
+runs through this helper and a `LegacyUnscopedRead` when it runs on the pool
+(`src/core/engine-sql/brands.ts`); the engine obtains the branded executor, so
+the type system keeps each read's scoping as it is. Moving a read from
+unscoped to scoped adds a transaction and a pool hold per read with the flag
+on, so it is a deliberate change with its own load test, never a drive-by.
+The non-owner `NOBYPASSRLS` isolation test is
+`test/e2e/engine-sql-rls-scope.test.ts`.
 
 ## Local Postgres
 
@@ -209,13 +308,30 @@ Details in INSTALL_FOR_AGENTS.md ("Engine preference for harness installs").
 **What it is:** Embedded Postgres compiled to WASM via ElectricSQL's PGLite. Runs in-process, no server, no Docker, no accounts. Same SQL as PostgresEngine -- not a separate dialect. Implements the full `BrainEngine` interface; `test/e2e/engine-parity.test.ts` pins that the two engines move in lockstep.
 
 **PGLite-specific details:**
-- Uses `pglite-schema.ts` for DDL (pgvector extension, pg_trgm, triggers, indexes)
+- Uses the generated `pglite-schema.generated.ts` template for DDL (pgvector extension, pg_trgm, triggers, indexes; see "Canonical schema sources" below)
 - Parameterized queries throughout (shared utilities in `src/core/utils.ts`)
 - `hybridSearch` keyword-only fallback when no embedding provider key is configured
 - Data stored at `~/.gbrain/brain.pglite` (configurable)
 - pgvector HNSW index for cosine similarity vector search (same as Postgres)
 - tsvector + ts_rank for full-text search (same as Postgres)
 - pg_trgm for fuzzy slug resolution (same as Postgres)
+
+### PGLite vector index ceiling
+
+PGLite runs Postgres inside WebAssembly, and pglite.wasm caps its memory at
+2 GiB. pgvector holds the whole HNSW graph in `maintenance_work_mem` while it
+builds, about 4.7 KB per 1,024-dimension chunk (1.16 GB at 250k chunks).
+gbrain starts PGLite with `max_parallel_maintenance_workers=0` (PGLite has no
+worker processes, and a planned parallel build reserved all of
+`maintenance_work_mem` up front) and `max_wal_size=8GB` (a build WAL-logs its
+whole index in one statement, and WAL past the automatic checkpoint trigger
+wedges PGLite). The deferred ANN build (`gbrain migrate embeddings`) and
+`gbrain reindex --vectors` size `maintenance_work_mem` to the graph
+(`withHnswBuildMemory` in `src/core/vector-index.ts`): a 248,802-chunk build
+takes about 11 minutes and a 1.9 GB index. A graph past the 1.5 GiB budget,
+about 300k chunks at 1,024 dimensions, is refused before the build with
+`pglite_vector_index_too_large`; vector search keeps working with exact scans,
+and the fix is the read-only `gbrain migrate --to postgres --plan --json`.
 
 **When to use PGLite vs Postgres:**
 
@@ -228,26 +344,47 @@ Details in INSTALL_FOR_AGENTS.md ("Engine preference for harness installs").
 | Concurrency | Single process | Connection pooling |
 | Backups | Manual (file copy) | Managed by Supabase |
 
-**Migration:** `gbrain migrate --to supabase` exports everything (pages, chunks, embeddings, links, tags, timeline, facts) and imports into Supabase. Config rows copy in full minus the engine-local denylist (`MIGRATE_CONFIG_ENGINE_LOCAL_KEYS`: the target-owned `engine`/`version` connection + schema ledger and the physical embedding-column registry keys); skipped keys are printed, never silent, and the run ends with a per-table copied-count summary. `gbrain migrate --to pglite` goes the other direction. Bidirectional, lossless.
+**Migration:** on a PGLite brain, `gbrain migrate --to postgres` (alias `--to supabase`) graduates the brain to Postgres. Without `--yes` it prints the plan and exits 3; `--yes --expect <plan_hash>` runs it. Graduation drains pending writes, copies every table verbatim with its primary keys (pages, facts, takes, versions, links, timeline, embeddings, transcripts and paid caches, request history and withdrawals, token and OAuth rows) into a fenced target, verifies row counts and digests, runs `gbrain doctor` on the target, and only then flips routing. It works for brains with write history and for managed brains. The PGLite data dir is retained as `<path>.graduated-<run_id>` and a tombstone file takes its place. Walkthrough, recovery by error code, rollback and what stays on this computer: [Move a PGLite brain to Postgres](guides/move-to-postgres.md).
 
-The migration and the autopilot daemon do not race: `migrate --to` claims a
-cooperative pause marker before touching the target. The marker doubles as a
-migration mutex — a second concurrent migrate refuses to run, and a marker
-that cannot be written refuses the migration outright. Background job workers
-stop picking up new work while it is parked, and the migration waits for
-in-flight sync/embed/cycle work and running jobs to actually drain (watching
-the DB lock table, capped by `GBRAIN_MIGRATE_QUIESCE_SECONDS` — default 300;
-`0` skips the wait). Cleanup registers the moment the claim lands, so the
-marker is released on failure and on catchable signals; a marker orphaned by
-an uncleanly killed run is adopted by a later migrate only after a
-pid-liveness check (a live migrate's marker is never stolen), and the daemon
-clears an orphan whose owning process died on its next poll. `gbrain
-autopilot --status` reports `paused` (exit 1) while the marker is parked and
-prints the marker path; on a host with no daemon running to self-heal,
-remove an orphan by hand only after confirming the pid it names is dead.
-After a clean flip the daemon detects the engine change on its next
-tick and relaunches onto the new engine, and the migration warns if an
-exported connection-string env var would override the new config.
+**Say to your agent:** *"Upgrade my brain to Postgres. Show me the plan first."*
+
+The legacy copier handles every other direction: `gbrain migrate --to pglite`, PGLite to Postgres when `gbrain config set migrate.graduation false` opts out of graduation, and history-free brains on Windows. It re-creates pages through `putPage` (chunks, embeddings, links, tags, timeline, facts) and copies config rows minus the engine-local denylist (`MIGRATE_CONFIG_ENGINE_LOCAL_KEYS`: the target-owned `engine`/`version` connection + schema ledger and the physical embedding-column registry keys); skipped keys are printed, never silent, and the run ends with a per-table copied-count summary. It forwards the full page row (origin path, kind, provenance, `ingested_at`, aliases, chunk code metadata). Pages the source had sealed are rebuilt on the target before the config flip, without an embedding key, keeping chunk ids and vectors whose input matches. A failed rebuild blocks the flip: the run exits 1 with no error code, prints `The active engine was NOT switched` and the failing pages, and leaves the source engine active; fix them (`gbrain projections drain` on the target) and re-run `gbrain migrate` to resume. Pages the source had not sealed arrive queued, with their verbatim chunks. It does not carry request IDs, withdrawals, attribution or ownership, so it refuses a managed brain and any brain with durable write history, fact withdrawals or canonical worktree ownership (rows in `persistence_requests`, `fact_withdrawals` or `persistence_worktrees`).
+
+<a id="engine-migration-refused"></a>**Engine migration refused (`writer_coordinator_required`).** The legacy copier's refusal is an agent-contract envelope whose `fix` names the refusing side; every branch verifies with the read-only `gbrain doctor --no-migrate --json`, and nothing has changed in either datastore:
+
+| Refusing side | `fix.next` | Next step |
+|---|---|---|
+| A PGLite brain with history (or a managed one) moving to Postgres with graduation turned off | `ask_user` (consent `egress`) | Relay `user_message`: turn graduation back on (`fix.argv`: `gbrain config unset migrate.graduation`) and preview the move with the read-only plan (`fix.then`: `gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --plan --json`, then the [two-command flow](guides/move-to-postgres.md#move-the-brain)), or keep it on PGLite and share it through `gbrain mcp expose`. |
+| A Postgres brain moving to PGLite | `report` | The brain stays on Postgres; moving down would drop its history. |
+| A target that already holds persistence history | `tell_user_to_run` | Rerun with an empty database the user provides (`--path` for a PGLite target). |
+
+On Windows, a PGLite brain with history gets `graduation_unsupported_platform` instead: it stays on PGLite and is shared with `gbrain mcp expose`.
+
+<a id="graduation-writer-held"></a>**Graduation refused: the brain is held (`graduation_source_writer_held`).** Graduation needs the PGLite kernel lock. A live stdio `gbrain serve` hands the brain over through the intent marker `<path>.gbrain-graduation.json` and exits; autopilot pauses. When another holder (an HTTP serve, a daemon, another command) does not release the brain within 30 seconds, the run refuses and names it with its pid and transport (`fix.next: tell_user_to_run`). The user stops that process, then the agent reruns the same `gbrain migrate` command. Verify with the read-only `gbrain migrate --status --json`. Nothing has changed in either datastore.
+
+The migration and the autopilot daemon do not race: both graduation and the
+legacy copier claim a cooperative pause marker before touching the target. The
+marker doubles as a migration mutex — a second concurrent migrate refuses to
+run (graduation exits 75 with `graduation_in_progress`), and a marker that
+cannot be written refuses the migration outright. Background job workers stop
+picking up new work while it is parked. The legacy copier then waits for
+in-flight sync/embed/cycle work and running jobs to drain (watching the DB lock
+table, capped by `GBRAIN_MIGRATE_QUIESCE_SECONDS` — default 300; `0` skips the
+wait). Graduation holds the PGLite kernel lock instead, so no other process has
+the brain open: expired run locks and active job leases are orphans it resets
+at once, and it waits only for queued write requests, bounded by
+`--drain-timeout` (default 60 seconds; exhaustion exits 11 with a
+`resume_command`). Cleanup registers the moment the claim lands, so the marker
+is released on failure and on catchable signals; a marker orphaned by an
+uncleanly killed run is adopted by a later migrate only after a pid-liveness
+check (a live migrate's marker is never stolen), and the daemon clears an
+orphan whose owning process died on its next poll. `gbrain autopilot --status`
+reports `paused` (exit 1) while the marker is parked and prints the marker
+path; on a host with no daemon running to self-heal, remove an orphan by hand
+only after confirming the pid it names is dead. After a clean flip the daemon
+detects the engine change on its next tick and relaunches onto the new engine,
+and the migration warns if an exported connection-string env var would
+override the new config (graduation lists such a variable as a plan blocker).
 
 ### Troubleshooting: startup abort (`RuntimeError: Aborted()`)
 
@@ -270,9 +407,12 @@ version bump changes it.
    backs up `pg_wal/` + `pg_control` into a sibling
    `<dataDir>.wal-repair-backup-<ts>/` dir, resets the WAL in place
    (pg_resetwal semantics — data files preserved; transactions not
-   checkpointed before the corruption may be lost), and retries once. On
-   success it prints a loud stderr notice naming the backup and recommending
-   `gbrain doctor`. Safety bounds: repair only runs under a cleanly-acquired
+   checkpointed before the corruption may be lost), and retries once. The
+   reset does not rebuild indexes, so a page written just before the crash
+   can be missing from vector search while keyword search still finds it.
+   On success it prints a loud stderr notice naming the backup and the next
+   commands: `gbrain reindex --vectors` (rebuilds every HNSW index from the
+   stored vectors, no re-embedding) and then `gbrain doctor`. Safety bounds: repair only runs under a cleanly-acquired
    data-dir lock (never after reaping another process's lock), skips for a
    cooldown window after a failed attempt
    (`GBRAIN_PGLITE_WAL_REPAIR_COOLDOWN_SECONDS`, default 3600), reuses one
@@ -297,6 +437,61 @@ version bump changes it.
 to connect: it diagnoses the dir from disk, names the repair command, reports
 retained repair backups, and escalates when repairs keep recurring (that
 means the unclean-shutdown genesis is still active — see the ladder's rung 4).
+
+## Canonical schema sources
+
+Schema DDL text has one hand-edited copy. `bun run build:schema`
+(`scripts/build-schema.ts`) generates everything else in a fixed order:
+
+```
+TS fragment modules (canonical for their tables) ─┐
+src/schema.sql (canonical for every other table) ─┴─> src/schema.sql BEGIN/END GENERATED regions
+                                                        ├─> src/core/schema-embedded.generated.ts (Postgres blob)
+                                                        └─> src/core/pglite-schema.generated.ts   (PGLite template)
+```
+
+- **Fragments** (`FRAGMENTS` in the generator): `grants/schema.ts`, `facts/withdrawal-schema.ts`,
+  `lease-schema.ts`, `page-state/schema.ts`, `persistence/schema.ts`,
+  `page-state/projection-schema.ts`, `persistence/topology-schema.ts`,
+  `company-brain/receipt-schema.ts`, `shared-skills/schema-all.ts`. Migrations import the same
+  constants, so a fragment is also the migration text. Each has one region in `src/schema.sql`
+  whose banner names the file to edit; never edit inside a region.
+- **PGLite template**: every `src/schema.sql` statement and fragment, transformed by explicit
+  capability rules (`PGLITE_RULES`, `PGLITE_DO_BLOCKS`, `PGLITE_ADDITIONS`, each with a reason).
+  `getPGLiteSchema(dims, model)` fills `__EMBEDDING_DIMS__` / `__EMBEDDING_MODEL__` and applies the
+  chunk-index and FTS-language policies at runtime. An unknown statement kind, an unclassified
+  `DO` block, or a rule that no longer matches fails the build.
+- **Guards**: `check:schema-fresh` regenerates the whole chain into a temp dir and names the source
+  to edit on drift; the catalog goldens (`test/schema-catalog-golden.test.ts`,
+  `test/e2e/schema-catalog-golden.test.ts`) and `test/pglite-upgrade-replay.test.ts` pin the end
+  state.
+
+Engine differences in the bootstrap (not reconciled; changing them is a schema change):
+`file_migration_ledger` is Postgres-only. PGLite gets `code_edges_chunk`, `code_edges_symbol`,
+`dream_verdicts`, `sources.chunker_version`, the `content_chunks` code-symbol and `search_vector`
+columns (with their indexes and trigger), `pages_generation_idx` and `idx_pages_updated_at_desc`
+from migrations. Postgres gets `slug_aliases`, `page_aliases`, the `page_links` view and
+`persistence_requests_database_pending` from migrations.
+
+Worked examples:
+
+1. **Add a column or index to a hand-written table** (say `pages.foo`). Scaffold the migration
+   (`bun run new:migration add_pages_foo`: `ALTER TABLE pages ADD COLUMN IF NOT EXISTS foo TEXT;`,
+   and for an index on Postgres `CREATE INDEX CONCURRENTLY` with `transaction: false` plus a plain
+   `sqlFor.pglite`). Add the column to the `pages` `CREATE TABLE` in `src/schema.sql` so fresh
+   installs get it, then `bun run build:schema`; both blobs follow.
+2. **Add a table.** Put its `CREATE TABLE` in `src/schema.sql` and create it in a migration. If
+   migrations and the blob should share one text, make it a TS fragment instead: export the SQL
+   constant, import it from the migration, add a `FRAGMENTS` entry and an empty region
+   (`-- BEGIN GENERATED from <path> (<CONST>). ...` / `-- END GENERATED from <path> (<CONST>)`)
+   where the table belongs, then `bun run build:schema`. A Postgres-only table gets a
+   `PGLITE_RULES` drop entry with its reason.
+3. **When the forward-reference bootstrap changes.** Existing brains replay the blob before
+   migrations run. If the blob gains an index, FK, trigger or view that references a column an
+   older brain may lack, add that column's probe and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+   to the forward-reference bootstrap both engines run (`src/core/engine-sql/bootstrap.ts`:
+   probe, gap, DDL). A column only defined in a
+   `CREATE TABLE` needs no bootstrap entry. `test/schema-bootstrap-coverage.test.ts` names any gap.
 
 ## Engine detection and access repair
 
@@ -393,7 +588,7 @@ names — reasons may be added, never renamed or removed). All 16:
 | `permission_denied` | 28000/42501 — the role lacks a GRANT or hits RLS |
 | `tenant_not_found` | Supavisor rejected the tenant — pooler usernames are `postgres.<project-ref>`; also raised by paused projects |
 | `ssl_required` | the server demands SSL — `?sslmode=require` rewrite (rewrite tier) |
-| `pool_exhausted` | 53300 / session-slot exhaustion — `export GBRAIN_POOL_SIZE=2` guidance |
+| `pool_exhausted` | 53300 / session-slot exhaustion — [pool sizing](#pool-sizing) guidance: `export GBRAIN_POOL_SIZE=6` per long-running process, fewer processes |
 | `conn_refused` | ECONNREFUSED — docker-start arm for gbrain's own container; pooler rewrite for Supabase direct URLs |
 | `dns_failed` | ENOTFOUND/EAI_AGAIN — one bounded retry; persistent + Supabase suggests a paused project |
 | `network_unreachable` | ENETUNREACH/ETIMEDOUT — often an IPv6-only direct host; session-pooler rewrite |
@@ -402,6 +597,7 @@ names — reasons may be added, never renamed or removed). All 16:
 | `db_missing` | 3D000 — the named database does not exist |
 | `schema_missing` | 42P01/42703 — pending migrations (`gbrain apply-migrations --yes`; excluded from the db-repair marker on the MCP mid-operation path, where it usually means code skew) |
 | `pgvector_missing` | the vector extension is absent — auto tier creates it |
+| `storage_corrupt` | XX001/XX002, or an XX000 such as `unexpected chunk number … for toast value` or `tuple concurrently deleted` — stored data is damaged; db-repair stops at manual and names the first step, `gbrain repair orphan-children` (preview, includes the torn-TOAST probe; [orphan children](guides/repair.md#orphan-children)) |
 | `unknown` | unclassified — redacted error + `gbrain doctor` |
 
 The classifier lives in `src/core/pg-access-classify.ts`; remediation copy has
@@ -427,6 +623,252 @@ keep die-on-startup (that lane's repair is `gbrain pglite-repair`), and
 mid-session outages ride the engine's own reconnect plus the per-call
 classified envelopes.
 
+### Pool sizing
+
+<a id="pool-sizing"></a>Each gbrain process opens its own ordinary pool of
+`GBRAIN_POOL_SIZE` connections (default 10; environment variable only, no
+config key). A long-running process (`gbrain serve`, `gbrain autopilot`,
+`gbrain jobs work`) needs at least **6**: two for write publication, one for the
+idle work probe, one each for the projection and effects workers, and one for
+reads and tool calls. Below that, boot or projection draining stalls under
+traffic. One-shot CLI commands can use `GBRAIN_POOL_SIZE=2`. With
+`GBRAIN_POOL_SIZE=1`, schema setup and maintenance still run (`gbrain init
+--db-only`, `apply-migrations`, `repair request-indexes`, `backfill`), but
+managed writes need two connections: they stay queued with
+`writer_pool_capacity`, so `gbrain init` without `--db-only` stops at its
+packaged-skill install. Long holds keep one connection free for reads and
+control work; only holds that use nothing but their own connection (migration
+DDL, concurrent index builds, backfill batches) may take a single
+connection.
+
+Size the pooler for every process at once:
+
+```
+long-running processes x GBRAIN_POOL_SIZE
+  + processes with GBRAIN_DIRECT_DATABASE_URL x GBRAIN_DIRECT_POOL_SIZE (default 3)
+  + one-shot commands running at the same time x their pool
+  <= the pooler's client limit (Supabase Supavisor: the project's pool_size)
+```
+
+When the sum does not fit, run fewer long-running processes (for example one
+shared `gbrain serve --http` instead of one stdio `serve` per agent session),
+or raise the pooler's limit. Do not lower a long-running process below 6.
+
+With a direct route configured, the persistence consumer's own tick
+statements (idle probe, switch read, recovery and expired-claim scans,
+capacity marking) take the direct pool beside the claims, renewals and the
+heartbeat, so a transaction-mode pooler never sits between the owner and its
+bookkeeping (#6317; `gbrain sources writer status --json` shows
+`connection.lane: direct`). `GBRAIN_CONSUMER_DIRECT_LANE=0` keeps those scans
+on the ordinary pool when the direct pool is too small for them.
+`pool_exhausted` errors (SQLSTATE `53300`) and the
+[serve boot timeout](#serve-boot-timeout) print this guidance.
+
+<a id="serve-boot-timeout"></a>**`serve_boot_timeout`** (stderr, exit 1).
+`gbrain serve` made no boot progress for `GBRAIN_SERVE_BOOT_TIMEOUT_SECONDS`
+(default 60; 0 disables), so it released the database and exited. The window
+restarts at every boot phase, progress note and answered request, so a large
+brain whose boot is slow but advancing is never stopped; the line also says how long the
+boot had been running. The line
+names the boot phase that never finished (`source_preflight`,
+`writeback_config`, `mcp_connect`, `source_scope`, `persistence_consumer`,
+`resolve_ipc_bind`, `startup_sweep`) and the pool pressure
+(`pool=<tracked checkouts>/<pool max>`). When the pool is below 6 or saturated,
+the fix is `export GBRAIN_POOL_SIZE=6` plus pooler sizing as above; otherwise
+check the configured provider endpoints for the named phase, or raise the
+timeout.
+
+### Pool and transaction diagnostics
+
+These warn lines and errors come from the Postgres engine's connection pools.
+Each one names a stable code, its cause, a command and this anchor.
+
+<a id="pg-connection-poisoned"></a>**`pg_connection_poisoned`** (warn).
+A pooled connection came back to the pool inside a transaction (ReadyForQuery
+status `T`) or a failed one (`E`), usually because a caller released a reserved
+connection without `COMMIT` or `ROLLBACK`. The driver terminates that connection
+instead of reusing it, so later statements never run inside the leftover
+transaction and never fail with SQLSTATE `25P02`. Queued statements move to a
+fresh connection. The line names the status byte and the pool (`read` or
+`direct`) and carries no query text. `getPoolDiagnostics().poisonedDiscards`
+counts discards per engine. There is no opt-out. Nothing needs to be repaired;
+if the line repeats, run `gbrain doctor --json` and report the warn lines with
+the operations that preceded them. A pool created with `max: 1` keeps the
+driver's documented single-connection idiom (`BEGIN` as an ordinary query)
+for unreserved statements.
+
+<a id="schema-lock-blocked"></a>**`schema_lock_blocked`** (error, retryable).
+A schema step waited its `lock_timeout` for a table lock another session holds
+and stopped instead of hanging (#5227). `gbrain init` and `upgrade` replay
+`schema.sql` on the reserved DDL backend; every `ALTER TABLE` there takes an
+ACCESS EXCLUSIVE lock even as a no-op, so one open transaction in another
+client (idle in transaction, a stuck job) used to park the whole command in
+`wait_event_type=Lock` with no output. The replay runs under a session-level
+`lock_timeout` on that backend (`GBRAIN_SCHEMA_LOCK_TIMEOUT_SECONDS`, default
+60; the value found before is restored on release, so a pooled backend never
+leaks it), a transaction-wrapped migration binds the same wait with
+`SET LOCAL lock_timeout`, and a `transaction: false` migration sets and
+restores it on its own reserved backend. Handler migrations and the
+post-migration `verifySchema` run outside the bound: they issue their own
+statements (`CREATE INDEX CONCURRENTLY` cannot run in a transaction) and stay
+as they were. While the wait is active a separate one-backend connection
+samples `pg_blocking_pids()` of the waiting backend once, so the refusal names
+the blocking sessions by pid, `application_name`, state and transaction age;
+after the cancel the blocker may already be gone, and the message says when the
+sample came late. Query text is never read or shown. `detail` names the step
+(`replay`, `migration v<N>`). The RLS block skips tables whose
+`relrowsecurity` is already set, so a re-run on a live brain no longer takes
+ACCESS EXCLUSIVE on them. `init` retries a blocked step a few times with a
+short backoff (`init-schema-retry.ts`); a lock that never clears is a bounded
+failure, not a hang. Fix: let the named session finish or, with the user's
+agreement, end it on the database host with `SELECT pg_terminate_backend(<pid>)`,
+then rerun the same command. Test: `test/e2e/init-schema-lock-blocked.test.ts`.
+
+<a id="pg-connection-stuck"></a>**`pg_connection_stuck`** (warn). A pooled
+statement waited past the pool's `statement_timeout` plus a grace with nothing
+coming back from the server, so the vendored driver retired that connection:
+the statement and every statement queued behind it failed with the driver error
+`CONNECTION_STUCK`, the connection left the pool before its socket closed, and
+the pool reconnected on its own (#6383). A legitimate statement cannot outlive
+the server-side timeout, so only a wedged connection reaches the budget: a
+pipeline the client and server no longer agree on, a transaction-mode pooler
+that swallowed a `CancelRequest` and left the backend in `ClientRead`, or a
+dead peer. The budget is the pool's own startup `statement_timeout` (5 min on
+the read pool, 30 min on the direct pool, `GBRAIN_STATEMENT_TIMEOUT` for the
+read pool) plus `GBRAIN_PG_STUCK_GRACE_MS` (default `30000`); it follows the
+configured timeout even through a pooler that drops the startup parameter, so a
+statement that must run longer raises `GBRAIN_STATEMENT_TIMEOUT`, and
+`GBRAIN_PG_STUCK_GRACE_MS=0` or `off` disables the watchdog. The clock restarts
+on every byte the server sends, so a long result set or a `COPY` is never cut
+short. The line names the pool, `age_ms`, `queued` (statements that failed with
+it) and the statement by first keyword and table (`sql=SELECT_pages`), never its
+text or parameters. `getPoolDiagnostics().stuckDiscards` counts retirements per
+engine; `/health?deep=1` reports them as `stuck_discards`. Retry the failed
+call; if the line repeats, run `gbrain doctor --json` and report the warn lines
+with the operations that preceded them.
+
+<a id="pg-connection-desync"></a>**`pg_connection_desync`** (warn). A statement's
+answer (columns, rows, a completion, a parse or bind acknowledgement, or a
+statement error) arrived on a pooled connection with no statement waiting for
+it, so the client and the server no longer agreed on which answer belonged to
+which statement. The vendored driver retired that connection, statements
+queued on it failed with a connection error, and the pool reconnected on its
+own. The line names the pool, the message type, the driver's connection id and
+the last statement written on it by first keyword and table, never its text or
+parameters. Notices, notifications and parameter changes never trigger it.
+`getPoolDiagnostics().desyncDiscards` counts retirements per engine;
+`/health?deep=1` reports them as `desync_discards`.
+Retry the failed call; if the line repeats, run `gbrain doctor --json` and
+report the warn lines.
+
+<a id="pg-statement-build-failed"></a>**`pg_statement_build_failed`** (warn). A
+statement could not be built from its parameters (`error=UNDEFINED_VALUE`: a
+parameter was `undefined`; `error=MAX_PARAMETERS_EXCEEDED`: more than 65534
+parameters). It was answered in its place in the pipeline by a query the server
+refuses, so only it failed and a transaction it was part of was aborted rather
+than committed without it. No other statement was affected: before #6383 the same failure, when the statement was
+pipelined behind another on its connection, rejected that other statement with
+its error, left the culprit queued with nothing on the wire, and delivered every
+later reply one statement late until the process restarted (the
+`null is not an object (evaluating 'query.statement.types')` line and a backend
+stuck `active / ClientRead` were that desync). The line names the pool and the
+statement by first keyword and table; the call site that bound `undefined` is a
+gbrain bug, so report the line. `getPoolDiagnostics().buildFailures` counts
+them.
+
+<a id="pg-pool-stalled"></a>**`pg_pool_stalled`** (warn, resident processes).
+`gbrain serve` reads its pool every 30 s; when connections are checked out or
+statements are waiting for one across two ticks in a row and the pool completed
+no statement in between, it logs this line once per tick with `checked_out`,
+`max`, `waiters`, `inflight_oldest_ms` and `stalled_ms`, and one
+`[gbrain] info code=pg_pool_recovered` line when statements complete again.
+One slow statement is one quiet tick and is never reported. With the in-flight
+watchdog on, a stall ends within `statement_timeout` plus grace and
+`pg_connection_stuck` names the connection; with the watchdog off this line is
+the only trace a wedged pool leaves. A line that keeps repeating with no
+recovery means the database or pooler is unreachable from the process:
+`gbrain doctor --json` from a fresh process, then restart the stalled one.
+
+**`/health?deep=1`** (`gbrain serve --http`). Plain `/health` stays the fast
+liveness probe, and it runs its `SELECT 1` on a reserved connection, which the
+driver only ever claims from idle connections; a wedged connection sits in the
+busy queue where handler statements are routed, so `/health` answered 200
+through the whole #6383 incident. `/health?deep=1` runs `SELECT 1` through the
+ordinary pooled dispatch (no reservation, 3 s budget) and answers 503 when the
+probe does not return in time, when `inflight_oldest_ms` is past the read
+pool's in-flight budget, or when an earlier deep probe is still pending (one
+deep probe per engine at a time). Its body carries the pool block:
+`{ checked_out, max, waiters, inflight_oldest_ms, completed, poisoned_discards,
+stuck_discards, build_failures, desync_discards }`. It is cheap enough for a two-minute cron. The
+same pool numbers ride the persistence consumer's heartbeat row, so
+`gbrain sources writer status --json` shows `pool.inflight_oldest_ms` for the
+owner process.
+
+<a id="backfill-rollback-failed"></a>**`backfill_rollback_failed`** (error).
+A `gbrain backfill` batch failed, and its `ROLLBACK` failed too. The run stops
+rather than retrying on a connection whose transaction state is unknown; the
+driver discards that connection. Nothing from the batch was committed and the
+checkpoint did not advance. The message names both errors (redacted, at most
+200 characters each). Fix the cause they name, then run
+`gbrain backfill <kind> --resume`.
+
+<a id="persistence-consumer-log"></a>**`[persistence] phase=<phase> reason=<code>`**
+(stderr). The resident write consumer could not finish a phase. `reason` is
+the SQLSTATE (for example `53300` when a pooler's client limit is reached),
+a write-error code, `storage_error`, or `deadline_exceeded` when the phase
+overran its five-second budget. `message` is the redacted error text, one line,
+at most 200 characters. When an unexpected exception in the owner failed a
+write (`storage_error` with a generic public message; the class and frame stay owner-only),
+the line also carries `class=`, `errno=` and `frame=` (the top gbrain source
+frame, repo-relative, for example `src/core/persistence/page-prepare.ts:120`):
+the owner diagnostics the receipt points at. The stored receipt keeps the same
+identifiers (never the error message) owner-side in `error_detail`, with the
+build that ran the attempt; `gbrain write-request <id>` names an owner on
+another build than the CLI (`owner_build`) and the restart to run. Connection-wait evidence follows on Postgres:
+`first_conn_ms` is the time from phase start until the phase obtained a
+connection; `checkout=not_observed conn_wait_ms=<n>` means it had not obtained
+one after `n` milliseconds (a saturated pool or pooler, not a slow query); and
+`loop_lag_ms` is the longest event-loop delay during the phase (a busy or
+starved process). The same fields appear in the consumer's status snapshot
+under `phase`. Unfinished work stays tracked and is retried; nothing is lost. Run `gbrain sources writer status --json` to see what is waiting.
+A `deadline_exceeded` phase is also how a round-trip a transaction-mode pooler
+(Supavisor port 6543, PgBouncer) never completed ends: the backend sits in
+`ClientRead`, the cancel request the deadline sends may never reach it, so
+`GBRAIN_CANCEL_SETTLE_MS` (default 2000) after the cancel the owner discards
+that reserved connection, the statement settles client-side, and the next tick
+runs. The connection end is not reported as `storage_error`; doctor's
+`persistence_session_timeouts` names a transaction-mode URL, and the
+session-mode URL of the same pooler (Supabase: port 5432) avoids the class.
+`phase=preparation` lines name a write whose preparation ran past its budget:
+`reason=deadline_exceeded` (the claim is released with `blocked_reason`
+`preparation_deadline` and one attempt is counted; the budget is
+`persistence.sync_preparation_ms` for a managed sync member,
+`persistence.maintenance_preparation_ms` for every other managed kind and 30 s
+for `remember`, `put_page` and `edit_page`), `reason=preparation_stalled` (the
+request reached `persistence.max_preparation_attempts` and was finished
+`failed` instead of being claimed again) and `reason=ceiling_exceeded` (the
+preparation ignored cancellation past `persistence.preparation_ceiling_ms`; the
+message names the step and what it waited on, and ends `restart_required` when
+this process holds as many such preparations as it tolerates and has stopped
+claiming). The runbook is
+[catch-up stuck](guides/troubleshooting.md#catch-up-stuck). The
+line is rate-limited (one per second, one per phase and code every 30 seconds).
+An idle consumer keeps one ordinary-pool connection for its work probe and
+never holds a direct or session-pooler connection, so a
+`GBRAIN_DIRECT_DATABASE_URL` that points at a session pooler is not pinned by
+idle `gbrain serve` processes.
+
+<a id="persistence-claim-phase"></a>**Claim phases.** Each claim renewal also records the claimed write's phase
+(`preparing` or `publishing`); `gbrain sources writer status --json` shows it as
+`claim` on running blockers, and doctor `persistence_write_stall` warns past
+`persistence.max_claim_ms` (default 600000, 60000 to 86400000). A running
+claim also carries the preparation `step`, how long it has been in it, what it
+waits on (`git`, `fs`, `db`, `pool` or `unknown`) and the owner process (kind,
+pid, gbrain version); past its budget, `claim.stall` reads
+`preparation_overdue`. Each request counts the cut-offs of its preparation in
+`persistence_requests.preparation_attempts`. See
+[troubleshooting](guides/troubleshooting.md#persistence-write-stall).
+
 ## JSONB writes: never double-encode
 
 Writing a JS value into a `jsonb` column has exactly two correct forms. Get this
@@ -438,6 +880,7 @@ real Postgres — `col ->> 'k'` returns NULL, `jsonb_array_elements` throws, and
 |---|---|
 | Template tag: `` sql`... ${sql.json(obj)}` `` (postgres-engine only) | ✅ native jsonb serialization |
 | Positional raw call, raw object: `executeRawJsonb(engine, sql, scalars, [obj])` | ✅ object reaches the wire as jsonb |
+| engine-sql domain code: `` sqlFragment`... ${jsonbParam(obj)}` `` | ✅ bound as `sql.json` on Postgres, serialized for PGLite's native text→jsonb parse |
 | Positional raw call, stringified: `executeRaw(\`... $N::text::jsonb\`, [JSON.stringify(x)])` | ✅ binds as text, the cast parses it |
 | Positional raw call, BARE cast: `executeRaw(\`... $N::jsonb\`, [JSON.stringify(x)])` | ❌ **double-encodes** under postgres.js `.unsafe()` |
 | Template literal interpolation: `` `... ${JSON.stringify(x)}::jsonb` `` | ❌ double-encodes |
@@ -481,9 +924,18 @@ and assert `jsonb_typeof` — the assertion PGLite cannot make.
    ```
    The factory uses dynamic imports so an engine's dependencies (e.g. the
    PGLite WASM blob) are only loaded when that engine is selected.
-3. Store engine type in `~/.gbrain/config.json`: `{ "engine": "myengine", ... }`
-4. Add tests. The test suite should be engine-agnostic where possible... same test cases, different engine constructor.
-5. Document in this file + add a design doc in `docs/`
+3. If the engine speaks the Postgres dialect, add a dialect adapter that
+   implements `SqlExecutor` (`src/core/engine-sql/executor.ts`) beside
+   `dialect-pglite.ts` and `dialect-postgres.ts`, expose it through a private
+   `engineSql` getter over the current connection, and delegate every method
+   of a migrated domain to `src/core/engine-sql/<domain>.ts` the way both
+   engines do. Declare its capabilities honestly. The binding matrix
+   (`test/helpers/executor-binding-matrix.ts`) and the engine-sql contract
+   tests tell you whether the adapter binds, counts, fails and cancels like the
+   others. A non-SQL engine implements every method itself.
+4. Store engine type in `~/.gbrain/config.json`: `{ "engine": "myengine", ... }`
+5. Add tests. The test suite should be engine-agnostic where possible... same test cases, different engine constructor.
+6. Document in this file + add a design doc in `docs/`
 
 ### What you DON'T need to touch
 
@@ -491,7 +943,8 @@ and assert `jsonb_typeof` — the assertion PGLite cannot make.
 - `src/mcp/server.ts` (same)
 - `src/core/chunkers/*` (shared across engines)
 - `src/core/embedding.ts` (shared across engines)
-- `src/core/search/hybrid.ts`, `expansion.ts`, `dedup.ts` (shared, operate on SearchResult[])
+- `src/core/search/hybrid.ts` + `hybrid/`, `expansion.ts`, `dedup.ts` (shared, operate on SearchResult[])
+- `src/core/engine-sql/<domain>.ts` (shared domain SQL, when your engine has a Postgres-dialect adapter)
 - `skills/*` (fat markdown, engine-agnostic)
 
 ### What you DO need to implement

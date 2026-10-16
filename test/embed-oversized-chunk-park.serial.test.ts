@@ -43,7 +43,9 @@ mock.module('../src/core/embedding.ts', () => ({
 // the projection layer is stubbed onto the same tracked mock engine: the
 // snapshot is whatever `getChunks` returns and installation is the old
 // `upsertChunks` call the assertions below already inspect.
+const realProjections = await import('../src/core/page-state/projections.ts');
 mock.module('../src/core/page-state/projections.ts', () => ({
+  ...realProjections,
   readProjectionSnapshot: async (engine: any, slug: string, sourceId: string) => {
     const chunks = await engine.getChunks(slug, { sourceId, includeUnsealed: true });
     if (!chunks) return null;
@@ -84,6 +86,10 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
   const proxy: any = new Proxy({} as any, {
     get(_, prop: string) {
       if (prop === '_calls') return calls;
+      if (prop === 'executeRaw') return async (sql: string, ...args: unknown[]) => {
+        if (sql.includes('count(*)') && sql.includes('s.archived')) return [{ n: 0 }];
+        return overrides.executeRaw ? overrides.executeRaw(sql, ...args) : [];
+      };
       if (overrides[prop]) return overrides[prop];
       // Guarded installs run inside engine.transaction(fn); the mock has no
       // isolation to offer, so the callback simply sees the same engine.

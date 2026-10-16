@@ -27,6 +27,7 @@ tools:
 mutating: false
 writes_pages: false
 upstream: context-audit@fc834ee
+when_to_use: "Use when the user asks: \"context audit\", \"context diet\", \"system prompt audit\", \"prompt compression\", \"reduce context size\"."
 ---
 
 # context-audit — Token Hygiene for the Always-Loaded Context Stack
@@ -105,7 +106,11 @@ List the always-loaded files for this harness and measure each:
 ```bash
 # bytes/2.8 (calibrated for Claude-family tokenizers on markdown, #4988); integer ceil: (n*10+27)/28
 for f in CLAUDE.md AGENTS.md SOUL.md USER.md ACCESS_POLICY.md HEARTBEAT.md MEMORY.md; do
-  [ -f "$f" ] && echo "$f: $(wc -c < "$f") bytes (~$(( ( $(wc -c < "$f") * 10 + 27 ) / 28 )) tokens)"
+  if [ -f "$f" ]; then
+    bytes=$(wc -c < "$f")
+    bytes=$((bytes + 0))
+    echo "$f: $bytes bytes (~$(( ( bytes * 10 + 27 ) / 28 )) tokens)"
+  fi
 done
 ```
 
@@ -198,6 +203,14 @@ Sorted by token savings, descending — except contradictions, which are called
 out first regardless of size (they cost correctness, not just tokens). Every
 row carries evidence (a quote or line reference) and names WHERE the fix
 belongs: source file, answer bank/template, memory store, or a new skill.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain eval cross-modal` exits 1 (FAIL): fix the flagged weaknesses and re-run; do not deliver a failed audit as passing.
+- No judge model or provider key is configured: say the audit ran structure-only and name the missing key; do not fabricate scores.
+- A paid multi-model audit hits `no_pricing` or a cost cap: fall back to the default single cheap judge and tell the user why.
 
 ## Anti-Patterns
 

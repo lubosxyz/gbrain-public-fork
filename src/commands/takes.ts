@@ -9,21 +9,26 @@
  *   takes update <slug> --row N ...flags   — update mutable fields
  *   takes supersede <slug> --row N ...     — strikethrough old + append new
  *   takes resolve <slug> --row N --outcome true|false [--value N --unit u]
+ *   takes remove <slug> --row N            — remove one row (fence + DB)
+ *   takes rebuild <slug> [--source-id id]  — rebuild one page's takes index from its fence
  *
  * Markdown is canonical. The four direct mutation commands use the same
  * durable takes_* operations as MCP, via takes-mutation.ts. This dispatcher
  * retains read/maintenance command parsing and presentation.
  */
 
+import { resolve as resolvePath } from 'node:path';
 import { existsSync } from 'node:fs';
 import type { BrainEngine } from '../core/engine.ts';
+import type { OperationError } from '../core/ops/contract.ts';
+import { usageError } from '../cli/cli-error.ts';
 import {
   TakesWriteError,
 } from '../core/takes-write.ts';
 import { resolveSourceId } from '../core/source-resolver.ts';
 import { resolveOwnerHolder } from '../core/owner-holder.ts';
 import { embedStaleTakes } from '../core/embed-takes.ts';
-import { assertEmbeddingEnabled } from '../core/embedding-dim-check.ts';
+import { assertBrainEmbeddingEnabled } from '../core/embedding-dim-check.ts';
 import { loadConfig } from '../core/config.ts';
 import { embedQuery } from '../core/embedding.ts';
 import {
@@ -176,7 +181,7 @@ async function cmdSearch(engine: BrainEngine, args: string[]): Promise<void> {
   const limit = parseInt(flagValue(args, '--limit') ?? '30', 10);
   let hits;
   if (semantic) {
-    assertEmbeddingEnabled(loadConfig());
+    await assertBrainEmbeddingEnabled(engine, loadConfig());
     const { validateEmbeddingCreds } = await import('../core/embed-preflight.ts');
     validateEmbeddingCreds();
     const queryEmbedding = await embedQuery(query);
@@ -209,7 +214,7 @@ async function cmdEmbed(engine: BrainEngine, args: string[]): Promise<void> {
   }
 
   if (!dryRun) {
-    assertEmbeddingEnabled(loadConfig());
+    await assertBrainEmbeddingEnabled(engine, loadConfig());
     const { validateEmbeddingCreds } = await import('../core/embed-preflight.ts');
     validateEmbeddingCreds();
   }
@@ -380,12 +385,29 @@ async function cmdPropose(engine: BrainEngine, args: string[], sourceId: string)
     configValue: await engine.getConfig('emotional_weight.user_holder'),
   });
 
+  const editFlags = ['--claim', '--weight', '--who', '--kind'].filter(flag => flagPresent(args, flag));
+  if (editFlags.length && acceptRaw === undefined) {
+    console.error(`Error: ${editFlags.join(', ')} edit a proposal only together with --accept <id>.`);
+    process.exit(1);
+  }
   if (acceptRaw !== undefined) {
     const id = parseId(acceptRaw, '--accept');
     const dirArg = flagValue(args, '--dir');
+    const weightRaw = flagValue(args, '--weight');
+    const weight = weightRaw === undefined ? undefined : Number(weightRaw);
+    if (weight !== undefined && (!Number.isFinite(weight) || weight < 0 || weight > 1)) {
+      console.error(`Invalid --weight "${weightRaw}". Expected a number from 0 to 1.`);
+      process.exit(1);
+    }
+    const kind = flagValue(args, '--kind');
+    if (kind !== undefined && !['fact', 'take', 'bet', 'hunch'].includes(kind)) {
+      console.error(`Invalid --kind "${kind}". Expected fact, take, bet or hunch.`);
+      process.exit(1);
+    }
     const brainDir = await resolveBrainDir(engine, dirArg ?? null);
     try {
-      const { proposal, rowNum } = await acceptProposal({ engine, brainDir, sourceId, actedBy }, id);
+      const { proposal, rowNum } = await acceptProposal({ engine, brainDir, sourceId, actedBy, config: loadConfig() ?? { engine: 'pglite' },
+        ...(dirArg ? { localDir: resolvePath(dirArg) } : {}) }, id, { claim: flagValue(args, '--claim'), weight, holder: flagValue(args, '--who'), kind });
       console.log(`Accepted proposal #${id} → take #${rowNum} on ${proposal.page_slug}.`);
     } catch (err) {
       if (err instanceof TakeProposalError) {
@@ -463,9 +485,13 @@ Subcommands:
                        [--evidence "..."] [--value N --unit usd|pct|count] [--by <slug>]
                                           Record bet resolution (immutable, v0.30.0)
                                           Back-compat: --outcome true|false (deprecated alias)
+  takes remove <slug> --row N             Remove one take row from the fence and the DB (other row numbers stay)
+  takes rebuild <slug> [--source-id <id>] [--json]
+                                          Rebuild one page's takes index from its canonical fence
   takes propose [--limit N] [--json]      List pending LLM-proposed takes (propose_takes queue)
-  takes propose --accept <id> [--dir <path>]
-                                          Promote a proposal into the page's takes fence
+  takes propose --accept <id> [--dir <path>] [--claim "..."] [--weight 0.6] [--who <holder>] [--kind <k>]
+                                          Promote a proposal into the page's takes fence (source take_proposals#<id>;
+                                          edits mark it "(edited)" and the queue keeps the original text)
   takes propose --reject <id>             Dismiss a proposal
   takes scorecard [<holder>] [--domain <prefix>] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]
                                           Aggregate calibration scorecard (v0.30.0)
@@ -494,7 +520,9 @@ Common flags:
     case 'add':
     case 'update':
     case 'supersede':
-    case 'resolve': { const { runTakesMutation } = await import('./takes-mutation.ts'); return runTakesMutation(engine, args); }
+    case 'resolve':
+    case 'remove': { const { runTakesMutation } = await import('./takes-mutation.ts'); return runTakesMutation(engine, args); }
+    case 'rebuild':     { const { runTakesRebuild } = await import('./takes-mutation.ts'); return runTakesRebuild(engine, rest); }
     // #2411: `takes propose` used to fall through to the slug path and print
     // "No takes on propose." — the LLM proposal queue had no drain surface.
     case 'propose':     return cmdPropose(engine, rest, await resolveTakesSourceId(engine));
@@ -521,8 +549,8 @@ async function cmdExtract(engine: BrainEngine, rest: string[]): Promise<void> {
   const sub = rest[0];
   if (sub !== '--from-pages') {
     process.stderr.write(
-      'Usage: gbrain takes extract --from-pages [--yes] [--dry-run] [--json] [--source-id <id>] [--max-pages N (clamped to 1000)] [--include-covered] [--holder <name>]\n' +
-      'Runs progress: pages that already hold takes are skipped, so repeat runs sweep a large corpus in slices. --include-covered rescans everything (refresh).\n',
+      'Usage: gbrain takes extract --from-pages [--yes] [--dry-run] [--json] [--source-id <id>] [--max-pages N (clamped to 1000)] [--before <updated_at>,<id>] [--include-covered] [--holder <name>]\n' +
+      'Runs progress: pages that already hold takes are skipped, so repeat runs sweep a large corpus in slices. Pass a run\'s next_before to --before to continue past pages that yielded no claims. --include-covered rescans everything (refresh).\n',
     );
     process.exit(1);
   }
@@ -537,13 +565,19 @@ async function cmdExtract(engine: BrainEngine, rest: string[]): Promise<void> {
   const holderIdx = rest.indexOf('--holder');
   const holder = holderIdx >= 0 ? rest[holderIdx + 1] : 'system';
   const includeCovered = rest.includes('--include-covered');
+  let before: { updatedAt: string; id: number } | undefined;
+  try {
+    before = parseTakesBeforeCursor(rest);
+  } catch (e) {
+    (await import('../cli/cli-error.ts')).exitCliError(e, 'takes');
+  }
 
   // A12 consent gate.
   const bootstrapEnabledCfg = await engine.getConfig('takes.bootstrap_enabled');
   const bootstrapEnabled = bootstrapEnabledCfg === 'true' || bootstrapEnabledCfg === '1';
   if (!bootstrapEnabled) {
     process.stderr.write(
-      `takes-bootstrap is opt-in. Enable with:\n  gbrain config set takes.bootstrap_enabled true\nThen re-run with --yes.\n`,
+      `takes-bootstrap is opt-in. Enable with:\n  gbrain config set takes.bootstrap_enabled true\nThen run it again with the user's approval (--yes).\n`,
     );
     process.exit(2);
   }
@@ -571,8 +605,13 @@ async function cmdExtract(engine: BrainEngine, rest: string[]): Promise<void> {
     dryRun,
     sourceIdFilter,
     maxPages,
+    before,
     includeCovered,
     holder,
+  }).catch(async (e: unknown) => {
+    const { isDatetimeInputError } = await import('../core/utils.ts');
+    if (before && isDatetimeInputError(e)) (await import('../cli/cli-error.ts')).exitCliError(beforeCursorError('The database could not read the --before timestamp.'), 'takes');
+    throw e;
   });
   if (result.llm_unavailable) {
     if (json) {
@@ -588,18 +627,60 @@ async function cmdExtract(engine: BrainEngine, rest: string[]): Promise<void> {
   }
   // #4473: takes are markdown-canonical — pages the fence writer refused are
   // skipped (never written DB-only). Say so instead of silently undercounting.
-  if (result.pages_skipped > 0) {
-    const reasons = [...new Set(result.skipped.map((s) => s.reason))].join(', ');
+  const unlocatable = result.skipped.filter((s) => !s.reason.startsWith('llm_error:'));
+  if (unlocatable.length > 0) {
+    const reasons = [...new Set(unlocatable.map((s) => s.reason))].join(', ');
     process.stderr.write(
-      `[takes extract] ${result.pages_skipped} page(s) skipped (${reasons}) — takes are ` +
+      `[takes extract] ${unlocatable.length} page(s) skipped (${reasons}) — takes are ` +
       `markdown-canonical; a page with no locatable .md file is not written. ` +
       `Configure sync.repo_path (or the source's local_path) and re-run.\n`,
     );
+  }
+  const llmErrors = result.skipped.filter((s) => s.reason.startsWith('llm_error:'));
+  if (llmErrors.length > 0) {
+    const reasons = [...new Set(llmErrors.map((s) => s.reason))].join(', ');
+    process.stderr.write(`[takes extract] ${llmErrors.length} page(s) skipped because the model call failed (${reasons}).\n`);
+  }
+  if (result.budget_exhausted) {
+    process.stderr.write(
+      `[takes extract] stopped at the USD budget; raise it with ` +
+      `\`gbrain config set takes.bootstrap_budget_usd <usd>\` and re-run to continue.\n`,
+    );
+  }
+  if (result.duplicates_skipped > 0) {
+    process.stderr.write(`[takes extract] ${result.duplicates_skipped} claim(s) already in the page's takes fence were not re-added.\n`);
   }
   process.stdout.write(
     `takes extract --from-pages: ${result.claims_extracted} claim(s) from ${result.pages_scanned} page(s)` +
     (dryRun ? ' (dry-run)' : '') + '\n',
   );
+  // Quoted: the cursor's timestamp contains a space.
+  if (result.next_before) process.stdout.write(`next: --before '${result.next_before}'\n`);
+}
+
+const BEFORE_CURSOR_RE = /^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}(?::?\d{2})?)?),([1-9]\d{0,15})$/;
+
+function beforeCursorError(message: string): OperationError {
+  return usageError(message, 'Pass the exact next_before value a previous takes extract run printed, or drop --before to start from the newest page.', {
+    why: '--before continues a sweep strictly below one (updated_at, id) keyset position; anything else could skip or repeat pages.',
+    fix: {
+      argv: ['gbrain', 'takes', 'extract', '--from-pages', '--dry-run', '--json'],
+      consent: [], actor: 'agent', requires_exclusive: false,
+      why: 'A dry run without --before lists the newest pages and prints a fresh next_before.',
+      verify: { argv: ['gbrain', 'config', 'get', 'takes.bootstrap_enabled'] },
+    },
+  });
+}
+
+/** #5059: `--before <updated_at>,<id>` (a run's next_before), or undefined. Refuses before any page is read. */
+export function parseTakesBeforeCursor(rest: readonly string[]): { updatedAt: string; id: number } | undefined {
+  const idx = rest.indexOf('--before');
+  if (idx < 0) return undefined;
+  const raw = rest[idx + 1];
+  if (raw === undefined || raw.startsWith('--')) throw beforeCursorError('--before needs a value: <updated_at>,<page id>.');
+  const m = BEFORE_CURSOR_RE.exec(raw.trim());
+  if (!m) throw beforeCursorError('--before is not an <updated_at>,<page id> cursor.');
+  return { updatedAt: m[1]!, id: Number(m[2]) };
 }
 
 /**

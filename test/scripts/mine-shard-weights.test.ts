@@ -12,6 +12,7 @@ import {
   mineWeights,
   parseLog,
   serializeWeights,
+  sourceE2ECorpus,
 } from "../../scripts/mine-shard-weights.ts";
 
 const SAMPLE = `test (1)\tUNKNOWN STEP\t2026-05-25T11:26:40.000000Z ##[group]test/alpha.test.ts:
@@ -72,6 +73,46 @@ describe("parseLog", () => {
     const noise =
       "test (1)\tUNKNOWN\t2026-05-25T11:26:40.000Z ##[group]Run actions/checkout\n";
     expect(parseLog(noise)).toEqual([]);
+  });
+});
+
+describe('full E2E timing extraction', () => {
+  const expectedFiles = ['test/e2e/alpha.test.ts', 'test/phantom-redirect-engine-parity.test.ts'];
+  const line = (job: string, text: string) => `${job}\tstep\t2026-09-24T06:00:00.000Z ${text}\n`;
+  const file = (job: string, name: string) => line(job, `=== ${name} ===`) + line(job, ' 0 fail') + line(job, 'Ran 1 test across 1 file. [2.50s]');
+  const complete = (job: string, names: string[]) => names.map(name => file(job, name)).join('') + line(job, `Files: ${names.length} total, ${names.length} passed, 0 failed`);
+  const raw = complete('coverage-full-e2e', ['alpha.test.ts', 'phantom-redirect-engine-parity.test.ts']);
+  const opts = { e2eProfile: 'full' as const, expectedFiles, expectedJobs: ['coverage-full-e2e'] };
+  it('resolves the outside-directory parity file without including selected-job timings', () => {
+    const noise = complete('Selected E2E (diff-relevant) 1', ['unrelated.test.ts']);
+    expect(Object.fromEntries(mineWeights(raw + noise, 'e2e', opts))).toEqual(Object.fromEntries(expectedFiles.map(file => [file, 2500])));
+    expect(Object.fromEntries(mineWeights(raw + noise, 'e2e'))).toEqual({ 'test/e2e/unrelated.test.ts': 2500 });
+  });
+  it('uses the final parent summary rather than a nested child summary', () => {
+    for (const [job, options] of [['coverage-full-e2e', opts], ['Selected E2E (diff-relevant) 1', {}]] as const) {
+      const nested = line(job, '=== alpha.test.ts ===') + line(job, ' 0 fail') + line(job, 'Ran 1 test across 1 file. [1.00ms]')
+        + line(job, ' 0 fail') + line(job, 'Ran 1 test across 1 file. [80.00ms]')
+        + file(job, 'phantom-redirect-engine-parity.test.ts') + line(job, 'Files: 2 total, 2 passed, 0 failed');
+      expect(mineWeights(nested, 'e2e', options).get(expectedFiles[0])).toBe(80);
+      expect(() => mineWeights(nested.replace(' 0 fail\n' + line(job, 'Ran 1 test across 1 file. [80.00ms]'), ' 1 fail\n' + line(job, 'Ran 1 test across 1 file. [80.00ms]')), 'e2e', options)).toThrow();
+    }
+  });
+  it('requires complete, disjoint matrix jobs and rejects missing, ambiguous and extra files', () => {
+    const jobs = ['coverage-full-e2e (1)', 'coverage-full-e2e (2)'];
+    const matrix = complete(jobs[0], ['alpha.test.ts']) + complete(jobs[1], ['phantom-redirect-engine-parity.test.ts']);
+    expect(mineWeights(matrix, 'e2e', { ...opts, expectedJobs: jobs }).size).toBe(2);
+    for (const bad of [
+      complete(jobs[0], ['alpha.test.ts']),
+      complete(jobs[0], ['alpha.test.ts']) + complete(jobs[1], ['alpha.test.ts']),
+      matrix.replace(' 0 fail', ' 1 fail'),
+      matrix.replace('1 passed, 0 failed', '0 passed, 1 failed'),
+      matrix.replace('1 passed, 0 failed', '0 passed, 0 failed'),
+      matrix.replace('phantom-redirect-engine-parity.test.ts', 'unknown.test.ts'),
+      matrix.replace('Ran 1 test across 1 file. [2.50s]', ''),
+    ]) expect(() => mineWeights(bad, 'e2e', { ...opts, expectedJobs: jobs })).toThrow();
+    expect(() => mineWeights(raw, 'e2e', { ...opts, expectedFiles: [...expectedFiles, 'test/alpha.test.ts'] })).toThrow('ambiguous');
+    expect(() => mineWeights(raw, 'e2e', { ...opts, expectedFiles: [...expectedFiles, 'test/e2e/missing.test.ts'] })).toThrow('missing source files');
+    expect(() => mineWeights(raw, 'e2e', { e2eProfile: 'full' })).toThrow('source corpus');
   });
 });
 
@@ -268,32 +309,134 @@ it('GitHub refresh verifies every eligible job before replacing the complete lan
   const dir = mkdtempSync(join(tmpdir(), 'gbrain-mine-github-'));
   try {
     const bin = join(dir, 'bin');
+    const artifacts = join(dir, 'artifacts');
     mkdirSync(bin);
+    mkdirSync(artifacts);
     const fakeGh = join(bin, 'gh');
-    writeFileSync(fakeGh, '#!/bin/sh\ncase "$*" in\n  "run view 123 --json conclusion,headSha,jobs") cat "$FIXTURE_GH_INFO" ;;\n  "run view 123 --log") cat "$FIXTURE_GH_LOG" ;;\n  *) exit 2 ;;\nesac\n');
+    writeFileSync(fakeGh, '#!/bin/sh\ncase "$*" in\n  "run view 123 --json conclusion,headSha,jobs") cat "$FIXTURE_GH_INFO" ;;\n  "run download 123 --name timings-unit-"*) [ -f "$FIXTURE_GH_ARTIFACTS/$5.log" ] && cp "$FIXTURE_GH_ARTIFACTS/$5.log" "$7/unit.log" ;;\n  *) exit 2 ;;\nesac\n');
     chmodSync(fakeGh, 0o755);
     const info = join(dir, 'run.json');
-    const input = join(dir, 'unit.log');
     const out = join(dir, 'weights.json');
     const meta = join(dir, 'weights.metadata.json');
-    const line = (job: string, text: string) => `${job}\tRun test shard\t2026-05-25T11:26:50.000Z ${text}\n`;
-    const complete = (job: string, file: string) => line(job, `##[group]${file}:`) + line(job, '0 fail') + line(job, 'Ran 1 test across 1 file. [1ms]');
-    const one = complete('test (1)', 'test/one.test.ts');
+    const line = (job: string, text: string) => `${job}\tcapture\t2026-05-25T11:26:50.000Z ${text}\n`;
+    const complete = (job: string, file: string) => line(job, '##[gbrain-capture-start]') + line(job, `::group::${file}:`) + line(job, '0 fail')
+      + line(job, 'Ran 1 test across 1 file. [1ms]') + line(job, '##[gbrain-capture-complete] exit=0');
+    const artifact = (shard: number, body: string | null) => {
+      const path = join(artifacts, `timings-unit-${shard}.log`);
+      if (body === null) rmSync(path, { force: true }); else writeFileSync(path, body);
+    };
+    artifact(1, complete('test (1)', 'test/one.test.ts'));
     writeFileSync(info, JSON.stringify({ conclusion: 'success', headSha: 'fixture-commit', jobs: [{ name: 'test (1)', conclusion: 'success' }, { name: 'test (2)', conclusion: 'success' }, { name: 'verify', conclusion: 'success' }] }));
     writeFileSync(out, '{"test/old.test.ts":42}\n');
     writeFileSync(meta, '{"existing":true}\n');
     const args = [join(import.meta.dir, '../../scripts/mine-shard-weights.ts'), '--run', '123', '--out', out];
-    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_GH_INFO: info, FIXTURE_GH_LOG: input };
-    for (const partial of [one, one + line('test (2)', 'snapshot setup started')]) {
-      writeFileSync(input, partial);
+    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_GH_INFO: info, FIXTURE_GH_ARTIFACTS: artifacts };
+    for (const partial of [null, line('test (2)', '##[gbrain-capture-start]') + line('test (2)', 'snapshot setup started') + line('test (2)', '##[gbrain-capture-complete] exit=0')]) {
+      artifact(2, partial);
       expect(spawnSync(process.execPath, args, { env, encoding: 'utf8' }).status).not.toBe(0);
       expect(readFileSync(out, 'utf8')).toBe('{"test/old.test.ts":42}\n');
       expect(readFileSync(meta, 'utf8')).toBe('{"existing":true}\n');
     }
-    writeFileSync(input, one + complete('test (2)', 'test/two.test.ts'));
+    artifact(2, complete('test (2)', 'test/two.test.ts'));
     const result = spawnSync(process.execPath, args, { env, encoding: 'utf8' });
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(readFileSync(out, 'utf8'))).toEqual({ 'test/one.test.ts': 0, 'test/two.test.ts': 0 });
     expect(JSON.parse(readFileSync(meta, 'utf8'))).toMatchObject({ commit: 'fixture-commit', measuredFiles: 2, totalFiles: 2, mergeExisting: false });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+it('GitHub unit refresh requires each shard capture artifact to record a successful completion', () => {
+  const job = 'test (1)';
+  const github = (text: string) => `${job}\tUNKNOWN STEP\t2026-10-10T06:00:01.000Z ${text}\n`;
+  const captured = (text: string) => `${job}\tcapture\t2026-10-10T06:00:01.000Z ${text}\n`;
+  const body = (line: (text: string) => string) => line('::group::test/one.test.ts:') + line(' 0 fail') + line('Ran 1 test across 1 file. [1ms]');
+  const opts = { expectedJobs: [job], requireCapture: true };
+  for (const raw of [body(github), body(captured), captured('##[gbrain-capture-start]') + body(captured),
+    captured('##[gbrain-capture-start]') + body(captured) + captured('##[gbrain-capture-complete] exit=1')]) {
+    expect(() => mineWeights(raw, 'unit', opts)).toThrow('capture completion');
+  }
+  expect([...mineWeights(captured('##[gbrain-capture-start]') + body(captured) + captured('##[gbrain-capture-complete] exit=0'), 'unit', opts).keys()]).toEqual(['test/one.test.ts']);
+  expect(mineWeights(body(github), 'unit', { expectedJobs: [job] }).size).toBe(1);
+});
+
+it('GitHub serial refresh reads each job log by id instead of the whole-run log', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gbrain-mine-serial-'));
+  try {
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'gh'), '#!/bin/sh\ncase "$*" in\n  "run view 123 --json conclusion,headSha,jobs") cat "$FIXTURE_GH_INFO" ;;\n  "run view 123 --job 77 --log") cat "$FIXTURE_GH_LOG" ;;\n  *) exit 2 ;;\nesac\n', { mode: 0o755 });
+    const info = join(dir, 'run.json');
+    const log = join(dir, 'serial.log');
+    const out = join(dir, 'weights.json');
+    const job = 'serial-tests (1)';
+    const line = (text: string) => `${job}\tUNKNOWN STEP\t2026-10-10T06:00:01.000Z ${text}\n`;
+    writeFileSync(log, line('[serial-tests] PASS 4s test/a.serial.test.ts (1pass)') + line('[serial-tests] all 1 file(s) passed in 4s (pool=4)'));
+    const args = [join(import.meta.dir, '../../scripts/mine-shard-weights.ts'), '--lane', 'serial', '--run', '123', '--out', out];
+    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_GH_INFO: info, FIXTURE_GH_LOG: log };
+    writeFileSync(info, JSON.stringify({ conclusion: 'success', headSha: 'fixture-commit', jobs: [{ name: job, conclusion: 'success' }] }));
+    expect(spawnSync(process.execPath, args, { env, encoding: 'utf8' }).stderr).toContain('serial: missing job identity');
+    writeFileSync(info, JSON.stringify({ conclusion: 'success', headSha: 'fixture-commit', jobs: [{ name: job, conclusion: 'success', databaseId: 77 }] }));
+    const result = spawnSync(process.execPath, args, { env, encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(out, 'utf8'))).toEqual({ 'test/a.serial.test.ts': 4 });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('full-profile CLI pins source, attempt and job provenance and preserves both outputs on refused evidence', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gbrain-mine-full-'));
+  try {
+    const repo = join(import.meta.dir, '../..');
+    const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).stdout.trim();
+    const corpus = sourceE2ECorpus(sha);
+    expect(corpus).toContain('test/phantom-redirect-engine-parity.test.ts');
+    expect(() => sourceE2ECorpus('wrong-commit')).toThrow('source SHA');
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'gh'), `#!/bin/sh
+case "$*" in
+  "run view 123 --json attempt,conclusion,headSha,jobs") cat "$FIXTURE_GH_INFO" ;;
+  "run view 123 --attempt 2 --job 456 --log") cat "$FIXTURE_GH_LOG" ;;
+  *) exit 2 ;;
+esac
+`, { mode: 0o755 });
+    const infoPath = join(dir, 'run.json');
+    const logPath = join(dir, 'full.log');
+    const out = join(dir, 'weights.json');
+    const meta = join(dir, 'weights.metadata.json');
+    const info = { attempt: 2, conclusion: 'success', headSha: sha, jobs: [{ name: 'coverage-full-e2e', databaseId: 456, conclusion: 'success' }] };
+    const line = (text: string) => `coverage-full-e2e\tstep\t2026-09-24T06:00:00.000Z ${text}\n`;
+    const files = corpus.map(path => line(`=== ${path.split('/').at(-1)} ===`) + line(' 0 fail') + line('Ran 1 test across 1 file. [1.00ms]'));
+    const complete = files.join('') + line(`Files: ${files.length} total, ${files.length} passed, 0 failed`);
+    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_GH_INFO: infoPath, FIXTURE_GH_LOG: logPath };
+    const base = [join(repo, 'scripts/mine-shard-weights.ts'), '--lane', 'e2e', '--e2e-profile', 'full', '--out', out];
+    const run = (args = ['--run', '123']) => spawnSync(process.execPath, [...base, ...args], { env, encoding: 'utf8' });
+    writeFileSync(out, '{"keep":123}\n');
+    writeFileSync(meta, '{"prior":true}\n');
+    for (const [metadata, log] of [
+      [{ ...info, conclusion: 'failure' }, complete],
+      [{ ...info, headSha: 'other-commit' }, complete],
+      [{ ...info, attempt: undefined }, complete],
+      [{ ...info, jobs: [{ ...info.jobs[0], conclusion: 'cancelled' }] }, complete],
+      [{ ...info, jobs: [{ ...info.jobs[0], databaseId: undefined }] }, complete],
+      [info, files.slice(1).join('') + line(`Files: ${files.length - 1} total, ${files.length - 1} passed, 0 failed`)],
+      [info, complete.replace(' 0 fail', ' 1 fail')],
+    ] as const) {
+      writeFileSync(infoPath, JSON.stringify(metadata));
+      writeFileSync(logPath, log);
+      expect(run().status).not.toBe(0);
+      expect(readFileSync(out, 'utf8')).toBe('{"keep":123}\n');
+      expect(readFileSync(meta, 'utf8')).toBe('{"prior":true}\n');
+    }
+    expect(run(['--from-file', logPath]).status).not.toBe(0);
+    writeFileSync(infoPath, JSON.stringify(info));
+    writeFileSync(logPath, complete);
+    const result = run();
+    expect(result.status, result.stderr).toBe(0);
+    expect(Object.keys(JSON.parse(readFileSync(out, 'utf8'))).sort()).toEqual([...corpus].sort());
+    expect(JSON.parse(readFileSync(meta, 'utf8'))).toMatchObject({
+      lane: 'e2e', e2eProfile: 'full', run: '123', commit: sha, attempt: 2, source: 'github',
+      jobs: [{ name: 'coverage-full-e2e', databaseId: 456 }], measuredFiles: corpus.length, totalFiles: corpus.length, mergeExisting: false,
+      logSha256: expect.stringMatching(/^[0-9a-f]{64}$/), corpusSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30000);

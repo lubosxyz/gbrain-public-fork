@@ -24,6 +24,7 @@ import { execFileSync, spawn, spawnSync } from 'child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join, resolve } from 'path';
+import { buildSide, loadReceiptDir } from '../../scripts/ci-executed-counts.ts';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
 const PARALLEL_SH_SRC = resolve(REPO_ROOT, 'scripts/run-unit-parallel.sh');
@@ -167,7 +168,7 @@ describe('run-unit-parallel.sh timeout escalation contract', () => {
     const source = readFileSync(PARALLEL_SH_SRC, 'utf-8');
     expect(source).toContain('SHARD_KILL_AFTER="${GBRAIN_TEST_SHARD_KILL_AFTER:-30}"');
     expect(source).toContain('--signal=TERM --kill-after="${SHARD_KILL_AFTER}s"');
-    expect(source).toContain('sleep "$SHARD_KILL_AFTER" && kill -KILL "$pid"');
+    expect(source).toContain('sleep "$SHARD_KILL_AFTER" && kill -KILL -- "-$pid"');
   });
 
   it('marks both ordinary timeout and forced-KILL timeout exits as wedged', () => {
@@ -403,6 +404,18 @@ describe('oom-once', () => {
     expect(r.code).toBe(0);
   }, 120_000);
 
+  it('writes a receipt per bun invocation; the rescue receipt supersedes the phantom failure (X2)', () => {
+    const r = runOom();
+    expect(r.code).toBe(0);
+    const dir = join(OROOT, '.context', 'test-receipts');
+    const receipts = loadReceiptDir(dir);
+    expect(receipts.filter(x => x.kind === 'rescue').map(x => [x.lane, x.files])).toEqual([['unit', ['test/b-oom-once.test.ts']]]);
+    expect(receipts.filter(x => x.kind === 'primary' && x.lane === 'unit').map(x => x.files[0]).sort()).toEqual(['test/a-pass.test.ts', 'test/b-oom-once.test.ts']);
+    const side = buildSide('local', receipts);
+    expect(side.issues).toEqual([]);
+    expect(side.lanes.get('unit')).toMatchObject({ executed: 2, failed: 0, superseded: 1 });
+  }, 120_000);
+
   it('GBRAIN_TEST_NO_OOM_FALLBACK=1 disables the rescue lane (stays red)', () => {
     const r = runOom({ GBRAIN_TEST_NO_OOM_FALLBACK: '1' });
     expect(r.code).not.toBe(0);
@@ -544,6 +557,7 @@ describe('run-unit-parallel.sh no-timeout-binary wedge sentinel (rc 143 at cap â
     // module-level ref'd timer no longer holds bun 1.3 open after the run,
     // so a sleeping test is the reliable way to be alive at the cap.
     const hanging = `import { describe, it } from 'bun:test';
+import {writeFileSync} from 'fs'; writeFileSync(${JSON.stringify(join(WROOT,'hung.pid'))},String(process.pid));
 describe('hanging', () => { it('sleeps past the shard cap', async () => { await Bun.sleep(30_000); }, 55_000); });`;
     writeFileSync(join(WROOT, 'test', 'a-hang-at-exit.test.ts'), hanging);
 
@@ -582,5 +596,9 @@ describe('hanging', () => { it('sleeps past the shard cap', async () => { await 
     expect(existsSync(join(WROOT, '.context', 'test-shards', 'shard-1.watchdog'))).toBe(true);
     const summary = readFileSync(join(WROOT, '.context', 'test-summary.txt'), 'utf-8');
     expect(summary).toContain('WEDGED');
+    const hungPid = Number(readFileSync(join(WROOT, 'hung.pid'), 'utf8'));
+    expect(hungPid).toBeGreaterThan(0);
+    const state = spawnSync('ps', ['-o', 'stat=', '-p', String(hungPid)], { encoding: 'utf8' }).stdout.trim();
+    expect(!state || state.startsWith('Z')).toBe(true);
   }, 120_000);
 });

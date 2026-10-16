@@ -18,7 +18,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import postgres from 'postgres';
+import postgres from '#postgres';
 import { hasDatabase } from './helpers.ts';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';

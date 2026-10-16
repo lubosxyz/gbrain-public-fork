@@ -36,8 +36,9 @@
  *    GBRAIN_DIRECT_DATABASE_URL override, ddl()/bulk() share the read pool.
  */
 
-import postgres from 'postgres';
-import { resolvePrepare, resolveSessionTimeouts, resolvePoolSize, resolveMaxLifetimeSeconds, endPoolBounded } from './db.ts';
+import postgres from '#postgres'
+import { traceSqlOptions } from './sql-trace.ts';
+import { gbrainApplicationName, resolvePrepare, resolveSessionTimeouts, resolvePoolSize, resolveMaxLifetimeSeconds, resolveUrlConnectTimeout, resolveSharedTypes, endPoolBounded, poolHealthOptions, type PoolHealthHooks } from './db.ts';
 import { redactPgUrl } from './url-redact.ts';
 import { logConnectionEvent } from './connection-audit.ts';
 
@@ -71,6 +72,10 @@ export interface ConnectionManagerOpts {
    * not call .end() on disconnect(). Default false (we own both pools).
    */
   readPoolOwnedExternally?: boolean;
+  /** #5730: told when the driver discards a pooled connection left inside a transaction. */
+  onpoisoned?: (pool: 'read' | 'direct', status: string) => void;
+  /** #6383: the driver's stuck-connection and build-failure reports, per pool (`onpoisoned` stays separate for its callers). */
+  health?: (pool: 'read' | 'direct') => Omit<PoolHealthHooks, 'onpoisoned'>;
 }
 
 /** Default direct-pool size (P1 raised from 2 to 3). Override via env. */
@@ -344,16 +349,19 @@ export class ConnectionManager {
     const opts: Record<string, unknown> = {
       max: resolvePoolSize(this.opts.readPoolSize),
       idle_timeout: 20,
-      connect_timeout: 10,
+      connect_timeout: resolveUrlConnectTimeout(this.opts.url),
       // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
       max_lifetime: resolveMaxLifetimeSeconds(),
       types: { bigint: postgres.BigInt },
+      onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
+      shared_types: resolveSharedTypes(this.opts.url),
     };
     const timeouts = resolveSessionTimeouts();
+    Object.assign(opts, poolHealthOptions({ ...this.opts.health?.('read'), onpoisoned: (status: string) => this.opts.onpoisoned?.('read', status) }, timeouts.statement_timeout));
     if (Object.keys(timeouts).length > 0) opts.connection = timeouts;
     const prepare = resolvePrepare(this.opts.url);
     if (typeof prepare === 'boolean') opts.prepare = prepare;
-    this._readPool = postgres(this.opts.url, opts);
+    this._readPool = postgres(this.opts.url, traceSqlOptions(opts, 'read'));
     logConnectionEvent({ pool: 'read', op: 'init' });
     return this._readPool;
   }
@@ -490,13 +498,16 @@ export class ConnectionManager {
     const opts: Record<string, unknown> = {
       max: size,
       idle_timeout: 20,
-      connect_timeout: 10,
+      connect_timeout: resolveUrlConnectTimeout(this._directUrl),
       // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
       max_lifetime: resolveMaxLifetimeSeconds(),
       types: { bigint: postgres.BigInt },
       // Always use prepared statements on the direct pool — no PgBouncer
       // here, so the prepare-cache invalidation issue doesn't apply.
       prepare: true,
+      onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
+      ...poolHealthOptions({ ...this.opts.health?.('direct'), onpoisoned: (status: string) => this.opts.onpoisoned?.('direct', status) }, String(DDL_STMT_TIMEOUT_MS)),
+      shared_types: resolveSharedTypes(this._directUrl),
       // Apply DDL session GUCs as connection startup parameters (durable
       // through any intermediary pooling layer, same trick as
       // resolveSessionTimeouts).
@@ -504,12 +515,13 @@ export class ConnectionManager {
         statement_timeout: String(DDL_STMT_TIMEOUT_MS),
         idle_in_transaction_session_timeout: String(DDL_IDLE_TX_TIMEOUT_MS),
         maintenance_work_mem: BULK_MAINTENANCE_WORK_MEM,
+        application_name: gbrainApplicationName(),
       },
     };
     const t0 = Date.now();
     let pool: Sql | null = null;
     try {
-      pool = postgres(this._directUrl, opts);
+      pool = postgres(this._directUrl, traceSqlOptions(opts, 'direct'));
       // Probe to validate connectivity early.
       await pool`SELECT 1`;
       logConnectionEvent({

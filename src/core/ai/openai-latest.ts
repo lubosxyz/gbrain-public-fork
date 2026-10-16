@@ -115,6 +115,13 @@ export function parseOpenAIChatId(id: string): ParsedOpenAIChatId | null {
   return { id, family: [Number(m[1]), Number(m[2] ?? 0)], suffix };
 }
 
+/**
+ * Priced for exact metering where a feature names the model (the #6188 fence
+ * repair default), but not eligible as a discovered tier default: one priced
+ * member of a newer family would otherwise become every tier's default.
+ */
+const METERED_ONLY: ReadonlySet<string> = new Set(['gpt-6.1-sol']);
+
 function familyCmp(a: [number, number], b: [number, number]): number {
   return a[0] !== b[0] ? a[0] - b[0] : a[1] - b[1];
 }
@@ -135,7 +142,7 @@ function pickBySuffix(members: ParsedOpenAIChatId[], order: readonly string[]): 
  */
 export function rankOpenAIChatModels(
   ids: string[],
-  priced: (id: string) => boolean = (id) => canonicalLookup(`openai:${id}`) !== undefined,
+  priced: (id: string) => boolean = (id) => canonicalLookup(`openai:${id}`) !== undefined && !METERED_ONLY.has(id),
 ): { tiers: OpenAITierPick | null; newestUnpriced?: string } {
   const parsed = ids.map(parseOpenAIChatId).filter((p): p is ParsedOpenAIChatId => p !== null);
   if (parsed.length === 0) return { tiers: null };
@@ -236,6 +243,7 @@ export function latestOpenAITiers(tier?: ModelTier): OpenAITierPick | string | n
 /* ── refresh (async, throttled, fail-open) ────────────────────────────────── */
 
 let _refreshInFlight: Promise<void> | null = null;
+let _refreshInFlightFp = '';
 let _warnedUnpriced: string | null = null;
 // Failure backoff: a persistently-failing refresh (blackholed network,
 // revoked key, unwritable config dir — nothing lands in the cache, so the
@@ -295,6 +303,7 @@ function stampAttempt(fp: string): void {
 
 export function _resetOpenAILatestForTests(): void {
   _refreshInFlight = null;
+  _refreshInFlightFp = '';
   _warnedUnpriced = null;
   _lastAttemptAt = 0;
   _lastAttemptFp = '';
@@ -338,9 +347,14 @@ export async function refreshLatestOpenAIModels(opts: RefreshOpts = {}): Promise
   const moduleAttempt = _lastAttemptFp === fp ? _lastAttemptAt : 0;
   if (!opts.force && Date.now() - Math.max(moduleAttempt, persistedAttempt) < FAILURE_BACKOFF_MS) return;
 
-  if (_refreshInFlight) return _refreshInFlight;
+  if (_refreshInFlight) {
+    if (_refreshInFlightFp === fp) return _refreshInFlight;
+    await _refreshInFlight;
+    return refreshLatestOpenAIModels(opts);
+  }
   _lastAttemptAt = Date.now();
   _lastAttemptFp = fp;
+  _refreshInFlightFp = fp;
   _refreshInFlight = (async () => {
     try {
       const doFetch = opts.fetchImpl ?? fetch;
@@ -385,6 +399,7 @@ export async function refreshLatestOpenAIModels(opts: RefreshOpts = {}): Promise
       stampAttempt(fp);
     } finally {
       _refreshInFlight = null;
+      _refreshInFlightFp = '';
     }
   })();
   return _refreshInFlight;

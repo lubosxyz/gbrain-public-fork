@@ -30,10 +30,12 @@
  * loop and handles page-level fall-back.
  */
 
+import { readProviderFailureSignals } from './ai/errors.ts';
 import { chat, type ChatOpts, type ChatResult } from './ai/gateway.ts';
 import { logSynopsisFailure, type SynopsisFailureKind } from './audit-synopsis.ts';
 import { sanitizeSynopsis } from './embedding-context.ts';
 import { resolveTierDefault } from './model-config.ts';
+import { safeSplitIndex } from './text-safe.ts';
 
 /**
  * Default cap on synopsis output tokens. ~200 tokens gives 50-100 token
@@ -138,8 +140,8 @@ export interface GeneratePerChunkSynopsisArgs {
  *   - failure variants → see D27 P1-2 dispatch in the service layer
  */
 export type GeneratePerChunkSynopsisResult =
-  | { kind: 'success'; synopsis: string }
-  | { kind: SynopsisFailureKind; detail?: string };
+  | { kind: 'success'; synopsis: string; usage?: ChatResult['usage'] }
+  | { kind: SynopsisFailureKind; detail?: string; usage?: ChatResult['usage'] };
 
 /**
  * Generate one synopsis for one chunk. ~$0.00006 per call at Haiku 4.5
@@ -160,7 +162,6 @@ export type GeneratePerChunkSynopsisResult =
 export async function generatePerChunkSynopsis(
   args: GeneratePerChunkSynopsisArgs,
 ): Promise<GeneratePerChunkSynopsisResult> {
-  const userPrompt = buildUserPrompt(args.pageTitle, args.documentText, args.chunkText);
   const maxTokens = args.maxTokens ?? SYNOPSIS_MAX_TOKENS;
 
   const chatOpts: ChatOpts = {
@@ -168,8 +169,21 @@ export async function generatePerChunkSynopsis(
     // an OPENAI_API_KEY-only install must not route to Anthropic.
     model: args.model ?? resolveTierDefault('utility'),
     system: SYSTEM_PROMPT,
-    messages: [{ role: 'user', content: userPrompt }],
+    // PR #6341: the title + document block is the only prefix every chunk of
+    // a page shares (the ~190-token system prompt is below every published
+    // minimum cacheable length), so it rides on its own `cache: true` block
+    // and the chunk follows in a second block. Joined with '\n' the two are
+    // byte-identical to the former single string (that is how the claude-cli
+    // adapter renders them), so SYNOPSIS_PROMPT_VERSION is unchanged.
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: buildPagePrompt(args.pageTitle, args.documentText), cache: true },
+        { type: 'text', text: buildChunkPrompt(args.chunkText) },
+      ],
+    }],
     maxTokens,
+    thinking: 'off',
     abortSignal: args.abortSignal,
     cacheSystem: true,
   };
@@ -205,7 +219,7 @@ export async function generatePerChunkSynopsis(
       detail: `stop_reason=${result.stopReason}`,
       pageLevelFallback: true,
     });
-    return { kind: 'refusal', detail: `stop_reason=${result.stopReason}` };
+    return { kind: 'refusal', detail: `stop_reason=${result.stopReason}`, usage: result.usage };
   }
 
   // #3883: stop_reason 'length' means the model hit maxTokens mid-sentence —
@@ -223,7 +237,7 @@ export async function generatePerChunkSynopsis(
       detail,
       pageLevelFallback: true,
     });
-    return { kind: 'malformed', detail };
+    return { kind: 'malformed', detail, usage: result.usage };
   }
 
   const synopsis = sanitizeSynopsis(result.text);
@@ -236,7 +250,7 @@ export async function generatePerChunkSynopsis(
       detail: `length=${result.text.length}`,
       pageLevelFallback: true,
     });
-    return { kind: 'empty', detail: `length=${result.text.length}` };
+    return { kind: 'empty', detail: `length=${result.text.length}`, usage: result.usage };
   }
 
   // Content-shape malformed detection stays minimal: synopses are plain
@@ -245,21 +259,18 @@ export async function generatePerChunkSynopsis(
   // stop_reason==='length' check above, #3883). Future extension could
   // parse a JSON-shaped response with `{synopsis, confidence}`.
 
-  return { kind: 'success', synopsis };
+  return { kind: 'success', synopsis, usage: result.usage };
 }
 
-function buildUserPrompt(
-  pageTitle: string,
-  documentText: string,
-  chunkText: string,
-): string {
+function buildPagePrompt(pageTitle: string, documentText: string): string {
   // Tail-truncate `documentText` to `SYNOPSIS_DOC_MAX_CHARS` so small local
   // chat models don't stall on >100KB pages. Head preserved (title block,
   // frontmatter, intro paragraphs carry the document-level anchor).
   let trimmedDoc = documentText;
   if (documentText.length > SYNOPSIS_DOC_MAX_CHARS) {
-    trimmedDoc = documentText.slice(0, SYNOPSIS_DOC_MAX_CHARS) +
-      `\n\n[... ${documentText.length - SYNOPSIS_DOC_MAX_CHARS} chars truncated for synopsis budget ...]`;
+    const cut = safeSplitIndex(documentText, SYNOPSIS_DOC_MAX_CHARS);
+    trimmedDoc = documentText.slice(0, cut) +
+      `\n\n[... ${documentText.length - cut} chars truncated for synopsis budget ...]`;
   }
   return [
     `<page_title>${pageTitle}</page_title>`,
@@ -267,6 +278,11 @@ function buildUserPrompt(
     '<full_document>',
     trimmedDoc,
     '</full_document>',
+  ].join('\n');
+}
+
+function buildChunkPrompt(chunkText: string): string {
+  return [
     '',
     '<chunk>',
     chunkText,
@@ -276,11 +292,21 @@ function buildUserPrompt(
   ].join('\n');
 }
 
+const TIMEOUT_ERROR_NAMES = new Set(['AbortError', 'TimeoutError']);
+const NETWORK_ERROR_CODES = new Set(['ENOTFOUND', 'ECONNREFUSED', 'ECONNRESET']);
+// `adapter aborted` is the claude-cli adapter's plain Error when the call's
+// signal fires (the gateway's chat timeout or a cancel); it has no abort name.
+const TIMEOUT_MESSAGE_RE = /timeout|timed out|adapter aborted/i;
+
 /**
  * Map a thrown error from `gateway.chat()` into the D27 P1-2 failure envelope.
  *
- * Gateway throws Anthropic-flavored errors with HTTP status info; we
- * pattern-match on those for the classification.
+ * chat() throws the gateway's normalized error, so the status, name and code
+ * that decide the class can sit on any wrapped layer (#5964): the claude-cli
+ * status as `apiErrorStatus`, an AI SDK `statusCode` on `cause` or on
+ * RetryError's `lastError`, a `TimeoutError` name on `cause`. Only an error
+ * that matches none of the transient classes is `malformed`, which makes the
+ * service re-embed the whole page at the title tier.
  */
 function classifyChatError(err: unknown): {
   kind: SynopsisFailureKind;
@@ -289,32 +315,24 @@ function classifyChatError(err: unknown): {
   if (err == null) {
     return { kind: 'malformed', detail: 'null error' };
   }
-  const e = err as { status?: number; message?: string; code?: string; name?: string };
-  const msg = (e.message ?? String(err)).slice(0, 200);
+  const outer = err as { message?: unknown; code?: unknown };
+  const msg = (typeof outer.message === 'string' ? outer.message : String(err)).slice(0, 200);
+  const { status, names, codes } = readProviderFailureSignals(err);
 
-  if (e.status === 401 || e.status === 403) {
-    return { kind: 'auth_failure', detail: `status=${e.status} msg=${msg}` };
+  if (status !== undefined) {
+    const byStatus: SynopsisFailureKind | null =
+      status === 401 || status === 403 ? 'auth_failure'
+        : status === 429 ? 'rate_limit'
+          : status >= 500 && status < 600 ? 'provider_5xx'
+            : null;
+    if (byStatus) return { kind: byStatus, detail: `status=${status} msg=${msg}` };
   }
-  if (e.status === 429) {
-    return { kind: 'rate_limit', detail: `status=429 msg=${msg}` };
-  }
-  if (e.status != null && e.status >= 500 && e.status < 600) {
-    return { kind: 'provider_5xx', detail: `status=${e.status} msg=${msg}` };
-  }
-  if (
-    e.name === 'AbortError' ||
-    e.code === 'ETIMEDOUT' ||
-    /timeout/i.test(msg)
-  ) {
+  if (names.some(name => TIMEOUT_ERROR_NAMES.has(name)) || codes.includes('ETIMEDOUT') || TIMEOUT_MESSAGE_RE.test(msg)) {
     return { kind: 'timeout', detail: msg };
   }
-  if (
-    e.code === 'ENOTFOUND' ||
-    e.code === 'ECONNREFUSED' ||
-    e.code === 'ECONNRESET' ||
-    /network|fetch/i.test(msg)
-  ) {
-    return { kind: 'network', detail: `code=${e.code ?? '?'} msg=${msg}` };
+  const networkCode = codes.find(code => NETWORK_ERROR_CODES.has(code));
+  if (networkCode !== undefined || /network|fetch/i.test(msg)) {
+    return { kind: 'network', detail: `code=${networkCode ?? outer.code ?? '?'} msg=${msg}` };
   }
 
   // Unknown error shape — treat as malformed so the service routes it

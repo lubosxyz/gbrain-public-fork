@@ -7,7 +7,7 @@ skill already documents: fetch replaces the manual download, and everything
 downstream (redaction, slugging, part-splitting, idempotency) is the exact
 `gbrain transcripts ingest` pipeline.
 
-Providers in v1: **ChatGPT** and **Claude** (both live). Perplexity has no live
+Live providers: **ChatGPT** and **Claude**. Perplexity has no live
 connector yet (no transcript adapter) — use the conversation-archive manual
 conversion for it.
 
@@ -34,8 +34,39 @@ gbrain config set connectors.chatgpt.auto_sync true
 gbrain autopilot --install
 ```
 
+A usage error (no provider, an unknown provider, or `--source` without a
+value) exits 2 with an `invalid_params` error; under `--json` it is one
+envelope whose `fix` is the corrected command (`gbrain connectors sync --help`
+prints the usage).
+
 `gbrain connectors status` shows credential provenance/expiry and sync state
 (never the secret). `gbrain connectors logout <provider>` removes a credential.
+
+### Headless lane (an agent without a terminal)
+
+The credential is the user's own browser session, so an agent cannot sign in
+for them. When `gbrain connectors auth <provider>` runs with no credential and
+nobody at the terminal (no TTY, `CI`, an agent process, or
+`GBRAIN_NON_INTERACTIVE=1`), it does not wait for a paste:
+
+- It prints an `[AGENT]` block (`actor: user`, `next: tell_user_to_run`) with
+  the provider's cookie checklist fenced in `[SHOW USER]` and the stdin command
+  to run, saves nothing, and exits 1.
+- `--try-oauth` never starts the loopback sign-in headless; it says OAuth
+  needs a person at a browser and hands over the same cookie checklist. With a person at the
+  terminal, `--no-browser` prints the sign-in URL instead of opening a browser.
+
+What the agent does: relay the `[SHOW USER]` text verbatim and ask the user to
+copy the cookie from a browser where they are logged in (never reuse, guess or
+search for one). The user can run `pbpaste | gbrain connectors auth <provider>
+--cookie -` themselves; if they hand the value over, pass it only on stdin
+(`printf '%s' "$COOKIE" | gbrain connectors auth <provider> --cookie -`), never
+in argv. A stdin that stays open without data ends after 30 seconds ("stdin
+was open but silent"; `GBRAIN_STDIN_TIMEOUT_MS` waits longer) and saves
+nothing. If the user would rather not share a session cookie, use the export
+lane (`gbrain transcripts ingest <export-file>`). Verify with
+`gbrain connectors status --json`. The full agent script lives in
+`skills/chat-connectors/SKILL.md`.
 
 ## How it works
 
@@ -51,7 +82,7 @@ gbrain autopilot --install
         │                              ▼
         │                    runTranscriptsIngest  (redact → slug → split → import)
         ▼                              │
-  watermark (config scalar) ◀──────────┘  advance ONLY on a fully clean run
+  watermark (config scalar) ◀──────────┘  advance once nothing still holds it back
   connectors.<p>.watermark_iso           receipt → ingest_log; stamp last_sync_at
 ```
 
@@ -67,10 +98,57 @@ imported. Later runs list newest-first and stop at `watermark − windowDays`
 - a conversation edited just behind the watermark (within the trailing window)
   is re-listed and re-imported in place — no silent gap.
 
-The watermark advances **only on a fully clean run** (no fetch errors, no
-`--limit` cap, clean ingest). A `partial` run leaves it untouched so the next run
-heals. Re-imports are free (content-hash idempotency), so re-running is always
-safe.
+The watermark moves forward only when nothing in the run still holds it back:
+the conversation list loaded completely, no `--limit` cap cut the run short,
+the run was not aborted, and every conversation that failed to fetch or ingest
+has now failed three times at its current update time. That last case is
+quarantine. On its third failure at the same `updatedAt` a conversation is
+listed under `quarantined` in the sync result (`--json`) and stops blocking the
+watermark, so the watermark can advance. Any other failed conversation keeps
+the watermark where it is, so the next run lists it and tries again.
+Re-imports are free (content-hash idempotency), so re-running is safe.
+
+A failed conversation is never forgotten. It stays in the source's failed
+ledger until it imports, even after the watermark passes it and the provider
+stops listing it. Each sync retries up to 10 due failures by id, oldest first,
+and keeps slots for them under `--limit`. A quarantined conversation waits 1
+hour, then 6 hours, then a day between attempts; an edit at the
+provider or `--full` retries it at once. While any conversation is
+unresolved, the sync status is `partial` and the result counts `unresolved`;
+`gbrain connectors status <provider> --json` lists each one with its next
+retry time, and `gbrain doctor` warns that the archive is incomplete. Aborting
+a sync or an expired cookie never counts against a conversation. When a
+`--full` listing no longer contains a failed conversation (it was deleted at
+the provider), the sync drops it and lists it under `gone`.
+
+Long messages are archived whole. A message too large for one page part
+continues in the next block under the same speaker and time; redaction runs
+over the whole message first.
+
+### Recovering an archive synced before this fix
+
+Two kinds of loss happened before the fix and leave no record a normal sync
+can find:
+
+- A conversation that failed three times while the watermark moved past it
+  was dropped from the failed ledger and never imported.
+- Every message longer than 4,000 characters was cut at 4,000 characters, and
+  the sync deleted its download, so the page holds only the start.
+
+One full re-sync recovers both, for conversations the provider still has. It
+re-downloads your whole history with your saved session: many requests to the
+provider, and pages whose text grows are re-imported (and re-extracted if fact
+extraction is on). **Ask the user first**, then run:
+
+```bash
+gbrain connectors sync <chatgpt|claude> --full
+```
+
+Conversations the provider deleted, or no longer returns, can't be recovered
+this way; use the official export if you still have one (`gbrain transcripts
+ingest conversations.json` re-imports it in full). Claude failures recorded
+before gbrain tracked their organization are held for the same `--full` run
+(the sync hint and doctor name the command).
 
 The watermark is deliberately a config scalar, **not** `op_checkpoint`:
 `op_checkpoint` stores a completed-key set (no scalar timestamp) and GCs rows
@@ -78,6 +156,28 @@ after 7 days, which would wipe the watermark on any gap longer than a week and
 trigger a full re-fetch of your entire history — the exact traffic pattern most
 likely to trip a provider's anti-abuse. The config table is durable and never
 GC'd.
+
+## Feed imported conversations to Dream
+
+Every imported session (connectors, `gbrain transcripts ingest` of a Hermes
+`state.db`, Claude or ChatGPT export) is a `type: conversation` page. Dream's
+synthesize phase reads those pages from the database, in the cycle's source
+(`gbrain dream --source <id>`), beside any `dream.synthesize.session_corpus_dir`
+files. `--date` / `--from` / `--to` filter on the page's `date` frontmatter;
+`dream.synthesize.min_chars` and `exclude_patterns` apply as for corpus files;
+a page is judged and synthesized again only after its text changes.
+
+| Setting | Effect |
+| --- | --- |
+| `session_corpus_dir` set, `conversation_pages` unset | corpus files + conversation pages |
+| `gbrain config set dream.synthesize.conversation_pages true` | conversation pages, with or without a corpus dir |
+| `gbrain config set dream.synthesize.conversation_pages false` | corpus files only |
+
+With neither a corpus dir nor `conversation_pages` set, synthesis is not
+configured; when the source holds conversation pages the phase warns
+`conversation_pages_not_consumed` and names the opt-in command (synthesis makes
+paid model calls, so it never starts on its own). Setting the key to `false`
+silences the warning.
 
 ## Automation lanes
 
@@ -137,12 +237,17 @@ the export-file lane (`conversation-archive`) — it always works.
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `forbidden` | Cloudflare/bot challenge on server-side fetch | Use the official export + `gbrain transcripts ingest` |
-| `auth_required` | cookie expired/invalid | Re-copy a fresh Cookie header, `gbrain connectors auth` |
-| `partial` | some fetches failed | Watermark not advanced; just re-run |
-| receipt shows drift | provider API shape changed | Affected threads skipped (not lost); export lane still works |
+<a id="chat-connectors-troubleshooting"></a>
+
+| Symptom | Cause | Fix | Who acts | Consent | Verify |
+|---|---|---|---|---|---|
+| `forbidden` | Cloudflare/bot challenge on server-side fetch | Use the official export + `gbrain transcripts ingest` | user (downloads the export); agent ingests it | none | `gbrain connectors status --json` |
+| `auth_required` | cookie expired/invalid | Re-copy a fresh Cookie header, `gbrain connectors auth` | user (copies a fresh Cookie header) | `credentials` | `gbrain connectors status --json` |
+| `connectors auth` exits 1 with an `[AGENT]` cookie checklist | no credential and nobody at the terminal ([headless lane](#headless-lane-an-agent-without-a-terminal)) | Relay the `[SHOW USER]` checklist; the user pipes the cookie into `gbrain connectors auth <provider> --cookie -` | user (copies the cookie) | `credentials` | `gbrain connectors status --json` |
+| `partial` | a conversation failed to fetch or import, the conversation list failed, or `--limit` capped the run | Re-run. A failed conversation is retried and holds the watermark until it imports. One that failed three times at the same update time is quarantined instead: it no longer holds the watermark and later syncs retry it on a backoff until it imports | agent | `credentials` (fetches from the provider again with the saved session) | `gbrain connectors status --json` |
+| `partial` with `unresolved`, doctor says "archive incomplete" | conversations not archived yet | Nothing to do: sync retries them automatically. If `held` lists ids (or doctor's fix names `--full`), ask the user, then run `gbrain connectors sync <provider> --full` ([recovery](#recovering-an-archive-synced-before-this-fix)) | agent | `credentials` (`--full` re-downloads the whole history with the saved session) | `gbrain connectors status <provider> --json` |
+| conversations or long-message tails synced before this fix are missing | lost before the fix; nothing records them | Ask the user, then run `gbrain connectors sync <provider> --full` once ([recovery](#recovering-an-archive-synced-before-this-fix)) | agent | `credentials` | `gbrain connectors status <provider> --json` |
+| receipt shows drift | provider API shape changed | Affected threads skipped (not lost); export lane still works | agent (reports it) | none | `gbrain connectors status --json` |
 
 ## v2 roadmap
 

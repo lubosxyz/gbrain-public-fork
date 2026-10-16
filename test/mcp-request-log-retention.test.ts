@@ -258,15 +258,15 @@ describe('purgeStaleMcpRequestLog', () => {
 
 describe('request-log retention — dream cycle purge-phase wiring (structural pin)', () => {
   test("the dream cycle's purge phase invokes purgeStaleMcpRequestLog and reports the count", () => {
-    // test-reads-source-ok: the dream cycle cannot run hermetically here; this pins that the purge phase stays wired into cycle.ts, not a drifting copy.
+    // test-reads-source-ok[structural]: the dream cycle cannot run hermetically here; this pins that the purge phase stays wired into cycle.ts, not a drifting copy.
     const src = readFileSync('src/core/cycle.ts', 'utf8');
     expect(src).toMatch(/purgeStaleMcpRequestLog\(engine\)/);
     expect(src).toMatch(/purged_mcp_request_log_count/);
   });
 
   test('serve-http admin agents metrics fold in mcp_request_log_purged', () => {
-    // test-reads-source-ok: the admin metrics endpoint needs a live HTTP server to test end-to-end; this pins the purged-counter fold-in at the source seam.
-    const src = readFileSync('src/commands/serve-http.ts', 'utf8');
+    // test-reads-source-ok[structural]: the admin metrics endpoint needs a live HTTP server to test end-to-end; this pins the purged-counter fold-in at the source seam.
+    const src = readFileSync('src/commands/serve-http-admin-api.ts', 'utf8');
     expect(src).toMatch(/mcp_request_log_purged/);
     expect(src).toMatch(/purged_requests/);
     expect(src).toMatch(/purged_last_used_at/);

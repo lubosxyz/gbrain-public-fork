@@ -34,6 +34,7 @@ import type { BrainEngine } from '../../engine.ts';
 import type { IngestionEvent } from '../../ingestion/types.ts';
 import { validateIngestionEvent } from '../../ingestion/types.ts';
 import { importFromContent } from '../../import-file.ts';
+import { maintenanceTransaction } from '../../persistence/attribution.ts';
 
 export interface IngestCaptureResult {
   slug: string;
@@ -201,7 +202,7 @@ export function makeIngestCaptureHandler(engine: BrainEngine) {
     // same-slug page in another source is untouched. Idempotent: a missing or
     // already-deleted page reports 'skipped'.
     if (isTombstone) {
-      const deleted = await engine.softDeletePage(slug, { sourceId: sourceId ?? 'default' });
+      const deleted = await maintenanceTransaction(engine, tx => tx.softDeletePage(slug, { sourceId: sourceId ?? 'default' }));
       if (sourceFallback) {
         console.error(
           `[WARN] ingest_capture: requested source '${sourceFallback.requested}' unavailable ` +
@@ -233,6 +234,8 @@ export function makeIngestCaptureHandler(engine: BrainEngine) {
       // and `content_flag.detail` injects text into the agent-trusted warning
       // channel. Trusted daemon emitters leave it false and keep their markers.
       remote: untrustedPayload,
+      // #5575 A3: webhook and ingestion-daemon captures are external content: stored external_untrusted and gated.
+      writeGate: { tier: 'external_untrusted' as const, origin: { channel: `ingest:${event.source_kind}`, source_uri: event.source_uri ?? null, source_kind: event.source_kind }, requestId: null },
     };
 
     let result;

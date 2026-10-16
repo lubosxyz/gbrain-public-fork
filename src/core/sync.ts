@@ -33,6 +33,11 @@ export interface RawManifestEntry {
 }
 
 export type SyncStrategy = 'markdown' | 'code' | 'auto';
+/** Every SyncStrategy; the only values `sources.config.strategy` may hold. */
+export const SYNC_STRATEGIES: readonly SyncStrategy[] = ['markdown', 'code', 'auto'];
+export function isSyncStrategy(value: unknown): value is SyncStrategy {
+  return typeof value === 'string' && (SYNC_STRATEGIES as readonly string[]).includes(value);
+}
 
 interface SyncableOptions {
   strategy?: SyncStrategy;
@@ -265,8 +270,9 @@ export function isMarkdownFilePath(path: string): boolean {
   return path.endsWith('.md') || path.endsWith('.mdx');
 }
 
-function isMultimodalEnabled(): boolean {
-  return process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
+/** The image side of the brain is on: the sync walker admits images, managed sync imports them (#6529) and `embed --stale` sweeps them. */
+export function isMultimodalEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
 }
 
 function isAllowedByStrategy(path: string, strategy: SyncStrategy): boolean {
@@ -540,6 +546,21 @@ export function sanitizePathForDisplay(path: string): string {
 export const SYNC_SKIP_FILES = ['schema.md', 'index.md', 'log.md', 'README.md', 'RESOLVER.md'] as const;
 
 /**
+ * #5186 (W14 P1.5b): `gbrain harden` scaffolds these at the source root as
+ * agent instructions, not brain content. Metafiles at depth 0 only: a
+ * `docs/AGENTS.md` is an ordinary page.
+ */
+export const SYNC_ROOT_SKIP_FILES = ['AGENTS.md', 'CLAUDE.md'] as const;
+
+/** Whether a repo-relative path is directory scaffolding sync never imports (`SYNC_SKIP_FILES` anywhere, `SYNC_ROOT_SKIP_FILES` at the root). */
+export function isSyncMetafile(path: string): boolean {
+  const segments = path.split('/');
+  const basename = segments[segments.length - 1] || '';
+  return (SYNC_SKIP_FILES as readonly string[]).includes(basename)
+    || (segments.length === 1 && (SYNC_ROOT_SKIP_FILES as readonly string[]).includes(basename));
+}
+
+/**
  * Internal classifier. Returns null when the path IS syncable, or a tagged
  * SyncableReason explaining why it isn't. The single source of truth that
  * both `isSyncable` (boolean) and `unsyncableReason` (tagged) call.
@@ -566,9 +587,7 @@ function classifySync(path: string, opts: SyncableOptions = {}): SyncableReason 
   if (isPathPruned(path, opts.includeHidden)) return 'pruned-dir';
 
   // Skip meta files that aren't pages
-  const segments = path.split('/');
-  const basename = segments[segments.length - 1] || '';
-  if ((SYNC_SKIP_FILES as readonly string[]).includes(basename)) return 'metafile';
+  if (isSyncMetafile(path)) return 'metafile';
 
   if (opts.include && opts.include.length > 0 && !matchesAnyGlob(path, opts.include)) return 'include-glob-miss';
   if (opts.exclude && opts.exclude.length > 0 && matchesAnyGlob(path, opts.exclude)) return 'exclude-glob-hit';

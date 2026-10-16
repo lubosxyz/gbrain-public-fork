@@ -1,7 +1,7 @@
 /**
  * v0.42.x — exposes `pages.last_retrieved_at` (migration v79, v0.37.0) on the
  * read-facing surfaces (`get_recent_salience`, `list_pages`, `get_page`) so
- * external consumers (e.g. `tools/gbrain-recall-metric` in the agentic-os
+ * external consumers (e.g. `tools/gbrain-recall-metric` in the downstream agent
  * fleet repo) can auto-upgrade from a write/salience proxy to a real
  * verified-read signal.
  *

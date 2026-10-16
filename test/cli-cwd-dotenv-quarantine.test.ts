@@ -222,26 +222,9 @@ describe('cli preflight ordering: cwd quarantine → ~/.gbrain/.env → guardrai
 // plus a `sh` PRESENCE probe: `GIT_SSL_NO_VERIFY=` (empty) still disables TLS
 // verification in git, so a dropped key must be ABSENT, not ''.
 const GIT_BIN = Bun.which('git');
-// util-linux `script` gives the wrapper a real pty so process.stdin.isTTY is
-// true — the only way to exercise the tty (ignore-only) SIGINT branch faithfully.
-const SCRIPT_BIN = Bun.which('script');
-/**
- * The command line handed to `script -c`. `script` runs it through `$SHELL`
- * (falling back to /bin/sh — hermeticEnv sets no SHELL), and the pty delivers
- * Ctrl-C to the WHOLE foreground group, that shell included. Which /bin/sh it
- * is then decides what `script` reports, not the wrapper or the re-run:
- *   - bash waits for its foreground child and, when the child did NOT die of
- *     SIGINT, treats the signal as handled and relays the child's status (42);
- *   - dash (/bin/sh on Debian/Ubuntu, whose package also patches out upstream
- *     dash's `sh -c cmd` → exec optimisation) remembers the SIGINT while it
- *     waits, then re-raises it on itself once the child returns — `script` sees
- *     a child killed by SIGINT and exits 128+2 = 130 although wrapper and
- *     re-run both behaved (the ubuntu-latest-only failure of the two pty tests).
- * `exec` replaces the shell with the wrapper, so no intermediate shell is left
- * in the foreground group and the status `script` relays is the wrapper's under
- * either shell. Redirections stay on the exec line: the shell applies them
- * before it execs, so the all-stdio-non-tty shape below still holds.
- */
+// Use Bun's native PTY (also used by tty-harness.ts). macOS script rejects
+// Bun's socket-backed stdin; util-linux's -c invocation also differs from BSD.
+// exec removes the intermediary shell so the wrapper owns the foreground PID.
 const ptyCommand = (argv: string, redirects = '') => `exec ${argv}${redirects}`;
 
 const HOSTILE_ENV_LINES = [
@@ -429,13 +412,13 @@ describe('a cwd .env cannot reach the programs gbrain spawns (sanitized re-run)'
   });
 
   // A3-5(b): with a real terminal attached the wrapper's stdin IS a tty, so it
-  // takes the ignore-only SIGINT branch. `script` runs the wrapper under a pty;
-  // writing \x03 to script's stdin is the terminal Ctrl-C, delivered by the pty
+  // takes the ignore-only SIGINT branch. Bun runs the wrapper under a pty;
+  // writing \x03 to the PTY is the terminal Ctrl-C, delivered by the pty
   // to the whole foreground process group (wrapper + re-run) exactly like a real
   // terminal. The tty wrapper does NOT forward, so the re-run receives SIGINT
   // exactly once and its once() graceful handler completes (exit 42) — a second,
   // forwarded delivery would have killed it after once() removed its listener.
-  test.skipIf(!GIT_BIN || !SCRIPT_BIN)('Ctrl-C from a real terminal (pty) reaches the re-run exactly once: the tty wrapper ignores SIGINT and the once() graceful handler completes (exit 42)', async () => {
+  test.skipIf(!GIT_BIN)('Ctrl-C from a real terminal (pty) reaches the re-run exactly once: the tty wrapper ignores SIGINT and the once() graceful handler completes (exit 42)', async () => {
     const { dir, entry, ready } = hostileGitRepo({
       entryBody: [
         // serve-http's shape: once('SIGINT') + a graceful-shutdown delay before exit.
@@ -445,21 +428,22 @@ describe('a cwd .env cannot reach the programs gbrain spawns (sanitized re-run)'
       ].join('\n'),
     });
     const cmd = ptyCommand(`${process.execPath} ${entry} --preflight`); // exec'd: see ptyCommand
-    const proc = Bun.spawn([SCRIPT_BIN!, '-qec', cmd, '/dev/null'], {
-      cwd: dir, env: hermeticEnv(dir), stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+    const proc = Bun.spawn(['/bin/sh', '-c', cmd], {
+      cwd: dir, env: hermeticEnv(dir),
+      terminal: { cols: 80, rows: 24, data() { /* drain PTY output */ } },
     });
-    const drain = (async () => { for await (const _ of proc.stdout) { /* mux pty output */ } })();
     const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* exited */ } }, CHILD_KILL_AFTER_MS);
     try {
       await waitReady(ready);
-      proc.stdin!.write('\x03'); // terminal Ctrl-C → pty → the foreground group
-      proc.stdin!.flush();
+      proc.terminal!.write('\x03'); // terminal Ctrl-C → pty → the foreground group
       const code = await proc.exited;
-      await drain;
       expect(proc.signalCode).toBeNull();
       expect(code).toBe(42);
     } finally {
       clearTimeout(timer);
+      if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
+      await proc.exited;
+      proc.terminal?.close();
     }
   });
 
@@ -499,9 +483,9 @@ describe('a cwd .env cannot reach the programs gbrain spawns (sanitized re-run)'
   // Ctrl-C reached wrapper and child and the wrapper forwarded a SECOND SIGINT,
   // aborting the child's once('SIGINT') graceful handler (exit 130). The wrapper
   // now probes for a controlling terminal (open("/dev/tty")) and forwards only
-  // when there is none. `script` provides the pty; the shell inside it redirects
+  // when there is none. Bun provides the pty; the shell inside it redirects
   // ALL THREE stdio to non-tty files — the `</dev/null >log 2>&1` shape.
-  test.skipIf(!GIT_BIN || !SCRIPT_BIN)('Ctrl-C with a controlling terminal but all three stdio non-tty: the wrapper does NOT forward; the once() graceful handler completes (exit 42)', async () => {
+  test.skipIf(!GIT_BIN)('Ctrl-C with a controlling terminal but all three stdio non-tty: the wrapper does NOT forward; the once() graceful handler completes (exit 42)', async () => {
     const { dir, entry, ready } = hostileGitRepo({
       entryBody: [
         `process.once('SIGINT', () => { setTimeout(() => process.exit(42), ${GRACEFUL_EXIT_DELAY_MS}); });`,
@@ -512,21 +496,22 @@ describe('a cwd .env cannot reach the programs gbrain spawns (sanitized re-run)'
     const out = join(dir, 'wrapper.out');
     const err = join(dir, 'wrapper.err');
     const cmd = ptyCommand(`${process.execPath} ${entry} --preflight`, ` </dev/null >${out} 2>${err}`); // exec'd: see ptyCommand
-    const proc = Bun.spawn([SCRIPT_BIN!, '-qec', cmd, '/dev/null'], {
-      cwd: dir, env: hermeticEnv(dir), stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+    const proc = Bun.spawn(['/bin/sh', '-c', cmd], {
+      cwd: dir, env: hermeticEnv(dir),
+      terminal: { cols: 80, rows: 24, data() { /* drain PTY output */ } },
     });
-    const drain = (async () => { for await (const _ of proc.stdout) { /* mux pty output */ } })();
     const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* exited */ } }, CHILD_KILL_AFTER_MS);
     try {
       await waitReady(ready);
-      proc.stdin!.write('\x03'); // terminal Ctrl-C → pty → the foreground group (wrapper AND re-run)
-      proc.stdin!.flush();
+      proc.terminal!.write('\x03'); // terminal Ctrl-C → pty → the foreground group (wrapper AND re-run)
       const code = await proc.exited;
-      await drain;
       expect(code).toBe(42);
       expect(readFileSync(err, 'utf8')).toContain('[env] Ignoring'); // the wrapper's stderr really was the file, not the pty
     } finally {
       clearTimeout(timer);
+      if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
+      await proc.exited;
+      proc.terminal?.close();
     }
   });
 

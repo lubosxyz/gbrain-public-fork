@@ -93,11 +93,15 @@ describe.skipIf(!url)('authenticated PostgreSQL HTTP accepted-write liveness', (
     mkdirSync(join(home, '.gbrain'), { recursive: true });
     writeFileSync(join(home, '.gbrain', 'config.json'), JSON.stringify({ engine: 'postgres', database_url: pg.databaseUrl, embedding_disabled: true }));
     env = keylessBrainEnv(process.env, home, { DATABASE_URL: pg.databaseUrl, GBRAIN_DATABASE_URL: pg.databaseUrl,
+      // CLI children may auto-migrate; never install host services from a fixture.
+      // The operator preload strips these non-test-prefixed parent settings.
+      GBRAIN_NO_AUTOPILOT_INSTALL: '1', GBRAIN_NO_REEMBED: '1', PGPASSWORD: process.env.PGPASSWORD,
       GBRAIN_ENGINE: 'postgres', GBRAIN_SOURCE: undefined, GBRAIN_BRAIN_ID: undefined, GBRAIN_SKIP_STARTUP_HOOKS: '1',
       GBRAIN_MCP_FORCE_SURFACE: undefined, GBRAIN_REMOTE_CLIENT_SECRET: undefined, GBRAIN_REMOTE_PRIVATE_PAGES: undefined });
     const legacy = cli(['auth', 'create', 'synthetic-http-writer', '--scopes', 'read,write']);
     tokens.push(legacy.match(/gbrain_[a-f0-9]{64}/)![0]);
-    await pg.engine.executeRaw("UPDATE access_tokens SET permissions=jsonb_set(COALESCE(permissions,'{}'::jsonb),'{source_id}',to_jsonb($1::text)) WHERE name='synthetic-http-writer'", [config.sourceIds[0]]);
+    // F3: grant through the editor; a raw JSONB edit on a unified token reads as drift and denies.
+    cli(['auth', 'rescope', '--token', 'synthetic-http-writer', '--sources', config.sourceIds[0]]);
     const oauth = cli(['auth', 'register-client', 'synthetic-oauth-writer', '--grant-types', 'client_credentials',
       '--scopes', 'read write', '--source', config.sourceIds[0]]);
     oauthId = oauth.match(/Client ID:\s+(gbrain_cl_\S+)/)![1];
@@ -149,7 +153,12 @@ describe.skipIf(!url)('authenticated PostgreSQL HTTP accepted-write liveness', (
       expect(aged.diagnostic.next_action).toBe('inspect_owner');
       expect(aged.retry_after_ms).toBe(30000);
       expect((await call(client, 'put_page', put)).body.suggestion).toContain('inspect');
-      await stop('SIGKILL');
+      await pg.engine.transaction(async tx => {
+        await waitFor(async () => (await tx.executeRaw(`SELECT id FROM persistence_requests
+          WHERE request_id=$1::uuid AND state='queued' FOR SHARE SKIP LOCKED`, [put.request_id])).length === 1,
+        { label: 'accepted queued receipt before owner restart' });
+        await stop('SIGKILL');
+      });
     } finally { await lock!.release(); }
     await start();
     await connect(tokens[0]); await connect(tokens[1]);

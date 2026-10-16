@@ -66,11 +66,15 @@ async function plantInvalidIndex(indexName: string, createSQL: string): Promise<
 
 describeE2E('migration invalid-remnant recovery (#1178)', () => {
   beforeAll(async () => {
-    await setupDB();
+    await setupDB({ replayMigrations: true });
     await runMigrationsUpTo(getEngine(), LATEST_VERSION);
   }, 30_000);
 
+  // The v66 cases leave idx_chunks_embedding_null on a head-version brain, but v225 drops it as
+  // a duplicate of content_chunks_stale_idx. The next file on this shared database starts warm at
+  // head without replaying migrations, so put the schema back where head leaves it.
   afterAll(async () => {
+    await MIGRATIONS.find(m => m.version === 225)!.handler!(getEngine());
     await teardownDB();
   });
 

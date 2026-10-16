@@ -44,6 +44,8 @@ interface TailnetOpts {
   dnsName?: string | null;
   /** Self.CapMap: true → carries the Funnel capability, false → CapMap without it, undefined → no CapMap field. */
   funnelCapable?: boolean;
+  /** Self.CapMap verbatim (overrides funnelCapable). */
+  capMap?: Record<string, unknown>;
   /** Pre-existing root handlers: port → funnel flag. */
   existingHandlers?: Record<number, boolean>;
   publishStatus?: number | null;
@@ -95,7 +97,7 @@ function fakeTailnet(o: TailnetOpts = {}): Fake {
     Version: '1.80.0', BackendState: state,
     Self: {
       DNSName: o.dnsName === undefined ? `${DNS}.` : (o.dnsName ?? ''), TailscaleIPs: ['100.64.0.1'],
-      ...(o.funnelCapable === undefined ? {} : { CapMap: o.funnelCapable ? { 'https://tailscale.com/cap/funnel': [] } : { 'https://tailscale.com/cap/is-admin': [] } }),
+      ...(o.capMap ? { CapMap: o.capMap } : o.funnelCapable === undefined ? {} : { CapMap: o.funnelCapable ? { 'https://tailscale.com/cap/funnel': [] } : { 'https://tailscale.com/cap/is-admin': [] } }),
     },
     CurrentTailnet: { MagicDNSEnabled: true }, CertDomains: o.certDomains ?? [DNS],
   });
@@ -283,6 +285,20 @@ describe('plan + consent', () => {
     const doc = jsonDoc(f);
     expect(doc).toMatchObject({ status: 'pending', reason: 'confirmation_required' });
     expect(doc.next_actions).toContain('gbrain mcp expose --yes');
+    // The consent payload's agent fields ride the legacy document (exit 2 stays under contract v1).
+    expect(doc).toMatchObject({
+      code: 'confirmation_required', effects: ['persistent_install', 'egress'], actor: 'agent', contract_version: 1,
+      fix: { argv: ['gbrain', 'mcp', 'expose', '--yes'], next: 'ask_user' },
+    });
+    expect(doc.user_message).toContain('publish your gbrain MCP server');
+    expect(doc.error).toBeUndefined();
+    const human = fakeTailnet();
+    expect(await runMcpExpose([], human.deps)).toBe(2);
+    const out = human.stdout.join('\n');
+    expect(out).toContain('[AGENT]');
+    expect(out).toContain('next: ask_user');
+    expect(out).toContain('if_yes: gbrain mcp expose --yes');
+    expect(out).not.toMatch(/re-?run[^.\n]{0,40}--yes/i);
     expect(existsSync(f.serveDir)).toBe(false);
     expect(joinedCalls(f).some(c => c.includes('--bg'))).toBe(false);
   });
@@ -292,7 +308,7 @@ describe('plan + consent', () => {
     f.deps.prompt = async () => 'n';
     expect(await runMcpExpose(['--json'], f.deps)).toBe(2);
     const doc = jsonDoc(f);
-    expect(doc).toMatchObject({ status: 'pending', reason: 'declined', message: 'Nothing changed. Re-run with --yes to confirm.' });
+    expect(doc).toMatchObject({ status: 'pending', reason: 'declined', message: 'Nothing changed: the confirmation was declined.', code: 'confirmation_required' });
     expect(checkOf(doc, 'consent')?.status).toBe('pending');
     expect(existsSync(f.serveDir)).toBe(false);
     expect(joinedCalls(f).some(c => c.includes('--bg'))).toBe(false);
@@ -441,6 +457,15 @@ describe('tailscale steps', () => {
     const i = fakeTailnet();
     expect(await runMcpExpose(['--yes', '--funnel', '--json'], i.deps)).toBe(0);
     expect(checkOf(jsonDoc(i), 'tailscale.identity')?.detail).toContain('publish step decides');
+  });
+  test('--funnel publishes on a Tailscale 1.102 node whose CapMap carries `funnel` + `…/cap/funnel-ports` (#5599)', async () => {
+    const f = fakeTailnet({ capMap: {
+      'default-auto-update': [], funnel: [], https: [],
+      'https://tailscale.com/cap/funnel-ports?ports=443,8443,10000': [],
+      'https://tailscale.com/cap/is-admin': [],
+    } });
+    expect(await runMcpExpose(['--yes', '--funnel', '--json'], f.deps)).toBe(0);
+    expect(joinedCalls(f)).toContain(`${TS} funnel --bg 3131`);
   });
   test('publish failure is classified: https_not_enabled surfaces the admin URL, exit 1', async () => {
     const f = fakeTailnet({ publishStatus: 1, publishStderr: 'error: HTTPS certificates are not enabled for this tailnet; enable them in the admin console' });
@@ -988,7 +1013,7 @@ describe('--remove', () => {
     f.deps.prompt = async () => 'no';
     expect(await runMcpExpose(['--remove', '--json'], f.deps)).toBe(2);
     const doc = jsonDoc(f);
-    expect(doc).toMatchObject({ status: 'pending', reason: 'declined', message: 'Nothing changed. Re-run with --yes to confirm.' });
+    expect(doc).toMatchObject({ status: 'pending', reason: 'declined', message: 'Nothing changed: the confirmation was declined.', code: 'confirmation_required' });
     expect(checkOf(doc, 'consent')?.status).toBe('pending');
     expect(existsSync(receiptPath(f.serveDir))).toBe(true);
     expect(joinedCalls(f).some(c => c.includes('disable') || c.includes('off'))).toBe(false);
@@ -1782,7 +1807,7 @@ describe('tailscale serve status fails closed', () => {
     expect(existsSync(receiptPath(f.serveDir))).toBe(true);
     expect(existsSync(wrapperPath(f.serveDir))).toBe(true);
     expect((await inner([TS, 'serve', 'status', '--json'])).stdout).toContain('127.0.0.1:3131');
-    expect(f.stderr.join('\n')).toContain('re-run `gbrain mcp expose --remove --yes`');
+    expect(f.stderr.join('\n')).toContain('run the removal again (the user already approved it: `gbrain mcp expose --remove --yes`)');
     // Tailscale is back → the same command completes the removal
     broken = false;
     f.calls.length = 0;

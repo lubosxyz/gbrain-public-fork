@@ -33,16 +33,20 @@ import { resolveAuthCapabilities } from '../core/harness/capabilities.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { buildToolDefs } from './tool-defs.ts';
 import { resolveMcpInstructions } from './instructions.ts';
+import { httpInstructionTools } from './initialize-context.ts';
 import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
 import { operations, operationsByName, opAllowedForBoundClient } from '../core/operations.ts';
+import { scopeDeniedError } from '../core/ops/op-fix.ts';
+import { isCallable, publishGatesFromDisabled } from '../core/ops/callable.ts';
 import type { AuthInfo } from '../core/operations.ts';
 import { gateRemoteToolCall } from '../core/auth-gate.ts';
 import { writeAuthAudit } from '../core/auth-audit.ts';
 import { isUndefinedColumnError } from '../core/utils.ts';
 import { VERSION } from '../version.ts';
-import { dispatchToolCall, requestLogStatusForResult } from './dispatch.ts';
+import { dispatchToolCall, requestLogStatusForResult, errorResult } from './dispatch.ts';
+import { GBRAIN_CLIENT_HEADER, resolveResultRowsMode, resultRowsForRequest } from './result-rows.ts';
 import { parseStrictParamsMode } from './validate-params.ts';
-import { filterOpsForSurface, clampSurface, type McpSurface } from './surface.ts';
+import { filterOpsForSurface, clampSurface, advertisedOps, resolveAdvertisedSurface, type McpSurface } from './surface.ts';
 import { disabledOpsForPublishGates } from './publish-gates.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
@@ -51,10 +55,17 @@ import { degradedLastError, isEngineDegraded } from '../core/degraded-marker.ts'
 import { classifyPgAccessError } from '../core/pg-access-classify.ts';
 import { redactConnectionInfo } from '../core/audit/redact-connection-info.ts';
 import { redactUrlsInText } from '../core/url-redact.ts';
-import { normalizeTokenScopes, parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions, parseLegacyOperationGrant } from '../core/legacy-token-scope.ts';
-export { parseLegacyTokenScope };
+import { authSourcesFromGrant, grantFromTokenRow } from '../core/grants/model.ts';
+import { resolveTokenGrant, touchTokenLastUsed } from '../core/grants/legacy-token.ts';
+import { storedMinTrust } from '../core/trust/tier.ts';
+export { parseLegacyTokenScope } from '../core/legacy-token-scope.ts';
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
+
+/** #6007: what an agent does after a 413: nothing was processed, so split the request. */
+function oversizeSuggestion(bodyCap: number): string {
+  return `Nothing was processed. Send smaller requests: split put_pages into calls under ${bodyCap} bytes each (a new request_id per call). The host operator sets this limit with GBRAIN_HTTP_MAX_BODY_BYTES.`;
+}
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -179,129 +190,16 @@ function resolveClientIp(req: Request, server: { requestIP: (r: Request) => { ad
   return sock?.address || 'unknown';
 }
 
-export async function startHttpTransport(opts: HttpTransportOptions) {
-  const { port, engine } = opts;
-
-  // Engine-aware: route SQL through the active BrainEngine. Both Postgres
-  // and PGLite carry access_tokens + mcp_request_log in their schemas
-  // (pglite-schema.ts:478,495 and schema.sql), so the legacy bearer-auth
-  // path works on either engine without a postgres.js singleton.
-  const sql = sqlQueryForEngine(engine);
-
-  // Classified reason for the /health degraded payload — read-only on the
-  // stored startup error, wrapped so a classifier bug degrades to a generic
-  // token rather than failing the health endpoint.
-  const degradedHealthReason = (): string => {
-    try {
-      const err = degradedLastError(engine);
-      return err === undefined ? 'startup_connect_failed' : classifyPgAccessError(err, {}).reason;
-    } catch {
-      return 'startup_connect_failed';
-    }
-  };
-
-  const limiters = opts.limiters || buildDefaultLimiters();
-  const bodyCap = envInt('GBRAIN_HTTP_MAX_BODY_BYTES', DEFAULT_BODY_CAP);
-  const corsAllowlist = parseCorsAllowlist();
-  // MEMORY_VERBS v1 [c1]: surface filter applies to THIS transport too —
-  // the advertised list AND dispatch (allowedOps), fail-closed. WP4: the
-  // GBRAIN_MCP_FORCE_SURFACE kill switch min()s in (narrow-only, FOV-6a);
-  // resolved once at startup — this transport builds its tool list once.
-  const surface = clampSurface(opts.surface ?? 'full');
-  // WP1/D7: this is a network transport — localOnly ops (operator-filesystem
-  // reach) never appear in its catalog, matching serve-http's filter. The
-  // dispatch-layer backstop denies them even if a caller guesses the name.
-  const surfacedOps = filterOpsForSurface(operations.filter(op => !op.localOnly), surface);
-  const surfaceAllowedOps: ReadonlySet<string> | undefined =
-    surface === 'full' ? undefined : new Set(surfacedOps.map(o => o.name));
-  // WP3: strict-params schema emission resolved ONCE at startup from the FILE
-  // config plane — this transport builds its tool list once, so a
-  // `mcp.strict_params` flip needs a restart here (deliberate; the OAuth
-  // serve-http path re-reads dual-plane per request). Dispatch-side
-  // enforcement still resolves per call.
-  const fileConfig = loadConfig();
-  const strictParams = parseStrictParamsMode(fileConfig?.mcp?.strict_params) === 'reject';
-  const tools = buildToolDefs(surfacedOps, { strictParams });
-
-  /**
-   * v0.41.3 (T6): single consolidated CORS header builder. Pre-fix there were
-   * two parallel functions (`corsHeaders` for actual requests, `corsPreflightHeaders`
-   * for OPTIONS) — the preflight variant unconditionally emitted
-   * `Access-Control-Allow-Methods` + `Access-Control-Allow-Headers` to EVERY
-   * Origin, leaking the API surface to attackers probing the preflight. The
-   * actual-request path was correctly default-deny.
-   *
-   * One function, one allowlist gate. Methods/Headers only emit when
-   * preflight=true AND origin is allowlisted. Allow-Origin emits only when
-   * origin is allowlisted (unchanged). `Vary: Origin` pairs with Allow-Origin
-   * so caches don't serve allowlisted responses to non-allowlisted requests.
-   *
-   * `extra` is for response-specific headers (Retry-After, etc.) and is
-   * never gated by the allowlist.
-   */
-  interface CorsHeaderOpts {
-    preflight?: boolean;
-    extra?: Record<string, string>;
-  }
-  function corsHeaders(origin: string | null, opts: CorsHeaderOpts = {}): Record<string, string> {
-    const { preflight = false, extra = {} } = opts;
-    const headers: Record<string, string> = { ...extra };
-    const allowed = corsAllowlist && origin && corsAllowlist.has(origin);
-    if (allowed) {
-      headers['Access-Control-Allow-Origin'] = origin;
-      headers['Vary'] = 'Origin';
-      if (preflight) {
-        headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS';
-        headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Accept';
-      }
-    }
-    return headers;
-  }
-
-  async function validateToken(authHeader: string | null): Promise<AuthResult> {
+async function validateToken(sql: ReturnType<typeof sqlQueryForEngine>, authHeader: string | null): Promise<AuthResult> {
     if (!authHeader?.startsWith('Bearer ')) return { ok: false };
     const token = authHeader.slice(7);
     const hash = hashToken(token);
     try {
-      // v132 tenant-remediation lane: read tenant/mint metadata too. The
-      // degrade rung fires ONLY on a missing column (pre-v132 brain,
-      // grandfathered semantics) — any other error is a fail-closed deny.
-      // A broad catch here would let a transient error reclassify a tenant
-      // token as a grandfathered full-access bearer.
-      let row: Record<string, unknown> | undefined;
-      try {
-        [row] = await sql`
-          SELECT id, name, permissions, scopes, company_slug, expires_at FROM access_tokens
-          WHERE token_hash = ${hash} AND revoked_at IS NULL
-        `;
-      } catch (err) {
-        if (
-          !isUndefinedColumnError(err, 'company_slug') &&
-          !isUndefinedColumnError(err, 'expires_at') &&
-          !isUndefinedColumnError(err, 'scopes')
-        ) {
-          return { ok: false };
-        }
-        // Degrade ladder mirrors oauth-provider: losing the TENANT columns
-        // must not also drop `scopes` — that would grandfather a scoped token
-        // into full access on a pre-v132 brain (#4043). Only when `scopes`
-        // itself is missing (pre-#4043 schema) does the projection fall to
-        // permissions-only, and that brain predates scoped minting entirely.
-        try {
-          [row] = await sql`
-            SELECT id, name, permissions, scopes FROM access_tokens
-            WHERE token_hash = ${hash} AND revoked_at IS NULL
-          `;
-        } catch (err2) {
-          if (!isUndefinedColumnError(err2, 'scopes') && !isUndefinedColumnError(err2, 'permissions')) {
-            return { ok: false };
-          }
-          [row] = await sql`
-            SELECT id, name, permissions FROM access_tokens
-            WHERE token_hash = ${hash} AND revoked_at IS NULL
-          `;
-        }
-      }
+      // SELECT * reads every schema generation (pre-F3 rows lack the grant columns).
+      const [row] = await sql`
+        SELECT * FROM access_tokens
+        WHERE token_hash = ${hash} AND revoked_at IS NULL
+      `;
       if (!row) {
         // v132: distinguish a revoked token (auditable identity) from an
         // unknown one, mirroring verifyAccessToken. Degrades silently on
@@ -350,43 +248,19 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         return { ok: false, tenantDeny: true };
       }
       const tenantScoped = companySlug !== undefined || rawExpiry != null;
-      // Debounced last_used_at update — grandfathered tokens only (tenant
-      // rows must leave zero non-audit writes behind a later gate deny).
-      // SQL-level WHERE clause keeps this race-tolerant even under concurrent requests.
-      if (!tenantScoped) {
-        sql`UPDATE access_tokens
-            SET last_used_at = now()
-            WHERE id = ${rowId}
-              AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')`
-          .catch(() => { /* fire-and-forget */ });
-      }
-      // v0.28: extract per-token takes-holder allow-list. Fail-safe default
-      // is ['world'] — a token with no permissions row sees public claims only.
-      // #2529: decode + parse via the shared core helpers so this transport and
-      // the OAuth provider behind `serve --http` cannot drift — including a
-      // double-encoded jsonb string scalar (#2339 class), which both now decode
-      // identically instead of one honoring the grant while the other fails
-      // open to ['world'].
-      const perms = coerceLegacyPermissions((row as { permissions?: unknown }).permissions);
-      const allowList = parseTakesHoldersAllowList(perms?.takes_holders) ?? ['world'];
-      // #1336: honor the operator-set source grant stored on the token.
-      const { sourceId, allowedSources } = parseLegacyTokenScope(perms?.source_id);
+      if (!tenantScoped) void touchTokenLastUsed(sql, row);
+      const grant = tenantScoped ? grantFromTokenRow(row) : await resolveTokenGrant(sql, row);
+      const allowList = grant.takesHolders ?? ['world'];
+      const { sourceId, allowedSources, hasSourceGrant } = authSourcesFromGrant(grant);
       const auth: AuthInfo = {
         token,
         clientId: rowId,
         principal: { kind: 'legacy_token', id: rowId },
         clientName: rowName,
-        // v132: server-derived token kind (this transport only verifies
-        // access_tokens rows).
         tokenKind: 'legacy',
-        // v132: tenant-scoped tokens thread their REAL stored grant (the
-        // gate requires exactly ['read']). Non-tenant tokens honor a stored
-        // scopes grant; grandfathered (NULL-scopes) rows keep full access (#4043).
-        scopes: tenantScoped
-          ? (normalizeTokenScopes(row.scopes) ?? [])
-          : (normalizeTokenScopes(row.scopes) ?? ['read', 'write', 'admin']),
+        scopes: grant.scopes,
         sourceId,
-        ...(perms?.allowed_operations === undefined ? {} : { allowedOperations: parseLegacyOperationGrant(perms.allowed_operations) }),
+        ...(grant.allowedOperations === null ? {} : { allowedOperations: grant.allowedOperations }),
         ...(allowedSources ? { allowedSources } : {}),
         // v132: tenant threading — whoami reports company_slug from HERE
         // (server-derived), and the shared auth gate keys its fail-closed
@@ -397,6 +271,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         ...(rawExpiry != null
           ? { expiresAt: Math.floor(new Date(rawExpiry as string | Date).getTime() / 1000) }
           : {}),
+        ...(storedMinTrust(row.min_trust) ? { minTrust: storedMinTrust(row.min_trust) } : {}),
       };
       return {
         ok: true,
@@ -409,12 +284,92 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         auth,
         // #3242: distinguish "operator granted a scope" from "historical
         // no-grant floor" — only the latter widens to federated sources.
-        hasSourceGrant: perms?.source_id != null,
+        hasSourceGrant,
       };
     } catch {
       return { ok: false };
     }
   }
+
+export async function startHttpTransport(opts: HttpTransportOptions) {
+  const { port, engine } = opts;
+
+  // Engine-aware: route SQL through the active BrainEngine. Both Postgres
+  // and PGLite carry access_tokens + mcp_request_log in their schemas
+  // (pglite-schema.ts:478,495 and schema.sql), so the legacy bearer-auth
+  // path works on either engine without a postgres.js singleton.
+  const sql = sqlQueryForEngine(engine);
+
+  // Classified reason for the /health degraded payload — read-only on the
+  // stored startup error, wrapped so a classifier bug degrades to a generic
+  // token rather than failing the health endpoint.
+  const degradedHealthReason = (): string => {
+    try {
+      const err = degradedLastError(engine);
+      return err === undefined ? 'startup_connect_failed' : classifyPgAccessError(err, {}).reason;
+    } catch {
+      return 'startup_connect_failed';
+    }
+  };
+
+  const limiters = opts.limiters || buildDefaultLimiters();
+  const bodyCap = envInt('GBRAIN_HTTP_MAX_BODY_BYTES', DEFAULT_BODY_CAP);
+  const corsAllowlist = parseCorsAllowlist();
+  // MEMORY_VERBS v1 [c1]: surface filter applies to THIS transport too —
+  // the advertised list AND dispatch (allowedOps), fail-closed. WP4: the
+  // GBRAIN_MCP_FORCE_SURFACE kill switch min()s in (narrow-only, FOV-6a);
+  // resolved once at startup — this transport builds its tool list once.
+  const surface = clampSurface(opts.surface ?? 'full');
+  // WP1/D7: this is a network transport — localOnly ops (operator-filesystem
+  // reach) never appear in its catalog, matching serve-http's filter. The
+  // dispatch-layer backstop denies them even if a caller guesses the name.
+  const surfacedOps = filterOpsForSurface(operations.filter(op => !op.localOnly), surface);
+  const surfaceAllowedOps: ReadonlySet<string> | undefined =
+    surface === 'full' ? undefined : new Set(surfacedOps.map(o => o.name));
+  // WP3: strict-params schema emission resolved ONCE at startup from the FILE
+  // config plane — this transport builds its tool list once, so a
+  // `mcp.strict_params` flip needs a restart here (deliberate; the OAuth
+  // serve-http path re-reads dual-plane per request). Dispatch-side
+  // enforcement still resolves per call. mcp.advertised_surface (file plane) narrows the tool list only.
+  const fileConfig = loadConfig();
+  const strictParams = parseStrictParamsMode(fileConfig?.mcp?.strict_params) === 'reject';
+  const tools = buildToolDefs(advertisedOps(surfacedOps, surface, await resolveAdvertisedSurface(null, fileConfig)), { strictParams });
+
+  /**
+   * v0.41.3 (T6): single consolidated CORS header builder. Pre-fix there were
+   * two parallel functions (`corsHeaders` for actual requests, `corsPreflightHeaders`
+   * for OPTIONS) — the preflight variant unconditionally emitted
+   * `Access-Control-Allow-Methods` + `Access-Control-Allow-Headers` to EVERY
+   * Origin, leaking the API surface to attackers probing the preflight. The
+   * actual-request path was correctly default-deny.
+   *
+   * One function, one allowlist gate. Methods/Headers only emit when
+   * preflight=true AND origin is allowlisted. Allow-Origin emits only when
+   * origin is allowlisted (unchanged). `Vary: Origin` pairs with Allow-Origin
+   * so caches don't serve allowlisted responses to non-allowlisted requests.
+   *
+   * `extra` is for response-specific headers (Retry-After, etc.) and is
+   * never gated by the allowlist.
+   */
+  interface CorsHeaderOpts {
+    preflight?: boolean;
+    extra?: Record<string, string>;
+  }
+  function corsHeaders(origin: string | null, opts: CorsHeaderOpts = {}): Record<string, string> {
+    const { preflight = false, extra = {} } = opts;
+    const headers: Record<string, string> = { ...extra };
+    const allowed = corsAllowlist && origin && corsAllowlist.has(origin);
+    if (allowed) {
+      headers['Access-Control-Allow-Origin'] = origin;
+      headers['Vary'] = 'Origin';
+      if (preflight) {
+        headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS';
+        headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Accept';
+      }
+    }
+    return headers;
+  }
+
 
   function logRequest(tokenName: string | null, operation: string, status: string, latencyMs: number) {
     sql`INSERT INTO mcp_request_log (token_name, operation, latency_ms, status)
@@ -491,17 +446,13 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       if (bodyText === null) {
         logRequest(null, 'unknown', 'body_too_large', Date.now() - startedMs);
         return Response.json(
-          { error: 'payload_too_large', message: `Request body exceeds ${bodyCap} bytes` },
+          { error: 'payload_too_large', message: `Request body exceeds ${bodyCap} bytes`, suggestion: oversizeSuggestion(bodyCap) },
           { status: 413, headers: corsHeaders(origin) },
         );
       }
 
-      // Auth.
-      const auth = await validateToken(req.headers.get('Authorization'));
+      const auth = await validateToken(sql, req.headers.get('Authorization'));
       if (!auth.ok) {
-        // v132: a tenant deny is already durably recorded in auth_audit and
-        // must leave no other writes behind; grandfathered/unknown denies
-        // keep the historical auth_failed request-log row.
         if (!auth.tenantDeny) {
           logRequest(null, 'unknown', 'auth_failed', Date.now() - startedMs);
         }
@@ -538,11 +489,6 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
 
       const { method, params, id } = body;
 
-      // v132 tenant-remediation lane: on the tenant path EVERY MCP method is
-      // an audited auth decision — initialize and tools/list included (with
-      // the audit sink down, a tenant token gets nothing, not even the
-      // handshake or the catalog). No-op for grandfathered tokens. The deny
-      // path emits no request-log row (the audit row is the record).
       if (auth.auth?.tenantScoped === true && (method === 'initialize' || method === 'tools/list')) {
         const methodGate = await gateRemoteToolCall(sql, auth.auth, method, 'read');
         if (!methodGate.allow) {
@@ -568,6 +514,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         // actually call it (OV2-14; a verbs/starter-pinned serve must not
         // order agents to call a tool dispatch will deny).
         const writeback = await resolveWritebackConfig(engine, fileConfig);
+        const canWriteOp = (name: string) => hasScope(auth.auth!.scopes, 'write') && (!surfaceAllowedOps || surfaceAllowedOps.has(name));
         return Response.json(
           {
             result: {
@@ -576,10 +523,8 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
               capabilities: { tools: {}, resources: {} },
               // #4748: contract (+ opt-in writeback section) + deployment identity.
               instructions: resolveMcpInstructions(fileConfig, process.env, {
-                writeback: ambientOptsFrom(writeback, {
-                  remember: hasScope(auth.auth!.scopes, 'write') && (!surfaceAllowedOps || surfaceAllowedOps.has('remember')),
-                  extractFacts: hasScope(auth.auth!.scopes, 'write') && (!surfaceAllowedOps || surfaceAllowedOps.has('extract_facts')),
-                }),
+                writeback: ambientOptsFrom(writeback, { remember: canWriteOp('remember'), extractFacts: canWriteOp('extract_facts') }),
+                tools: await httpInstructionTools(engine, fileConfig, { ops: surfacedOps, surface, auth: auth.auth!, allowedOps: surfaceAllowedOps }), // F1
               }),
             },
             jsonrpc: '2.0',
@@ -611,22 +556,13 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         }
       }
 
-      // tools/list
       if (method === 'tools/list') {
-        // WP1/E5 truthful catalog on THIS transport too: publish-gated ops
-        // (`Operation.publishGateKey`) are hidden while their gate resolves
-        // off. Read per request (dual-plane, DB > file > false) so a
-        // `gbrain config set mcp.publish_skills true` takes effect on the
-        // next list with no restart — matching the OAuth transport. The
-        // resolver never throws (read failure = hidden, the fail-closed
-        // consent posture); the in-handler gates stay as the call-time
-        // backstop. Pre-fix this transport listed the gated ops
-        // unconditionally, so gates-off served the exact listed-but-denied
-        // catalog lie E5 (test/truthful-catalog.e2e-lite.test.ts) pins out.
         const gateDisabled = await disabledOpsForPublishGates(engine, fileConfig);
+        const publishGates = publishGatesFromDisabled(surfacedOps, gateDisabled); // A2: one callability predicate + bound-client fence
         const visibleTools = tools.filter(t => {
           const op = operationsByName[t.name];
-          return op && !gateDisabled.has(t.name) && operationScopesAllowed(auth.auth!.scopes, op) && opAllowedForBoundClient(auth.auth!, op);
+          return op && isCallable(op, { transport: 'http', surface, scopes: auth.auth!.scopes, publishGates, allowedOps: surfaceAllowedOps })
+            && opAllowedForBoundClient(auth.auth!, op);
         });
         logRequest(auth.tokenName!, 'tools/list', 'success', Date.now() - startedMs);
         return Response.json(
@@ -677,10 +613,13 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
           );
         }
         const op = operationsByName[toolName];
-        if (op && !op.localOnly && !operationScopesAllowed(auth.auth!.scopes, op)) {
+        // #5575: cliOnly ops reach the dispatcher's trusted_local_only refusal (the host command), never a grant-widening scope fix.
+        if (op && !op.localOnly && !op.cliOnly && !operationScopesAllowed(auth.auth!.scopes, op)) {
           logRequest(auth.tokenName!, `tools/call:${toolName}`, 'denied_after_list', Date.now() - startedMs);
-          return Response.json({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text',
-            text: JSON.stringify({ error: 'permission_denied', message: `Tool requires ${op.scope ?? 'read'} scope` }) }] } },
+          // Frozen v1 pair: `error: permission_denied` stays; `code: insufficient_scope`.
+          const denial = scopeDeniedError({ op: toolName, required: [op.scope ?? 'read', ...(op.requiredScopes ?? [])], auth: auth.auth,
+            transport: 'http', message: `Tool requires ${op.scope ?? 'read'} scope`, legacy_error: 'permission_denied' });
+          return Response.json({ jsonrpc: '2.0', id, result: errorResult(denial, { remote: true, transport: 'http', auth: auth.auth }, { op: toolName }) },
             { headers: corsHeaders(origin) });
         }
         // v0.28: thread per-token takes-holder allow-list so takes_list /
@@ -718,6 +657,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
           // WP4 (D2): this transport has no per-client rows, so its surface
           // IS the ceiling request_tools bounds catalog + persist by.
           surfaceCeiling: surface,
+          resultRows: resultRowsForRequest(req.headers.get(GBRAIN_CLIENT_HEADER), await resolveResultRowsMode(engine, fileConfig)), // C1; row shape only, never authority
         });
         // Same status taxonomy as the OAuth transport (denied_after_list /
         // success_with_warnings feed the amendment-33 metric + E4 usage).
