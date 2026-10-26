@@ -35,6 +35,29 @@
 #      connectors sync), so a reset only in afterEach still reads the
 #      previous file's verdict in its first test: edge-proposals-json-bigint
 #      failed this way three times after a shard reshuffle.
+#  R7: a file whose code calls `__unconfigureGatewayForTests(` or
+#      `_clearGatewayForTests(` must call `resetGateway(` from an
+#      afterEach/afterAll hook (or pass it as the hook: `afterEach(resetGateway)`).
+#      An unconfigured gateway is process-global too: the next file's
+#      beforeAll then sizes its PGLite schema from nothing, and a `-t`
+#      filtered run or a throw before an inline restore leaves it empty.
+#      Comments do not count either way (#6514).
+#  R8: no scratch directory inside the source tree
+#      (`join(import.meta.dir, '.tmp-...')`). Guards such as
+#      test-reads-source-smell walk test/ in the same lane, and a scratch
+#      directory created and removed by another file mid-walk fails them with
+#      ENOENT (import-file.test.ts did this to test-reads-source-smell).
+#      Use mkdtempSync(join(tmpdir(), '...')).
+#  R9: a file that installs one of the process-global hooks below must undo
+#      it from an afterEach/afterAll hook (an inline undo does not survive a
+#      throw or a -t filter). Each installer patches console, stderr, signal
+#      listeners or a module scope for the rest of the shard process: the
+#      cli-socket output capture left by cli-socket.test.ts failed
+#      cli-socket-context.test.ts in a shared shard (#7494), and the stdio
+#      redirect left console.log bound to stderr. Comments do not count.
+#        installOutputCapture( / startCliSocketServer(  -> _uninstallOutputCaptureForTests
+#        redirectStdoutLoggingToStderr( / _resetStdoutRedirectForTests(  -> _resetStdoutRedirectForTests
+#        installSigchldHandler(  -> _uninstallSigchldHandlerForTests
 #
 # Scope:
 #  - Recursively scans `test/**/*.test.ts`.
@@ -176,7 +199,66 @@ GATEWAY_CODE_SCAN='
   }
   END { if (calls != "" && !restored) printf "%s", calls }
 '
-CANDIDATES="$(guard_candidates -E -e "$ENV_MUTATION_PATTERN" -e "$MODULE_MOCK_PATTERN" -e "$ENGINE_PATTERN" -e "$GATEWAY_PATTERN" -e "$VERDICT_PATTERN" <<< "$FILE_LIST")"
+UNCONFIGURE_PATTERN='(__unconfigureGatewayForTests|_clearGatewayForTests)[[:space:]]*\('
+# R8: a scratch path joined onto this file's own directory.
+SOURCE_TREE_SCRATCH_PATTERN="(import\\.meta\\.dir(name)?|__dirname)[[:space:]]*,[[:space:]]*['\"\`]\\.?tmp[-_./'\"\`]"
+# R7: same comment removal; a resetGateway call counts only inside an
+# afterEach/afterAll block (brace depth from the hook's line) or on the
+# hook line itself. Prints the unconfigure lines when no hook restore is left.
+UNCONFIGURE_CODE_SCAN='
+  in_block {
+    if (index($0, "*/") == 0) next
+    in_block = 0
+    next
+  }
+  /^[[:space:]]*\/\*/ {
+    if (index(substr($0, index($0, "/*") + 2), "*/") == 0) in_block = 1
+    next
+  }
+  {
+    code = $0
+    sub(/(^|[[:space:];,(){}])\/\/.*$/, "", code)
+    opens = gsub(/\{/, "{", code); closes = gsub(/\}/, "}", code)
+    if (in_after) { depth += opens - closes; if (code ~ /resetGateway[[:space:]]*\(/) restored = 1; if (depth <= 0) in_after = 0; next }
+    if (code ~ /after(Each|All)[[:space:]]*\(/) {
+      if (code ~ /resetGateway/) restored = 1
+      depth = opens - closes; if (depth > 0) in_after = 1; next
+    }
+    if (code ~ /(__unconfigureGatewayForTests|_clearGatewayForTests)[[:space:]]*\(/ && code !~ /import/) calls = calls NR ":" $0 "\n"
+  }
+  END { if (calls != "" && !restored) printf "%s", calls }
+'
+# R9: installer pattern|restorer name, one pair per line.
+PAIRED_RULES='installOutputCapture[[:space:]]*[(]|startCliSocketServer[[:space:]]*[(]|_uninstallOutputCaptureForTests
+redirectStdoutLoggingToStderr[[:space:]]*[(]|_resetStdoutRedirectForTests[[:space:]]*[(]|_resetStdoutRedirectForTests
+installSigchldHandler[[:space:]]*[(]|_uninstallSigchldHandlerForTests'
+PAIRED_PATTERN='installOutputCapture[[:space:]]*[(]|startCliSocketServer[[:space:]]*[(]|redirectStdoutLoggingToStderr[[:space:]]*[(]|_resetStdoutRedirectForTests[[:space:]]*[(]|installSigchldHandler[[:space:]]*[(]'
+# R9: same comment removal and after-hook tracking as UNCONFIGURE_CODE_SCAN,
+# with the installer pattern in trig and the restorer name in rest.
+PAIRED_CODE_SCAN='
+  in_block {
+    if (index($0, "*/") == 0) next
+    in_block = 0
+    next
+  }
+  /^[[:space:]]*\/\*/ {
+    if (index(substr($0, index($0, "/*") + 2), "*/") == 0) in_block = 1
+    next
+  }
+  {
+    code = $0
+    sub(/(^|[[:space:];,(){}])\/\/.*$/, "", code)
+    opens = gsub(/\{/, "{", code); closes = gsub(/\}/, "}", code)
+    if (in_after) { depth += opens - closes; if (code ~ ENVIRON["REST"]) restored = 1; if (depth <= 0) in_after = 0; next }
+    if (code ~ /after(Each|All)[[:space:]]*\(/) {
+      if (code ~ ENVIRON["REST"]) restored = 1
+      depth = opens - closes; if (depth > 0) in_after = 1; next
+    }
+    if (code ~ ENVIRON["TRIG"] && code !~ /import/) calls = calls NR ":" $0 "\n"
+  }
+  END { if (calls != "" && !restored) printf "%s", calls }
+'
+CANDIDATES="$(guard_candidates -E -e "$ENV_MUTATION_PATTERN" -e "$MODULE_MOCK_PATTERN" -e "$ENGINE_PATTERN" -e "$GATEWAY_PATTERN" -e "$VERDICT_PATTERN" -e "$UNCONFIGURE_PATTERN" -e "$SOURCE_TREE_SCRATCH_PATTERN" -e "$PAIRED_PATTERN" <<< "$FILE_LIST")"
 
 violations=0
 file_count=0
@@ -258,6 +340,31 @@ while IFS= read -r f; do
       emit_violation "$f" "R6" "currentExitCode() read with no baseline; the verdict is process-global, so the first test reads whatever the previous file in the shard left. Call _resetCliExitVerdictForTests() in beforeEach (or before the run it checks), not only in afterEach" "$unbased"
     fi
   fi
+  # R7: the gateway is unconfigured but no after-hook puts the baseline back.
+  if grep -qE "$UNCONFIGURE_PATTERN" "$f" 2>/dev/null; then
+    unrestored=$(awk "$UNCONFIGURE_CODE_SCAN" "$f" 2>/dev/null || true)
+    if [ -n "$unrestored" ]; then
+      emit_violation "$f" "R7" "__unconfigureGatewayForTests()/_clearGatewayForTests() with no resetGateway() in an afterEach/afterAll hook; an empty gateway is process-global, so the next file's beforeAll sizes its schema from nothing. Add afterEach(() => resetGateway()) (an inline restore does not survive a throw or a -t filter) or rename to *.serial.test.ts" "$unrestored"
+    fi
+  fi
+  # R8: scratch directory inside the source tree.
+  scratch_lines=$(grep -nE "$SOURCE_TREE_SCRATCH_PATTERN" "$f" 2>/dev/null || true)
+  if [ -n "$scratch_lines" ]; then
+    emit_violation "$f" "R8" "scratch directory inside the source tree; tree walkers in the same lane (test-reads-source-smell) fail with ENOENT when it is created or removed mid-walk. Use mkdtempSync(join(tmpdir(), '...'))" "$scratch_lines"
+  fi
+  # R9: a process-global hook installed with no after-hook undo.
+  if grep -qE "$PAIRED_PATTERN" "$f" 2>/dev/null; then
+    while IFS= read -r pair; do
+      trig="${pair%|*}"; rest="${pair##*|}"
+      grep -qE "$trig" "$f" 2>/dev/null || continue
+      unrestored=$(TRIG="$trig" REST="$rest" awk "$PAIRED_CODE_SCAN" "$f" 2>/dev/null || true)
+      if [ -n "$unrestored" ]; then
+        emit_violation "$f" "R9" "process-global hook installed with no $rest() in an afterEach/afterAll hook; it stays installed for every later file in the shard. Add afterEach(() => $rest()) or rename to *.serial.test.ts" "$unrestored"
+      fi
+    done <<PAIRS
+$PAIRED_RULES
+PAIRS
+  fi
 done <<EOF
 $FILE_LIST
 EOF
@@ -275,6 +382,11 @@ if [ $violations -gt 0 ]; then
   echo "    puts back the preload's baseline gateway for the next file."
   echo "  - For currentExitCode(), reset the verdict in beforeEach (or right"
   echo "    before the run it checks) with _resetCliExitVerdictForTests()."
+  echo "  - For __unconfigureGatewayForTests(), call resetGateway() in"
+  echo "    afterEach or afterAll; it puts back the preload's baseline gateway."
+  echo "  - For a scratch directory, use mkdtempSync(join(tmpdir(), '...'))."
+  echo "  - For a process-global hook (R9), call its named undo from afterEach"
+  echo "    or afterAll."
   echo
   echo "Or, if this is a baseline file from before the lint shipped,"
   echo "add it to scripts/check-test-isolation.allowlist (with a TODO"

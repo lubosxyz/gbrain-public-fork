@@ -22,6 +22,7 @@
 import type { BrainEngine } from '../engine.ts';
 import type { SearchResult } from '../types.ts';
 import { parseFactsFence } from '../facts-fence.ts';
+import { rankingLinkSql } from '../link-ranking-policy.ts';
 import { resolveQueryEntity } from './alias-fanout.ts';
 
 export const GENERATED_FACTOR = 0.5;
@@ -38,15 +39,32 @@ export function recordsCorrection(frontmatter: Record<string, unknown> | null, b
   }
 }
 
-export async function applyGeneratedDemotion(engine: BrainEngine, list: SearchResult[], query: string,
-  scope: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean }): Promise<void> {
+export type GeneratedPage = { id: number; frontmatter: Record<string, unknown> | null; compiled_truth: string | null };
+
+const pageIds = (list: SearchResult[]) => [...new Set(list.map(r => r.page_id).filter((id): id is number => typeof id === 'number'))];
+
+/**
+ * The generated pages among `list`; null when the read failed. It reads only the
+ * pool's page ids, so callers start it before stages that change scores but not membership.
+ */
+export async function readGeneratedPages(engine: BrainEngine, list: SearchResult[]): Promise<GeneratedPage[] | null> {
   try {
-    const ids = [...new Set(list.map(r => r.page_id).filter((id): id is number => typeof id === 'number'))];
-    if (!ids.length) return;
-    const generated = await engine.executeRaw<{ id: number; frontmatter: Record<string, unknown> | null; compiled_truth: string | null }>(
+    const ids = pageIds(list);
+    if (!ids.length) return [];
+    return await engine.executeRaw<GeneratedPage>(
       `SELECT id, frontmatter, compiled_truth FROM pages
         WHERE id = ANY($1::int[]) AND (frontmatter->>'dream_generated' = 'true' OR type = 'extract_receipt')`, [ids]);
-    if (!generated.length) return;
+  } catch {
+    return null;
+  }
+}
+
+export async function applyGeneratedDemotion(engine: BrainEngine, list: SearchResult[], query: string,
+  scope: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean }, generatedRead = readGeneratedPages(engine, list)): Promise<void> {
+  try {
+    const ids = pageIds(list);
+    const generated = await generatedRead;
+    if (!generated?.length) return;
     const generatedIds = new Set(generated.map(g => Number(g.id)));
     for (const r of list) if (generatedIds.has(r.page_id)) r.provenance = 'generated';
     if (isOff(await engine.getConfig('search.demote_generated'))) return;
@@ -60,7 +78,7 @@ export async function applyGeneratedDemotion(engine: BrainEngine, list: SearchRe
     const targetIds = targets.map(t => Number(t.id));
     if (!targetIds.length) return;
     const linking = new Set((await engine.executeRaw<{ id: number }>(
-      `SELECT DISTINCT from_page_id AS id FROM links WHERE from_page_id = ANY($1::int[]) AND to_page_id = ANY($2::int[])`,
+      `SELECT DISTINCT l.from_page_id AS id FROM links l WHERE l.from_page_id = ANY($1::int[]) AND l.to_page_id = ANY($2::int[]) AND ${rankingLinkSql('l')}`,
       [ids, targetIds])).map(r => Number(r.id)));
     const primaryPresent = list.some(r => !generatedIds.has(r.page_id) && (targetIds.includes(r.page_id) || linking.has(r.page_id)));
     if (!primaryPresent) return;

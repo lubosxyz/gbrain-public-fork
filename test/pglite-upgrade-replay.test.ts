@@ -78,11 +78,12 @@ import {
 const FRESH_GOLDEN = 'pglite-upgrade-replay/catalog-before-boot';
 /**
  * Master finding (see header): functions whose body text on an upgraded brain
- * differs from a fresh install by whitespace only.
+ * differs from a fresh install by whitespace only. v248 re-creates
+ * bump_page_generation_fn from the same fragment the schema blob embeds, so its
+ * drift is gone.
  */
 const WHITESPACE_ONLY_FUNCTION_DRIFT = [
   'bump_page_generation_clock_fn()',
-  'bump_page_generation_fn()',
 ];
 /** Fresh fork schema positions vs v240 additions to the pinned upstream brain. */
 const TOKEN_COLUMN_ORDINAL_DRIFT: Record<string, [number, number]> = {

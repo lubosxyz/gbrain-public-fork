@@ -1,6 +1,6 @@
 /**
  * recall's `question` ranking (MEMORY_VERBS v1 additive field): active facts
- * ranked by relevance to the question instead of by recency, inside any
+ * (every fact with `include_expired`) ranked by relevance to the question instead of by recency, inside any
  * `entity`, `session_id`, `since` or `grep` filter. The candidate pool and
  * the score are fact-relevance.ts's (shared with the temporal fact reserve);
  * the read policy is recall's own (source scope, trust floor, quarantine and
@@ -15,13 +15,15 @@ import type { Action, Notice } from '../agent-output.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { opError } from '../ops/contract.ts';
 import { MEMORY_VERBS_VERSION } from '../verbs.ts';
-import { isAvailable } from '../ai/gateway.ts';
+import { getEmbeddingDimensions, getEmbeddingModel, isAvailable } from '../ai/gateway.ts';
+import { calibrationKey } from './supersession-threshold.ts';
 import { rowToFact, type FactRowSqlShape } from '../engine-sql/facts.ts';
+import { collapseFactReads, type CollapsedFactRead } from './capture-dedup.ts';
 import { loadEmbeddingQueryPrefix } from '../search/query-prefix.ts';
 import { embedQueryBounded, makeQueryEmbedDeadline } from '../search/hybrid.ts';
 import { resolveHnswIterativeScan } from '../search/hnsw-iterative-scan.ts';
 import {
-  QUESTION_ADMISSION_RULES, admitted, collectFactCandidates, countUncomparableFacts, poolEntityPairs, queryTerms, scoreFactCandidates,
+  FACT_ADMISSION_FLOOR_EVIDENCE, QUESTION_ADMISSION_RULES, admitted, collectFactCandidates, countUncomparableFacts, poolEntityPairs, queryTerms, scoreFactCandidates,
   type FactPoolFilters, type FactPoolScope, type QuestionAdmissionRule,
 } from '../search/fact-relevance.ts';
 
@@ -36,6 +38,18 @@ export interface FactsDegraded {
   reason?: string;
   /** Facts in the authorized pool the cosine arm could not compare (no vector, another model, a stale hash or other dimensions). */
   unembedded?: number;
+}
+
+/**
+ * #6590: the cosine arm admitted facts at the absolute floors, and the
+ * embedding model has no measured floor (FACT_ADMISSION_FLOOR_EVIDENCE), so on
+ * a high-baseline embedder an empty or short facts list is weaker evidence of
+ * "nothing matched". Informational: `facts_degraded` is unchanged.
+ */
+export interface FactsCalibration {
+  status: 'unmeasured';
+  /** `provider:model@dims`, the key doctor `fact_admission_floors` reports. */
+  model_key: string;
 }
 
 export type EntityCandidate = { source_id: string; entity_slug: string };
@@ -86,9 +100,9 @@ function invalidQuestionCall(message: string, suggestion: string, retry: Record<
 }
 
 /**
- * The validated `question`, or null when absent. Refuses the combinations
- * ranking cannot honor (`supersessions`, `include_expired`) and an over-long
- * question, each with the corrected call as its fix.
+ * The validated `question`, or null when absent. Refuses the combination
+ * ranking cannot honor (`supersessions`) and an over-long question, each with
+ * the corrected call as its fix. `include_expired` widens the ranked pool.
  */
 export function parseQuestionParam(p: Record<string, unknown>): string | null {
   if (p.question === undefined || p.question === null) return null;
@@ -103,11 +117,6 @@ export function parseQuestionParam(p: Record<string, unknown>): string | null {
     const { supersessions: _s, ...rest } = args;
     throw invalidQuestionCall('question cannot be combined with supersessions: the supersession log is ordered by when facts were replaced, not ranked.',
       'Drop supersessions to rank active facts, or drop question to read the supersession log.', rest, 'The same recall without supersessions.');
-  }
-  if (p.include_expired === true) {
-    const { include_expired: _e, ...rest } = args;
-    throw invalidQuestionCall('question cannot be combined with include_expired: ranking runs over active facts only.',
-      'Drop include_expired to rank active facts, or drop question to list expired facts newest first.', rest, 'The same recall without include_expired.');
   }
   if (question.length > QUESTION_MAX_CHARS) {
     throw invalidQuestionCall(`question is ${question.length} characters; the limit is ${QUESTION_MAX_CHARS}.`,
@@ -159,25 +168,31 @@ export interface QuestionRecallInput {
   sessionId: string | null;
   since: Date | null;
   grep: string | null;
+  /** Rank expired, superseded and lapsed facts too (recall's `include_expired`). */
+  includeExpired?: boolean;
 }
 
 export interface QuestionRecall {
-  rows: FactRow[];
+  /** Ranked rows, copies of one claim collapsed (#7043) before the `limit` cut. */
+  rows: CollapsedFactRead<FactRow>[];
   /** fact id → relevance (cosine + term share + 0.1 when dated). */
   relevance: Map<number, number>;
   degraded?: FactsDegraded;
+  /** Present when the cosine arm ran on a model with no measured admission floor. */
+  calibration?: FactsCalibration;
   /** The source holding the most uncomparable facts, for the `embed --stale --facts` fix. */
   unembeddedSource?: string;
   ambiguousEntity: EntityCandidate[] | null;
 }
 
-/** Active facts ranked by relevance to `question` under recall's read policy and filters. */
+/** Active facts (all facts with `includeExpired`) ranked by relevance to `question` under recall's read policy and filters. */
 export async function rankFactsByQuestion(ctx: OperationContext, input: QuestionRecallInput): Promise<QuestionRecall> {
   const { question, scope } = input;
   const filters: FactPoolFilters = {
     ...(input.sessionId ? { sessionId: input.sessionId } : {}),
     ...(input.since ? { since: input.since } : {}),
     ...(input.grep ? { grep: input.grep } : {}),
+    ...(input.includeExpired ? { includeExpired: true } : {}),
   };
   const empty = (degraded?: FactsDegraded, ambiguousEntity: EntityCandidate[] | null = null): QuestionRecall => ({ rows: [], relevance: new Map(), ambiguousEntity, ...(degraded ? { degraded } : {}) });
   try {
@@ -201,7 +216,7 @@ export async function rankFactsByQuestion(ctx: OperationContext, input: Question
       embedding ? countUncomparableFacts(ctx.engine, scope, filters, embedding.length) : [],
       admissionRule(ctx.engine),
     ]);
-    const ranked = scoreFactCandidates(question, pool.candidates).filter(s => admitted(s, rule)).slice(0, input.limit);
+    const ranked = scoreFactCandidates(question, pool.candidates).filter(s => admitted(s, rule));
     const unembedded = uncomparable.reduce((n, r) => n + r.n, 0);
     const why = reason ?? (embedding && !pool.column ? 'facts_embedding_column_missing' : undefined);
     const degraded: FactsDegraded | undefined = why || unembedded ? { ...(why ? { reason: why } : {}), ...(unembedded ? { unembedded } : {}) } : undefined;
@@ -210,11 +225,13 @@ export async function rankFactsByQuestion(ctx: OperationContext, input: Question
       ? await ctx.engine.executeRaw<FactRowSqlShape>('SELECT * FROM facts WHERE source_id = ANY($1::text[]) AND id = ANY($2::bigint[])', [input.factSources, ids])
       : [];
     const byId = new Map(raw.map(r => { const row = rowToFact(r); return [row.id, { ...row, embedding: null }] as const; }));
+    const modelKey = embedding && pool.column ? calibrationKey(getEmbeddingModel(), getEmbeddingDimensions()) : null;
     return {
-      rows: ids.flatMap(id => byId.get(id) ?? []),
+      rows: (await collapseFactReads(ctx.engine, ids.flatMap(id => byId.get(id) ?? []))).slice(0, input.limit),
       relevance: new Map(ranked.map(s => [s.candidate.id, Math.round(s.score * 1e4) / 1e4])),
       ambiguousEntity: null,
       ...(degraded ? { degraded } : {}),
+      ...(modelKey && FACT_ADMISSION_FLOOR_EVIDENCE[modelKey] === undefined ? { calibration: { status: 'unmeasured' as const, model_key: modelKey } } : {}),
       ...(uncomparable[0] ? { unembeddedSource: uncomparable[0].source_id } : {}),
     };
   } catch (error) {
@@ -238,12 +255,34 @@ export function recallHintNotice(p: Record<string, unknown>, queryText: string):
   };
 }
 
-/** Notices for a question-ranked recall: facts the cosine arm could not compare, with the preview-then-approve embed fix. */
-export function questionRecallNotices(ranking: QuestionRecall): Notice[] {
+const FACT_FLOORS_VERIFY = { argv: ['gbrain', 'doctor', '--only', 'fact_admission_floors', '--json'] };
+
+/**
+ * #6590: the once-per-session explanation of `facts_calibration`. Kind info
+ * (muteable); its `dedupe_key` (brain + model key) keeps it to one notice per
+ * brain per session in the notice ledger, while the response field rides
+ * every call.
+ */
+export function factsCalibrationNotice(calibration: FactsCalibration, brainId?: string): Notice {
+  const dedupe_key = [brainId ?? 'host', calibration.model_key].join('|');
+  return {
+    code: 'facts_calibration_unmeasured',
+    kind: 'info',
+    why: `recall ranked saved facts with semantic matching on embedding model ${calibration.model_key}, whose fact admission floors were never measured (facts_calibration: unmeasured). `
+      + 'If this model scores unrelated text high, a fact can pass for a question nothing answers, so a short facts list is weaker evidence than on a measured model; check the facts against the question before relying on them. Results and facts_degraded are unchanged.',
+    fix: { argv: FACT_FLOORS_VERIFY.argv, consent: [], actor: 'agent', requires_exclusive: false, verify: FACT_FLOORS_VERIFY,
+      why: "Read-only: doctor's fact_admission_floors names the model key, the cosine floors in use and whether an eval measured them." },
+    dedupe_key,
+  };
+}
+
+/** Notices for a question-ranked recall: the unmeasured-floor explanation, and facts the cosine arm could not compare with the preview-then-approve embed fix. */
+export function questionRecallNotices(ranking: QuestionRecall, brainId?: string): Notice[] {
+  const calibration = ranking.calibration ? [factsCalibrationNotice(ranking.calibration, brainId)] : [];
   const n = ranking.degraded?.unembedded ?? 0;
-  if (!n || !ranking.unembeddedSource) return [];
+  if (!n || !ranking.unembeddedSource) return calibration;
   const base = ['gbrain', 'embed', '--stale', '--facts', '--source', ranking.unembeddedSource];
-  return [{
+  return [...calibration, {
     code: 'facts_unembedded',
     kind: 'degraded',
     why: `${n} saved fact(s) in scope have no embedding this brain can compare with the question (none stored, another embedding model, a changed text or other dimensions), so they were ranked by word overlap alone and a relevant one can be missing.`,

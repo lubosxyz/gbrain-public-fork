@@ -124,8 +124,7 @@ push SHA, first red SHA, merged PRs). Labels, close rules and recovery steps:
 merge queue is enabled for `master` in the repository settings; check with
 `gh api repos/garrytan/gbrain/rulesets` (or the branch protection page). Queue runs use
 the pull-request profile against the queued merge commit: primary native scope,
-the newest Bun version only in the security and persistence matrices, the
-2,500-write soak and the 10,001-page export scale; the E2E selector diffs the
+the 2,500-write soak and the 10,001-page export scale; the E2E selector diffs the
 queued commit against `master`.
 
 - Without the queue, a release rebases onto the latest `origin/master` and re-runs
@@ -205,7 +204,10 @@ and the commit it would make, and changes nothing.
    required row of the CLAUDE.md "Version locations" table: VERSION,
    `package.json`, the three plugin manifests, the BOOTSTRAP runbook stamp,
    the CHANGELOG entry (re-stamped on top of master's entries with today's
-   date), and branch-added TODOS lines naming the old version.
+   date), branch-added TODOS lines naming the old version, and every
+   `since: 'TBD'` row in `src/core/behavior-change-notice.ts` (development
+   branches write their BEHAVIOR_CHANGES rows as TBD; the stamp gives them the
+   new version, and a restamp moves the branch's own rows from the old version).
 5. Renumbers the branch's own schema migrations (files `origin/master` does
    not have) consecutively from master's latest + 1, in their original order.
    It changes only the filename, the `export const v<NNN>` name and the
@@ -223,7 +225,9 @@ and the commit it would make, and changes nothing.
    line (an edited line is not listed again), or pass `--accept-references`
    with `--continue` when a line means the published migration.
 8. Runs the drift checks (version stamps and CHANGELOG agree, bootstrap
-   stamp, plugin tree, template repo, migration registry and order), commits
+   stamp, plugin tree, template repo, migration registry and order, no
+   `since: 'TBD'` row left: `bun scripts/check-behavior-since.ts --stamped`, and every
+   master release heading still in CHANGELOG.md: `bun scripts/check-changelog-headings.ts`), commits
    once as `v<new> chore(release): restamp onto master v<master>`, and prints
    the old-to-new migration mapping with the collision-recovery steps, the
    golden-regeneration reason for the PR body, the PR title and
@@ -533,7 +537,9 @@ the release the same, uses that version's `CHANGELOG.md` entry as the notes
 (`scripts/changelog-entry.sh`; falls back to a CHANGELOG link if the entry is
 missing), and attaches the compiled binaries.
 
-The executable build job pins Bun 1.4.2 and verifies the Darwin artifact with
+The executable build job pins Bun 1.4.4, the first release with the Brotli fix
+for CVE-2026-111497 (#7373): a standalone binary embeds the Bun it was built
+with, so never pin a build below it. The job verifies the Darwin artifact with
 strict native `codesign` before publishing it. A source merge does not repair
 already-published bad binaries; an affected release needs its own explicitly
 approved recovery and asset verification. The template and plugin publishing
@@ -555,6 +561,12 @@ succeed on the release commit.
 - **Backfill:** `gh workflow run release.yml --ref master` gates and publishes
   master HEAD's VERSION. Other refs are refused.
 - The gate waits up to 110 minutes, then fails with the backfill command.
+- **Reused push run:** a push run that reused a passed full-suite run of its
+  exact tree ([master-push reuse](ci-event-parity.md#master-push-reuse))
+  publishes only with a readable `reuse.json` naming the same workflow, the
+  push head and a valid source run. The gate prints the reused run per
+  workflow and writes `test_reused_run_id` / `e2e_reused_run_id` (empty when
+  that workflow ran in full); the `ci-gate` job exposes both as outputs.
 
 ### The `latest-stable` tag
 
@@ -575,6 +587,61 @@ release already exists with all assets):
 ```bash
 git push origin "+refs/tags/v<VERSION>^{commit}:refs/tags/latest-stable"
 ```
+
+### Stable channel promotion
+
+The stable channel is a slower ref than `latest-stable`: a release reaches it
+only after the production-shaped soak passed on its exact git tree. A
+maintainer promotes with `.github/workflows/promote-stable.yml`
+(`scripts/promote-stable.ts`), weekly or whenever a soak passes; both go
+through the same dispatch:
+
+```bash
+gh workflow run promote-stable.yml -f version=<VERSION> \
+  -f soak_run_url=https://github.com/<owner>/<repo>/actions/runs/<run id>
+```
+
+- **Refs.** `refs/tags/stable` is an annotated tag on the promoted release
+  commit, moved only by this workflow. Clients peel it (`refs/tags/stable^{}`)
+  and take the `v<VERSION>` tag on that commit; the update check reads
+  `https://raw.githubusercontent.com/<owner>/<repo>/stable/VERSION`.
+  `refs/tags/stable-v<VERSION>` is an immutable annotated record created on a
+  version's first promotion and never moved or deleted. Both carry the same
+  message: a title line (`gbrain`, then `stable channel: v<VERSION>`), then one
+  `key: value` line each for `version`, `commit`, `tree`, `soak_run`,
+  `scoreboard`, `promoted_by`, `promoted_at` (UTC), `previous`
+  (`none` on the first promotion), `rollback` and `reason` (`-` when
+  empty).
+- **Inputs.** `version` (an existing `v<VERSION>` release tag),
+  `soak_run_url` (the soak's Actions run URL, optionally
+  `/attempts/<n>`), `scoreboard_url` (optional, defaults to the run URL),
+  `rollback` (default false) and `reason` (required with rollback).
+- **Who.** Only an actor with the admin or maintain role; anyone else is
+  refused.
+- **Soak run.** The run must belong to this repository, be completed with
+  conclusion `success`, and run the workflow file named by the
+  `STABLE_SOAK_WORKFLOW` repository variable (Settings → Secrets and
+  variables → Actions → Variables; a bare file name like `soak.yml` or the
+  full `.github/workflows/soak.yml` path). With the variable unset, every
+  promotion is refused.
+- **Published release.** The tag's `VERSION` file must say the version, and
+  its GitHub release must exist and not be a draft, so binary clients can
+  fetch the stable release.
+- **Exact tree.** The soak run's head commit must have the same git tree as
+  the release tag. A soak of another tree is refused with both trees and the
+  run's head commit, even when the version string matches; soak the release
+  itself, then promote that run.
+- **Ordering and rollback.** The version must be newer than the current
+  stable (numeric 3- or 4-part comparison); promoting the current stable is a
+  no-op refusal. `rollback=true` with a `reason` moves stable to an older
+  release, or back to one promoted before (its record tag already exists and
+  is kept; without rollback an existing record tag is refused).
+- **One atomic push.** The record tag and `stable` land together or not at
+  all, `stable` leased on the value the run read, so a concurrent move fails
+  the run instead of being overwritten and a failed push leaves nothing to
+  clean up before the re-run. The `promote-stable` concurrency group runs one promotion at a
+  time. The run's step summary lists the version, commit, tree, soak run,
+  scoreboard, previous stable and rollback reason.
 
 ### The `publish-template` job
 

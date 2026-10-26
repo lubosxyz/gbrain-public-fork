@@ -16,6 +16,9 @@
       "backfill": [
         "./commands/backfill.ts"
       ],
+      "beliefs": [
+        "./commands/beliefs.ts"
+      ],
       "book-mirror": [
         "./commands/book-mirror.ts"
       ],
@@ -49,6 +52,9 @@
       "core": [
         "./commands/core.ts"
       ],
+      "diag": [
+        "./commands/diag.ts"
+      ],
       "edge-proposals": [
         "./commands/edge-proposals.ts"
       ],
@@ -56,7 +62,8 @@
         "./commands/edges-backfill.ts"
       ],
       "embed": [
-        "./commands/embed.ts"
+        "./commands/embed.ts",
+        "./core/held-embedding.ts"
       ],
       "enrich": [
         "./commands/enrich.ts"
@@ -147,6 +154,7 @@
         "./commands/reindex.ts",
         "./commands/reindex-multimodal.ts",
         "./core/sync-concurrency.ts",
+        "./core/oversized-backfill.ts",
         "./commands/reindex-vectors.ts",
         "./commands/reindex-aliases.ts",
         "./commands/reindex.ts",
@@ -175,6 +183,7 @@
         "./commands/salience.ts"
       ],
       "serve": [
+        "./core/serve-log.ts",
         "./commands/serve.ts"
       ],
       "skillopt": [

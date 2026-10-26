@@ -8,6 +8,8 @@
 #   unit     scripts/run-unit-shard.sh FILE    (DATABASE_URL unset)
 #   serial   scripts/run-serial-tests.sh FILE  (DATABASE_URL unset)
 #   slow     scripts/run-slow-tests.sh FILE    (DATABASE_URL unset)
+#   pg-arms  FILE's PostgreSQL arm, exactly as persistence-validation's
+#            unit-postgres-arms step runs it, against this slot's gbrain_arms_test database
 #   e2e      scripts/run-e2e.sh FILE against this slot's own postgres + pgbouncer
 #            (backend-matrix files also run through the slot's pgbouncer)
 #   verify   check-bun-test-timeout.sh + bun run verify (no FILE)
@@ -16,6 +18,7 @@
 # Every item is bracketed by marker lines the orchestrator parses:
 #   __ubi_item_begin__ <lane> <file>
 #   __ubi_item__ rc=<exit> ms=<duration> lane=<lane> file=<file>
+#   __ubi_load__ load1=<1-minute load average> vcpus=<nproc>   (the VM's load as the item ended)
 set -uo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -44,6 +47,11 @@ run_item() {
     unit) bash scripts/run-unit-shard.sh "$1" ;;
     serial) bash scripts/run-serial-tests.sh "$1" ;;
     slow) bash scripts/run-slow-tests.sh "$1" ;;
+    pg-arms)
+      env -u GBRAIN_TEST_TIMEOUT_MULTIPLIER -u GBRAIN_TEST_EXPORT_SCALE_PAGES \
+        DATABASE_URL="$pg/gbrain_arms_test" GBRAIN_TEST_ALLOW_DATABASE_URL=1 \
+        bun --no-env-file test --timeout=120000 "$1"
+      ;;
     e2e)
       DATABASE_URL="$pg/gbrain_test" \
       GBRAIN_PGBOUNCER_URL="$pgb/gbrain_pgbouncer_test" \
@@ -71,4 +79,5 @@ for item in "${items[@]}"; do
   run_item "$item" 2>&1
   rc=$?
   echo "__ubi_item__ rc=$rc ms=$(( $(date +%s%3N) - start )) lane=$lane file=$item"
+  echo "__ubi_load__ load1=$(cut -d' ' -f1 /proc/loadavg) vcpus=$(nproc)"
 done

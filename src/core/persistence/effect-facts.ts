@@ -1,5 +1,6 @@
 import type { BrainEngine } from '../engine.ts';
 import type { ParsedPage } from '../import-file.ts';
+import { factsAbsorbWriteKey } from '../facts/dead-absorb-retry.ts';
 import { isFactsBackstopEligible } from '../facts/eligibility.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
 import { resolvePageWriteNotabilityFilter } from '../facts/notability-filter.ts';
@@ -13,6 +14,7 @@ import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { completeEffect } from './effect-journal.ts';
 import { guardEffectSource } from './effect-recovery.ts';
 import { derivedExtractionSkip } from './derived-extraction-gate.ts';
+import { bodyUnread, isSegmentedPage } from '../page-body/page-shape.ts';
 import type { PersistenceEffect } from './effect-model.ts';
 import type { WriteRequest } from './model.ts';
 
@@ -78,7 +80,8 @@ async function extractionCompletedForPage(engine: BrainEngine, pageId: number): 
  */
 async function bodyAlreadyOffered(engine: BrainEngine, slug: string, page: ParsedPage, before: PageSnapshot | null): Promise<boolean> {
   const live = before && !before.page.deleted_at ? before.page : null;
-  if (!live || live.compiled_truth !== page.compiled_truth) return false;
+  // A segmented prior body is not compared; the extraction's watermark finds nothing appended and calls no model.
+  if (!live || isSegmentedPage(live) || bodyUnread(page) || live.compiled_truth !== page.compiled_truth) return false;
   if (!isFactsBackstopEligible(slug, live).ok) return false;
   if (!(await extractionCompletedForPage(engine, live.id))) return false;
   return !(await extractionPendingForPage(engine, live.id));
@@ -145,10 +148,11 @@ export async function dispatchFactsBackstopEffect(engine: BrainEngine, effect: P
     // #6231: the page-write filter in force when the effect dispatches; the job keeps it across retries.
     const notabilityFilter = await resolvePageWriteNotabilityFilter(tx);
     const job = await new MinionQueue(tx).add('facts-absorb', {
-      slug: effect.data.slug, sourceId: effect.source_id, source: 'mcp:put_page', notabilityFilter,
+      // #6333: a stable per-page session (mirrors sync's `sync:<slug>`) so a re-extraction feeds the same-page shadow counter.
+      slug: effect.data.slug, sourceId: effect.source_id, source: 'mcp:put_page', sessionId: `put_page:${effect.data.slug}`, notabilityFilter,
       visibility: effect.data.visibility === 'world' ? 'world' : 'private',
       persistence_request_id: effect.request_id, page_id: effect.data.page_id, revision: effect.revision,
-    }, { queue: 'default', idempotency_key: `facts-absorb:write:${effect.request_id}`, max_attempts: 5, backoff_delay: 60_000 });
+    }, { queue: 'default', idempotency_key: factsAbsorbWriteKey(effect.request_id), max_attempts: 5, backoff_delay: 60_000 });
     await completeEffect(tx, effect, { facts: 'queued', job_id: job.id });
   });
 }

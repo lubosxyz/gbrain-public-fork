@@ -9,7 +9,6 @@
 
 const load_admin = () => import('./ops/admin.ts') as Promise<Record<string, unknown>>;
 const load_attribution = () => import('./ops/attribution.ts') as Promise<Record<string, unknown>>;
-const load_auth_tokens = () => import('./ops/auth-tokens.ts') as Promise<Record<string, unknown>>;
 const load_brain_membership = () => import('./ops/brain-membership.ts') as Promise<Record<string, unknown>>;
 const load_calibration = () => import('./ops/calibration.ts') as Promise<Record<string, unknown>>;
 const load_chronicle = () => import('./ops/chronicle.ts') as Promise<Record<string, unknown>>;
@@ -22,6 +21,7 @@ const load_extraction = () => import('./ops/extraction.ts') as Promise<Record<st
 const load_facts = () => import('./ops/facts.ts') as Promise<Record<string, unknown>>;
 const load_feedback = () => import('./ops/feedback.ts') as Promise<Record<string, unknown>>;
 const load_files = () => import('./ops/files.ts') as Promise<Record<string, unknown>>;
+const load_graph_rank = () => import('./ops/graph-rank.ts') as Promise<Record<string, unknown>>;
 const load_image = () => import('./ops/image.ts') as Promise<Record<string, unknown>>;
 const load_ingest_log = () => import('./ops/ingest-log.ts') as Promise<Record<string, unknown>>;
 const load_insights = () => import('./ops/insights.ts') as Promise<Record<string, unknown>>;
@@ -30,8 +30,10 @@ const load_links = () => import('./ops/links.ts') as Promise<Record<string, unkn
 const load_loops = () => import('./ops/loops.ts') as Promise<Record<string, unknown>>;
 const load_notices = () => import('./ops/notices.ts') as Promise<Record<string, unknown>>;
 const load_orphans = () => import('./ops/orphans.ts') as Promise<Record<string, unknown>>;
+const load_page_append = () => import('./ops/page-append.ts') as Promise<Record<string, unknown>>;
 const load_page_batch = () => import('./ops/page-batch.ts') as Promise<Record<string, unknown>>;
 const load_page_edit = () => import('./ops/page-edit.ts') as Promise<Record<string, unknown>>;
+const load_page_upload = () => import('./ops/page-upload.ts') as Promise<Record<string, unknown>>;
 const load_pages = () => import('./ops/pages.ts') as Promise<Record<string, unknown>>;
 const load_persistence = () => import('./ops/persistence.ts') as Promise<Record<string, unknown>>;
 const load_purge = () => import('./ops/purge.ts') as Promise<Record<string, unknown>>;
@@ -40,6 +42,7 @@ const load_raw_data = () => import('./ops/raw-data.ts') as Promise<Record<string
 const load_request_tools = () => import('./ops/request-tools.ts') as Promise<Record<string, unknown>>;
 const load_salience = () => import('./ops/salience.ts') as Promise<Record<string, unknown>>;
 const load_schema_packs = () => import('./ops/schema-packs.ts') as Promise<Record<string, unknown>>;
+const load_search_exact = () => import('./ops/search-exact.ts') as Promise<Record<string, unknown>>;
 const load_search = () => import('./ops/search.ts') as Promise<Record<string, unknown>>;
 const load_skillopt = () => import('./ops/skillopt.ts') as Promise<Record<string, unknown>>;
 const load_skills_catalog = () => import('./ops/skills-catalog.ts') as Promise<Record<string, unknown>>;
@@ -51,6 +54,7 @@ const load_timeline = () => import('./ops/timeline.ts') as Promise<Record<string
 const load_transcripts = () => import('./ops/transcripts.ts') as Promise<Record<string, unknown>>;
 const load_trust = () => import('./ops/trust.ts') as Promise<Record<string, unknown>>;
 const load_usage = () => import('./ops/usage.ts') as Promise<Record<string, unknown>>;
+const load_whois = () => import('./ops/whois.ts') as Promise<Record<string, unknown>>;
 const load_verbs = () => import('./verbs.ts') as Promise<Record<string, unknown>>;
 
 export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<string, unknown>>, string]> = {
@@ -67,9 +71,16 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "capture": [load_pages, "pagesOperations"],
   "fetch": [load_pages, "pagesOperations"],
   "edit_page": [load_page_edit, "pageEditOperations"],
+  "append_page": [load_page_append, "pageAppendOperations"],
   "put_pages": [load_page_batch, "pageBatchOperations"],
+  "begin_page_upload": [load_page_upload, "pageUploadOperations"],
+  "upload_page_part": [load_page_upload, "pageUploadOperations"],
+  "get_page_upload": [load_page_upload, "pageUploadOperations"],
+  "commit_page_upload": [load_page_upload, "pageUploadOperations"],
+  "abort_page_upload": [load_page_upload, "pageUploadOperations"],
   "get_write_request": [load_persistence, "persistenceOperations"],
   "list_write_requests": [load_persistence, "persistenceOperations"],
+  "list_write_conflicts": [load_persistence, "persistenceOperations"],
   "cancel_write_request": [load_persistence, "persistenceOperations"],
   "search": [load_search, "searchOperations"],
   "query": [load_search, "searchOperations"],
@@ -78,6 +89,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "search_modes": [load_search, "searchOperations"],
   "search_tune": [load_search, "searchOperations"],
   "cache_stats": [load_search, "searchOperations"],
+  "search_exact": [load_search_exact, "searchExactOperations"],
   "rate_answer": [load_feedback, "feedbackOperations"],
   "search_by_image": [load_image, "imageOperations"],
   "add_tag": [load_tags, "tagsOperations"],
@@ -95,6 +107,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "get_stats": [load_admin, "adminOperations"],
   "get_health": [load_admin, "adminOperations"],
   "run_doctor": [load_admin, "adminOperations"],
+  "get_brain_health": [load_admin, "adminOperations"],
   "get_versions": [load_admin, "adminOperations"],
   "revert_version": [load_admin, "adminOperations"],
   "get_brain_identity": [load_admin, "adminOperations"],
@@ -123,6 +136,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "get_raw_data": [load_raw_data, "rawDataOperations"],
   "resolve_slugs": [load_chunks, "chunksOperations"],
   "get_chunks": [load_chunks, "chunksOperations"],
+  "whois": [load_whois, "whoisOperations"],
   "log_ingest": [load_ingest_log, "ingestLogOperations"],
   "get_ingest_log": [load_ingest_log, "ingestLogOperations"],
   "get_usage": [load_usage, "usageOperations"],
@@ -131,6 +145,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "file_url": [load_files, "filesOperations"],
   "submit_job": [load_jobs, "jobsOperations"],
   "get_job": [load_jobs, "jobsOperations"],
+  "wait_job": [load_jobs, "jobsOperations"],
   "list_jobs": [load_jobs, "jobsOperations"],
   "cancel_job": [load_jobs, "jobsOperations"],
   "retry_job": [load_jobs, "jobsOperations"],
@@ -143,6 +158,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "get_agent_job": [load_jobs, "jobsOperations"],
   "get_job_stats": [load_jobs, "jobsOperations"],
   "find_orphans": [load_orphans, "orphansOperations"],
+  "rank_entities": [load_graph_rank, "graphRankOperations"],
   "get_calibration_profile": [load_calibration, "calibrationOperations"],
   "takes_list": [load_takes, "takesOperations"],
   "takes_search": [load_takes, "takesOperations"],
@@ -161,8 +177,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "sources_remove": [load_sources, "sourcesOperations"],
   "sources_status": [load_sources, "sourcesOperations"],
   "sources_inspect": [load_sources, "sourcesOperations"],
-  "token_mint_scoped": [load_auth_tokens, "authTokenOperations"],
-  "token_revoke": [load_auth_tokens, "authTokenOperations"],
+  "sources_resolve_path": [load_sources, "sourcesOperations"],
   "request_tools": [load_request_tools, "requestToolsOperations"],
   "get_recent_salience": [load_salience, "salienceOperations"],
   "find_anomalies": [load_salience, "salienceOperations"],

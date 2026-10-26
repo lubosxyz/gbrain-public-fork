@@ -98,18 +98,26 @@ export async function resolveQueryEntities(engine: BrainEngine, query: string, s
     }
   }
   const norms = [...new Set(grams.map(g => g.norm))];
-  const aliasHits = await engine.resolveAliases(norms, scope).catch(() => new Map<string, Array<{ slug: string; source_id: string }>>());
   const sources = scope.sourceIds?.length ? scope.sourceIds : [scope.sourceId ?? 'default'];
-  const policy = await readMentionPolicy(engine);
-  const types = [...new Set((await Promise.all(sources.map(async s => linkableTypesFor(await loadSourcePack(engine, s), policy)))).flat())];
   const { privatePagesFilterFragment } = await import('./private-visibility.ts');
-  const titleRows = await engine.executeRaw<{ slug: string; source_id: string; t: string }>(
-    `SELECT slug, source_id, lower(title) AS t FROM pages
-      WHERE lower(title) = ANY($1::text[]) AND source_id = ANY($2::text[]) AND type = ANY($3::text[]) AND deleted_at IS NULL
-      ${scope.excludePrivate ? `AND ${privatePagesFilterFragment('pages')}` : ''}`, [norms, sources, types]).catch(() => []);
-  const caseRows = await engine.executeRaw<{ slug: string; alias_norm: string; alias_text: string | null }>(
-    `SELECT slug, alias_norm, alias_text FROM page_aliases WHERE alias_norm = ANY($1::text[]) AND case_sensitive AND source_id = ANY($2::text[])`,
-    [norms, sources]).catch(() => []);
+  // The alias, title and case-sensitive reads depend on nothing but the n-grams (the title read also on the
+  // linkable types, which the request's config snapshot answers), so they run at once: on a pooled Postgres
+  // one round trip of wall time instead of three in series (#6721). A policy or pack failure still throws.
+  const titleRead = (async () => {
+    const policy = await readMentionPolicy(engine);
+    const types = [...new Set((await Promise.all(sources.map(async s => linkableTypesFor(await loadSourcePack(engine, s), policy)))).flat())];
+    return engine.executeRaw<{ slug: string; source_id: string; t: string }>(
+      `SELECT slug, source_id, lower(title) AS t FROM pages
+        WHERE lower(title) = ANY($1::text[]) AND source_id = ANY($2::text[]) AND type = ANY($3::text[]) AND deleted_at IS NULL
+        ${scope.excludePrivate ? `AND ${privatePagesFilterFragment('pages')}` : ''}`, [norms, sources, types]).catch(() => []);
+  })();
+  const [aliasHits, titleRows, caseRows] = await Promise.all([
+    engine.resolveAliases(norms, scope).catch(() => new Map<string, Array<{ slug: string; source_id: string }>>()),
+    titleRead,
+    engine.executeRaw<{ slug: string; alias_norm: string; alias_text: string | null }>(
+      `SELECT slug, alias_norm, alias_text FROM page_aliases WHERE alias_norm = ANY($1::text[]) AND case_sensitive AND source_id = ANY($2::text[])`,
+      [norms, sources]).catch(() => []),
+  ]);
   const covered = new Set<number>();
   for (const g of grams) {
     if ([...Array(g.to - g.from + 1).keys()].some(k => covered.has(g.from + k))) continue;
@@ -190,20 +198,25 @@ export async function aliasFanoutMax(engine: BrainEngine): Promise<number> {
 /**
  * Splice rows found under the entity's other names into `results`. `fallback`
  * supplies (name, alias) pairs the top rows declare, used when no entity
- * resolves. Fail-soft: any error returns `results` unchanged.
+ * resolves. `resolving` is `resolveQueryEntity` for the same query and scope,
+ * when the caller started it before the search. Fail-soft: any error returns
+ * `results` unchanged.
  */
 export async function withAliasFanOut(engine: BrainEngine, results: SearchResult[], queryText: string, scope: Scope, searchOpts: SearchOpts,
-  fallback: () => Array<{ name: string; alias: string; slug: string }>): Promise<{ results: SearchResult[]; fanout?: FanoutMeta; entity?: ResolvedEntity }> {
+  fallback: () => Array<{ name: string; alias: string; slug: string }>, resolving?: Promise<ResolvedEntity | null>): Promise<{ results: SearchResult[]; fanout?: FanoutMeta; entity?: ResolvedEntity }> {
   try {
     const max = await aliasFanoutMax(engine);
-    if (max === 0) return { results, ...(await resolveEntityQuiet(engine, queryText, scope)) };
+    if (max === 0) {
+      const entity = await (resolving ?? resolveQueryEntity(engine, queryText, scope)).catch(() => null);
+      return { results, ...(entity ? { entity } : {}) };
+    }
     const words = (text: string) => normalizeAlias(text).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
     const queryWords = words(queryText);
     const inQuery = (name: string) => {
       const w = words(name);
       return w.length > 0 && queryWords.some((_, i) => w.every((t, k) => queryWords[i + k] === t));
     };
-    const resolved = await resolveQueryEntity(engine, queryText, scope);
+    const resolved = await (resolving ?? resolveQueryEntity(engine, queryText, scope));
     let names: Array<{ alias: string; page: string }>;
     let usedTokens: [number, number] | null = null;
     if (resolved) {
@@ -244,9 +257,4 @@ export async function withAliasFanOut(engine: BrainEngine, results: SearchResult
   } catch {
     return { results };
   }
-}
-
-async function resolveEntityQuiet(engine: BrainEngine, query: string, scope: Scope): Promise<{ entity?: ResolvedEntity }> {
-  const entity = await resolveQueryEntity(engine, query, scope).catch(() => null);
-  return entity ? { entity } : {};
 }

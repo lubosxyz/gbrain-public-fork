@@ -5,7 +5,7 @@ import { buildChunkTokenLimitMarker } from '../core/embed-skip.ts';
 import { describeOversizedInput, isEmbedInputOversized, partitionEmbedInputs } from '../core/embed-input-guard.ts';
 import { AITransientError, isInputTooLargeError } from '../core/ai/errors.ts';
 import { isEmbeddingZeroNormError } from '../core/ai/embedding-guard.ts';
-import { statusFromCause } from '../core/embed-overlength-heal.ts';
+import { isSingleInputOverLengthError, statusFromCause } from '../core/embed-overlength-heal.ts';
 import { embedBatchKeepingUsable, embedBatchWithBackoff, isEmbedRetriableError, isTransientNetworkEmbedError, type EmbedBatchWithBackoffOpts } from '../core/embed-retry.ts';
 import type { Chunk } from '../core/types.ts';
 import { observed, type DbPacer } from '../core/db-pacer.ts';
@@ -83,7 +83,7 @@ export async function embedPageTexts(
       if (sendable.length <= 1) throw e; // nothing to isolate
       // #3374 — network-transient exhaustion isn't chunk-specific either:
       // fanning out during an outage multiplies failing calls per page.
-      if (isEmbedRetriableError(e) || isTransientNetworkEmbedError(e) || e instanceof AITransientError) throw e;
+      if (!isSingleInputOverLengthError(e) && (isEmbedRetriableError(e) || isTransientNetworkEmbedError(e) || e instanceof AITransientError)) throw e;
       const status = statusFromCause(e);
       if (status === 401 || status === 403) throw e;
     }

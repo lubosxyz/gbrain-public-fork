@@ -85,75 +85,51 @@ export function readRecordedPhysicalRootReservation(recorded: string): PhysicalR
   if (value && coordinationLockIsInsideRoot(recorded, value.coordinationPath)) throw physicalRootError('The stable coordination lock must live outside the canonical checkout.');
   return value;
 }
-/** Every invariant except where the coordination lock lives; the caller decides about that one. */
-function readReservationIdentity(root: string): PhysicalRootReservation | null {
+/** Whether `path` is `root` or lies under it (both canonical). */
+export function coordinationPathInsideRoot(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`);
+}
+function readReservationRecord(root: string, allowInsideLock = false): PhysicalRootReservation | null {
   const value = readPrivate(physicalRootReservationPath(root)) as PhysicalRootReservation | null;
   if (value === null) return null;
   if (value.version !== 1 || ![value.token,value.brainId,value.worktreeId,value.hostId].every(uuid)
     || value.root !== root || typeof value.coordinationPath !== 'string' || !isAbsolute(value.coordinationPath) || value.coordinationPath.includes('\0')
     || canonicalFilesystemPath(value.coordinationPath) !== value.coordinationPath
     || ![value.initialDevice,value.initialInode,value.initialBirth].every(part => part === null || typeof part === 'string' && /^\d+$/.test(part))) throw physicalRootError();
+  if (canonicalFilesystemPath(value.coordinationPath) !== value.coordinationPath) throw physicalRootError();
+  if (!allowInsideLock && coordinationPathInsideRoot(root, value.coordinationPath)) throw physicalRootError('The stable coordination lock must live outside the canonical checkout. '
+    + 'A reservation an older release wrote with its lock inside the checkout (GBRAIN_HOME inside the source root) is repaired by the next claim of this checkout on the host that reserved it; do not delete it.');
   return value;
 }
-export function coordinationLockIsInsideRoot(root: string, coordinationPath: string): boolean {
-  const lockRelative = relative(root, coordinationPath);
-  return !isAbsolute(lockRelative) && lockRelative !== '..' && !lockRelative.startsWith(`..${sep}`);
-}
-export function readPhysicalRootReservation(path: string): PhysicalRootReservation | null {
+/** #6766: the reservation an older release wedged with its lock inside the checkout (every other field valid), or null. */
+export function readWedgedPhysicalRootReservation(path: string): PhysicalRootReservation | null {
   const root = canonicalFilesystemPath(path);
-  const value = readReservationIdentity(root);
-  if (value === null) return null;
-  if (coordinationLockIsInsideRoot(root, value.coordinationPath)) throw physicalRootError('The stable coordination lock must live outside the canonical checkout.');
-  return value;
+  const value = readReservationRecord(root, true);
+  return value && coordinationPathInsideRoot(root, value.coordinationPath) ? value : null;
 }
-/**
- * Move an existing reservation's coordination lock out of its own checkout, keeping every identity
- * field. A v0.51 claim writes the reservation BEFORE validating it, so a brain whose persistence
- * home was inside its source root is left holding a record that no later read can accept — the
- * source is then unclaimable and every write fail-closes. Repair is identity-preserving (same
- * token, brain, worktree, host, inode stamps) and only ever moves the lock OUT of the root, so it
- * cannot adopt another owner's root or invent a new worktree.
- */
-/**
- * Guard for repairing ONE reservation. It is derived from the reservation file, which is fixed by
- * the root alone, so every repairer serializes on the same inode no matter how its coordination
- * home is configured. It lives beside the reservation — outside the checkout — and never becomes a
- * coordination lock itself.
- */
+/** The guard every wedged-reservation repairer of `root` takes: beside the reservation, so it never depends on the coordination env. */
 export function reservationRepairGuardPath(root: string): string {
   return `${physicalRootReservationPath(canonicalFilesystemPath(root))}.repair.lock`;
 }
-export async function repairReservationCoordinationPath(path: string, compliant: (worktreeId: string) => string,
-  localBrainId: string, localHostId: string): Promise<PhysicalRootReservation | null> {
+/**
+ * #6766: rewrite only the coordinationPath of a wedged reservation. The caller holds the repair guard and verified the
+ * brain, host and absence of a worktree row; the record is re-read and compared by digest before the atomic rename.
+ */
+export function repairReservationCoordinationPath(path: string, expected: PhysicalRootReservation, coordinationPath: string): void {
   const root = canonicalFilesystemPath(path);
-  // No record, or a record whose lock is already outside: nothing to repair and no guard to take,
-  // so a fresh claim never waits on an unrelated repair while it holds a database transaction.
-  const current = readReservationIdentity(root);
-  if (current === null || !coordinationLockIsInsideRoot(root, current.coordinationPath)) {
-    return readPhysicalRootReservation(root);
+  if (expected.root !== root || canonicalFilesystemPath(coordinationPath) !== coordinationPath || coordinationPathInsideRoot(root, coordinationPath)) {
+    throw physicalRootError('The repaired coordination lock must be a canonical path outside the canonical checkout.');
   }
-  const guard = await acquireNativeLock(reservationRepairGuardPath(root), { timeoutMs: 2000 });
-  if (!guard) throw new OperationError('writer_lock_unavailable', 'Another process is repairing this reservation.', 'Wait for the existing reservation repair to finish, then inspect writer status.');
-  try {
-    const value = readReservationIdentity(root);
-    if (value === null || !coordinationLockIsInsideRoot(root, value.coordinationPath)) return readPhysicalRootReservation(root);
-    if (value.brainId !== localBrainId) throw physicalRootError();
-    if (value.hostId !== localHostId) throw physicalRootError('Another host reserved this physical checkout.');
-    const coordinationPath = compliant(value.worktreeId);
-    if (coordinationLockIsInsideRoot(root, coordinationPath)) throw physicalRootError('The repaired coordination lock still lies inside the canonical checkout.');
-    const repaired: PhysicalRootReservation = { ...value, coordinationPath };
-    const target = physicalRootReservationPath(root);
-    const temporary = `${target}.${randomUUID()}.tmp`;
-    try {
-      createPrivate(temporary, repaired);
-      // Re-read under the guard: refuse if anything replaced the record while we prepared the copy.
-      const current = readReservationIdentity(root);
-      if (!current || current.token !== value.token || current.coordinationPath !== value.coordinationPath) throw physicalRootError();
-      renameSync(temporary, target); flushDirectory(dirname(target));
+  replacePrivate(physicalRootReservationPath(root), { ...expected, coordinationPath }, () => {
+    const current = readReservationRecord(root, true);
+    if (!current || digest(current) !== digest(expected)) {
+      const error = physicalRootError('The ownership reservation changed while its coordination lock was being repaired; run the claim again.');
+      error.detail = 'stale_record';
+      throw error;
     }
-    finally { try { unlinkSync(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; } }
-    return readPhysicalRootReservation(root);
-  } finally { await guard.release(); }
+  });
+  if (readPhysicalRootReservation(root)?.coordinationPath !== coordinationPath) throw physicalRootError('The repaired ownership reservation contains unexpected bytes.');
 }
 export function readPhysicalRootStamp(root: string): PhysicalRootStamp | null {
   const value = readPrivate(join(root, PHYSICAL_ROOT_MARKER)) as PhysicalRootStamp | null;
@@ -283,12 +259,13 @@ export function physicalRootDeviceChange(stamp: PhysicalRootStamp, reservation: 
     || info.birthtimeNs === 0n || stamp.device === info.dev.toString()) return null;
   return { from: stamp.device, to: info.dev.toString() };
 }
-function replacePrivate(path: string, value: unknown): void {
+function replacePrivate(path: string, value: unknown, beforeRename?: () => void): void {
   const temporary = `${path}.${randomUUID()}.tmp`;
   let created = false;
   try {
     created = createPrivate(temporary, value);
     if (!created || digest(readPrivate(temporary)) !== digest(value)) throw physicalRootError('The re-stamped ownership record contains unexpected bytes.');
+    beforeRename?.();
     renameSync(temporary, path); created = false; flushDirectory(dirname(path));
   } finally { if (created) try { unlinkSync(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; } }
 }

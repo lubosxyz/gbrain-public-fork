@@ -23,17 +23,21 @@ import { hasSourceFilesystemLock, withSourceFilesystemLock, assertSourceFilesyst
  */
 
 import { existsSync, statSync, mkdirSync, unlinkSync, readdirSync, readFileSync } from 'fs';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { atomicWriteFileSync } from './atomic-write.ts';
 import type { BrainEngine } from './engine.ts';
 import { isRelativeFileUri, serializePageToMarkdown, resolvePageFilePath, resolveSourceLocalFilePath } from './markdown.ts';
 import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
 import { readSlugRootMode, resolveSlugRootMode, type SlugRootMode } from './sync-anchor.ts';
 import { resolveSlugForPath } from './sync.ts';
+import { PUSH_SCAN_MAX_FILE_BYTES } from './page-size-policy.ts';
+import { canonicalFilesystemPath } from './persistence/root-registry.ts';
 import {
   isDurabilityHardened, commitWriteThroughFile, currentBranch, getLastPushOutcome,
   type PushLogOutcome,
 } from './brain-repo-durability.ts';
+import { bindOrigin } from './persistence/origin-guard.ts';
+import { urlCloneReadOnly } from './url-clone.ts';
 
 /** Minimal logger surface — structurally compatible with operations.ts `Logger`. */
 export interface WriteThroughLogger {
@@ -91,8 +95,10 @@ export interface WriteThroughResult {
    *   - file_changed: the caller passed `expectedFileBytes` and the file on
    *     disk no longer holds them (an edit landed after the caller read it) —
    *     the edit is kept and nothing is written.
+   *   - over_push_scan_cap: the rendered file is over the pre-push secret-scan
+   *     cap (PUSH_SCAN_MAX_FILE_BYTES), so committing it would block every push.
    */
-  skipped?: 'disabled_by_config' | 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root' | 'case_insensitive_collision' | 'file_changed';
+  skipped?: 'disabled_by_config' | 'url_clone' | 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root' | 'case_insensitive_collision' | 'file_changed' | 'over_push_scan_cap';
   /** Caller-visible advisory when a permitted DB-only outcome is still risky. */
   warning?: string;
   /** Set when the render/write/rename itself threw (EACCES, ENOTDIR, disk full). */
@@ -275,6 +281,27 @@ export async function scannerSlugRootMode(engine: BrainEngine, sourceId: string,
 }
 
 /**
+ * #2018/#7203: the other source whose own working tree is `path` or contains
+ * it, compared by filesystem identity, so a symlink, a trailing slash, or a
+ * macOS case or /private alias still matches. A spelling that cannot be
+ * resolved counts as a match: the leak guard fails closed.
+ */
+export async function otherSourceOwning(engine: BrainEngine, sourceId: string, path: string): Promise<string | null> {
+  const rows = await engine.executeRaw<{ id: string; local_path: string }>(
+    `SELECT id, local_path FROM sources WHERE id <> $1 AND local_path IS NOT NULL AND local_path <> '' ORDER BY id`,
+    [sourceId],
+  );
+  const identity = (spelling: string) => { try { return canonicalFilesystemPath(msysToNativePath(spelling)); } catch { return null; } };
+  const target = identity(path);
+  return rows.find(row => {
+    const other = identity(row.local_path);
+    if (target === null || other === null) return true;
+    const rel = relative(other, target);
+    return !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`);
+  })?.id ?? null;
+}
+
+/**
  * Compute the ONE file a (source, slug) pair lives in on disk.
  *
  * #2018: pick the disk target so a page is NEVER written into a different
@@ -362,18 +389,15 @@ export async function resolvePageWriteTarget(
     if (!existsSync(repoPath) || !statSync(repoPath).isDirectory()) {
       return { ok: false, skipped: 'repo_not_found' };
     }
-    // Leak guard: refuse to write into a path that is some OTHER source's
-    // own working tree (#2018).
-    const collide = await engine.executeRaw<{ one: number }>(
-      `SELECT 1 AS one FROM sources WHERE id <> $1 AND local_path = $2 LIMIT 1`,
-      [sourceId, repoPath],
-    );
-    if (collide.length > 0) {
-      return { ok: false, skipped: 'source_repo_belongs_to_other_source' };
-    }
     const pageRoot = sourceId === 'default' ? repoPath : join(repoPath, '.sources', sourceId);
     const knownPath = recordedPath ?? recordedPathFromFileUri(recordedUri, pageRoot);
     filePath = knownPath ? join(pageRoot, knownPath) : resolvePageFilePath(repoPath, slug, sourceId);
+    // Leak guard: refuse a file inside some OTHER source's own working tree
+    // (#2018) under any spelling, whether sync.repo_path is that tree, lies
+    // inside it, or contains it (#7203).
+    if (await otherSourceOwning(engine, sourceId, filePath)) {
+      return { ok: false, skipped: 'source_repo_belongs_to_other_source' };
+    }
     writeRoot = repoPath;
     // pageRoot, not repoPath: a later `sources add --path <pageRoot>` scan
     // walks pageRoot, so the bind must speak that scan's convention.
@@ -397,6 +421,7 @@ export async function resolvePageWriteTarget(
  * `sync.repo_path`. Never throws — failures are reported via the result's
  * `skipped` / `error` fields. put_page calls it before its transaction commits
  * and rejects non-deliberate skips so a file failure rolls back the DB write.
+ * A clone gbrain owns on an unmanaged brain is skipped (`url_clone`, #6946).
  */
 export async function writePageThrough(
   engine: BrainEngine,
@@ -412,6 +437,9 @@ export async function writePageThrough(
     // loops don't pay one config SELECT per page.
     if (await isWriteThroughDisabled(engine)) {
       return { written: false, skipped: 'disabled_by_config' };
+    }
+    if (await urlCloneReadOnly(engine, sourceId)) {
+      return { written: false, skipped: 'url_clone' };
     }
     const target = await resolvePageWriteTarget(engine, slug, sourceId);
     if (!target.ok) {
@@ -431,6 +459,12 @@ export async function writePageThrough(
     const md = serializePageToMarkdown(writtenPage, tags, {
       frontmatterOverrides: opts.frontmatterOverrides,
     });
+    // The pre-push secret scan refuses to push any file it cannot scan, so a
+    // file over its cap would block every later push of the brain repo.
+    if (Buffer.byteLength(md, 'utf-8') > PUSH_SCAN_MAX_FILE_BYTES) {
+      opts.logger?.warn(`[write-through] ${slug}: the rendered file is over the ${PUSH_SCAN_MAX_FILE_BYTES}-byte pre-push secret-scan cap — file not written (DB row is intact)`);
+      return { written: false, skipped: 'over_push_scan_cap' };
+    }
 
     // #2831: two distinct DB slugs differing only by case (FOO vs foo) resolve
     // to the SAME file on a case-insensitive filesystem — the second write
@@ -460,25 +494,22 @@ export async function writePageThrough(
     // EEXIST when the directory already exists (POSIX no-ops it). That aborts
     // the put_page / enrich / capture write-through whenever the prefix dir
     // already exists, silently leaving the DB and the .md file plane out of sync.
-    if (opts.expectedFileBytes !== undefined
-      && (existsSync(filePath) ? readFileSync(filePath, 'utf-8') : null) !== opts.expectedFileBytes) {
-      return { written: false, skipped: 'file_changed' };
-    }
+    const fileChanged = () => opts.expectedFileBytes !== undefined
+      && (existsSync(filePath) ? readFileSync(filePath, 'utf-8') : null) !== opts.expectedFileBytes;
+    if (fileChanged()) return { written: false, skipped: 'file_changed' };
 
+    await engine.transaction(tx => bindOrigin(tx, { sourceId, slug, sourcePath: sourcePathToBind, onlyIfUnset: true, liveOnly: true }));
     assertSourceFilesystemActive();
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-
-    await engine.executeRaw(
-      `UPDATE pages
-          SET source_path = $1
-        WHERE source_id = $2
-          AND slug = $3
-          AND deleted_at IS NULL
-          AND source_path IS NULL`,
-      [sourcePathToBind, sourceId, slug],
-    );
     assertSourceFilesystemActive();
-    atomicWriteFileSync(filePath, md, { verify: () => assertSourceFilesystemActive() });
+    if (fileChanged()) return { written: false, skipped: 'file_changed' };
+    const changedWhileStaging = new Error('file_changed');
+    try {
+      atomicWriteFileSync(filePath, md, { verify: () => { assertSourceFilesystemActive(); if (fileChanged()) throw changedWhileStaging; } });
+    } catch (error) {
+      if (error === changedWhileStaging) return { written: false, skipped: 'file_changed' };
+      throw error;
+    }
 
     // #2426: on a durability-hardened repo (user ran `gbrain sources harden`),
     // commit the artifact so it reaches git — pre-fix, write-through content
@@ -495,7 +526,7 @@ export async function writePageThrough(
         committed = commitWriteThroughFile(writeRoot, filePath, slug);
         if (committed) {
           pushed = 'pending';
-          lastPushStatus = getLastPushOutcome(currentBranch(writeRoot));
+          lastPushStatus = getLastPushOutcome(currentBranch(writeRoot), writeRoot);
         }
       }
     } catch { /* best-effort */ }
@@ -528,10 +559,13 @@ export interface DeleteThroughResult {
    * Non-error reasons nothing was removed. Shares the target-resolution skip
    * vocabulary (kept in lockstep via the Extract), plus:
    *   - disabled_by_config: the operator opted the brain out of the disk sink.
+   *   - url_clone: the source is a clone gbrain owns and pulls (#6946); its checkout is never written.
    *   - file_not_present: the page had no artifact on disk (DB-only page, or
    *     already removed by hand) — a clean no-op, not a failure.
+   *   - file_changed: the caller passed `expectedFileBytes` and the file no
+   *     longer holds them (an edit landed after the caller read it) — kept.
    */
-  skipped?: 'disabled_by_config' | 'file_not_present' | Extract<PageWriteTarget, { ok: false }>['skipped'];
+  skipped?: 'disabled_by_config' | 'url_clone' | 'file_not_present' | 'file_changed' | Extract<PageWriteTarget, { ok: false }>['skipped'];
   /** Set when the unlink itself threw (EACCES, EPERM, read-only mount). */
   error?: string;
 }
@@ -559,11 +593,15 @@ export interface DeleteThroughResult {
  * stamp would miss the recorded path, fall back to the slug-derived twin, and
  * report a clean `file_not_present` no-op while the REAL artifact stayed on
  * disk — the very silent-no-op class this helper exists to close.
+ *
+ * `opts.expectedFileBytes`: the file bytes the caller compared; rechecked
+ * under the source filesystem lock right before the unlink, and a file that
+ * changed since is kept (`skipped: 'file_changed'`).
  */
 export async function deletePageThrough(
   engine: BrainEngine,
   slug: string,
-  opts: { sourceId?: string; logger?: WriteThroughLogger; target?: PageWriteTarget } = {},
+  opts: { sourceId?: string; logger?: WriteThroughLogger; target?: PageWriteTarget; expectedFileBytes?: string } = {},
 ): Promise<DeleteThroughResult> {
   const sourceId = opts.sourceId ?? 'default';
   try {
@@ -571,6 +609,9 @@ export async function deletePageThrough(
     // the disk sink entirely — never unlink files gbrain does not own.
     if (await isWriteThroughDisabled(engine)) {
       return { removed: false, skipped: 'disabled_by_config' };
+    }
+    if (await urlCloneReadOnly(engine, sourceId)) {
+      return { removed: false, skipped: 'url_clone' };
     }
     const target = opts.target ?? await resolvePageWriteTarget(engine, slug, sourceId);
     if (!target.ok) return { removed: false, skipped: target.skipped };
@@ -581,6 +622,9 @@ export async function deletePageThrough(
 
     if (!existsSync(filePath)) {
       return { removed: false, path: filePath, skipped: 'file_not_present' };
+    }
+    if (opts.expectedFileBytes !== undefined && readFileSync(filePath, 'utf-8') !== opts.expectedFileBytes) {
+      return { removed: false, path: filePath, skipped: 'file_changed' };
     }
 
     assertSourceFilesystemActive();

@@ -10,11 +10,13 @@
  * shared by every machine on that database, so one machine's explicit run
  * does not override what the owner set for all of them.
  */
-import { createEngine } from '../../core/engine-factory.ts';
-import { isThinClient, toEngineConfig, type GBrainConfig } from '../../core/config.ts';
+import { isThinClient, type GBrainConfig } from '../../core/config.ts';
 import { declinedMigrations } from '../../core/migration-ledger.ts';
 import { opError, type OperationError } from '../../core/ops/contract.ts';
 import type { Migration } from './types.ts';
+import { connectMigrationEngine } from './run-engine.ts';
+import { hostWorkMigrations } from '../../core/shared-skills/migration-host-work.ts';
+import type { BrainEngine } from '../../core/engine.ts';
 
 export { declinedMigrations, isMigrationDeclinedValue } from '../../core/migration-ledger.ts';
 
@@ -26,9 +28,19 @@ export { declinedMigrations, isMigrationDeclinedValue } from '../../core/migrati
 export async function readDeclinedMigrations(config: GBrainConfig): Promise<Set<string>> {
   if (isThinClient(config)) return new Set();
   try {
-    const engine = await createEngine(toEngineConfig(config));
-    await engine.connect(toEngineConfig(config));
-    try { return await declinedMigrations(engine); } finally { await engine.disconnect(); }
+    const { engine, close } = await connectMigrationEngine(config);
+    try { return await declinedMigrations(engine); } finally { await close(); }
+  } catch {
+    return new Set();
+  }
+}
+
+/** #6796: the applied migrations whose stored report still names host work; an unreachable brain reads as none. */
+export async function readHostWorkMigrations(config: GBrainConfig): Promise<Set<string>> {
+  if (isThinClient(config)) return new Set();
+  try {
+    const { engine, close } = await connectMigrationEngine(config);
+    try { return await hostWorkMigrations(engine as BrainEngine); } finally { await close(); }
   } catch {
     return new Set();
   }

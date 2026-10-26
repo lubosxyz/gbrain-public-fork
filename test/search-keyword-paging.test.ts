@@ -21,12 +21,13 @@
  * keyword counts or keyword-mode paging (new surface); (4) no new seam: the
  * unavailable-count tests wrap the real engine.
  */
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { dispatchToolCall, type ToolResult } from '../src/mcp/dispatch.ts';
 import { errorCodeRow } from '../src/core/error-docs.ts';
 import { countKeywordMatches, searchCountLine } from '../src/core/search/keyword-paging.ts';
+import { safeChunksFilter } from '../src/core/search/safe-chunks.ts';
 import { withEnv } from './helpers/with-env.ts';
 import {
   DOMINANT_CHUNKS, DOMINANT_SLUG, MANY_PAGES, MIXED_TYPES, TERM, callSearch, seedKeywordCorpus, seedPage, walkKeyword,
@@ -74,6 +75,24 @@ describe('engine: strict keyword pages', () => {
     expect(relaxed.length).toBe(2);
     expect(await engine.countKeywordPages('zephyrine obsidianite')).toBe(0);
     expect(await engine.searchKeywordPages('zephyrine obsidianite', undefined, { limit: 10 })).toEqual([]);
+  });
+
+  test('a CJK count binds only the parameters its WHERE reads and equals the rows, under filters', async () => {
+    await seedPage(engine, 'notes/cjk-glucose-a', '오늘 혈당 기록을 정리했다.');
+    await seedPage(engine, 'meetings/cjk-glucose-b', '회의에서 혈당 관리 방안을 논의했다.', { type: 'meeting' });
+    await seedPage(engine, 'notes/cjk-other', '오늘 날씨가 맑았다.');
+    try {
+      expect(await engine.countKeywordPages('혈당')).toBe(2);
+      expect(await engine.countKeywordPages('혈당', { types: ['meeting'], sourceId: 'default' })).toBe(1);
+      expect(await countKeywordMatches(engine, '혈당', {})).toEqual({ total: 2, capped: false });
+      const rows = await engine.searchKeywordPages('혈당', undefined, { limit: 10 });
+      expect(rows.map(r => r.slug).sort()).toEqual(['meetings/cjk-glucose-b', 'notes/cjk-glucose-a']);
+      const hybrid = await callSearch(engine, { query: '혈당' });
+      expect(hybrid.retrieval.keyword_total).toBe(2);
+      expect(hybrid.retrieval.degraded ?? []).not.toContainEqual(expect.objectContaining({ stage: 'keyword_count_unavailable' }));
+    } finally {
+      await engine.executeRaw(`DELETE FROM pages WHERE slug LIKE '%/cjk-%'`);
+    }
   });
 });
 
@@ -217,6 +236,8 @@ describe('MCP: model-visible counts and paging (content blocks only, no _meta)',
     await seedPage(engine, 'meetings/sos-1', `${TERM} ${TERM} ${TERM} sos short one.`, { type: 'meeting' });
     await seedPage(engine, 'meetings/sos-2', `${TERM} sos oversized middle. ${'Filler sentence about logistics planning. '.repeat(400)}`, { type: 'meeting' });
     await seedPage(engine, 'meetings/sos-3', `${TERM} sos short three.`, { type: 'meeting' });
+    // Delivery's own omission contract, without W5's whole-page cut (default on), which stops at the oversized page.
+    await engine.setConfig('search.page_rank_cut', 'off');
     try {
       const keyword = await callSearch(engine, { query: `${TERM} sos`, match: 'keyword', types: ['meeting'] });
       const order = keyword.rows.map(r => String(r.slug));
@@ -227,6 +248,7 @@ describe('MCP: model-visible counts and paging (content blocks only, no _meta)',
       expect(order).toEqual(['meetings/sos-1', 'meetings/sos-2', 'meetings/sos-3']);
       expect(rows.filter(r => r.evidence_omitted).map(r => r.slug)).toEqual(['meetings/sos-2']);
     } finally {
+      await engine.unsetConfig('search.page_rank_cut');
       await engine.executeRaw(`DELETE FROM pages WHERE slug LIKE 'meetings/sos-%'`);
     }
   });
@@ -291,6 +313,44 @@ describe('count unavailable: a degraded stage, never a number', () => {
     expect(await countKeywordMatches(stalled(engine, 'timeout'), TERM, {}, 1000)).toEqual({ unavailable: 'timeout' });
   });
 
+  const delayed = (base: BrainEngine, ms: number, seen: Array<Record<string, unknown> | undefined>): BrainEngine => new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop === 'countKeywordPages') {
+        return async (q: string, o?: Record<string, unknown>) => { seen.push(o); await new Promise(r => setTimeout(r, ms)); return target.countKeywordPages(q, o as never); };
+      }
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+  const after = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+  test('#6632: a count past the floor still lands while the search is running', async () => {
+    const seen: Array<Record<string, unknown> | undefined> = [];
+    const count = await countKeywordMatches(delayed(engine, 150, seen), TERM, {}, 50, after(400));
+    expect('total' in count ? count.total : -1).toBeGreaterThan(0);
+  });
+
+  test('#6632: a count still running after the search and its grace is given up, not waited on', async () => {
+    const started = Date.now();
+    expect(await countKeywordMatches(stalled(engine, 'hang'), TERM, {}, 50, after(150))).toEqual({ unavailable: 'timeout' });
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(150);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  test('#6632: the count statement runs under the operator bound, not a narrower fixed deadline', async () => {
+    const seen: Array<Record<string, unknown> | undefined> = [];
+    await countKeywordMatches(delayed(engine, 0, seen), TERM, {}, 50);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.timeoutMs).toBeUndefined();
+  });
+
+  test('#6632: the safe-chunk predicate compares the bare NOT NULL column, so the planner keeps its statistics', async () => {
+    expect(await engine.executeRaw(`SELECT data_type, is_nullable FROM information_schema.columns WHERE table_name = 'pages' AND column_name = 'chunker_version'`))
+      .toEqual([{ data_type: 'smallint', is_nullable: 'NO' }]);
+    expect(safeChunksFilter('p')).toBe('p.chunker_version >= 4');
+  });
+
   test('over MCP: the line says unavailable, the stage is recorded, keyword paging still works', async () => {
     const e = stalled(engine, 'timeout');
     const hybrid = await withEnv({ GBRAIN_BACKUP_CHECK: '0' }, () => dispatchToolCall(e, 'search', { query: TERM }, REMOTE));
@@ -299,6 +359,26 @@ describe('count unavailable: a degraded stage, never a number', () => {
     const keyword = await withEnv({ GBRAIN_BACKUP_CHECK: '0' }, () => dispatchToolCall(e, 'search', { query: TERM, match: 'keyword', limit: 3 }, REMOTE));
     expect(countLine(keyword)).toStartWith('[gbrain search] Keyword match count unavailable (timed out; not a count of zero); showing 1-3');
     expect(nextFromLine(countLine(keyword))).toBeDefined();
+  });
+
+  test('a failed (non-timeout) count is unavailable with its SQLSTATE logged once per process', async () => {
+    const failing = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'countKeywordPages') return async () => { throw Object.assign(new Error('bind message supplies 2 parameters'), { code: '08P01' }); };
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    }) as BrainEngine;
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(await countKeywordMatches(failing, TERM, {}, 1000)).toEqual({ unavailable: 'error' });
+      expect(await countKeywordMatches(failing, TERM, {}, 1000)).toEqual({ unavailable: 'error' });
+      const logged = warn.mock.calls.map(c => String(c[0])).filter(l => l.includes('Keyword match count failed'));
+      expect(logged).toEqual([expect.stringContaining('SQLSTATE 08P01')]);
+      expect(logged[0]).not.toContain(TERM);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test('the line renderer never invents a number', () => {

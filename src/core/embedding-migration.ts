@@ -11,7 +11,7 @@ import {
   lockEmbeddingSources,
   splitEmbeddingSignature,
   currentSpaceChunkPredicate,
-  countRestampOnlyChunks,
+  measureRestampOnlyChunks,
 } from './embedding-invalidation.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { readPrimaryEmbeddingStores, readStoredEmbeddingIdentity } from './stored-embedding-identity.ts';
@@ -21,6 +21,7 @@ import { AUDIT_ROW_SOURCES } from './facts/audit-sources.ts';
 import { countStaleFactEmbeddings } from './facts/embedding-identity.ts';
 import { prepareEmbeddingProjections } from './embedding-readiness.ts';
 import { assertRetainedEmbeddingRebuildability } from './embedding-migration-retention.ts';
+import { withMigrationLeaseTransaction, type MigrationLeaseAssert } from './embedding-migration-budget.ts';
 import { annIndexValidity, canonicalChunkAnnIndex, mergeDeferredAnnIndexes, parseDeferredAnnIndexes, type DeferredAnnIndex } from './embedding-ann-build.ts';
 import { SMOKE_QUERY_CHUNK_UNITS, SMOKE_QUERY_TITLE_UNITS } from './embedding-migration-worst-case.ts';
 
@@ -630,7 +631,9 @@ export async function planEmbeddingMigration(
     // counts what the stamp hides. No overlap — the stale predicates skip
     // exactly the target-stamped pages' EMBEDDED chunks counted here.
     falseStamped = await countFalseStampedChunks(engine, toModel, toDims);
-    if (!schemaRebuildNeeded(col.dims, toDims)) restamp = await countRestampOnlyChunks(engine, { signature: sig, includeNullSignature: true });
+    const kept = schemaRebuildNeeded(col.dims, toDims) ? { chunks: 0, chars: 0 } : await measureRestampOnlyChunks(engine, { signature: sig, includeNullSignature: true });
+    restamp = kept.chunks;
+    totalChars = Math.max(0, totalChars - kept.chars);
   } else {
     // Column ABSENT: the stale predicates reference cc.embedding and would
     // throw. Every chunk needs embedding once the column is (re)built.
@@ -1197,7 +1200,7 @@ export async function applyEmbeddingMigration(
     ignoreEnvOverride?: boolean;
     /** Persist target model+dims to the file plane + reconfigure the gateway. */
     persistConfig?: (toModel: string, toDims: number, tx: BrainEngine) => void | Promise<void>;
-    assertOwned?: (tx?: BrainEngine) => Promise<void>;
+    assertOwned?: MigrationLeaseAssert;
   } = {},
 ): Promise<MigrationApplyResult> {
   const envWarning = detectEnvOverride(plan.to_model, plan.to_dims);
@@ -1207,9 +1210,10 @@ export async function applyEmbeddingMigration(
 
   try {
     await opts.assertOwned?.();
-    await engine.transaction(async tx => { await opts.assertOwned?.(tx); await assertRetainedEmbeddingRebuildability(tx, plan.to_dims, plan.to_model, plan); });
+    await withMigrationLeaseTransaction(engine, opts.assertOwned,
+      tx => assertRetainedEmbeddingRebuildability(tx, plan.to_dims, plan.to_model, plan), { deadlockRetries: 3 });
     const readiness = await prepareEmbeddingProjections(engine, { repair: true, assertOwned: opts.assertOwned });
-    if (readiness.blocked) return { status: 'failed', reason: `projection_blocked: ${readiness.blocked} page(s) remain; no embedding invalidation performed. Canonical projection recovery may have made durable progress. Inspect blockers before retrying: archived sources require deliberate gbrain sources restore <id>; unsupported media requires its source importer. See docs/guides/embedding-migration.md#recovery.` };
+    if (readiness.blocked) return { status: 'failed', reason: `projection_blocked: ${readiness.blocked} page(s) remain; no embedding invalidation performed. Canonical projection recovery may have made durable progress. Inspect blockers before retrying: archived sources require deliberate gbrain sources restore <id>; image pages are counted by class in gbrain doctor --only text_projection_readiness --json (gbrain projections drain seals the sealable ones). See docs/guides/embedding-migration.md#recovery.` };
     await opts.assertOwned?.();
     // 1. State marker FIRST — a crash after any later step is resumable.
     //    Same-target re-apply PRESERVES the original started_at (set-if-
@@ -1251,8 +1255,7 @@ export async function applyEmbeddingMigration(
         { to_model: prior.state.to_model, to_dims: prior.state.to_dims, started_at: prior.state.started_at },
       ];
     }
-    await engine.transaction(async tx => {
-      await opts.assertOwned?.(tx);
+    await withMigrationLeaseTransaction(engine, opts.assertOwned, async tx => {
       await assertRetainedEmbeddingRebuildability(tx, plan.to_dims, plan.to_model, plan);
       await tx.setConfig(MIGRATION_STATE_KEY, JSON.stringify(state));
     });
@@ -1272,8 +1275,7 @@ export async function applyEmbeddingMigration(
       const pinned = await readDimPinnedWidths(engine);
       const stalePinned = pinned.filter((p) => schemaRebuildNeeded(p.dims, plan.to_dims));
       if (stalePinned.length > 0) {
-        await engine.transaction(async (tx) => {
-          await opts.assertOwned?.(tx);
+        await withMigrationLeaseTransaction(engine, opts.assertOwned, async (tx) => {
           await assertRetainedEmbeddingRebuildability(tx, plan.to_dims, plan.to_model, plan);
           const stalePinned = (await readDimPinnedWidths(tx)).filter(p => schemaRebuildNeeded(p.dims, plan.to_dims));
           const ann: DeferredAnnIndex[] = [];
@@ -1299,8 +1301,7 @@ export async function applyEmbeddingMigration(
     //    vectors are invisible to every stale selector, so NULLing them
     //    would be permanent loss.
     //
-    const invalidated = await engine.transaction(async tx => {
-      await opts.assertOwned?.(tx);
+    const invalidated = await withMigrationLeaseTransaction(engine, opts.assertOwned, async tx => {
       await assertRetainedEmbeddingRebuildability(tx, plan.to_dims, plan.to_model, plan);
       await clearFalseStampedSignatures(tx, plan.to_model, plan.to_dims);
       return invalidateStaleSignatureEmbeddingsGuarded(tx, {
@@ -1310,8 +1311,7 @@ export async function applyEmbeddingMigration(
     });
 
     let cacheCleared = 0;
-    await engine.transaction(async (tx) => {
-      await opts.assertOwned?.(tx);
+    await withMigrationLeaseTransaction(engine, opts.assertOwned, async (tx) => {
       const clearCompanions = await assertRetainedEmbeddingRebuildability(tx, plan.to_dims, plan.to_model, plan);
       const stores = await readPrimaryEmbeddingStores(tx);
       if (clearCompanions) {

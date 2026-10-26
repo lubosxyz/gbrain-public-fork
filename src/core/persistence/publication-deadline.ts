@@ -19,8 +19,9 @@
  * The wave 9 yield between groups is outside any one `boundPublication` call, so it never counts against a group.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { BrainEngine } from '../engine.ts';
+import type { BrainEngine, TransactionOptions } from '../engine.ts';
 import { gucMilliseconds, resolveSessionTimeouts } from '../db.ts';
+import { declareDurablePersistence } from './protocol.ts';
 
 export const PUBLICATION_CEILING_KEY = 'persistence.publication_ceiling_ms';
 /** `persistence.publication_ceiling_ms`' default (60000 to 3600000 accepted). */
@@ -28,17 +29,40 @@ export const PUBLICATION_CEILING_DEFAULT_MS = 5 * 60_000;
 /** After the ceiling: how long before the publication's signal is aborted, and how long after that before `restart_required`. */
 export const PUBLICATION_GRACE_MS = 30_000;
 export const PUBLICATION_SETTLE_MS = 5_000;
+
+/** #6574: the claim lease a publication takes before it opens its transaction: past it, the owner has already reported restart_required. */
+export function publicationLeaseMs(ceilingMs: number, marginMs = 30_000): number {
+  return ceilingMs + PUBLICATION_GRACE_MS + PUBLICATION_SETTLE_MS + marginMs;
+}
 const CEILING_TTL_MS = 5_000;
 
 let ceiling = { value: PUBLICATION_CEILING_DEFAULT_MS, at: 0 };
 const signals = new AsyncLocalStorage<AbortSignal>();
 
+/** Test seam (`_setPublicationTimingForTest`): a ceiling and grace below the accepted range, so a test can overrun the ceiling. */
+let testTiming: { ceilingMs: number; graceMs: number } | undefined;
+
 /** The ceiling (cached for 5 s); anything missing or outside 60000..3600000 reads as the default. */
 export async function readPublicationCeilingMs(engine: Pick<BrainEngine, 'getConfig'>): Promise<number> {
+  if (testTiming) return testTiming.ceilingMs;
   if (Date.now() - ceiling.at < CEILING_TTL_MS) return ceiling.value;
   const n = Number((await engine.getConfig(PUBLICATION_CEILING_KEY).catch(() => null))?.trim());
   ceiling = { value: Number.isInteger(n) && n >= 60_000 && n <= 3_600_000 ? n : PUBLICATION_CEILING_DEFAULT_MS, at: Date.now() };
   return ceiling.value;
+}
+
+/** Test seam: the next readPublicationCeilingMs reads the config again. */
+export function _resetPublicationCeilingForTest(): void { ceiling = { ...ceiling, at: 0 }; }
+/** Test seam: every publication's ceiling and grace (undefined restores the configured ceiling and `PUBLICATION_GRACE_MS`). */
+export function _setPublicationTimingForTest(timing: { ceilingMs: number; graceMs: number } | undefined): void { testTiming = timing; }
+
+/**
+ * Large-pages hardening (c): whether the current publication (the `boundPublication` this async context runs in) was
+ * cancelled at the ceiling. transient-retry.ts counts such a publication's failure against `persistence.max_transient_retries`.
+ */
+export function publicationDeadlinePassed(): boolean {
+  const signal = signals.getStore();
+  return !!signal?.aborted && (signal.reason as { code?: unknown } | null)?.code === 'publication_deadline';
 }
 
 /** The idle-in-transaction bound a publish transaction gets: the ceiling, never above the pool's own session value. */
@@ -58,16 +82,28 @@ export async function bindPublicationTimeouts(tx: BrainEngine): Promise<void> {
 }
 
 /**
+ * #6712 L6: the publication's opening statement: the idle bound above (Postgres only, for the same reason) and
+ * `declareDurablePersistence` in one round trip. A refused SET fails the publication's transaction as above.
+ */
+export async function declarePublication(tx: BrainEngine, bound: Pick<BrainEngine, 'kind'> = tx): Promise<string | null> {
+  return declareDurablePersistence(tx, undefined, undefined, bound.kind === 'postgres' ? `${publicationIdleTimeoutMs()}ms` : undefined);
+}
+
+/**
  * `engine.transaction`, passing the current publication's signal on as `{ signal }`. An aborted transaction rejects
  * while its body may still be parked, so a rejection waits for the body to settle first: nothing (recovery included)
- * acts on the publication while the body can still rename a file.
+ * acts on the publication while the body can still rename a file. `pipelineFirst` (GBRA-156) is for a body that opens
+ * with `declarePublication` and does nothing that needs BEGIN answered first; a lane group's body does (its begun mark
+ * orders the next group's BEGIN), so the group runner passes none.
  */
-export async function publicationTransaction<T>(engine: BrainEngine, fn: (tx: BrainEngine) => Promise<T>): Promise<T> {
+export async function publicationTransaction<T>(engine: BrainEngine, fn: (tx: BrainEngine) => Promise<T>,
+  { pipelineFirst }: Pick<TransactionOptions, 'pipelineFirst'> = {}): Promise<T> {
   const signal = signals.getStore();
-  if (!signal) return engine.transaction(fn);
+  const first = pipelineFirst ? { pipelineFirst } : {};
+  if (!signal) return pipelineFirst ? engine.transaction(fn, first) : engine.transaction(fn);
   let body: Promise<unknown> = Promise.resolve();
   try {
-    return await engine.transaction(tx => { const run = fn(tx); body = run; return run; }, { signal });
+    return await engine.transaction(tx => { const run = fn(tx); body = run; return run; }, { signal, ...first });
   } catch (error) {
     await body.then(() => undefined, () => undefined);
     const closed = (error as { cause?: { code?: unknown } })?.cause?.code;
@@ -104,7 +140,7 @@ export function boundPublication<T>(publish: () => Promise<T>, bound: Publicatio
   const schedule = bound.later ?? realTimer;
   const cancels: Array<() => void> = [];
   const later = (ms: number, fn: () => void) => { cancels.push(schedule(ms, fn)); };
-  const grace = bound.graceMs ?? PUBLICATION_GRACE_MS, settle = bound.settleMs ?? PUBLICATION_SETTLE_MS;
+  const grace = bound.graceMs ?? testTiming?.graceMs ?? PUBLICATION_GRACE_MS, settle = bound.settleMs ?? PUBLICATION_SETTLE_MS;
   later(bound.ceilingMs, () => bound.onOverdue?.());
   later(bound.ceilingMs + grace, () => controller.abort(Object.assign(new Error('publication_deadline'), { code: 'publication_deadline' })));
   later(bound.ceilingMs + grace + settle, () => bound.onStuck?.(settled));

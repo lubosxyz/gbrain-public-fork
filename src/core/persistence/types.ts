@@ -7,7 +7,7 @@ export type WriteRequestState = typeof WRITE_REQUEST_STATES[number];
 
 export const WRITE_ERROR_CODES = [
   'writer_lock_unavailable', 'writer_pool_capacity', 'owner_unavailable',
-  'recovery_required', 'queue_capacity', 'revision_required', 'revision_conflict',
+  'recovery_required', 'queue_capacity', 'write_quota_exhausted', 'write_quota_insufficient', 'write_capacity_backpressure', 'revision_required', 'revision_conflict',
   'idempotency_conflict', 'source_changed', 'write_pending', 'storage_error', 'cancelled',
   'permission_denied', 'scope_denied', 'invalid_params', 'not_found', 'page_not_found',
   'page_identity_changed', 'write_claim_lost', 'request_too_large', 'response_too_large',
@@ -19,8 +19,8 @@ export const WRITE_ERROR_CODES = [
   'invalid_connector_text', 'connector_holds_exhausted', 'connector_fence_below_timeline',
   'core_budget_exceeded', 'core_mark_owner_only', 'core_remote_edit_refused', 'core_delete_owner_only',
   'timeline_rows_would_be_removed', 'purged_content', 'preparation_stalled',
-  'fence_unrenderable',
-  'write_outcome_unknown',
+  'fence_unrenderable', 'page_body_segmented', 'revision_changed', 'tail_changed',
+  'write_outcome_unknown', 'write_interrupted', 'connection_inherited_read_only',
 ] as const;
 
 export type WriteErrorCode = typeof WRITE_ERROR_CODES[number];
@@ -52,10 +52,14 @@ export interface WriteReceipt {
     mode: 'filesystem' | 'database';
     file_written?: boolean;
     git_state?: string;
+    /** G2: the commit a strict (canonical: git) source's write was committed in before its row. */
+    git_commit?: string;
   };
   created_at?: string;
   updated_at?: string;
   diagnostic?: WriteDiagnostic;
+  /** #7248: a remember's target page and the entity slug its fact is keyed under (set on its own replies, never read back from the journal). */
+  target?: { slug: string | null; entity_slug: string | null };
 }
 
 /** Wire names stay separate from the engine's camelCase precondition. */
@@ -116,6 +120,7 @@ export function isWriteReceipt(value: unknown): value is WriteReceipt {
     if (!isRecord(value.persistence) || !['filesystem', 'database'].includes(String(value.persistence.mode))) return false;
     if (value.persistence.file_written !== undefined && typeof value.persistence.file_written !== 'boolean') return false;
     if (value.persistence.git_state !== undefined && typeof value.persistence.git_state !== 'string') return false;
+    if (value.persistence.git_commit !== undefined && typeof value.persistence.git_commit !== 'string') return false;
   }
   return true;
 }
@@ -146,9 +151,11 @@ export function publicWriteReceipt(receipt: WriteReceipt): WriteReceipt {
       mode: receipt.persistence.mode,
       ...(receipt.persistence.file_written !== undefined ? { file_written: receipt.persistence.file_written } : {}),
       ...(receipt.persistence.git_state !== undefined ? { git_state: receipt.persistence.git_state } : {}),
+      ...(receipt.persistence.git_commit !== undefined ? { git_commit: receipt.persistence.git_commit } : {}),
     } } : {}),
     ...(receipt.created_at !== undefined ? { created_at: receipt.created_at } : {}),
     ...(receipt.updated_at !== undefined ? { updated_at: receipt.updated_at } : {}),
+    ...(receipt.target !== undefined ? { target: receipt.target } : {}),
     ...(!isTerminalWriteState(receipt.state) && isWriteDiagnostic(receipt.diagnostic) ? { diagnostic: {
       age_ms: receipt.diagnostic.age_ms, assessment: receipt.diagnostic.assessment,
       reason: receipt.diagnostic.reason, next_action: receipt.diagnostic.next_action,

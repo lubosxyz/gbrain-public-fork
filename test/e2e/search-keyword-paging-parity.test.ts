@@ -88,12 +88,32 @@ for (const backend of backends) {
       await seedPage(e, 'meetings/sos-1', `${TERM} ${TERM} ${TERM} sos short one.`, { type: 'meeting' });
       await seedPage(e, 'meetings/sos-2', `${TERM} sos oversized middle. ${'Filler sentence about logistics planning. '.repeat(400)}`, { type: 'meeting' });
       await seedPage(e, 'meetings/sos-3', `${TERM} sos short three.`, { type: 'meeting' });
+      // Delivery's own omission contract, without W5's whole-page cut (default on), which stops at the oversized page.
+      await e.setConfig('search.page_rank_cut', 'off');
       try {
         const page = await callSearch(e, { query: `${TERM} sos`, match: 'keyword', types: ['meeting'], return_unit: 'page', token_budget: 60 });
         expect(page.rows.map(r => r.slug)).toEqual(['meetings/sos-1', 'meetings/sos-2', 'meetings/sos-3']);
         expect(page.rows.filter(r => r.evidence_omitted).map(r => r.slug)).toEqual(['meetings/sos-2']);
       } finally {
+        await e.unsetConfig('search.page_rank_cut');
         await e.executeRaw(`DELETE FROM pages WHERE slug LIKE 'meetings/sos-%'`);
+      }
+    });
+
+    test('a CJK count equals its rows, with type and source filters renumbering the placeholders', async () => {
+      const e = arm().engine;
+      await seedPage(e, 'notes/cjk-glucose-a', '오늘 혈당 기록을 정리했다.');
+      await seedPage(e, 'meetings/cjk-glucose-b', '회의에서 혈당 관리 방안을 논의했다.', { type: 'meeting' });
+      try {
+        expect(await e.countKeywordPages('혈당', { types: ['meeting'], sourceId: 'default' })).toBe(1);
+        const hybrid = await callSearch(e, { query: '혈당', source_id: 'default' });
+        expect(hybrid.retrieval.keyword_total).toBe(2);
+        expect(hybrid.retrieval.degraded ?? []).not.toContainEqual(expect.objectContaining({ stage: 'keyword_count_unavailable' }));
+        const typed = await walkKeyword(e, { query: '혈당', types: ['meeting'], limit: 5 });
+        expect(typed.pages[0].retrieval.total).toBe(1);
+        expect(typed.slugs).toEqual(['meetings/cjk-glucose-b']);
+      } finally {
+        await e.executeRaw(`DELETE FROM pages WHERE slug LIKE '%/cjk-glucose-%'`);
       }
     });
 

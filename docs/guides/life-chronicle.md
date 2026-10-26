@@ -254,6 +254,7 @@ brackets are filled in with real values on each surface.
 | `not_yet_happened` | decision | The calendar event has not ended yet; it is picked up automatically after its end time, with no edit needed. | — | — | — |
 | `too_short` | decision | The page body is under 80 characters, too short to hold events. | — | — | — |
 | `dream_generated` | decision | Dream-generated pages are never mined for events. | — | — | — |
+| `page_body_segmented` | decision | An earlier release skipped this page: its body is over the 24 MiB single-string ceiling and is stored in segments. This release reads segmented pages, so the next revision or a backfill extracts it. | — | — | — |
 | `no_write_decision` | discovery | This revision has no recorded write decision (written by an older binary or before this release activated), so only a trusted backfill extracts it. | `gbrain chronicle-backfill --source <source> --since <YYYY-MM-DD> --limit 50 --yes` (preview: `gbrain chronicle-backfill --source <source> --since <YYYY-MM-DD> --limit 50 --dry-run`) | agent | paid |
 | `not_chronicle_shaped` | decision | The page is no longer a meeting, conversation or calendar page, so the events extracted from it were retired. | — | — | — |
 | `already_extracted` | decision | This exact content was already extracted; its events are current, so no new call is made. | — | — | — |
@@ -276,5 +277,21 @@ brackets are filled in with real values on each surface.
 | `no_chat_provider` | phase | No chat provider is configured on the brain host, so the chronicle phase made no calls. | — | user | credentials |
 <!-- chronicle-reasons:end -->
 
+A `malformed_proposal` refusal also says which check failed, without the
+proposal itself. The chronicle phase prints one warning line per refused page
+(`code=when_unparseable field=when; proposal 2 of 7; 1 of 7 inspected invalid`),
+and the extractor result carries the same fields under `malformed`: `code`
+(`not_object`, `missing_field`, `wrong_type`, `when_too_short`,
+`when_unparseable`, `what_blank`, `who_item_not_string`, or `beyond_bounds`
+when the defect lies past what was inspected), the schema `field`, the JSON
+`shape` found there, and counts. It never contains a value, a key the model
+invented, the prompt or the raw response. At most 50 proposals, 50 `who`
+entries each and 256 characters per string are inspected, and nested values
+are never walked. The refusal itself, its retry with backoff and the ledger
+row are unchanged.
+
 Don't hand-write `life/events/` pages: extraction owns them and retires events
-the page no longer supports. Edit the meeting page instead.
+the page no longer supports. Edit the meeting page instead. Only a complete
+re-extraction retires events: one that finds no events, drops or caps a
+proposal, or reads a page longer than the judge's window keeps the earlier
+events live.

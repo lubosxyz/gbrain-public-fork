@@ -23,13 +23,17 @@
  * extractTotals (cycle.ts) — facts_consolidated + takes_written.
  */
 
+import type { Action } from '../../agent-output.ts';
 import type { BrainEngine, FactRow } from '../../engine.ts';
 import type { PhaseResult } from '../../cycle.ts';
 import { cosineSimilarity } from '../../facts/classify.ts';
 import { claimsDiverge, EXPLICIT_DUPLICATE_THRESHOLD } from '../../facts/capture-dedup.ts';
+import { sameInstantTies, type SameInstantTie } from '../../facts/claim-ties.ts';
 import { createHash } from 'node:crypto';
 import { isAborted } from '../../abort-check.ts';
+import { classifyItemFailure, ItemRun } from '../../item-failure.ts';
 import { maintenancePreflight, submitMaintenanceConsolidation } from '../../persistence/prepared-maintenance.ts';
+import { clearConsolidationTies, consolidationRestored, factPreimages, holdConsolidationTie, recordConsolidationGeneration } from '../../generations/adapters/fact-rows.ts';
 import { managedPersistenceEnabled } from '../../persistence/ownership.ts';
 import { declareDerivation, derivedMaintenanceTransaction, derivedWriteTrust, isExternalTier, readTaintInputs } from '../../trust/taint.ts';
 import { DEFAULT_WRITE_GATE_CONFIG, type WriteGateConfig } from '../../write-gate.ts';
@@ -64,10 +68,63 @@ export interface ConsolidatePhaseOpts {
   /** Minimum age (ms) of the OLDEST fact in a bucket before consolidation. Default 24h. */
   minOldestAgeMs?: number;
   sourceId?: string;
+  /** `gbrain dream --phase consolidate --once`: run even when `cycle.consolidate.enabled` is false. */
+  once?: boolean;
 }
+
+/**
+ * #6667: `cycle.consolidate.enabled` (default on) is the off switch for this
+ * phase, which promotes unreviewed facts into takes. Only an explicit falsy
+ * value skips it; unset, a truthy value and a config read failure keep it on.
+ */
+export const CONSOLIDATE_ENABLED_KEY = 'cycle.consolidate.enabled';
+
+async function disabledSkip(engine: BrainEngine, opts: ConsolidatePhaseOpts): Promise<PhaseResult | null> {
+  if (opts.once || !/^\s*(false|0|off|no)\s*$/i.test(await engine.getConfig(CONSOLIDATE_ENABLED_KEY).catch(() => null) ?? '')) return null;
+  return { phase: 'consolidate', status: 'skipped', duration_ms: 0, summary: `consolidate skipped: ${CONSOLIDATE_ENABLED_KEY}=false`,
+    details: { reason: 'disabled', enable_hint: `gbrain config set ${CONSOLIDATE_ENABLED_KEY} true` } };
+}
+
+/** At most this many failed buckets are listed in `details.bucket_failures`; `buckets_failed` counts them all. */
+const BUCKET_FAILURE_SAMPLES = 10;
 
 export const CLUSTER_THRESHOLD_KEY = 'cycle.consolidate.cluster_threshold';
 export const DEFAULT_CLUSTER_THRESHOLD = 0.85;
+
+/**
+ * v0.35.4 (D-CDX-4 part 2) — chronological valid_until writeback.
+ * Sort the cluster by (valid_from ASC, id ASC); walk consecutive
+ * pairs; stamp the older fact's valid_until = next_newer.valid_from.
+ * The newest fact keeps valid_until = NULL. This makes the facts
+ * table a proper bitemporal record without the contradiction probe
+ * having to mutate it (preserves auto-supersession.ts:4 invariant —
+ * see also R8 test guard).
+ *
+ * Idempotent: re-running on the same cluster produces the same
+ * chronological order and the same valid_until values. No-op if
+ * valid_until is already correct.
+ */
+async function writeValidUntilChain(tx: BrainEngine, cluster: FactRow[]): Promise<void> {
+  const chronological = [...cluster].sort((a, b) => {
+    const t = a.valid_from.getTime() - b.valid_from.getTime();
+    if (t !== 0) return t;
+    return a.id - b.id;
+  });
+  for (let i = 0; i < chronological.length - 1; i++) {
+    const older = chronological[i];
+    const newer = chronological[i + 1];
+    await tx.executeRaw(
+      // Only UPDATE when the new value would actually change. Avoids
+      // touching updated_at on no-op rewrites and keeps idempotency
+      // observable in the DB (zero affected rows on stable re-run).
+      `UPDATE facts
+         SET valid_until = $1
+       WHERE id = $2
+         AND (valid_until IS DISTINCT FROM $1)`,
+      [newer.valid_from, older.id],
+    );
+  }
+}
 
 /**
  * #5363: parse `cycle.consolidate.cluster_threshold`. A cosine similarity in
@@ -86,6 +143,8 @@ export async function runPhaseConsolidate(
   engine: BrainEngine,
   opts: ConsolidatePhaseOpts = {},
 ): Promise<PhaseResult> {
+  const disabled = await disabledSkip(engine, opts);
+  if (disabled) return disabled;
   const dryRun = opts.dryRun === true;
   const managed = await managedPersistenceEnabled(engine);
   const { threshold, thresholdInvalid } = await resolveClusterThreshold(engine, opts.clusterThreshold);
@@ -99,6 +158,8 @@ export async function runPhaseConsolidate(
   let clustersSkippedRetired = 0;
   let clustersGateHeld = 0;
   let clustersGateRejected = 0;
+  let clustersHeldSameInstant = 0;
+  const sameInstantClusters: SameInstantCluster[] = [];
   // #6023: a dry run lists the clusters it would write so an operator can
   // inspect them before `--yes`; capped so the envelope stays bounded.
   const preview: ConsolidateClusterPreview[] = [];
@@ -140,6 +201,9 @@ export async function runPhaseConsolidate(
     };
   }
 
+  const run = new ItemRun('consolidate.buckets');
+  let bucketsFailed = 0;
+  const bucketFailures: Array<{ source_id: string; entity_slug: string; code: string; message: string; fix: Action }> = [];
   for (const b of buckets) {
     // #1972: bail at the top of the bucket loop on abort. Each prior bucket's
     // per-row INSERT/consolidate is already committed, so breaking returns a
@@ -150,218 +214,209 @@ export async function runPhaseConsolidate(
       try { await opts.yieldDuringPhase(); } catch { /* keepalive errors non-fatal */ }
     }
 
-    const maintenance = managed && !dryRun ? await maintenancePreflight(engine, b.source_id) : null;
-    const candidates = await engine.listFactsByEntity(b.source_id, b.entity_slug, {
-      activeOnly: true,
-      unconsolidatedOnly: true,
-      visibility: managed ? ['world'] : undefined,
-      limit: 100,
-    });
-    // Takes here are the user's own (holder 'self'): a claim the assistant or
-    // a named third party asserted is never promoted into one.
-    const unconsolidated = candidates.filter(f => (!managed || f.visibility === 'world') && (!f.attributed_to || f.attributed_to === 'user'));
-    if (unconsolidated.length < minPerBucket) {
-      bucketsSkipped += 1;
-      continue;
-    }
-
-    // Age gate: oldest must be at least minOldestAgeMs old.
-    const oldest = unconsolidated.reduce((min, f) =>
-      f.valid_from.getTime() < min.valid_from.getTime() ? f : min,
-    );
-    if (Date.now() - oldest.valid_from.getTime() < minOldestAgeMs) {
-      bucketsSkipped += 1;
-      continue;
-    }
-
-    bucketsProcessed += 1;
-    const claims = await loadClaimShapes(engine, unconsolidated.map(f => f.id));
-    // #5575 ENG-3: a take's tier is the least trusted fact in its cluster, so
-    // external facts cluster apart from owner facts and their takes are external.
-    const taint = new Map((await readTaintInputs(engine, unconsolidated.map(f => ({ table: 'facts' as const, id: f.id })))).map(i => [Number(i.id), i]));
-    const clusters = [false, true].flatMap(external =>
-      clusterFacts(unconsolidated.filter(f => isExternalTier(taint.get(f.id)!.tier) === external), threshold, claims));
-
-    // Resolve entity_slug → page_id. If page missing in this source, skip.
-    const pageRows = await engine.executeRaw<{ id: number }>(
-      `SELECT id FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
-      [b.source_id, b.entity_slug],
-    );
-    if (pageRows.length === 0) continue;
-    const pageId = pageRows[0].id;
-
-    // Existing row_num max for this page → start appending after it.
-    const rowMaxRows = await engine.executeRaw<{ max: number }>(
-      `SELECT COALESCE(MAX(row_num), 0)::int AS max FROM takes WHERE page_id = $1`,
-      [pageId],
-    );
-    let nextRowNum = (rowMaxRows[0]?.max ?? 0) + 1;
-
-    for (const cluster of clusters) {
-      if (cluster.length < 2) continue;
-      // Take selection: pick the highest-confidence fact's text as the
-      // take claim (v0.31 deterministic). v0.32 will swap to a Sonnet
-      // synthesis pass.
-      const best = cluster.reduce((a, b) => (b.confidence > a.confidence ? b : a));
-      const avgWeight = cluster.reduce((s, f) => s + f.confidence, 0) / cluster.length;
-      const sources = Array.from(new Set(cluster.map(c => c.source_session ?? c.source).filter(Boolean))).join(',');
-      const sinceISO = cluster
-        .map(c => c.valid_from)
-        .reduce((min, d) => (d < min ? d : min))
-        .toISOString()
-        .slice(0, 10);
-      const inputs = cluster.map(f => taint.get(f.id)!);
-      const derivation = { inputs, trust: derivedWriteTrust({ channel: 'derive:consolidate', inputs }) };
-
-      if (dryRun) {
-        // Pretend we did it.
-        takesWritten += 1;
-        factsConsolidated += cluster.length;
-        nextRowNum += 1;
-        if (preview.length < DRY_RUN_CLUSTER_CAP) {
-          const text = (f: FactRow) => (showPrivate || f.visibility === 'world' ? f.fact : null);
-          preview.push({ source_id: b.source_id, entity_slug: b.entity_slug, claim: text(best),
-            members: cluster.map(f => ({ id: f.id, visibility: f.visibility, fact: text(f) })) });
-        }
-        continue;
-      }
-
-      if (maintenance) {
-        const receipt = await submitMaintenanceConsolidation(engine, maintenance, b.entity_slug, cluster,
-          { claim: best.fact, weight: clamp01(avgWeight), source: sources.slice(0, 200), since: sinceISO },
-          declareDerivation(derivation.trust, inputs));
-        factsConsolidated += Number(receipt.facts_consolidated ?? 0);
-        takesWritten += Number(receipt.takes_written ?? 0);
-        if (receipt.reason === 'retired_take') clustersSkippedRetired++;
-        continue;
-      }
-
-      // v0.35.4 (D-CDX-4) — semantic upsert. The full dream cycle runs
-      // `extract_facts` BEFORE `consolidate`; `extract_facts` hard-deletes
-      // and re-inserts page facts via deleteFactsForPage + insertFacts,
-      // which clears `consolidated_at` on every fact. Without this lookup,
-      // a second cycle run would re-INSERT a duplicate take via
-      // `MAX(row_num)+1`, silently poisoning trajectory + scorecard data.
-      // Match on (page_id, claim) restricted to the rows this phase authors.
-      //
-      // `since_date` is NOT part of the identity: it is derived from
-      // MIN(valid_from) of the cluster, so it describes the fact rows that
-      // happen to exist right now. When extract_facts re-inserts a claim with
-      // a fresh `valid_from` (the common case: an LLM extraction that defaults
-      // valid_from to now()), keying on since_date makes this lookup miss and
-      // the upsert degrades into the duplicate-INSERT path this block exists
-      // to prevent.
-      //
-      // `kind = 'fact' AND holder = 'self'` mirrors the INSERT below, so the
-      // lookup can only ever match a take this phase wrote. Without it the
-      // widened match reaches human-authored takes that share the claim text
-      // and the UPDATE below would overwrite their provenance.
-      //
-      // Deliberately NOT filtered on `active`: a superseded take still owns
-      // this claim. Skipping it would send us down the INSERT path and
-      // resurrect a claim the user retired. `ORDER BY id` keeps the choice
-      // deterministic if a page already holds more than one matching row
-      // (duplicates minted by the pre-fix since_date lookup).
-      const existing = await engine.executeRaw<{ id: number; resolved_at: Date | null }>(
-        `SELECT id, resolved_at FROM takes
-         WHERE page_id = $1 AND claim = $2 AND kind = 'fact' AND holder = 'self'
-         ORDER BY id
-         LIMIT 1`,
-        [pageId, best.fact],
-      );
-
-      // #5575: the take, its source refresh, the consolidation marks and the
-      // valid_until writeback are one maintenance transaction at the cluster's
-      // derived tier. A re-promotion changes no content column, so the take is
-      // lowered explicitly to min(existing, cluster): an external cluster
-      // cannot keep an owner take's tier. Edges: take -> every cluster fact.
-      // Write gate on a new take: reject skips the cluster; hold records it for review and leaves the facts unconsolidated.
-      const takeRow = { page_id: pageId, row_num: nextRowNum, claim: best.fact, kind: 'fact', holder: 'self', weight: clamp01(avgWeight),
-        since_date: sinceISO, source: sources.slice(0, 200), active: true };
-      const gate = existing.length ? null : await gateNewTake(engine, derivation, takeRow, { sourceId: b.source_id, slug: b.entity_slug },
-        gateConfig ??= (await loadImportSanityConfig(engine)).writeGate ?? DEFAULT_WRITE_GATE_CONFIG);
-      if (gate && gate.action !== 'insert') { if (gate.action === 'hold') clustersGateHeld++; else clustersGateRejected++; continue; }
-      const written = await derivedMaintenanceTransaction<{ created: boolean; takeId: number | null } | null>(engine, derivation, async tx => {
-        let takeId: number;
-        let created = false;
-        if (existing.length > 0) {
-          // Re-promotion of a cluster we already wrote a take for. Refresh
-          // the source-aggregation string (new fact rows may carry new
-          // source_session values that the prior run didn't see); leave
-          // row_num + weight untouched to keep the take's identity stable.
-          takeId = existing[0].id;
-          // A resolved take is immutable everywhere else (the engines throw
-          // TAKE_RESOLVED_IMMUTABLE / TAKE_ALREADY_RESOLVED); this raw UPDATE
-          // would bypass that guard. Reuse its id so the facts still consolidate
-          // into it, but leave the row untouched.
-          if (existing[0].resolved_at === null) {
-            await tx.executeRaw(`UPDATE takes SET source = $1, updated_at = now() WHERE id = $2`, [sources.slice(0, 200), takeId]);
-          }
-        } else {
-          const inserted = await tx.addTakesBatch([takeRow]);
-          if (inserted < 1) return { result: null, rows: [] };
-          const idRows = await tx.executeRaw<{ id: number }>(
-            `SELECT id FROM takes WHERE page_id = $1 AND row_num = $2`,
-            [pageId, nextRowNum],
-          );
-          if (idRows.length === 0) return { result: { created: true, takeId: null }, rows: [] };
-          takeId = idRows[0].id;
-          created = true;
-          if (gate) await recordFlaggedRow(tx, gate, { table: 'takes', id: takeId, sourceId: b.source_id });
-        }
-
-        // Mark all contributing facts consolidated.
-        for (const f of cluster) await tx.consolidateFact(f.id, takeId);
-
-        // v0.35.4 (D-CDX-4 part 2) — chronological valid_until writeback.
-        // Sort the cluster by (valid_from ASC, id ASC); walk consecutive
-        // pairs; stamp the older fact's valid_until = next_newer.valid_from.
-        // The newest fact keeps valid_until = NULL. This makes the facts
-        // table a proper bitemporal record without the contradiction probe
-        // having to mutate it (preserves auto-supersession.ts:4 invariant —
-        // see also R8 test guard).
-        //
-        // Idempotent: re-running on the same cluster produces the same
-        // chronological order and the same valid_until values. No-op if
-        // valid_until is already correct.
-        const chronological = [...cluster].sort((a, b) => {
-          const t = a.valid_from.getTime() - b.valid_from.getTime();
-          if (t !== 0) return t;
-          return a.id - b.id;
-        });
-        for (let i = 0; i < chronological.length - 1; i++) {
-          const older = chronological[i];
-          const newer = chronological[i + 1];
-          await tx.executeRaw(
-            // Only UPDATE when the new value would actually change. Avoids
-            // touching updated_at on no-op rewrites and keeps idempotency
-            // observable in the DB (zero affected rows on stable re-run).
-            `UPDATE facts
-               SET valid_until = $1
-             WHERE id = $2
-               AND (valid_until IS DISTINCT FROM $1)`,
-            [newer.valid_from, older.id],
-          );
-        }
-        return { result: { created, takeId }, rows: [{ table: 'takes' as const, id: Number(takeId), sourceId: b.source_id }] };
+    // One bucket the writer refuses (an entity or evidence page made private or deleted while its world facts
+    // stay active) is counted and sampled; later buckets still consolidate. Abort, budget and lost-connection
+    // errors stay run-scoped, and an accepted write still publishing keeps ending the phase as before.
+    try {
+      const maintenance = managed && !dryRun ? await maintenancePreflight(engine, b.source_id) : null;
+      const candidates = await engine.listFactsByEntity(b.source_id, b.entity_slug, {
+        activeOnly: true,
+        unconsolidatedOnly: true,
+        visibility: managed ? ['world'] : undefined,
+        limit: 100,
       });
-      if (written?.created) nextRowNum += 1;
-      if (!written?.takeId) continue;
-      if (written.created) takesWritten += 1;
-      factsConsolidated += cluster.length;
+      // Takes here are the user's own (holder 'self'): a claim the assistant or
+      // a named third party asserted is never promoted into one.
+      const unconsolidated = candidates.filter(f => (!managed || f.visibility === 'world') && (!f.attributed_to || f.attributed_to === 'user'));
+      if (unconsolidated.length < minPerBucket) {
+        bucketsSkipped += 1;
+        continue;
+      }
+
+      // Age gate: oldest must be at least minOldestAgeMs old.
+      const oldest = unconsolidated.reduce((min, f) =>
+        f.valid_from.getTime() < min.valid_from.getTime() ? f : min,
+      );
+      if (Date.now() - oldest.valid_from.getTime() < minOldestAgeMs) {
+        bucketsSkipped += 1;
+        continue;
+      }
+
+      bucketsProcessed += 1;
+      const claims = await loadClaimShapes(engine, unconsolidated.map(f => f.id));
+      // #5575 ENG-3: a take's tier is the least trusted fact in its cluster, so
+      // external facts cluster apart from owner facts and their takes are external.
+      const taint = new Map((await readTaintInputs(engine, unconsolidated.map(f => ({ table: 'facts' as const, id: f.id })))).map(i => [Number(i.id), i]));
+      const clusters = [false, true].flatMap(external =>
+        clusterFacts(unconsolidated.filter(f => isExternalTier(taint.get(f.id)!.tier) === external), threshold, claims));
+
+      // Resolve entity_slug → page_id. If page missing in this source, skip.
+      const pageRows = await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
+        [b.source_id, b.entity_slug],
+      );
+      if (pageRows.length === 0) continue;
+      const pageId = pageRows[0].id;
+
+      // Existing row_num max for this page → start appending after it.
+      const rowMaxRows = await engine.executeRaw<{ max: number }>(
+        `SELECT COALESCE(MAX(row_num), 0)::int AS max FROM takes WHERE page_id = $1`,
+        [pageId],
+      );
+      let nextRowNum = (rowMaxRows[0]?.max ?? 0) + 1;
+      const recordsTies = !dryRun && !maintenance;
+      if (recordsTies) await clearConsolidationTies(engine, b.source_id, b.entity_slug);
+
+      for (const cluster of clusters) {
+        if (cluster.length < 2) continue;
+        const tie = clusterTie(cluster, claims);
+        if (tie) { clustersHeldSameInstant += 1; if (sameInstantClusters.length < SAME_INSTANT_SAMPLES) sameInstantClusters.push(heldCluster(b, tie)); if (recordsTies) await recordTie(engine, b, cluster, tie); continue; }
+        if (await consolidationRestored(engine, b.source_id, b.entity_slug, cluster.map(f => f.id))) continue; // the operator reopened this chain
+        // Take selection: pick the highest-confidence fact's text as the
+        // take claim (v0.31 deterministic). v0.32 will swap to a Sonnet
+        // synthesis pass.
+        const best = cluster.reduce((a, b) => (b.confidence > a.confidence ? b : a));
+        const avgWeight = cluster.reduce((s, f) => s + f.confidence, 0) / cluster.length;
+        const sources = Array.from(new Set(cluster.map(c => c.source_session ?? c.source).filter(Boolean))).join(',');
+        const sinceISO = cluster
+          .map(c => c.valid_from)
+          .reduce((min, d) => (d < min ? d : min))
+          .toISOString()
+          .slice(0, 10);
+        const inputs = cluster.map(f => taint.get(f.id)!);
+        const derivation = { inputs, trust: derivedWriteTrust({ channel: 'derive:consolidate', inputs }) };
+
+        if (dryRun) {
+          // Pretend we did it.
+          takesWritten += 1;
+          factsConsolidated += cluster.length;
+          nextRowNum += 1;
+          if (preview.length < DRY_RUN_CLUSTER_CAP) {
+            const text = (f: FactRow) => (showPrivate || f.visibility === 'world' ? f.fact : null);
+            preview.push({ source_id: b.source_id, entity_slug: b.entity_slug, claim: text(best),
+              members: cluster.map(f => ({ id: f.id, visibility: f.visibility, fact: text(f) })) });
+          }
+          continue;
+        }
+
+        if (maintenance) {
+          const receipt = await submitMaintenanceConsolidation(engine, maintenance, b.entity_slug, cluster,
+            { claim: best.fact, weight: clamp01(avgWeight), source: sources.slice(0, 200), since: sinceISO },
+            declareDerivation(derivation.trust, inputs));
+          factsConsolidated += Number(receipt.facts_consolidated ?? 0);
+          takesWritten += Number(receipt.takes_written ?? 0);
+          if (receipt.reason === 'retired_take') clustersSkippedRetired++;
+          if (receipt.reason === 'same_instant_typed_claims') clustersHeldSameInstant++;
+          continue;
+        }
+
+        // v0.35.4 (D-CDX-4) — semantic upsert. The full dream cycle runs
+        // `extract_facts` BEFORE `consolidate`; `extract_facts` hard-deletes
+        // and re-inserts page facts via deleteFactsForPage + insertFacts,
+        // which clears `consolidated_at` on every fact. Without this lookup,
+        // a second cycle run would re-INSERT a duplicate take via
+        // `MAX(row_num)+1`, silently poisoning trajectory + scorecard data.
+        // Match on (page_id, claim) restricted to the rows this phase authors.
+        //
+        // `since_date` is NOT part of the identity: it is derived from
+        // MIN(valid_from) of the cluster, so it describes the fact rows that
+        // happen to exist right now. When extract_facts re-inserts a claim with
+        // a fresh `valid_from` (the common case: an LLM extraction that defaults
+        // valid_from to now()), keying on since_date makes this lookup miss and
+        // the upsert degrades into the duplicate-INSERT path this block exists
+        // to prevent.
+        //
+        // `kind = 'fact' AND holder = 'self'` mirrors the INSERT below, so the
+        // lookup can only ever match a take this phase wrote. Without it the
+        // widened match reaches human-authored takes that share the claim text
+        // and the UPDATE below would overwrite their provenance.
+        //
+        // Deliberately NOT filtered on `active`: a superseded take still owns
+        // this claim. Skipping it would send us down the INSERT path and
+        // resurrect a claim the user retired. `ORDER BY id` keeps the choice
+        // deterministic if a page already holds more than one matching row
+        // (duplicates minted by the pre-fix since_date lookup).
+        const existing = await engine.executeRaw<{ id: number; resolved_at: Date | null }>(
+          `SELECT id, resolved_at FROM takes
+           WHERE page_id = $1 AND claim = $2 AND kind = 'fact' AND holder = 'self'
+           ORDER BY id
+           LIMIT 1`,
+          [pageId, best.fact],
+        );
+
+        // #5575: the take, its source refresh, the consolidation marks and the
+        // valid_until writeback are one maintenance transaction at the cluster's
+        // derived tier. A re-promotion changes no content column, so the take is
+        // lowered explicitly to min(existing, cluster): an external cluster
+        // cannot keep an owner take's tier. Edges: take -> every cluster fact.
+        // Write gate on a new take: reject skips the cluster; hold records it for review and leaves the facts unconsolidated.
+        const takeRow = { page_id: pageId, row_num: nextRowNum, claim: best.fact, kind: 'fact', holder: 'self', weight: clamp01(avgWeight),
+          since_date: sinceISO, source: sources.slice(0, 200), active: true };
+        const gate = existing.length ? null : await gateNewTake(engine, derivation, takeRow, { sourceId: b.source_id, slug: b.entity_slug },
+          gateConfig ??= (await loadImportSanityConfig(engine)).writeGate ?? DEFAULT_WRITE_GATE_CONFIG);
+        if (gate && gate.action !== 'insert') { if (gate.action === 'hold') clustersGateHeld++; else clustersGateRejected++; continue; }
+        const written = await derivedMaintenanceTransaction<{ created: boolean; takeId: number | null } | null>(engine, derivation, async tx => {
+          let takeId: number;
+          let created = false;
+          if (existing.length > 0) {
+            // Re-promotion of a cluster we already wrote a take for. Refresh
+            // the source-aggregation string (new fact rows may carry new
+            // source_session values that the prior run didn't see); leave
+            // row_num + weight untouched to keep the take's identity stable.
+            takeId = existing[0].id;
+            // A resolved take is immutable everywhere else (the engines throw
+            // TAKE_RESOLVED_IMMUTABLE / TAKE_ALREADY_RESOLVED); this raw UPDATE
+            // would bypass that guard. Reuse its id so the facts still consolidate
+            // into it, but leave the row untouched.
+            if (existing[0].resolved_at === null) {
+              await tx.executeRaw(`UPDATE takes SET source = $1, updated_at = now() WHERE id = $2`, [sources.slice(0, 200), takeId]);
+            }
+          } else {
+            const inserted = await tx.addTakesBatch([takeRow]);
+            if (inserted < 1) return { result: null, rows: [] };
+            const idRows = await tx.executeRaw<{ id: number }>(
+              `SELECT id FROM takes WHERE page_id = $1 AND row_num = $2`,
+              [pageId, nextRowNum],
+            );
+            if (idRows.length === 0) return { result: { created: true, takeId: null }, rows: [] };
+            takeId = idRows[0].id;
+            created = true;
+            if (gate) await recordFlaggedRow(tx, gate, { table: 'takes', id: takeId, sourceId: b.source_id });
+          }
+
+          await closeCluster(tx, b, cluster, takeId);
+          return { result: { created, takeId }, rows: [{ table: 'takes' as const, id: Number(takeId), sourceId: b.source_id }] };
+        });
+        if (written?.created) nextRowNum += 1;
+        if (!written?.takeId) continue;
+        if (written.created) takesWritten += 1;
+        factsConsolidated += cluster.length;
+      }
+      run.succeed();
+    } catch (error) {
+      if (classifyItemFailure(error).scope === 'pending') throw error;
+      const failure = run.fail(`${b.source_id}:${b.entity_slug}`, error);
+      bucketsFailed += 1;
+      if (bucketFailures.length < BUCKET_FAILURE_SAMPLES) {
+        bucketFailures.push({ source_id: b.source_id, entity_slug: b.entity_slug, code: failure.code, message: failure.message.slice(0, 300),
+          fix: { argv: ['gbrain', 'dream', '--phase', 'consolidate', '--source', b.source_id], consent: [], actor: 'agent', requires_exclusive: false,
+            why: 'Reruns consolidate for this source; the bucket consolidates once its entity and evidence pages are readable again.' } });
+      }
     }
   }
 
   return {
     phase: 'consolidate',
-    status: factsConsolidated === 0 && clustersSkippedRetired > 0 ? 'skipped' : 'ok',
+    status: bucketsFailed > 0 || clustersHeldSameInstant > 0 ? 'warn' : factsConsolidated === 0 && clustersSkippedRetired > 0 ? 'skipped' : 'ok',
     duration_ms: 0,
-    summary: dryRun
+    summary: (dryRun
       ? `(dry-run) would promote ${factsConsolidated} facts into ${takesWritten} takes across ${bucketsProcessed} buckets`
       : `promoted ${factsConsolidated} facts into ${takesWritten} takes across ${bucketsProcessed} buckets` +
         (clustersSkippedRetired ? `; skipped ${clustersSkippedRetired} clusters with retired takes` : '') +
         (clustersGateHeld ? `; held ${clustersGateHeld} takes for write-gate review` : '') +
-        (clustersGateRejected ? `; write gate rejected ${clustersGateRejected} takes` : ''),
+        (clustersGateRejected ? `; write gate rejected ${clustersGateRejected} takes` : '') +
+        (bucketsFailed ? `; ${bucketsFailed} bucket(s) failed (details.bucket_failures)` : '')) +
+      (clustersHeldSameInstant ? `; held ${clustersHeldSameInstant} cluster(s) whose typed claims state one metric for the same effective time (details.same_instant_clusters)` : ''),
     details: {
       dryRun,
       cluster_threshold: threshold,
@@ -375,6 +430,10 @@ export async function runPhaseConsolidate(
       clusters_skipped_retired: clustersSkippedRetired,
       clusters_gate_held: clustersGateHeld,
       clusters_gate_rejected: clustersGateRejected,
+      clusters_held_same_instant: clustersHeldSameInstant,
+      same_instant_clusters: sameInstantClusters,
+      buckets_failed: bucketsFailed,
+      bucket_failures: bucketFailures,
       ...(factsConsolidated === 0 && clustersSkippedRetired > 0 ? { reason: 'retired_take' } : {}),
     },
   };
@@ -392,6 +451,51 @@ async function gateNewTake(engine: BrainEngine, derivation: { trust: WriteTrust;
     input: { tier: derivation.trust.tier, origin: derivation.trust.origin, requestId: null }, cfg });
   if (gate.action === 'hold') await derivedMaintenanceTransaction(engine, derivation, async tx => ({ result: await recordWriteGateHold(tx, gate.hold!), rows: [] }));
   return gate;
+}
+
+/** One cluster held because two or more of its typed claims tie at one effective instant (`details.same_instant_clusters`). */
+export interface SameInstantCluster {
+  source_id: string;
+  entity_slug: string;
+  metric: string;
+  unit: string | null;
+  period: string | null;
+  valid_from: string;
+  fact_ids: number[];
+  fix: Action;
+}
+const SAME_INSTANT_SAMPLES = 20;
+
+function clusterTie(cluster: FactRow[], claims: Map<number, ClaimShape>): SameInstantTie | undefined {
+  return sameInstantTies(cluster.map(f => ({ id: f.id, at: f.valid_from.getTime(), metric: claims.get(f.id)?.metric ?? null,
+    unit: claims.get(f.id)?.unit ?? null, period: claims.get(f.id)?.period ?? null })))[0];
+}
+
+/**
+ * Marks the cluster consolidated into `takeId` and closes its chain, recording each member's before-state as the cluster's
+ * consolidation generation first (GBRA-161 PR 2), so `gbrain repair generations --kind consolidation` can reopen it.
+ */
+async function closeCluster(tx: BrainEngine, bucket: { source_id: string; entity_slug: string }, cluster: FactRow[], takeId: number): Promise<void> {
+  const before = await factPreimages(tx, bucket.source_id, cluster.map(f => f.id));
+  for (const f of cluster) await tx.consolidateFact(f.id, takeId);
+  await writeValidUntilChain(tx, cluster);
+  await recordConsolidationGeneration(tx, bucket.source_id, bucket.entity_slug, before);
+}
+
+/** #6023 (GBRA-161 PR 2): records a tied cluster as a held consolidation generation (`tie`); nothing is written to its facts. */
+async function recordTie(engine: BrainEngine, bucket: { source_id: string; entity_slug: string }, cluster: FactRow[], tie: SameInstantTie): Promise<void> {
+  await engine.transaction(tx => holdConsolidationTie(tx, bucket.source_id, bucket.entity_slug, cluster.map(f => f.id),
+    { entity_slug: bucket.entity_slug, tied: tie.ids, valid_from: new Date(tie.at).toISOString(), metric: tie.metric }));
+}
+
+function heldCluster(bucket: { source_id: string; entity_slug: string }, tie: SameInstantTie): SameInstantCluster {
+  const validFrom = new Date(tie.at).toISOString();
+  const claim = [tie.metric, tie.unit, tie.period].filter(Boolean).join(', ');
+  return { source_id: bucket.source_id, entity_slug: bucket.entity_slug, metric: tie.metric, unit: tie.unit, period: tie.period, valid_from: validFrom,
+    fact_ids: tie.ids, fix: { ask_user: true, argv: ['gbrain', 'forget', '<FACT_ID>'], consent: [], actor: 'agent', requires_exclusive: false,
+      inputs: [{ name: 'FACT_ID', how: `One of facts ${tie.ids.join(', ')}: the statement the user says is no longer current; for exact duplicates, any one of them.` }],
+      why: 'Consolidation cannot order statements of one metric at one effective time, so it left the cluster unchanged; forgetting the stale one lets the next consolidate run promote the rest.',
+      user_message: `Facts ${tie.ids.join(', ')} on ${bucket.entity_slug} state ${claim} for the same effective time (${validFrom}), and gbrain cannot tell which one is current, so it left them unconsolidated. Which one should stay? The other is forgotten, and the next consolidate run promotes the cluster.` } };
 }
 
 /** The typed-claim columns of a fact (FactRow does not carry them). */

@@ -51,12 +51,14 @@ export function privatePagesFilterFragment(pageAlias: string): string {
 
 /**
  * `privatePagesFilterFragment` with a cheap first test: a page with no
- * `visibility` or `derived_from` key whose type is not atom, concept or event
- * is visible by every rule above, so only the remaining pages run the full
- * check. For scans over thousands of candidate pages (an entity's referrers).
+ * `visibility` or `derived_from` key (nor, unless the operator turned
+ * `visibility.honor_aliases` off, a privacy-alias key) whose type is not atom, concept or event is visible by every rule
+ * above, so only the remaining pages run the full check. For scans over thousands of
+ * candidate pages (an entity's referrers).
  */
 export function privatePagesFilterFragmentFast(pageAlias: string): string {
-  return `((${pageAlias}.frontmatter->'visibility' IS NULL AND ${pageAlias}.frontmatter->'derived_from' IS NULL
+  return `((${pageAlias}.frontmatter->'visibility' IS NULL AND ${pageAlias}.frontmatter->'derived_from' IS NULL${honorAliases()
+      ? `\n      AND ${pageAlias}.frontmatter->'access' IS NULL AND ${pageAlias}.frontmatter->'confidentiality' IS NULL` : ''}
       AND ${pageAlias}.type NOT IN ('atom', 'concept', 'event'))
     OR ${privatePagesFilterFragment(pageAlias)})`;
 }
@@ -85,11 +87,14 @@ function declaredLineagePrivateSql(p: string): string {
  * as `page_versions` that have no page identity to follow to an origin. Callers
  * pair it with privatePagesFilterFragment on the live page. A page carrying the
  * `pinned_question` marker is private whatever its `visibility` says (pinned
- * questions are owner-private, src/core/questions/pages.ts).
+ * questions are owner-private, src/core/questions/pages.ts). A page with no
+ * `visibility` but a privacy alias is private too, unless the operator turned
+ * `visibility.honor_aliases` off; the row-side isPrivatePage applies the same rule.
  */
 export function privateSnapshotFilterFragment(alias: string): string {
   return `(COALESCE(${alias}.frontmatter->>'visibility', CASE WHEN ${derivedPageSql(alias)} THEN 'private' ELSE 'world' END) <> 'private'
-    AND NOT COALESCE(${alias}.frontmatter ? 'pinned_question', false))`;
+    AND NOT COALESCE(${alias}.frontmatter ? 'pinned_question', false)${honorAliases()
+      ? `\n    AND NOT (${alias}.frontmatter->>'visibility' IS NULL AND ${privacyAliasSql(alias)})` : ''})`;
 }
 
 /**
@@ -130,13 +135,77 @@ function chronicleOriginNotVisibleSql(p: string): string {
 export type Visibility = 'private' | 'world';
 
 /**
- * #5525 — the visibility a derived page takes from its origin under the
- * read-side rule: transcripts and missing origins are private, and a page
- * origin is private exactly when remote readers cannot see it.
+ * Privacy aliases: keys a page may carry instead of `visibility` (the
+ * bulk-ingestion template's `access`, a `confidentiality` field), with the
+ * values that mean private. Matching is case-insensitive on the trimmed value.
+ * Everything derived from an aliased page (facts, chronicle events, timeline
+ * rows, remember saves into it) is private. Remote page reads honor the aliases
+ * too unless the operator sets `visibility.honor_aliases false`.
+ */
+export const PRIVACY_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  access: ['private', 'restricted', 'confidential'],
+  confidentiality: ['confidential', 'secret', 'private', 'restricted'],
+};
+export const HONOR_ALIASES_KEY = 'visibility.honor_aliases';
+
+function hasPrivacyAlias(frontmatter: Record<string, unknown>): boolean {
+  return Object.entries(PRIVACY_ALIASES).some(([key, values]) => {
+    const value = frontmatter[key];
+    return typeof value === 'string' && values.includes(value.trim().toLowerCase());
+  });
+}
+
+/** SQL twin of hasPrivacyAlias on a page alias (a code-provided literal). */
+export function privacyAliasSql(alias: string): string {
+  return `(${Object.entries(PRIVACY_ALIASES).map(([key, values]) =>
+    `COALESCE(lower(btrim(${alias}.frontmatter->>'${key}')) IN (${values.map(v => `'${v}'`).join(',')}), false)`).join(' OR ')})`;
+}
+
+/**
+ * `visibility.honor_aliases` per brain in this process, as last read by
+ * resolveExcludePrivatePages (the resolver every remote read runs before it builds
+ * SQL). The fragments are synchronous, so the setting is process-wide and leans
+ * private: the aliases are honored unless a brain turned them off and no brain in
+ * the process keeps them on. Unset means on.
+ */
+const honorAliasEngines = new Set<BrainEngine>();
+const aliasOptOutEngines = new Set<BrainEngine>();
+const ALIAS_OPT_OUT_VALUES = ['false', '0', 'off', 'no'];
+function honorAliases(): boolean {
+  return honorAliasEngines.size > 0 || aliasOptOutEngines.size === 0;
+}
+
+/** Reads this brain's `visibility.honor_aliases` into the process setting; true unless it is false/0/off/no. Unreadable keeps the last value. */
+export async function readHonorAliases(engine: BrainEngine): Promise<boolean> {
+  try {
+    const optOut = ALIAS_OPT_OUT_VALUES.includes((await engine.getConfig(HONOR_ALIASES_KEY))?.trim().toLowerCase() ?? '');
+    (optOut ? aliasOptOutEngines : honorAliasEngines).add(engine);
+    (optOut ? honorAliasEngines : aliasOptOutEngines).delete(engine);
+    return !optOut;
+  } catch {
+    return !aliasOptOutEngines.has(engine);
+  }
+}
+
+/** A page whatever is derived from it must not outrank: private to remote readers, or carrying a privacy alias. */
+export function isDerivationPrivate(page: { type?: string | null; frontmatter?: unknown }): boolean {
+  if (isPrivatePage(page)) return true;
+  return typeof page.frontmatter === 'object' && page.frontmatter !== null && hasPrivacyAlias(page.frontmatter as Record<string, unknown>);
+}
+
+/** SQL twin of isDerivationPrivate. */
+export function derivationPrivateSql(alias: string): string {
+  return `(NOT ${privateSnapshotFilterFragment(alias)} OR ${privacyAliasSql(alias)})`;
+}
+
+/**
+ * #5525 — the visibility a derived page takes from its origin: transcripts and
+ * missing origins are private, and a page origin is private when remote
+ * readers cannot see it or it carries a privacy alias.
  */
 export function effectiveVisibility(origin: { kind: 'transcript' } | { kind: 'page'; page: { type?: string | null; frontmatter?: unknown } | null }): Visibility {
   if (origin.kind === 'transcript' || !origin.page) return 'private';
-  return isPrivatePage(origin.page) ? 'private' : 'world';
+  return isDerivationPrivate(origin.page) ? 'private' : 'world';
 }
 
 /** Derived outputs take the strictest visibility of their inputs. */
@@ -187,6 +256,7 @@ export function isPrivatePage(page: { type?: string | null; frontmatter?: unknow
   const frontmatter = typeof page.frontmatter === 'object' && page.frontmatter !== null
     ? page.frontmatter as Record<string, unknown> : {};
   if (frontmatter.pinned_question != null) return true;
+  if (frontmatter.visibility == null && honorAliases() && hasPrivacyAlias(frontmatter)) return true;
   const derived = page.type === 'atom' || page.type === 'question' || (page.type === 'concept' && frontmatter.synthesized_by != null);
   return (frontmatter.visibility ?? (derived ? 'private' : 'world')) === 'private';
 }
@@ -236,6 +306,8 @@ let cache = new WeakMap<BrainEngine, { at: number; expose: boolean }>();
 /** Test helper: drop the per-engine config cache. */
 export function __resetPrivateVisibilityCacheForTests(): void {
   cache = new WeakMap();
+  honorAliasEngines.clear();
+  aliasOptOutEngines.clear();
 }
 
 /**
@@ -261,6 +333,7 @@ export async function resolveExcludePrivatePages(
     } catch {
       expose = false; // config unreadable → enforce (fail-closed)
     }
+    await readHonorAliases(engine);
     cache.set(engine, { at: Date.now(), expose });
   }
   return !expose;

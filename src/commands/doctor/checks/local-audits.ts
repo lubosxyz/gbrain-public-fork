@@ -26,6 +26,7 @@ import {
   computeConversationParserProbeHealthCheck,
 } from './search-eval.ts';
 import type { Check } from '../../doctor.ts';
+import { withSkippedSegmented } from '../check-fix.ts';
 import type { DoctorContext, DoctorEntry } from '../context.ts';
 
 async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
@@ -123,6 +124,8 @@ async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
 export const stubGuardEntry: DoctorEntry = {
   name: 'stub_guard_24h',
   emits: ['stub_guard_24h', 'sync_failures', 'managed_sync_backlog', 'slug_fallback_audit'],
+  engineChecks: ['sync_failures', 'managed_sync_backlog'],
+  tier: 'quick',
   run: runStubGuard,
 };
 
@@ -190,7 +193,8 @@ async function runExtractionBacklogs(ctx: DoctorContext): Promise<Check[]> {
       probeEnabled = resolveProbeEnabled(dbVal, (cfg as any)?.autopilot?.nightly_quality_probe?.enabled);
     } catch { /* config unavailable → treat as disabled */ }
     const events = readRecentQualityProbeEvents(7);
-    const check = computeNightlyQualityProbeHealthCheck(probeEnabled, events);
+    const { PROBE_QA_DIMENSIONS } = await import('../../../core/cycle/nightly-probe-adapters.ts');
+    const check = computeNightlyQualityProbeHealthCheck(probeEnabled, events, PROBE_QA_DIMENSIONS);
     checks.push(check);
   } catch {
     // Best-effort; audit-log read failure shouldn't stop doctor.
@@ -208,10 +212,12 @@ async function runExtractionBacklogs(ctx: DoctorContext): Promise<Check[]> {
       applyExtractAtomsNoPricing(check, await readExtractAtomsNoPricing(engine).catch(() => []));
       // #5151: unmanaged brains reconcile fences in the cycle, so fence pages
       // behind their facts watermark are facts not indexed yet.
+      let skippedSegmented = 0;
       if (!await managedPersistenceEnabled(engine).catch(() => true)) {
         const backlog = await readFactsReconcileBacklog(engine).catch(() => null);
-        if (backlog) applyFactsReconcileBacklog(check, backlog);
+        if (backlog) { applyFactsReconcileBacklog(check, backlog); skippedSegmented = backlog.skipped_segmented ?? 0; }
       }
+      Object.assign(check, withSkippedSegmented(check, skippedSegmented));
       checks.push(check);
     } catch {
       // Best-effort; rollup-table missing on pre-v106 brains is normal
@@ -398,7 +404,7 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
   // PATH or the entry is broken. Skips silently when gbrain isn't on PATH
   // at all (e.g. running via `bun src/cli.ts`).
   try {
-    const { execSync } = await import('node:child_process');
+    const { execSync } = await import('../../../core/spawn.ts');
     let candidates: string[] = [];
     try {
       candidates = execSync('which -a gbrain', {
@@ -457,10 +463,21 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
     );
     if (leftovers.status !== 'skip') {
       const copy = leftovers.retained?.[0];
+      const store = leftovers.leftovers[0];
       checks.push({
         name: 'pglite_leftovers',
         status: leftovers.status,
         message: leftovers.message,
+        // #7145: the legacy copier's old store gets the same consent-gated delete as a graduation copy, after a size preview.
+        ...(!copy && store ? {
+          details: { leftovers: leftovers.leftovers, preview: ['du', '-sh', store.path] },
+          fix: {
+            argv: ['rm', '-rf', store.path], consent: ['destructive'], actor: 'agent', requires_exclusive: false,
+            verify: { argv: ['gbrain', 'doctor', '--only', 'pglite_leftovers', '--json'] }, docs: 'docs/guides/move-to-postgres.md#after-the-move',
+            why: `${store.path} is the PGLite store the engine migration left behind; the brain reads Postgres (config.json engine), so nothing uses it. Preview its size with du -sh ${store.path}; deleting it frees that disk and cannot be undone.`,
+            user_message: `Your brain moved to Postgres, but the old local PGLite copy is still at ${store.path}. Once you have a recent Postgres backup, should I delete it? It cannot be undone.`,
+          },
+        } : {}),
         ...(copy ? {
           details: { retained: leftovers.retained },
           fix: {
@@ -476,6 +493,15 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
     // Best-effort filesystem-hygiene check; never block doctor (a missing/
     // unparseable config.json lands here and skips, same fail-open posture).
   }
+  // GBRA-108: cron lines (and scripts they run) that call gbrain without GBRAIN_HOME (doctor/checks/cron-gbrain-home.ts).
+  // No environment gate: a container can run cron too; without a crontab the check emits nothing.
+  try {
+    const { cronGbrainHomeCheck, readCrontab } = await import('./cron-gbrain-home.ts');
+    const cron = cronGbrainHomeCheck(readCrontab(), process.env.GBRAIN_HOME || undefined);
+    if (cron) checks.push(cron);
+  } catch {
+    // Best-effort: an unreadable crontab never blocks doctor.
+  }
   // Engine graduation state (filesystem only; src/commands/doctor/checks/engine-graduation.ts).
   try {
     const { graduationStateCheck } = await import('./engine-graduation.ts');
@@ -489,7 +515,7 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
 
 export const homeDirInWorktreeEntry: DoctorEntry = {
   name: 'home_dir_in_worktree',
-  emits: ['home_dir_in_worktree', 'npm_squat', 'pglite_leftovers', 'graduation_interrupted'],
+  emits: ['home_dir_in_worktree', 'npm_squat', 'pglite_leftovers', 'cron_gbrain_home', 'graduation_interrupted'],
   run: runHomeDirInWorktree,
 };
 

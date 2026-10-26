@@ -14,7 +14,7 @@
  */
 
 import type { BrainEngine } from './engine.ts';
-import { loadCompletedMigrations, type CompletedMigrationEntry } from './preferences.ts';
+import { loadCompletedMigrations, preferencesPaths, type CompletedMigrationEntry } from './preferences.ts';
 
 /**
  * Version strings of every registered host migration, in registry order.
@@ -53,6 +53,11 @@ export async function declinedMigrations(engine: Pick<BrainEngine, 'getConfig'>)
 
 /** Bug 3 attempt cap — consecutive partials before a version counts wedged. */
 export const MAX_CONSECUTIVE_PARTIALS = 3;
+
+/** Where a wedged migration's failure reasons are recorded: its partial rows in this brain's completion ledger (not every partial row carries phases). */
+export function wedgedLedgerHint(): string {
+  return `the migration's partial rows in ${preferencesPaths.completedJsonl()} (phases[].detail, if present)`;
+}
 
 /**
  * Compare two semver strings (MAJOR.MINOR.PATCH). Returns -1 / 0 / 1.
@@ -102,10 +107,33 @@ export function statusForVersion(
 }
 
 /** Consecutive `partial` entries at the end of one version's ledger history: the wedge counter. A `retry` or `complete` entry resets it. */
+/**
+ * #6796: the latest ledger row for the version is `complete` but recorded
+ * `apply_migrations_pending`: the mechanical checkpoint landed and host work
+ * (publication, client activation) is still outstanding.
+ */
+export function hostWorkPendingForVersion(version: string, byVersion: Map<string, CompletedMigrationEntry[]>): boolean {
+  const latest = byVersion.get(version)?.at(-1);
+  return latest?.status === 'complete' && latest.apply_migrations_pending === true;
+}
+
+/** Read-only next step for host work a migration left pending: its per-source inventory. */
+export function hostWorkInspectArgv(version: string): string[] {
+  return ['gbrain', 'apply-migrations', '--migration', version, '--dry-run', '--json'];
+}
+
 export function trailingPartialCount(entries: readonly CompletedMigrationEntry[]): number {
   let consecutive = 0;
   for (let i = entries.length - 1; i >= 0 && entries[i].status === 'partial'; i--) consecutive++;
   return consecutive;
+}
+
+/**
+ * Doctor's forward-progress rule (`minions_migration`): a partial or wedged version is history, not outstanding work, once a
+ * newer migration really ran (a `complete` entry that is not an init fresh-install stamp). Returns that newer version, or null.
+ */
+export function forwardProgressPast(version: string, entries: readonly CompletedMigrationEntry[]): string | null {
+  return entries.find(e => e.status === 'complete' && !isFreshInstallStamp(e) && compareVersions(e.version, version) > 0)?.version ?? null;
 }
 
 /** A ledger entry `gbrain init` wrote for a `fresh_install_noop` migration (src/commands/migrations/fresh-install.ts). */

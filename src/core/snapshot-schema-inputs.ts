@@ -41,20 +41,25 @@ export const SNAPSHOT_SCHEMA_LEAVES: readonly string[] = [
 /** Dynamic imports inside the closure that never run during schema init or migrations. */
 export const SNAPSHOT_DYNAMIC_IMPORTS_NOT_HASHED: Readonly<Record<string, string>> = {
   'operations.ts': 'verbs.ts request-time verb handlers',
+  'ops/context.ts': 'verbs.ts request-time verb handlers (synthesize source scope, #7147)',
+  'ops/facts.ts': 'verbs.ts request-time verb handlers (remember TTL parsing, #7147)',
+  'ai/gateway.ts': 'search/projection-statistics.ts embed-drain refresh reads the configured embedding model at request time (#7083)',
   'persistence/memory-mutations.ts': 'verbs.ts request-time verb handlers',
   'persistence/verb-errors.ts': 'verbs.ts request-time verb handlers',
   'feedback/record.ts': 'verbs.ts request-time answer recording',
   'verbs/entity-card.ts': 'verbs.ts request-time verb handlers',
   'verbs/entity-card-identity.ts': 'verbs.ts request-time verb handlers (identity siblings notice)',
   'verbs/entity-names.ts': 'verbs.ts request-time verb handlers (entity names[] compact rows)',
+  'verbs/entity-source.ts': 'verbs.ts request-time verb handlers (entity source walk, #6723)',
   'mentions/coverage.ts': 'verbs.ts request-time verb handlers (entity coverage notice)',
   'think/index.ts': 'verbs.ts request-time verb handlers',
-  'embedding.ts': 'verbs.ts request-time verb handlers',
+  'search/query-prefix.ts': 'verbs.ts request-time verb handlers (synthesize question embed, #3783)',
   'model-pricing.ts': 'verbs.ts request-time verb handlers',
   'interop-notices.ts': 'verbs.ts request-time verb handlers (agent contract notices)',
   'remember-batch.ts': 'verbs.ts request-time verb handlers (remember items[])',
   'mentions/siblings.ts': 'entities/resolve.ts request-time entity resolution (identity-sibling names)',
   'mentions/policy.ts': 'entities/resolve.ts request-time entity resolution (pack linkable types)',
+  '../version.ts': 'backfill-base.ts skip-ledger producer stamp, read when a backfill runs (never shapes the schema)',
 };
 
 const STATIC_SPECIFIER =

@@ -14,7 +14,7 @@ import { createHash } from 'node:crypto';
 import { renderAttachmentInspection, threadAttachmentReceipts } from './attachment-receipts.ts';
 
 import { emailCitation } from '../output/scaffold.ts';
-import { DEFAULT_CONTACTS_DIR, type CalendarEventData, type ContactData, type GmailThreadData } from './types.ts';
+import { DEFAULT_CONTACTS_DIR, type CalendarEventData, type ContactData, type GmailMessageMeta, type GmailThreadData } from './types.ts';
 
 // ── Noise + signature rules (recipes/email-to-brain.md, now code) ───────────
 
@@ -40,6 +40,19 @@ const GOOGLE_SYSTEM_SENDERS: ReadonlySet<string> = new Set(['gemini-notes@google
 export function isNoiseSender(fromAddress: string): boolean {
   const f = fromAddress.toLowerCase();
   return GOOGLE_SYSTEM_SENDERS.has(f) || NOISE_SENDER_SUBSTRINGS.some((p) => f.includes(p));
+}
+
+const BULK_PRECEDENCE = new Set(['bulk', 'list', 'junk']);
+
+/**
+ * #5012: mail that positively declares itself automated: `Precedence:
+ * bulk|list|junk`, a `List-Id` header, or a no-reply `From` or `Reply-To`.
+ * Category labels and sender guesses are deliberately not signals, so a cold
+ * introduction from a real person still owes a reply.
+ */
+export function isPositivelyAutomated(m: GmailMessageMeta): boolean {
+  return BULK_PRECEDENCE.has(m.precedence ?? '') || m.listId === true || isNoiseSender(m.fromAddress)
+    || (m.replyTo ?? []).some((a) => isNoiseSender(a));
 }
 
 /**
@@ -293,6 +306,18 @@ export function renderThreadPage(thread: GmailThreadData): RenderedPage | null {
   return { relPath: threadRelPath(thread), markdown: fm.join('\n') + body.join('\n') + '\n' };
 }
 
+/**
+ * The rendered page with `visibility: private` in its frontmatter (any other
+ * `visibility` line replaced). A re-render of a page that is private today
+ * keeps it private: tighten-only, whoever set the label.
+ */
+export function withPrivateVisibility(markdown: string): string {
+  const match = /^---\n([\s\S]*?)\n---(\n|$)/.exec(markdown);
+  if (!match) return `---\nvisibility: private\n---\n${markdown}`;
+  const lines = match[1]!.split('\n').filter((line) => !/^visibility\s*:/.test(line));
+  return `---\n${[...lines, 'visibility: private'].join('\n')}\n---${markdown.slice(match[0].length - match[2]!.length)}`;
+}
+
 // ── Calendar event page ──────────────────────────────────────────────────────
 
 export function calendarRelPath(ev: CalendarEventData): string {
@@ -320,6 +345,7 @@ export function renderCalendarEventPage(ev: CalendarEventData): RenderedPage | n
     `attendees: ${yamlList(attendees.map((a) => a.email))}`,
     ...(ev.location ? [`location: ${yamlStr(ev.location)}`] : []),
     ...(ev.htmlLink ? [`url: ${yamlStr(ev.htmlLink)}`] : []),
+    ...(ev.private ? ['visibility: private'] : []),
     '---',
   ];
   const body: string[] = [

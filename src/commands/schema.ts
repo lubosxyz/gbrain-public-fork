@@ -20,6 +20,7 @@ import { assertManagedFilesystemWrite } from '../core/persistence/filesystem-gua
 
 import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
   addAliasToType,
@@ -405,7 +406,7 @@ function packPathByName(name: string): string | null {
     const asset = bundledPackPath(name);
     if (asset) return asset;
     // Resolve bundled YAML — import.meta fallback, try a few locations.
-    const here = dirname(new URL(import.meta.url).pathname);
+    const here = dirname(fileURLToPath(import.meta.url));
     const candidates = [
       join(here, '..', 'core', 'schema-pack', 'base', `${name}.yaml`),
       join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', `${name}.yaml`),
@@ -1149,7 +1150,7 @@ function runReloadCmd(args: string[]): void {
 }
 
 async function runAddTypeCmd(args: string[]): Promise<void> {
-  const { json } = parseFlags(args);
+  const json = parseFlags(args).json || args.includes('--json=true');
   const { parseAddTypeArgs, NO_PREFIX_NOTE } = await import('./schema-add-type.ts');
   let parsed: import('./schema-add-type.ts').AddTypeArgs;
   try {

@@ -38,6 +38,16 @@
  *
  * MENTION_EXTRACTOR_VERSION is separate from LINK_EXTRACTOR_VERSION_TS, so a
  * gazetteer change never reruns link or timeline extraction.
+ *
+ * A segmented page (body in segments, NULL body columns) is scanned block by
+ * block (page-body/segment-blocks.ts), the title first, keeping each target's
+ * first mention, and incrementally: each run's mentions are stored on its
+ * page_segment_derivations row keyed by its text, the gazetteer's digest and
+ * the scan options, so only runs that changed are read again. A name whose
+ * tokens straddle a segment cut (a blank line, heading, dated line or message
+ * boundary) is not matched. A gazetteer change
+ * marks every segmented page in scope due (no SQL prefilter reads its body).
+ * Derived aliases are still refreshed for inline entity pages only.
  */
 
 import { createHash } from 'node:crypto';
@@ -46,8 +56,12 @@ import { pipelined } from '../page-state/transactions.ts';
 import { isCrossSourceLinksEnabled } from '../link-extraction.ts';
 import {
   buildGazetteer, findMentionedEntities, gazetteerEntryKeys, tokenizeTitle,
-  type Gazetteer, type GazetteerEntry, type GazetteerEntryKey,
+  type FindMentionsOpts, type Gazetteer, type GazetteerEntry, type GazetteerEntryKey, type Mention,
 } from '../by-mention.ts';
+import { bodyBlocks, detachedValue } from '../page-body/segment-blocks.ts';
+import { commitRuns, derivationScope, keyDigest, planRuns, readRuns, SegmentDerivationRaced, type DeriveRun } from '../page-body/segment-derive.ts';
+import { canonicalJson } from '../belief/keys.ts';
+import { classifyItemFailure } from '../item-failure.ts';
 import { linkableTypesFor, loadSourcePack, parseNameList, readMentionPolicy, type MentionPolicy, type PackTypes } from './policy.ts';
 import { deriveEntityAliases, type DerivedAlias } from './aliases.ts';
 import { normalizeAliasList } from '../search/alias-normalize.ts';
@@ -56,7 +70,7 @@ import { maintenanceAttribution } from '../persistence/attribution.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 
 /** Bump to rescan every page's mentions once (gazetteer or scanner behavior change). */
-export const MENTION_EXTRACTOR_VERSION = 5;
+export const MENTION_EXTRACTOR_VERSION = 7;
 /** Bump to re-derive every entity page's declared aliases and title subject once. */
 export const ALIAS_DERIVATION_VERSION = 4;
 
@@ -79,7 +93,15 @@ export interface MentionPassResult {
   remaining: number;
   state: MentionState;
   error?: string;
+  /** Pages whose own content the scanner refused (a run it must read whole is over its bound); they stay due and the pass goes on. */
+  failed?: number;
+  failures?: MentionPageFailure[];
 }
+
+export interface MentionPageFailure { slug: string; source_id: string; code: string; message: string }
+
+/** The failed pages a pass lists; `failed` still counts every one. */
+export const MENTION_FAILURE_REPORT_LIMIT = 20;
 
 export interface MentionPassOpts {
   sourceId?: string;
@@ -228,7 +250,82 @@ async function disableSource(engine: BrainEngine, managed: boolean, sourceId: st
 }
 
 interface DuePage { id: number; slug: string; source_id: string; revision: string; title: string | null; type: string | null;
-  compiled_truth: string | null; timeline: string | null; mention_ignore: unknown; frontmatter?: Record<string, unknown> | null }
+  compiled_truth: string | null; timeline: string | null; mention_ignore: unknown; frontmatter?: Record<string, unknown> | null; body_storage?: string }
+
+/** What one run of a segmented body holds for the mention pass: its UTF-16 length and each target's first mention in it (offset run-local). */
+interface MentionRunOutput { chars: number; mentions: Mention[] }
+
+const gazetteerDigests = new WeakMap<Gazetteer, string>();
+
+/** A digest of every gazetteer entry (all fields), computed once per gazetteer object: the input a body run's mentions depend on. */
+function gazetteerDigest(gazetteer: Gazetteer): string {
+  let digest = gazetteerDigests.get(gazetteer);
+  if (digest === undefined) {
+    digest = keyDigest(canonicalJson([...gazetteer].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))));
+    gazetteerDigests.set(gazetteer, digest);
+  }
+  return digest;
+}
+
+/**
+ * The body mentions of a segmented page per run (spec 8.2 mentions), in page order: runs whose rows match the gazetteer,
+ * the scan options and their text are reused, the others are scanned block by block and stored. Null when the page is
+ * not segmented.
+ */
+async function segmentedRunMentions(engine: BrainEngine, p: { id: number; slug: string; source_id: string }, gazetteer: Gazetteer,
+  opts: FindMentionsOpts): Promise<Array<{ run: DeriveRun; output: MentionRunOutput }> | null> {
+  const scope = await derivationScope(engine, p);
+  if (!scope) return null;
+  const inputs = { extractor: MENTION_EXTRACTOR_VERSION, gazetteer: gazetteerDigest(gazetteer), opts, separator: '\n\n' };
+  const plan = await planRuns<MentionRunOutput>(engine, 'mentions', scope, () => inputs);
+  const fresh = new Map(plan.todo.map(run => [run.index, { chars: 0, mentions: [] as Mention[], seen: new Set<string>() }]));
+  await readRuns(engine, scope, new Set(fresh.keys()), (run, block) => {
+    const out = run && fresh.get(run.index);
+    if (!out) return;
+    for (const m of findMentionedEntities(block.text, gazetteer, opts)) {
+      if (out.seen.has(`${m.source_id}\0${m.slug}`)) continue;
+      out.seen.add(`${m.source_id}\0${m.slug}`);
+      out.mentions.push(detachedValue({ ...m, offset: m.offset + out.chars }));
+    }
+    out.chars += block.text.length;
+  }, { separator: '\n\n' });
+  const outputs = new Map([...fresh].map(([index, { chars, mentions }]) => [index, { chars, mentions }]));
+  await commitRuns(engine, 'mentions', scope, outputs, () => inputs);
+  return scope.runs.map(run => ({ run, output: outputs.get(run.index) ?? plan.current.get(run.index)! }));
+}
+
+/**
+ * findMentionedEntities over `${title}\n\n${compiled_truth}\n\n${timeline}`; a segmented body is scanned block by block,
+ * incrementally (segmentedRunMentions), or in a full pass when its body moves during the read.
+ */
+export async function pageMentions(engine: BrainEngine,
+  p: { id: number; slug: string; source_id: string; title: string | null; compiled_truth?: string | null; timeline?: string | null; body_storage?: string | null },
+  gazetteer: Gazetteer, opts: FindMentionsOpts): Promise<Mention[]> {
+  if (p.body_storage !== 'segmented') {
+    return (p.title || p.compiled_truth || p.timeline) ? findMentionedEntities(`${p.title ?? ''}\n\n${p.compiled_truth ?? ''}\n\n${p.timeline ?? ''}`, gazetteer, opts) : [];
+  }
+  const found = new Map<string, Mention>();
+  const add = (mentions: Mention[], at: number) => {
+    for (const m of mentions) if (!found.has(`${m.source_id}\0${m.slug}`)) found.set(`${m.source_id}\0${m.slug}`, { ...m, offset: m.offset + at });
+  };
+  add(findMentionedEntities(p.title ?? '', gazetteer, opts), 0);
+  const base = (p.title ?? '').length + 2;
+  const runs = await segmentedRunMentions(engine, p, gazetteer, opts).catch(error => {
+    if (error instanceof SegmentDerivationRaced) return null;
+    throw error;
+  });
+  if (!runs) {
+    for await (const block of bodyBlocks(engine, p, { separator: '\n\n' })) add(findMentionedEntities(block.text, gazetteer, opts), base + block.at);
+    return [...found.values()];
+  }
+  let at = base;
+  for (const { run, output } of runs) {
+    if (run.region === 'timeline' && (run.index === 0 || runs[run.index - 1]!.run.region === 'truth')) at += 2;
+    add(output.mentions, at);
+    at += output.chars;
+  }
+  return [...found.values()];
+}
 
 /** Alias derivation options from the mention policy (`mentions.alias_deny`, `mentions.multiword_aliases`). */
 export function aliasOptsOf(policy: Pick<MentionPolicy, 'aliasDeny' | 'multiwordAliases'>): { deny: string[]; multiword: boolean } {
@@ -256,7 +353,7 @@ async function refreshAliases(engine: BrainEngine, managed: boolean, sourceId: s
     const pages = await engine.executeRaw<DuePage>(
       `SELECT p.id, p.slug, p.source_id, p.knowledge_revision::text AS revision, p.title, p.type, p.compiled_truth, p.timeline, NULL AS mention_ignore, p.frontmatter
          FROM pages p LEFT JOIN page_mention_state s ON s.page_id = p.id
-        WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.type = ANY($2::text[]) AND p.id > $3
+        WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.body_storage = 'inline' AND p.type = ANY($2::text[]) AND p.id > $3
           AND (s.page_id IS NULL OR s.alias_revision IS DISTINCT FROM p.knowledge_revision OR s.alias_version IS DISTINCT FROM $4)
         ORDER BY p.id LIMIT $5`, [sourceId, types, after, ALIAS_DERIVATION_VERSION, ALIAS_BATCH]);
     if (!pages.length) break;
@@ -320,16 +417,17 @@ async function pagesMatchingNames(engine: BrainEngine, sourceIds: string[], adde
   const out: number[] = [];
   let after = 0;
   for (;;) {
-    const rows = await engine.executeRaw<{ id: number; slug: string; source_id: string; body: string; mention_ignore: unknown }>(
-      `SELECT id, slug, source_id, COALESCE(title, '') || E'\\n\\n' || COALESCE(compiled_truth, '') || E'\\n\\n' || COALESCE(timeline, '') AS body,
+    const rows = await engine.executeRaw<{ id: number; slug: string; source_id: string; body_storage: string; body: string; mention_ignore: unknown }>(
+      `SELECT id, slug, source_id, body_storage, COALESCE(title, '') || E'\\n\\n' || COALESCE(compiled_truth, '') || E'\\n\\n' || COALESCE(timeline, '') AS body,
               frontmatter->'mention_ignore' AS mention_ignore
          FROM pages WHERE deleted_at IS NULL AND source_id = ANY($1::text[]) AND id > $2
-          ${ascii ? `AND lower(COALESCE(title, '') || ' ' || COALESCE(compiled_truth, '') || ' ' || COALESCE(timeline, '')) LIKE ANY($4::text[])` : ''}
+          ${ascii ? `AND (body_storage = 'segmented' OR lower(COALESCE(title, '') || ' ' || COALESCE(compiled_truth, '') || ' ' || COALESCE(timeline, '')) LIKE ANY($4::text[]))` : ''}
         ORDER BY id LIMIT $3`,
       ascii ? [sourceIds, after, PREFILTER_BATCH, patterns] : [sourceIds, after, PREFILTER_BATCH]);
     if (!rows.length) break;
     after = rows[rows.length - 1]!.id;
     for (const r of rows) {
+      if (r.body_storage === 'segmented') { out.push(Number(r.id)); continue; }
       const hits = findMentionedEntities(r.body, added, { fromSlug: r.slug, fromSourceId: r.source_id, allowCrossSource });
       if (hits.length) out.push(Number(r.id));
     }
@@ -428,24 +526,36 @@ async function reconcileSource(engine: BrainEngine, sourceId: string, gazetteer:
     if (Date.now() > deadline) return;
     const pages = await engine.executeRaw<DuePage>(
       `SELECT p.id, p.slug, p.source_id, p.knowledge_revision::text AS revision, p.title, p.type, p.compiled_truth, p.timeline,
-              p.frontmatter->'mention_ignore' AS mention_ignore
+              p.frontmatter->'mention_ignore' AS mention_ignore, p.body_storage
          FROM pages p LEFT JOIN page_mention_state s ON s.page_id = p.id
         WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.id > $3 AND ${DUE_PREDICATE}
         ORDER BY p.id LIMIT $4`, [sourceId, MENTION_EXTRACTOR_VERSION, after, RECONCILE_BATCH]);
     if (!pages.length) return;
     after = pages[pages.length - 1]!.id;
-    const found = new Map(pages.map(p => [Number(p.id), (p.title || p.compiled_truth || p.timeline)
-      ? findMentionedEntities(`${p.title ?? ''}\n\n${p.compiled_truth ?? ''}\n\n${p.timeline ?? ''}`, gazetteer, {
-          fromSlug: p.slug, fromSourceId: p.source_id, allowCrossSource, ignoreNames: parseNameList(p.mention_ignore),
-        })
-      : []]));
-    await opts.beforePublish?.(pages.map(p => Number(p.id)));
+    const found = new Map<number, Mention[]>();
+    const readable: DuePage[] = [];
+    for (const p of pages) {
+      try {
+        found.set(Number(p.id), await pageMentions(engine, p, gazetteer,
+          { fromSlug: p.slug, fromSourceId: p.source_id, allowCrossSource, ignoreNames: parseNameList(p.mention_ignore) }));
+        readable.push(p);
+      } catch (error) {
+        const failure = classifyItemFailure(error);
+        if (failure.scope !== 'item' || failure.class !== 'content') throw error;
+        result.failed = (result.failed ?? 0) + 1;
+        if ((result.failures ??= []).length < MENTION_FAILURE_REPORT_LIMIT) {
+          result.failures.push({ slug: p.slug, source_id: p.source_id, code: failure.code, message: failure.message.slice(0, 500) });
+        }
+      }
+    }
+    if (!readable.length) continue;
+    await opts.beforePublish?.(readable.map(p => Number(p.id)));
     const outcome = await engine.transaction(async tx => {
       if (!sameGenerations(generations, await readGenerations(tx, genSources, true))) return null;
       const current = new Map((await tx.executeRaw<{ id: number; revision: string }>(
         `SELECT id, knowledge_revision::text AS revision FROM pages WHERE id = ANY($1::int[]) AND deleted_at IS NULL FOR SHARE`,
-        [pages.map(p => p.id)])).map(r => [Number(r.id), r.revision]));
-      const fresh = pages.filter(p => current.get(Number(p.id)) === p.revision);
+        [readable.map(p => p.id)])).map(r => [Number(r.id), r.revision]));
+      const fresh = readable.filter(p => current.get(Number(p.id)) === p.revision);
       if (!fresh.length) return { fresh: 0, created: 0, removed: 0 };
       const rows = await tx.executeRaw<{ id: number; from_page_id: number; to_slug: string; to_source_id: string; plain: boolean }>(
         `SELECT l.id, l.from_page_id, t.slug AS to_slug, t.source_id AS to_source_id,
@@ -476,9 +586,9 @@ async function reconcileSource(engine: BrainEngine, sourceId: string, gazetteer:
         [sourceId, fresh.map(p => p.id), fresh.map(p => p.revision), MENTION_EXTRACTOR_VERSION, generations.get(sourceId) ?? '0']);
       return { fresh: fresh.length, created, removed: drop.length };
     });
-    if (!outcome) { result.skipped += pages.length; return; }
+    if (!outcome) { result.skipped += readable.length; return; }
     result.pages += outcome.fresh;
-    result.skipped += pages.length - outcome.fresh;
+    result.skipped += readable.length - outcome.fresh;
     result.created += outcome.created;
     result.removed += outcome.removed;
   }

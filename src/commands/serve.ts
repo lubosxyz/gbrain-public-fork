@@ -1,5 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { PoolStallWatch } from '../core/postgres-engine/pool-stall-watch.ts';
+import { installRestartRequiredExit, recordServeTransport, resolveRestartRequiredExitSeconds, SERVE_RESTART_REQUIRED_EXIT_ENV } from './serve-health.ts';
+import { SERVE_UNHEALTHY_EXIT_CODE } from '../core/exit-codes.ts';
 import type { BrainEngine } from '../core/engine.ts';
 // C10: `--fail-fast` / GBRAIN_SERVE_FAIL_FAST=1 — exit with the classified envelope instead of status-only/degraded mode (decided in src/cli.ts's connect path; F4's status mode consults it too).
 export { serveFailFastRequested, writeServeFailFastEnvelope } from '../core/serve-fail-fast.ts';
@@ -10,7 +12,10 @@ import { RESIDENT_POOL_FLOOR } from '../core/pg-access-classify.ts';
 import { redirectStdoutLoggingToStderr } from '../core/console-prefix.ts';
 import { startFactsDrainScheduler, type FactsDrainScheduler, type FactsDrainSchedulerOpts } from '../core/facts/drain-scheduler.ts';
 import { startMovementWatch, type MovementWatch } from '../core/persistence/sync-movement.ts';
+import { startServeHeadWatcher } from '../core/serve-head-watcher.ts';
+import { isReadOnlyServeArgs, readOnlyServeSkipsResidentDuties } from '../core/direct-pool-profile.ts';
 import { onForwardProgress } from '../core/forward-progress.ts';
+import { foregroundWindow } from '../core/foreground-activity.ts';
 import { graduationHandoffRequested, writeServeGraduationEnvelope } from '../core/persistence/graduation-serve-guard.ts';
 import {
   installLoopStallWatchdog,
@@ -66,6 +71,18 @@ const PARENT_WATCHDOG_INTERVAL_MS = 5_000;
 // sweep fires after 10–20 min of true inactivity — the armIdle re-arm
 // semantics expressed through the injectable deps.setInterval seam.
 const IDLE_SWEEP_INTERVAL_MS = 10 * 60_000;
+/** GBRA-156: GBRAIN_SWEEP_IDLE_INTERVAL_MS shortens the cadence for benchmarks that force a sweep beside searches (scripts/bench/production-soak/socket-probe.ts); at least 1 s. */
+function idleSweepIntervalMs(): number {
+  const n = Number(process.env.GBRAIN_SWEEP_IDLE_INTERVAL_MS);
+  return Number.isFinite(n) && n >= 1_000 ? Math.floor(n) : IDLE_SWEEP_INTERVAL_MS;
+}
+
+/** GBRA-156: each idle sweep names its start and its duration on stderr, so slow requests can be lined up with it. */
+async function loggedIdleSweep(log: (line: string) => void, run: () => Promise<unknown>): Promise<void> {
+  const startedAt = Date.now();
+  log('[gbrain serve] idle sweep: started');
+  try { await run(); } finally { log(`[gbrain serve] idle sweep: finished in ${Date.now() - startedAt} ms`); }
+}
 
 // Small per-run budget for idle sweeps: the serve must snap back to
 // serving tool calls the moment the client wakes up.
@@ -235,7 +252,7 @@ export async function runServe(
   // 'verbs' exposes exactly the seven protocol verbs (the quickstart surface);
   // 'starter' the ~20-op daily-driver set; 'full' keeps every operation.
   const { parseSurfaceFlag, resolveSurfaceWithSource, resolveStdioSurface, parseAccessFlag, SURFACE_SOURCE_LABEL } = await import('../mcp/surface.ts');
-  const { loadConfig } = await import('../core/config.ts');
+  const { loadConfig, MERGED_CONFIG_BY_ENGINE } = await import('../core/config.ts');
   const surfaceFlag = parseSurfaceFlag(args);
   const resolved = isHttp ? resolveSurfaceWithSource(surfaceFlag, loadConfig()) : resolveStdioSurface(surfaceFlag, loadConfig());
   const surface = resolved.surface;
@@ -246,8 +263,21 @@ export async function runServe(
     console.error(`[gbrain serve] ignoring GBRAIN_SURFACE="${resolved.invalidEnv}" (use verbs | starter | full)`);
   }
   console.error(`[gbrain serve] surface=${surface} (source: ${SURFACE_SOURCE_LABEL[resolved.source]})`);
+  void (await import('../core/serve-behavior-notice.ts')).logServeBehaviorNotice(engine, loadConfig());
+  // #6543 (A6): serve's stuck, desync and recovery events go to the pool-recovery audit `doctor --only pool_reap_health` reads.
+  if (engine.kind === 'postgres') {
+    const { logPoolRecovery } = await import('../core/audit/pool-recovery-audit.ts');
+    (await import('../core/pool-gauge.ts')).setPoolIncidentAudit((kind, detail) => logPoolRecovery(kind, undefined, detail));
+  }
   // #6383: the pool stall line (Postgres only; the watch reports nothing for an engine without pool numbers).
   if (engine.kind === 'postgres') new PoolStallWatch(engine, (line) => console.error(line)).start();
+  // #6543: the read pool's transport facts, logged once and kept for /health?deep=1; the opt-in unhealthy exit.
+  if (engine.kind === 'postgres') void recordServeTransport(engine, (line) => console.error(line));
+  const restartRequiredExitSeconds = resolveRestartRequiredExitSeconds(process.env[SERVE_RESTART_REQUIRED_EXIT_ENV]);
+  if (restartRequiredExitSeconds !== null) {
+    installRestartRequiredExit(engine, restartRequiredExitSeconds, { log: (line) => console.error(line), exit: opts.exit ?? ((code: number) => { process.exit(code); }) });
+    console.error(`[gbrain serve] ${SERVE_RESTART_REQUIRED_EXIT_ENV}=${restartRequiredExitSeconds}: exits ${SERVE_UNHEALTHY_EXIT_CODE} after persistence_restart_required holds that long (at most 3 self-exits per hour)`);
+  }
   // #4768: stdio read-only access ceiling. HTTP refuses it: per-token grants
   // (auth rescope-token --operations / rescope-client) are its operation control.
   const access = parseAccessFlag(args);
@@ -262,6 +292,12 @@ export async function runServe(
   // binding is deliberate or unambiguous — sole-source brains are a pure
   // no-op. Stdio-only: the OAuth HTTP path scopes writes per token instead.
   const sourceGuard = args.includes('--source-guard');
+  // Opt-in warm CLI socket (core/cli-socket/server.ts): off, the serve loads nothing and reads nothing for it.
+  const cliSocketOn = args.includes('--cli-socket') || MERGED_CONFIG_BY_ENGINE.get(engine)?.serve_cli_socket === true;
+  // Opt-in vector index prewarm (core/vector-prewarm.ts): off, the serve loads nothing and reads nothing for it.
+  if (MERGED_CONFIG_BY_ENGINE.get(engine)?.serve_vector_prewarm === true) {
+    void import('../core/vector-prewarm.ts').then(m => m.prewarmAtServeStart(engine, opts.log ?? ((msg: string) => console.error(msg))));
+  }
   if (sourceGuard && isHttp) {
     // Loud posture warning (the --log-full-params precedent): the guard is a
     // stdio-lane mechanism; HTTP writes are scoped per token instead. An
@@ -352,11 +388,13 @@ export async function runServe(
     const { armCorpusDrain } = await import('../core/sweep.ts');
     const corpusDrain = (opts.armCorpusDrain ?? armCorpusDrain)(engine, { sourceId: process.env.GBRAIN_SOURCE || undefined });
 
+    const cliSocket = cliSocketOn ? await (await import('../core/cli-socket/server.ts')).startCliSocket(engine, httpLog) : null;
     try {
       await runHttp(engine, { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams, bind, suppressBootstrapToken, printAdminToken, surface, adoptServer: opts.adoptServer });
     } finally {
       stallWatchdog?.dispose();
       corpusDrain?.cancel();
+      cliSocket?.close();
     }
 
     await finishHttpServe(engine, opts);
@@ -437,6 +475,8 @@ export async function runServe(
     // earlier flips stdin into flowing mode and can consume a fast client's
     // initialize frame before the SDK sees it.
     activateStdioIdleActivityTracking();
+    // Opt-in warm CLI socket; bound after the stdout redirect so a request's captured console output keeps its stream.
+    if (cliSocketOn) void import('../core/cli-socket/server.ts').then(m => m.startCliSocket(engine, opts.log ?? ((msg: string) => console.error(msg))));
   } finally {
     if (bootDeadline) clearTimeout(bootDeadline);
     stopProgressWatch();
@@ -578,13 +618,16 @@ function installFactsDrain(engine: BrainEngine, opts: ServeOptions, deps: StdioL
 /**
  * #6317 (B4): the facts drain plus the movement watch (one `[gbrain notice]`
  * when a managed source's sync data stops moving; reader in
- * persistence/sync-movement.ts), stopped together at shutdown.
+ * persistence/sync-movement.ts), stopped together at shutdown. #6858 ask 6:
+ * the on-commit HEAD watcher (`sync.on_commit`, core/serve-head-watcher.ts)
+ * stops with them, before shutdownDelegatedSync aborts the sync it started.
  */
 function installResidentTickers(engine: BrainEngine, opts: ServeOptions, deps: StdioLifecycleDeps, shuttingDown: () => boolean): { stop(): Promise<void> } {
   const factsDrain = installFactsDrain(engine, opts, deps, shuttingDown);
   // The watch keeps its own unref'd timer: the injected lifecycle timers are the parent watchdog's and the idle sweep's, which tests count.
   const movementWatch: MovementWatch = startMovementWatch(engine, { log: deps.log });
-  return { stop: async () => { movementWatch.stop(); await factsDrain?.stop(); } };
+  const headWatcher = startServeHeadWatcher(engine, { log: deps.log });
+  return { stop: async () => { const settled = headWatcher.stop(); movementWatch.stop(); await settled; await factsDrain?.stop(); } };
 }
 
 function installStdioLifecycle(
@@ -809,9 +852,9 @@ function installStdioLifecycle(
   // budget). SEPARATE timer from the parent watchdog, through the same
   // injectable deps.setInterval seam, unref'd per the serve convention so
   // it can never hold the process open. Cleared in beginShutdown. Kill
-  // switch: GBRAIN_SWEEP=0 (seam: opts.sweepEnabled). Chunk-level stdin
-  // 'data' granularity is sufficient — same rationale as armIdle below.
-  const sweepEnabled = opts.sweepEnabled ?? (process.env.GBRAIN_SWEEP !== '0');
+  // switch: GBRAIN_SWEEP=0 (seam: opts.sweepEnabled). Chunk-level stdin 'data' granularity is sufficient (see armIdle).
+  const lean = readOnlyServeSkipsResidentDuties(isReadOnlyServeArgs(args), engine.kind); // #7599: a read-only Postgres serve
+  const sweepEnabled = !lean && (opts.sweepEnabled ?? (process.env.GBRAIN_SWEEP !== '0')); // runs no sweep
   if (sweepEnabled) {
     const runIdleSweep = opts.sweep ?? (async (e: BrainEngine) => {
       // #4409: the runner loads lazily here too — the sweep fires after
@@ -839,6 +882,7 @@ function installStdioLifecycle(
     });
     let stdinSawData = false;
     let sweepInFlight = false;
+    const sawForeground = foregroundWindow();
     let dataListenerAttached = false;
     idleSweepTimer = deps.setInterval(() => {
       if (shuttingDown) return;
@@ -854,22 +898,21 @@ function installStdioLifecycle(
         dataListenerAttached = true;
         return;
       }
-      if (stdinSawData) { stdinSawData = false; return; } // active — re-arm
-      if (sweepInFlight) return; // never overlap sweeps
-      // Degraded mode (db-availability 4c): background sweeps must not burn
+      if (sawForeground() || stdinSawData) { stdinSawData = false; return; } // active (stdin, or a warm CLI socket request: GBRA-156) — re-arm
+      // Never overlap sweeps. Degraded mode (db-availability 4c): background sweeps must not burn
       // the min-interval reconnect budget — tool calls own recovery.
-      if (isEngineDegradedForServe(engine)) return;
+      if (sweepInFlight || isEngineDegradedForServe(engine)) return;
       sweepInFlight = true;
       Promise.resolve()
-        .then(() => runIdleSweep(engine))
+        .then(() => loggedIdleSweep(deps.log, () => runIdleSweep(engine)))
         .catch(() => { /* idle sweep is best-effort; never kill serve */ })
         .finally(() => { sweepInFlight = false; });
-    }, IDLE_SWEEP_INTERVAL_MS);
+    }, idleSweepIntervalMs());
     (idleSweepTimer as { unref?: () => void } | null)?.unref?.();
   }
 
   // Automatic facts drain (Lane D) and the #6317 movement watch: see installResidentTickers.
-  factsDrain = installResidentTickers(engine, opts, deps, () => shuttingDown);
+  factsDrain = lean ? null : installResidentTickers(engine, opts, deps, () => shuttingDown); // #7599: nor its resident tickers
 
   // Optional idle-timeout safety net. Default OFF; opt-in via
   // `--stdio-idle-timeout <seconds>`. The flag is for the rare case where

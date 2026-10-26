@@ -14,11 +14,16 @@ op	capture	coordinator	submitPageMutation admits a journaled page mutation.
 op	cancel_write_request	no_canonical_write	Cancels a queued journal request; no canonical row changes.
 op	add_tag	coordinator	submitPageMutation admits a journaled page mutation.
 op	remove_tag	coordinator	submitPageMutation admits a journaled page mutation.
-op	add_link	coordinator	coordinatedManualLinkWrite: durable authority, withCoordinatedWrite, both endpoint page keys locked; database-only.
-op	remove_link	coordinator	coordinatedManualLinkWrite, same boundary as add_link.
+op	add_link	coordinator	submitPageMutation admits a journaled page mutation of the from page's links fence; the edge is projected from it.
+op	remove_link	coordinator	submitPageMutation, same boundary as add_link; the apply also deletes the matching database-only edges.
 op	add_timeline_entry	coordinator	submitPageMutation admits a journaled page mutation.
 op	revert_version	coordinator	submitPageMutation admits a journaled page mutation.
 op	edit_page	coordinator	submitPageMutation admits a journaled page mutation; edits apply to the locked snapshot.
+op	append_page	coordinator	submitPageMutation admits a journaled page mutation; the append applies to the locked snapshot.
+op	begin_page_upload	no_canonical_write	Opens an upload session row; no page is written until commit_page_upload.
+op	upload_page_part	no_canonical_write	Stages one part of an upload session; no page is written until commit_page_upload.
+op	commit_page_upload	coordinator	submitPageMutation admits the staged body as a journaled page mutation (put_page, or append_page in append mode).
+op	abort_page_upload	no_canonical_write	Discards an uncommitted upload session and its staged parts; no page is written.
 op	put_skill	coordinator	Shared-skill publication through the persistence journal.
 op	delete_skill	coordinator	Shared-skill publication through the persistence journal.
 op	set_skill_policy	no_canonical_write	Shared-skill policy row, epoch-guarded; no page content.

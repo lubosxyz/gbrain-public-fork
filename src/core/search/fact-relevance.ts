@@ -55,9 +55,24 @@ export const TERM_STUFFING_RATIO = 3;
 /** The two preregistered admission rules; dev picks one (`recall.question_admission`). */
 export const QUESTION_ADMISSION_RULES = ['reserve', 'facts_arm'] as const;
 export type QuestionAdmissionRule = (typeof QUESTION_ADMISSION_RULES)[number];
-const RESERVE_COSINE_MIN = 0.5;
+/**
+ * Absolute cosine floors: a fact passes on similarity alone at or above them.
+ * They are a property of the embedding model's cosine scale and no model has
+ * a measured floor yet (#6590): on a high-baseline embedder an unrelated
+ * question clears them, so an empty facts list stops meaning "nothing
+ * matched". Doctor `fact_admission_floors` says so for the configured model.
+ */
+export const RESERVE_COSINE_MIN = 0.5;
 const RESERVE_TERM_SHARE_MIN = 0.34;
-const FACTS_ARM_COSINE_MIN = 0.6;
+/** The facts-arm floor; `query`'s facts arm (facts-arm.ts) and the `facts_arm` admission rule share it. */
+export const FACTS_ARM_COSINE_MIN = 0.6;
+/**
+ * Embedding models whose admission floors an eval measured, keyed
+ * `provider:model@dims` (facts/supersession-threshold.ts calibrationKey). Add
+ * a row only with an eval behind it. Doctor `fact_admission_floors` and
+ * recall's `facts_calibration` (#6590) read it.
+ */
+export const FACT_ADMISSION_FLOOR_EVIDENCE: Readonly<Record<string, string>> = {};
 
 export interface FactPoolScope {
   sourceId?: string; sourceIds?: string[]; remote: boolean;
@@ -75,6 +90,8 @@ export interface FactPoolFilters {
   /** Event time, COALESCE(valid_from, created_at). */
   since?: Date;
   grep?: string;
+  /** Also pool expired, superseded and lapsed facts (recall's `include_expired`). */
+  includeExpired?: boolean;
 }
 
 export interface FactPoolOpts {
@@ -120,8 +137,8 @@ function poolPredicate(scope: FactPoolScope, filters: FactPoolFilters | undefine
   const params: unknown[] = [scope.sourceIds?.length ? scope.sourceIds : [scope.sourceId ?? 'default'], [...AUDIT_ROW_SOURCES]];
   const bind = (v: unknown) => { params.push(v); return `$${params.length}`; };
   const clauses = [
-    'f.source_id = ANY($1::text[]) AND f.expired_at IS NULL AND f.superseded_by IS NULL',
-    '(f.valid_until IS NULL OR f.valid_until > now()) AND f.source != ALL($2::text[])',
+    filters?.includeExpired ? 'f.source_id = ANY($1::text[])' : 'f.source_id = ANY($1::text[]) AND f.expired_at IS NULL AND f.superseded_by IS NULL',
+    filters?.includeExpired ? 'f.source != ALL($2::text[])' : '(f.valid_until IS NULL OR f.valid_until > now()) AND f.source != ALL($2::text[])',
     quarantinedProvenanceFilterFragment('f'),
     ...(scope.remote ? [`f.visibility = 'world'`] : []),
     ...(scope.excludePrivate ? [privateProvenanceFilterFragment('f')] : []),
@@ -231,11 +248,12 @@ export async function countUncomparableFacts(engine: BrainEngine, scope: FactPoo
   const column = await factsEmbeddingColumn(engine);
   if (!column) return [];
   const declared = column.dims === dims;
+  const active = filters?.includeExpired ? '' : ' AND f.expired_at IS NULL';
   // Cheap candidates first (idx_facts_unembedded, idx_facts_embedding_model), then the read policy on those rows only.
   const uncomparable = declared
-    ? `SELECT f.id FROM facts f WHERE f.source_id = ANY($1::text[]) AND f.expired_at IS NULL AND (f.embedding IS NULL OR f.embedded_text_hash IS DISTINCT FROM md5(f.fact))
-       UNION SELECT f.id FROM facts f WHERE f.source_id = ANY($1::text[]) AND f.expired_at IS NULL AND (f.embedding_model IS NULL OR f.embedding_model < ${model} OR f.embedding_model > ${model})`
-    : `SELECT f.id FROM facts f WHERE f.source_id = ANY($1::text[]) AND f.expired_at IS NULL AND NOT (${comparable(model, `$${params.length + 2}`)})`;
+    ? `SELECT f.id FROM facts f WHERE f.source_id = ANY($1::text[])${active} AND (f.embedding IS NULL OR f.embedded_text_hash IS DISTINCT FROM md5(f.fact))
+       UNION SELECT f.id FROM facts f WHERE f.source_id = ANY($1::text[])${active} AND (f.embedding_model IS NULL OR f.embedding_model < ${model} OR f.embedding_model > ${model})`
+    : `SELECT f.id FROM facts f WHERE f.source_id = ANY($1::text[])${active} AND NOT (${comparable(model, `$${params.length + 2}`)})`;
   const rows = await customPlan<{ source_id: string; n: number | string }>(engine,
     `WITH u AS MATERIALIZED (${uncomparable})
      SELECT f.source_id, count(*) AS n FROM facts f WHERE f.id IN (SELECT id FROM u) AND ${where}

@@ -30,7 +30,7 @@ import { opError, OperationError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { recordUpstreamObservation } from '../sync-upstream.ts';
 import { checkpointRetryCommand } from './checkpoint-validation.ts';
-import { localHostId, persistenceHome } from './identity.ts';
+import { existingLocalHostId, localHostId, persistenceHome } from './identity.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
 import { getWorktreeBinding, managedPersistenceEnabled, type WorktreeBinding } from './ownership.ts';
 import { isPhysicalRootMetadata } from './physical-root-record.ts';
@@ -38,6 +38,7 @@ import { startPersistenceConsumer } from './service.ts';
 import { lockTopologyPrincipal, lockTopologyRows, topologyPrincipal, withTopologyLocks } from './topology-locks.ts';
 import { ACTIVE_REFRESH_STATES_SQL, CHECKOUT_EFFECT_KINDS_SQL, type WorktreeRefreshState } from './worktree-refresh-schema.ts';
 import { gitChildEnv } from '../git-env.ts';
+import { classifyOriginUniqueViolation } from './origin-guard.ts';
 
 export interface WorktreeRefreshRow {
   id: string; worktree_id: string; source_ids: string[]; principal_id: string; owner_epoch: string | number;
@@ -71,6 +72,19 @@ function refusal(name: CatalogueName, cause: string, fix: string, refreshId?: st
   const error = catalogueError(name, cause, fix);
   if (refreshId) error.detail = `refresh_id=${refreshId}`;
   return error;
+}
+/**
+ * GBRA-133: the owner check reads this process's host identity without minting one (a cron job with another HOME would
+ * otherwise become a new host silently), and its refusal names the identity file it read and the HOME it resolved from.
+ */
+function assertRefreshOwner<B extends { owner_host_id: string | null; local_path: string | null }>(binding: B, sourceId: string, action: string): asserts binding is B & { local_path: string } {
+  const hostId = existingLocalHostId();
+  if (binding.owner_host_id === hostId && binding.local_path) return;
+  const path = join(persistenceHome(), 'host.json');
+  const self = hostId ? `host identity ${hostId} from ${path}` : `no host identity at ${path} (none was created)`;
+  throw refusal('refresh_not_owner',
+    `Only the registered owner host (${binding.owner_host_id}) of source ${sourceId} may ${action}; this process has ${self}, resolved from HOME=${process.env.HOME ?? '(unset)'} and GBRAIN_HOME=${process.env.GBRAIN_HOME?.trim() || '(unset)'}.`,
+    `Run it on the owner host with the HOME or GBRAIN_HOME its writer uses (a cron job often runs with a different HOME, so set GBRAIN_HOME explicitly); check the owner with gbrain sources writer status ${sourceId}`);
 }
 const writerStatusFix = (why: string, sourceId?: string): Action => readFix(why,
   { argv: ['gbrain', 'sources', 'writer', 'status', ...(sourceId ? ['--source', sourceId] : []), '--json'] });
@@ -137,7 +151,7 @@ async function configuredMs(engine: BrainEngine, flag: number | undefined, env: 
   return Math.floor(raw);
 }
 
-function refreshLockPath(worktreeId: string): string { return join(persistenceHome(), 'locks', `refresh-${worktreeId}.lock`); }
+export function refreshLockPath(worktreeId: string): string { return join(persistenceHome(), 'locks', `refresh-${worktreeId}.lock`); }
 
 async function readActiveRefresh(engine: BrainEngine, worktreeId: string): Promise<WorktreeRefreshRow | null> {
   const [row] = await engine.executeRaw<WorktreeRefreshRow>(`SELECT * FROM persistence_worktree_refreshes
@@ -189,12 +203,10 @@ interface Plan {
 async function precheck(engine: BrainEngine, git: Git, sourceId: string, fetchTimeoutMs: number): Promise<Plan> {
   if (!await managedPersistenceEnabled(engine)) throw refusal('refresh_not_managed',
     'This brain is not managed, so gbrain sync pulls the checkout itself; there is no worktree fence to coordinate.', `gbrain sync --source ${sourceId}`);
-  const binding = await getWorktreeBinding(engine, sourceId);
+  const binding = await getWorktreeBinding(engine, sourceId, existingLocalHostId());
   if (!binding) throw refusal('refresh_not_managed',
     `Source ${sourceId} has no claimed canonical worktree, so gbrain sync pulls it without a refresh.`, `gbrain sync --source ${sourceId}`);
-  if (binding.owner_host_id !== localHostId() || !binding.local_path) throw refusal('refresh_not_owner',
-    `Only the registered owner host of source ${sourceId} may move its checkout; this host is not that owner.`,
-    `Run gbrain sources refresh ${sourceId} on the owner host; check which host owns it with gbrain sources writer status ${sourceId}`);
+  assertRefreshOwner(binding, sourceId, 'move its checkout');
   const root = binding.local_path;
   const active = await readActiveRefresh(engine, binding.worktree_id);
   if (active) throw refusal('refresh_in_progress', `Refresh ${active.id} of this worktree is ${active.state}; only one refresh per worktree runs at a time.`,
@@ -237,12 +249,28 @@ async function precheck(engine: BrainEngine, git: Git, sourceId: string, fetchTi
   const targetHead = await revParse(git, root, '@{upstream}');
   if (!oldHead || !targetHead) throw refusal('refresh_no_upstream', `The checkout HEAD or its upstream ${upstreamRef} does not resolve to a commit.`,
     `git -C ${q(root)} fetch ${remote || 'origin'}, then gbrain sources refresh ${sourceId}`);
-  if (oldHead !== targetHead && !await isAncestor(git, root, oldHead, targetHead)) throw refusal('refresh_diverged',
-    `The checkout HEAD ${oldHead} is not an ancestor of ${upstreamRef} (${targetHead}); a fast-forward is impossible and nothing changed.`,
-    `Reconcile the histories and push from a non-managed clone, then retry gbrain sources refresh ${sourceId}; or replace the checkout with gbrain sources reclone ${sourceId} (ask the user first).`);
+  if (oldHead !== targetHead && !await isAncestor(git, root, oldHead, targetHead)) throw await divergedRefusal(git, root, sourceId, upstreamRef, oldHead, targetHead);
   const dirt = await dirtyOverlap(git, root, oldHead, targetHead);
   if (dirt.overlap.length) throw dirtyRefusal(sourceId, dirt.overlap);
   return { binding, root, members, upstreamRef, oldHead, targetHead, ...dirt };
+}
+/**
+ * Q1: a diverged checkout is reconciled without moving it: `gbrain git commit-push --push-only --keep-checkout` merges the
+ * upstream into HEAD in memory and pushes the merge (refusing on a conflict, never touching the checkout), after which HEAD
+ * is an ancestor of the upstream and the refresh fast-forwards. It publishes the local commits, so the user decides.
+ */
+async function divergedRefusal(git: Git, root: string, sourceId: string, upstreamRef: string, oldHead: string, targetHead: string): Promise<OperationError> {
+  const count = Number((await git(['-C', root, 'rev-list', '--count', `${targetHead}..${oldHead}`])).stdout.trim()) || 0;
+  const local = count ? `${count} local commit(s)` : 'the local commits';
+  const argv = ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', root, '--json'];
+  const error = refusal('refresh_diverged',
+    `The checkout HEAD ${oldHead} is not an ancestor of ${upstreamRef} (${targetHead}); a fast-forward is impossible and nothing changed.`,
+    `Publish ${local} merged with ${upstreamRef}: ${argv.map(q).join(' ')} (it merges in memory, refuses on a conflict and never moves the checkout), then retry gbrain sources refresh ${sourceId}. Ask the user first, because it pushes those commits (git -C ${q(root)} log --stat ${upstreamRef}..HEAD lists them). gbrain sources reclone ${sourceId} replaces the checkout instead and drops them.`);
+  error.fix = { argv, consent: [], actor: 'user', ask_user: true, requires_exclusive: false,
+    why: `HEAD has ${local} that ${upstreamRef} lacks while ${upstreamRef} moved on; pushing HEAD merged with it makes HEAD an ancestor of the upstream, so the refresh can fast-forward.`,
+    user_message: `The checkout of source ${sourceId} has ${local} that were never pushed while its remote moved on. Push them, merged with the remote, so gbrain can bring the checkout up to date? Conflicting files stop the push and change nothing.`,
+    docs: 'docs/guides/write-refusals.md#refresh_diverged' };
+  return error;
 }
 function dirtyRefusal(sourceId: string, overlap: string[], refreshId?: string): OperationError {
   const named = overlap.slice(0, 20).join(', ') + (overlap.length > 20 ? ` and ${overlap.length - 20} more` : '');
@@ -275,17 +303,21 @@ async function worktreeRecoveryPending(engine: BrainEngine, binding: WorktreeBin
   try { const held = await probe(); return held?.publication === true || held?.topology === true; }
   finally { await lock.release(); }
 }
-/** Never wait on a sync: an unexhausted cursor names its own resume command. */
+/**
+ * Never wait on a sync: an unexhausted cursor names its own resume command. #6712 PR 4b (design v3.2 §3.3): a
+ * non-company source's pass is never stranded by a checkout move (it reconciles whatever HEAD it pins next), so only
+ * cursors refuse: a company brain's, and a legacy one the first pass has not retired yet.
+ */
 async function assertNoUnfinishedSync(engine: BrainEngine, members: string[]): Promise<void> {
-  const [cursor] = await engine.executeRaw<{ source_id: string; header: Record<string, unknown>; failed: boolean }>(`SELECT c.completed_keys->0->>'sourceId' AS source_id,
-    c.completed_keys->0 AS header,EXISTS (SELECT 1 FROM op_checkpoints f WHERE f.op='managed-sync-failure' AND f.fingerprint=c.fingerprint) AS failed
+  const [cursor] = await engine.executeRaw<{ source_id: string; header: Record<string, unknown> }>(`SELECT c.completed_keys->0->>'sourceId' AS source_id,
+    c.completed_keys->0 AS header
     FROM op_checkpoints c WHERE c.op='managed-sync' AND COALESCE(c.completed_keys->0->>'done','false')<>'true'
     AND c.completed_keys->0->>'sourceId'=ANY($1::text[]) ORDER BY c.updated_at LIMIT 1`, [members]);
   if (!cursor) return;
   const header = cursor.header as { processingOptions?: Record<string, boolean>; syncOptions?: Parameters<typeof checkpointRetryCommand>[0]['syncOptions'] };
   const resume = checkpointRetryCommand({ sourceId: cursor.source_id, processingOptions: header.processingOptions, syncOptions: header.syncOptions ?? null });
   throw refusal('sync_in_progress', `Source ${cursor.source_id} has an unfinished managed sync cursor; moving the checkout now would strand it.`,
-    `${cursor.failed ? resume : resume.replace(' --retry-failed', '')}, then retry the refresh.`);
+    `${resume}, then retry the refresh.`);
 }
 
 async function drainCounts(engine: BrainEngine, worktreeId: string): Promise<{ requests: number; effects: number; recovery: number }> {
@@ -313,28 +345,32 @@ async function bookkeeping(engine: BrainEngine, row: WorktreeRefreshRow): Promis
   });
 }
 
-/** Steps 6-7: the managed `--no-pull` sync per member, then completion when every member is at target_head. */
-async function syncMembers(engine: BrainEngine, git: Git, row: WorktreeRefreshRow, root: string): Promise<{ synced: RefreshMemberSync[]; blocked: RefreshSyncBlocked[] }> {
+/** #6712: a member has synced the refresh once its `last_commit` is the target or a descendant of it (a commit landed on top of the target). */
+async function reachedTarget(git: Git, root: string, row: WorktreeRefreshRow, commit: string | null): Promise<boolean> {
+  return commit === row.target_head || (!!commit && commit !== row.old_head && await isAncestor(git, root, row.target_head, commit));
+}
+
+/** Steps 6-7: the managed `--no-pull` sync per member, then completion when every member reached target_head (or a descendant). */
+async function syncMembers(engine: BrainEngine, git: Git, row: WorktreeRefreshRow, root: string): Promise<{ synced: RefreshMemberSync[]; blocked: RefreshSyncBlocked[]; atTarget: boolean }> {
   const { performManagedSync } = await import('./sync-run.ts');
   const synced: RefreshMemberSync[] = [], blocked: RefreshSyncBlocked[] = [];
   for (const sourceId of row.source_ids) {
     let status = 'up_to_date';
     for (let pass = 0; pass < MAX_MEMBER_SYNC_PASSES; pass++) {
-      const commit = await lastCommit(engine, sourceId);
-      if (commit === row.target_head || (commit && commit !== row.old_head && await isAncestor(git, root, row.target_head, commit))) break;
+      if (await reachedTarget(git, root, row, await lastCommit(engine, sourceId))) break;
       let result: SyncResult;
       try { result = await performManagedSync(engine, { sourceId, noPull: true }); }
       catch (error) {
         const failure = error instanceof OperationError ? error : opError('storage_error', error instanceof Error ? error.message : String(error),
-          `The managed sync of source ${sourceId} failed during refresh ${row.id}. Check its writer status, fix the cause, then resume with gbrain sync --source ${sourceId} --no-pull --retry-failed.`);
-        blocked.push({ source_id: sourceId, code: failure.code, message: failure.message, resume: `gbrain sync --source ${sourceId} --no-pull --retry-failed` });
+          `The managed sync of source ${sourceId} failed during refresh ${row.id}. Check its writer status, fix the cause, then resume with gbrain sync --source ${sourceId} --no-pull.`);
+        blocked.push({ source_id: sourceId, code: failure.code, message: failure.message, resume: `gbrain sync --source ${sourceId} --no-pull` });
         status = 'blocked';
         break;
       }
       status = result.status;
       if (result.status === 'blocked_by_failures') {
         blocked.push({ source_id: sourceId, code: result.managedWrite?.write_error ?? result.failureCodes?.[0]?.code ?? 'sync_blocked',
-          message: result.managedWrite?.message ?? 'The managed sync is blocked by a failed write.', resume: `gbrain sync --source ${sourceId} --no-pull --retry-failed` });
+          message: result.managedWrite?.message ?? 'The managed sync is blocked by a failed write.', resume: `gbrain sync --source ${sourceId} --no-pull` });
         break;
       }
       if (result.status === 'partial') await new Promise(resolve => setTimeout(resolve, DRAIN_POLL_MS));
@@ -342,18 +378,19 @@ async function syncMembers(engine: BrainEngine, git: Git, row: WorktreeRefreshRo
     await recordUpstreamObservation(engine, sourceId);
     synced.push({ source_id: sourceId, status, last_commit: await lastCommit(engine, sourceId) });
   }
-  const atTarget = synced.every(member => member.last_commit === row.target_head);
+  let atTarget = true;
+  for (const member of synced) if (!await reachedTarget(git, root, row, member.last_commit)) { atTarget = false; break; }
   if (atTarget || blocked.length) await engine.transaction(tx => transition(tx, row, ['syncing'], 'completed',
     { synced, ...(blocked.length ? { sync_blocked: blocked } : {}) }));
-  return { synced, blocked };
+  return { synced, blocked, atTarget };
 }
 async function lastCommit(engine: BrainEngine, sourceId: string): Promise<string | null> {
   const [row] = await engine.executeRaw<{ last_commit: string | null }>('SELECT last_commit FROM sources WHERE id=$1', [sourceId]);
   return row?.last_commit ?? null;
 }
 
-function finished(row: WorktreeRefreshRow, sync: { synced: RefreshMemberSync[]; blocked: RefreshSyncBlocked[] }, preserved = row.preserved_uncommitted): WorktreeRefreshResult {
-  const status = sync.blocked.length ? 'sync_blocked' : sync.synced.every(member => member.last_commit === row.target_head) ? 'completed' : 'syncing';
+function finished(row: WorktreeRefreshRow, sync: { synced: RefreshMemberSync[]; blocked: RefreshSyncBlocked[]; atTarget: boolean }, preserved = row.preserved_uncommitted): WorktreeRefreshResult {
+  const status = sync.blocked.length ? 'sync_blocked' : sync.atTarget ? 'completed' : 'syncing';
   return { status, refresh_id: row.id, worktree_id: row.worktree_id, source_ids: row.source_ids, old_head: row.old_head, target_head: row.target_head,
     upstream_ref: row.upstream_ref, preserved_uncommitted: preserved, synced: sync.synced,
     ...(sync.blocked.length ? { sync_blocked: sync.blocked, next: sync.blocked.map(item => item.resume).join(' ; ') } : {}),
@@ -383,10 +420,10 @@ export async function refreshWorktree(engine: BrainEngine, sourceId: string, opt
         try {
           const result = await performManagedSync(engine, { sourceId: member, noPull: true });
           if (result.status === 'blocked_by_failures') blocked.push({ source_id: member, code: result.managedWrite?.write_error ?? 'sync_blocked',
-            message: result.managedWrite?.message ?? 'The managed sync is blocked by a failed write.', resume: `gbrain sync --source ${member} --no-pull --retry-failed` });
+            message: result.managedWrite?.message ?? 'The managed sync is blocked by a failed write.', resume: `gbrain sync --source ${member} --no-pull` });
           synced.push({ source_id: member, status: result.status, last_commit: await lastCommit(engine, member) });
         } catch (error) {
-          blocked.push({ source_id: member, code: (error as OperationError).code ?? 'storage_error', message: (error as Error).message, resume: `gbrain sync --source ${member} --no-pull --retry-failed` });
+          blocked.push({ source_id: member, code: (error as OperationError).code ?? 'storage_error', message: (error as Error).message, resume: `gbrain sync --source ${member} --no-pull` });
         }
       }
       return { ...base, status: blocked.length ? 'sync_blocked' : 'already_current', synced, ...(blocked.length ? { sync_blocked: blocked, next: blocked.map(b => b.resume).join(' ; ') } : {}) };
@@ -436,7 +473,7 @@ async function fenceDraining(engine: BrainEngine, sourceId: string, plan: Plan, 
       plan.oldHead, plan.targetHead, plan.upstreamRef, plan.preserved]);
     return row;
   })).catch(error => {
-    if ((error as { code?: string }).code === '23505') throw refusal('refresh_in_progress', 'Another refresh of this worktree started first.', `gbrain sources refresh ${sourceId} --resume`);
+    if ((error as { code?: string }).code === '23505' && !classifyOriginUniqueViolation(error)) throw refusal('refresh_in_progress', 'Another refresh of this worktree started first.', `gbrain sources refresh ${sourceId} --resume`);
     throw error;
   });
 }
@@ -543,18 +580,20 @@ export async function resumeWorktreeRefreshes(engine: BrainEngine, opts: { hostI
         if (after.state !== row.state) moved++;
       });
     } catch (error) {
-      if (!(error instanceof OperationError && ['write_pending', 'recovery_required', 'refresh_recovery_required', 'owner_unavailable'].includes(error.code))) throw error;
+      // GBRA-130 A-34: one refresh's unexpected failure leaves that row for the next owner start and never stops the others or the topology scan.
+      if (!(error instanceof OperationError && ['write_pending', 'recovery_required', 'refresh_recovery_required', 'owner_unavailable'].includes(error.code))) {
+        console.error(`[gbrain] worktree refresh ${row.id} (${row.source_ids.join(', ')}) did not converge at owner start (${String((error as { code?: unknown } | null)?.code ?? (error as Error)?.name ?? 'error')}); it stays ${row.state} and the next owner start retries it. Check it with gbrain sources writer status ${row.source_ids[0]}.`);
+      }
     } finally { await lock.release(); }
   }
   return moved;
 }
 
 async function resumeOrAbandon(engine: BrainEngine, sourceId: string, opts: RefreshOptions): Promise<WorktreeRefreshResult> {
-  const binding = await getWorktreeBinding(engine, sourceId);
+  const binding = await getWorktreeBinding(engine, sourceId, existingLocalHostId());
   if (!await managedPersistenceEnabled(engine) || !binding) throw refusal('refresh_not_managed',
     `Source ${sourceId} has no claimed canonical worktree on a managed brain, so there is no refresh to resume.`, `gbrain sync --source ${sourceId}`);
-  if (binding.owner_host_id !== localHostId() || !binding.local_path) throw refusal('refresh_not_owner',
-    `Only the registered owner host of source ${sourceId} may resume its refresh.`, `Run it on the owner host; check it with gbrain sources writer status ${sourceId}`);
+  assertRefreshOwner(binding, sourceId, 'resume its refresh');
   const root = binding.local_path;
   const active = await readActiveRefresh(engine, binding.worktree_id);
   const empty: WorktreeRefreshResult = { status: 'nothing_to_resume', refresh_id: null, worktree_id: binding.worktree_id, source_ids: [sourceId],

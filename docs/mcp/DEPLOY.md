@@ -71,6 +71,12 @@ catalog, `--surface verbs` exposes exactly the seven-verb memory protocol
 `delta` — [MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) and `--surface
 starter` sits between (40 ops: the verbs plus the daily-driver set).
 
+On a Postgres brain, `gbrain serve --cli-socket` (off by default; or
+`gbrain config set serve.cli_socket true`) also lets this serve answer the
+same user's CLI `search`, `query`, `get` and op-backed `recall` over a
+private Unix socket, so agents that shell out to the CLI skip a cold database
+connection per call ([warm CLI socket](../guides/cli-socket.md)).
+
 `--surface` is the callable ceiling. To keep every operation callable while
 listing fewer tools to the agent, set `mcp.advertised_surface`:
 
@@ -690,7 +696,18 @@ Retry-After: 5
   (`checked_out`, `waiters`, `inflight_oldest_ms`, `stuck_discards`, …) and
   answers 503 when the probe times out or a statement is past the pool's
   in-flight budget ([pool diagnostics](../ENGINES.md#pg-connection-stuck)). A
-  two-minute interval is fine; one deep probe runs at a time.
+  two-minute interval is fine; one deep probe runs at a time. Every 503 names a
+  stable `code` (`persistence_restart_required`, `pool_inflight_over_budget`,
+  `deep_health_probe_failed`) with `fix` and `docs`, and both answers carry the
+  `transport` block (pooler mode, `max_pipeline`, the server
+  `statement_timeout`); the probe only reports
+  ([serve deep health](../ENGINES.md#serve-deep-health)).
+- To have serve restart itself when it stays unhealthy, set
+  `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS=<n>` (at least `120`; in `~/.gbrain/env`
+  for the service `gbrain mcp expose` installs). After `n` continuous seconds
+  of `persistence_restart_required` it exits `69` (`serve_unhealthy_exit`,
+  cleanup bounded at 5 s; at most 3 self-exits per hour) and the supervisor starts a fresh one
+  ([unhealthy exit](../ENGINES.md#serve-unhealthy-exit)).
 - A second `gbrain serve --http` on a port another server already holds exits
   with `serve_port_in_use`. A Postgres connect failure keeps the degraded-engine
   path (`GBRAIN_DB_ACCESS` marker, `gbrain db-repair`).
@@ -738,6 +755,20 @@ Operator checklist:
 
 Optional defense-in-depth: a dedicated Postgres role (or RLS) limited to the
 allowed `source_id`s, so even a leaked connection string can't read everything.
+
+### Writer coordination lock in containers
+
+A managed checkout's writers share one native lock file outside the checkout.
+It lives in `$GBRAIN_HOME/.gbrain/persistence/locks` unless `GBRAIN_HOME` is the
+checkout or lies inside it; then it goes under `GBRAIN_COORDINATION_HOME` (else
+`~/.gbrain/persistence`). For the lock to survive container recreation, mount the
+directory that holds it together with the checkout and its parent: mount
+`GBRAIN_HOME`, or, when `GBRAIN_HOME` is inside the checkout, set
+`GBRAIN_COORDINATION_HOME` to a mounted absolute path outside the checkout in the
+container's environment (a `.env` file in the working directory cannot set it).
+`gbrain sources writer status --json` shows the resolved path and the rule that
+chose it under `onboarding.sources[].coordination_lock`; the full rule is in
+[topologies](../architecture/topologies.md#coordination-lock).
 
 ### Run gbrain under a real init (tini / `--init`)
 

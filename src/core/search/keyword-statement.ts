@@ -20,8 +20,9 @@
  * round-trips through JSON exactly.
  */
 import type { SearchOpts } from '../types.ts';
-import { escapeLikePattern, hasCJK, splitCJKQueryTerms } from '../cjk.ts';
+import { escapeLikePattern, hasCJK, cjkMatchTerms } from '../cjk.ts';
 import { getFtsLanguage } from '../fts-language.ts';
+import { frontmatterWhereSql } from './frontmatter-where.ts';
 import { resolveBoostMap, resolveHardExcludes } from './source-boost.ts';
 import { buildHardExcludeClause, buildSourceFactorCase, buildVisibilityClause } from './sql-ranking.ts';
 
@@ -33,7 +34,8 @@ export interface KeywordPageAfter { score: number; page_id: number }
 
 export interface KeywordPageWindow { limit: number; offset?: number; after?: KeywordPageAfter }
 
-interface KeywordMatch { where: string; score: string; params: unknown[] }
+/** `params[0..whereParamCount)` are the ones `where` reads; the rank params follow, read only by `score`. */
+interface KeywordMatch { where: string; score: string; params: unknown[]; whereParamCount: number }
 
 const FROM = `content_chunks cc JOIN pages p ON p.id = cc.page_id JOIN sources s ON s.id = p.source_id`;
 
@@ -41,26 +43,25 @@ const FROM = `content_chunks cc JOIN pages p ON p.id = cc.page_id JOIN sources s
 export function buildKeywordMatch(query: string, opts: SearchOpts | undefined): KeywordMatch | null {
   const params: unknown[] = [];
   let predicate: string;
-  let rank: string;
+  let rank: () => string;
   if (hasCJK(query)) {
-    const terms = splitCJKQueryTerms(query);
+    const terms = cjkMatchTerms(query);
     if (terms.length === 0) return null;
     const likes = terms.map(term => {
       params.push(`%${escapeLikePattern(term)}%`);
       return `cc.chunk_text ${term.toLowerCase() === term.toUpperCase() ? 'LIKE' : 'ILIKE'} $${params.length} ESCAPE '\\'`;
     });
-    const freq = terms.map(term => {
+    predicate = likes.join(' AND ');
+    rank = () => terms.map(term => {
       params.push(term);
       return `((LENGTH(cc.chunk_text) - LENGTH(REPLACE(cc.chunk_text, $${params.length}, ''))) / NULLIF(LENGTH($${params.length}), 0)::real)`;
-    });
-    predicate = likes.join(' AND ');
-    rank = freq.join(' + ');
+    }).join(' + ');
   } else {
     if (query.trim() === '') return null;
     params.push(query);
     const tsq = `websearch_to_tsquery('${getFtsLanguage()}', $${params.length})`;
     predicate = `cc.search_vector @@ ${tsq}`;
-    rank = `ts_rank(cc.search_vector, ${tsq})`;
+    rank = () => `ts_rank(cc.search_vector, ${tsq})`;
   }
   const add = (value: unknown, clause: (n: string) => string): string => { params.push(value); return ` AND ${clause(`$${params.length}`)}`; };
   let filters = '';
@@ -69,6 +70,7 @@ export function buildKeywordMatch(query: string, opts: SearchOpts | undefined): 
   if (opts?.symbolKind) filters += add(opts.symbolKind, n => `cc.symbol_type = ${n}`);
   if (opts?.type) filters += add(opts.type, n => `p.type = ${n}`);
   if (opts?.types?.length) filters += add(opts.types, n => `p.type = ANY(${n}::text[])`);
+  filters += frontmatterWhereSql('p', opts?.where, json => `$${params.push(json)}`);
   if (opts?.exclude_slugs?.length) filters += add(opts.exclude_slugs, n => `p.slug != ALL(${n}::text[])`);
   const dated = `COALESCE(p.effective_date, p.updated_at, p.created_at)`;
   if (opts?.afterDate) filters += add(opts.afterDate, n => `${dated} ${opts.afterDateInclusive ? '>=' : '>'} ${n}::text::timestamptz`);
@@ -77,11 +79,9 @@ export function buildKeywordMatch(query: string, opts: SearchOpts | undefined): 
   else if (opts?.sourceId) filters += add(opts.sourceId, n => `p.source_id = ${n}`);
   const hardExclude = buildHardExcludeClause('p.slug', resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes));
   const factor = buildSourceFactorCase('p.slug', opts?.source_boosts ?? resolveBoostMap(), opts?.detail);
-  return {
-    where: `${predicate}${filters} ${hardExclude} ${buildVisibilityClause('p', 's', opts)} AND cc.modality = 'text'`,
-    score: `((${rank}) * ${factor})::float8`,
-    params,
-  };
+  const where = `${predicate}${filters} ${hardExclude} ${buildVisibilityClause('p', 's', { ...opts, chunkAlias: 'cc' })} AND cc.modality = 'text'`;
+  const whereParamCount = params.length;
+  return { where, score: `((${rank()}) * ${factor})::float8`, params, whereParamCount };
 }
 
 /** Distinct matching pages, capped at KEYWORD_COUNT_CAP + 1. */
@@ -90,7 +90,7 @@ export function buildKeywordCountStatement(query: string, opts: SearchOpts | und
   if (!m) return null;
   return {
     sql: `SELECT count(*)::int AS n FROM (SELECT DISTINCT cc.page_id FROM ${FROM} WHERE ${m.where} LIMIT ${KEYWORD_COUNT_CAP + 1}) matched`,
-    params: m.params,
+    params: m.params.slice(0, m.whereParamCount),
   };
 }
 

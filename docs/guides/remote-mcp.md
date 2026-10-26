@@ -6,6 +6,8 @@ it running as a user service, and prints the URL your other devices, apps and
 cloud agents connect to. Tailscale is the recommended path; ngrok and cloud
 hosts stay as [alternatives](#alternatives).
 
+> **Rather not keep a computer online?** [gbrain.io](https://gbrain.io/?ref=remote-mcp) is hosted GBrain: always on, and reachable from ChatGPT, Claude and Cursor without Tailscale or a user service.
+
 **Say to your agent:** *"use my brain over mcp"* — *"put my brain on
 tailscale"* — *"connect grok bot to my brain"* / *"connect claude desktop to
 my brain"* — *"reach my brain from my phone"*. The `remote-mcp` skill
@@ -407,14 +409,20 @@ put_pages with one request_id per batch and wait_ms 25000."*
 - **Links.** For remote writes, `[[wikilinks]]` in a page body that point at
   pages already in the same source become plain `mentions` links after the
   commit, and a batch links pages to each other once its last page commits.
+  `append_page` links what the appended text mentions the same way, without
+  re-reading the rest of the page.
   The batch receipt's `links` field shows when they have landed; agents do
   not add them by hand. Typed links still need `add_link`. Turn this off with
   `gbrain config set mcp.remote_auto_links false`.
 - **Embedding** runs after the commit. New text is searchable by keyword
   immediately and by meaning once its embedding effect finishes.
-- **Request size.** `gbrain serve --http` reads the whole request; the
-  simpler HTTP transport caps a request at `GBRAIN_HTTP_MAX_BODY_BYTES`
-  (1 MiB by default) and its 413 reply tells the agent to split the batch.
+- **Request size.** HTTP carries less than the 24 MiB page ceiling:
+  `gbrain serve --http` reads at most 4 MiB per request (the MCP SDK
+  default), and the simpler HTTP transport caps a request at
+  `GBRAIN_HTTP_MAX_BODY_BYTES`. A batch goes in smaller `put_pages` calls; a
+  page over the transport limit goes by file on the brain host (sync,
+  `gbrain import` or `gbrain put`), never split by hand. Every limit is in
+  [limits per entry point](memory-boundaries.md#large-page-limits).
 
 ## PGLite brains
 
@@ -448,7 +456,14 @@ port once the cause is fixed. `--fail-fast` (or `GBRAIN_SERVE_FAIL_FAST=1`)
 exits instead.
 
 `gbrain mcp expose --status` re-runs the probes; `--json` names the failing
-check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`.
+check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`. Serve rotates each
+of them at 10 MiB and keeps 5 copies (`serve.log.1` to `serve.log.5`), and a
+line repeated within 10 minutes is written once, followed by one
+`[gbrain serve-log] repeated N more time(s)` line. The same applies to any
+`gbrain serve` whose output you redirect to a file with `>>`. Tune it with
+`GBRAIN_SERVE_LOG_MAX_BYTES` (0 turns rotation off),
+`GBRAIN_SERVE_LOG_MAX_FILES` and `GBRAIN_SERVE_LOG_DEDUPE_SECONDS` (0 turns
+dedupe off) in the serve wrapper's environment.
 
 <a id="remote-mcp-symptoms"></a>
 

@@ -25,7 +25,10 @@
  * readPageSnapshotsBatch (the batched extract / derived-link snapshot read)
  * adds one: 24 call sites, 24 methods; master pins 25. Cat 40 Hard F2 adds the
  * scoped keyword count and keyword-mode page reads (countKeywordPages,
- * searchKeywordPages): 27 and 27. The golden pins the exact numbers.
+ * searchKeywordPages): 27 and 27. Wave B PR 2 lane X adds keywordBoundedRead
+ * (an unscoped read in one transaction under the keyword statement bound,
+ * for the segmented-region read): 33 and 33.
+ * The golden pins the exact numbers.
  */
 
 import { describe, expect, test } from 'bun:test';
@@ -98,6 +101,28 @@ function lanesOf(trace: Awaited<ReturnType<typeof runCase>>['trace']): string[] 
   return [...new Set(trace.filter((t): t is RecordedStatement => t.kind === 'query').map((t) => t.lane))].sort();
 }
 
+/**
+ * The scope statements that enter a scoped read, in order. A top-level read
+ * sets the scope once (it ends with the transaction); a read nested in a
+ * caller's transaction reads the caller's scope, sets its own, and restores
+ * the caller's after (postgres-engine/search-settings.ts), so a set that
+ * follows an entered nested read is its restore.
+ */
+function scopesEntered(trace: Awaited<ReturnType<typeof runCase>>['trace']): RecordedStatement[] {
+  const nested: Array<'read' | 'entered'> = [];
+  const entered: RecordedStatement[] = [];
+  for (const t of trace) {
+    if (t.kind !== 'query') continue;
+    if (t.text.startsWith("SELECT current_setting('app.scopes'")) nested.push('read');
+    else if (t.text.startsWith("SELECT set_config('app.scopes'")) {
+      if (nested.at(-1) === 'entered') { nested.pop(); continue; }
+      if (nested.at(-1) === 'read') nested[nested.length - 1] = 'entered';
+      entered.push(t);
+    }
+  }
+  return entered;
+}
+
 async function observe(cases: SqlCase[]): Promise<Record<string, RuntimeObservation>> {
   const out: Record<string, RuntimeObservation> = {};
   const on = await withPinnedSqlEnvironment('1', async () => Promise.all(cases.map(runCase)));
@@ -105,7 +130,7 @@ async function observe(cases: SqlCase[]): Promise<Record<string, RuntimeObservat
   cases.forEach((c, i) => {
     const onTrace = on[i].trace;
     const sets = onTrace.filter((t): t is RecordedStatement => t.kind === 'query' && t.text.startsWith("SELECT set_config('app.scopes'"));
-    const entered = sets.filter((_, k) => k % 2 === 0);
+    const entered = scopesEntered(onTrace);
     if (on[i].error || off[i].error) throw new Error(`${c.method}#${c.variant}: ${on[i].error ?? off[i].error}`);
     out[`${c.method}#${c.variant}`] = {
       flagOn: sets.length > 0 ? 'scoped' : 'unscoped',
@@ -126,6 +151,7 @@ async function observe(cases: SqlCase[]): Promise<Record<string, RuntimeObservat
 const SCOPED_THROUGH_NON_THIS_CALLEE: Record<string, string> = {
   putPage: 'expectedRevision variant calls tx.readPageSnapshot on the transaction clone',
   createVersion: 'page-state/versions.ts createPageVersion calls tx.readPageSnapshot',
+  updateSlug: 'engine-sql/pages.ts updateSlug versions the page first through tx.readPageSnapshot (belief ledger W2 rename preimage)',
   replaceDerivedLinks: 'derived-links.ts replaceDerivedLinks reads the origin via readPageSnapshot',
   replaceDerivedLinksBatch: 'derived-links.ts replaceDerivedLinksBatch reads the origins via tx.readPageSnapshotsBatch',
 };
@@ -154,8 +180,8 @@ describe('EO4 RLS scope inventory (master)', () => {
     const scoping = astScoping(capture.ast);
 
     const callSites = Object.values(capture.ast).reduce((a, m) => a + m.directCallSites, 0);
-    expect(callSites).toBe(29);
-    expect(Object.values(capture.ast).filter((m) => m.directCallSites > 0).length).toBe(29);
+    expect(callSites).toBe(33);
+    expect(Object.values(capture.ast).filter((m) => m.directCallSites > 0).length).toBe(33);
 
     const byMethod = new Map<string, RuntimeObservation[]>();
     for (const [key, obs] of Object.entries(capture.runtime)) {

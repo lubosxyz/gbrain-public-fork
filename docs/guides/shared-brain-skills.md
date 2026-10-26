@@ -56,7 +56,12 @@ canonical-owner binding.
 The source must have no Git sync commit, external repository, connector, or
 company-ingestion policy. Existing external roots and incomplete or mismatched
 receipts retain the ordinary never-synced/stale checks; managed persistence alone
-does not exempt a source. No `last_sync_at` timestamp is fabricated. The separate
+does not exempt a source. No `last_sync_at` timestamp is fabricated. A dedicated
+skills source is the other exemption: a source holding an adopted skill pack
+(live heads on its current incarnation) whose content is a read-only catalog, with
+no Git commit recorded and, when doctor may read the checkout, no `.git` under
+its root, counts as `read_only_pack_count` in `sync_freshness`. A git-backed pack
+is still judged stale. The separate
 `canonical_content_writes` check reports queued publication and required recovery
 for these roots. Both checks classify ownership from database records; remote
 doctor does not inspect or execute commands against stored filesystem paths.
@@ -380,6 +385,23 @@ does not expose them to every source. Do not count `pending_host_work` or
 per-source `action_required` as completion even if the migration ledger says
 the mechanical checkpoint completed.
 
+While a source's inventory, ownership (writer), projection or policy stage, or
+a brain-level pending action, is still open, `gbrain apply-migrations --list` shows 0.53.0 as
+`applied_pending_host_work` (not `applied`), `--list --json` adds an
+`applied_pending_host_work` array whose `fix.argv` is the read-only
+inventory, and `gbrain doctor` warns on `minions_migration` with
+`details.code: migration_host_work_pending`:
+
+```bash
+gbrain apply-migrations --migration 0.53.0 --dry-run --json   # each source's next step; changes nothing
+gbrain apply-migrations --yes                                  # after the work: the re-check records it done
+```
+
+The `members` stage alone (no installation enrolled yet, as on every new
+brain) is not host work, and neither is a source that opted out with
+`gbrain sources shared-skills <id> off`; a brain that declines the migration
+(below) never reports it.
+
 The host report's `member_installations` inventories known members per source,
 with `joined`, `refresh_pending`, `delivery_reported`, `source_changed`, or
 `left` and a `next_action`. `delivery_reported` means client-reported artifact
@@ -579,7 +601,11 @@ erasure of source material, history, or backups.
 
 Managed removal disables local following and attempts owned-file cleanup even
 when offline or already revoked. `remote_membership_pending: true` means the
-host has not acknowledged leave; retry remote cleanup when possible. Do not
+host has not acknowledged leave; retry remote cleanup when possible. A
+bootstrap-managed enrollment whose credential is already revoked cannot leave
+remotely; `gbrain bootstrap harness` finishes its local cleanup and records it
+as left with reason `credential_revoked`, because a revoked principal's
+membership is inert ([cleanup pending](bootstrap.md#cleanup-pending)). Do not
 claim a server-side departure from successful local deletion, or delete edited
 files to make the status look complete.
 

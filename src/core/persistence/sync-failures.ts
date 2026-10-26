@@ -6,6 +6,9 @@ import type { SyncProcessingOptions } from './sync-authority.ts';
 import type { SyncCursorOptions } from './sync-prepare.ts';
 import { resolveManagedSyncContext, syncGit, syncGitPath } from './sync-discovery.ts';
 import { readGitHold } from './sync-holds.ts';
+import { pruneMirrorOnlyManagedFailures } from './managed-sync-orphans.ts';
+import { publicFailureDetail } from './publication-failure.ts';
+import { VERSION } from '../../version.ts';
 
 export interface ManagedSyncFailure {
   source_id: string;
@@ -22,25 +25,51 @@ export interface ManagedSyncFailure {
   observation_id: string;
   first_seen: string;
   attempts: number;
+  /**
+   * GBRA-133 S-60: how many runs in a row stopped on this path with this code and message (1 on the first); a different
+   * path, code or message starts over. Absent on failures recorded before it was kept.
+   */
+  repeats?: number;
+  /** GBRA-133 S-60: the invocation that recorded it, so a resumed cursor's same observation still counts a new run. */
+  invocation?: string;
   /** The cursor-selecting options of the failed run; absent on failures recorded before they were kept. */
   syncOptions?: SyncCursorOptions;
   processingOptions?: Partial<SyncProcessingOptions>;
+  /** #6513: the receipt's public failure detail (`publicFailureDetail`: fixed identifiers and the closed `reason`), when the receipt stored one. */
+  write_error_detail?: Record<string, unknown>;
+  /**
+   * #6643: the request whose failure this one is a knock-on of (or, for a checkpoint, the receipt that blocks it),
+   * followed through recorded knock-on roots. `request_id` null with `unknown` true: the canceller recorded no root
+   * (a receipt from before #6643); the victim is then the only request named.
+   */
+  root_cause?: ManagedSyncRootCause;
+  /** #6712 PR 3 (L7): the gbrain version that recorded the failure; absent on failures recorded before it was kept. */
+  gbrain_version?: string;
 }
+export interface ManagedSyncRootCause { request_id: string | null; slug: string | null; state: string | null; code: string | null; message: string | null;
+  /** The cursor fence cause when the root is a cursor refusal (`outside_fence`, `run_replaced`, `window_dropped`). */
+  cause?: string; unknown?: true }
 
-export async function recordManagedSyncFailure(engine: BrainEngine, value: Omit<ManagedSyncFailure, 'first_seen' | 'attempts'> & { first_seen?: string }): Promise<{ failure: ManagedSyncFailure; ledgerRecorded: boolean }> {
-  const failure = { ...value, first_seen: value.first_seen ?? new Date().toISOString(), attempts: 1 };
+export async function recordManagedSyncFailure(engine: BrainEngine, value: Omit<ManagedSyncFailure, 'first_seen' | 'attempts' | 'repeats'> & { first_seen?: string }): Promise<{ failure: ManagedSyncFailure; ledgerRecorded: boolean }> {
+  const failure = { ...value, gbrain_version: VERSION, first_seen: value.first_seen ?? new Date().toISOString(), attempts: 1, repeats: 1 };
   const recorded = await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
     const [row] = await tx.executeRaw<{ completed_keys: [ManagedSyncFailure] }>(`
+      WITH pair AS (SELECT completed_keys->0 AS was, $2::text::jsonb->0 AS incoming FROM op_checkpoints WHERE op='managed-sync-failure' AND fingerprint=$1),
+      same AS (SELECT was, incoming, was->>'path'=incoming->>'path' AND was->>'code'=incoming->>'code' AND was->>'message'=incoming->>'message' AS same,
+        COALESCE((was->>'repeats')::int,1)+1 AS repeats FROM pair)
       INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('managed-sync-failure',$1,$2::text::jsonb)
       ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=CASE
         WHEN op_checkpoints.completed_keys->0->>'observation_id'=EXCLUDED.completed_keys->0->>'observation_id'
-        THEN op_checkpoints.completed_keys
+        THEN CASE WHEN (SELECT same AND incoming->>'invocation' IS NOT NULL AND was->>'invocation' IS DISTINCT FROM incoming->>'invocation' FROM same)
+          THEN jsonb_build_array(op_checkpoints.completed_keys->0 || jsonb_build_object('repeats',(SELECT repeats FROM same),'invocation',EXCLUDED.completed_keys->0->>'invocation'))
+          ELSE op_checkpoints.completed_keys END
         WHEN op_checkpoints.completed_keys->0->>'target' IS DISTINCT FROM EXCLUDED.completed_keys->0->>'target'
         THEN EXCLUDED.completed_keys
         ELSE jsonb_build_array(EXCLUDED.completed_keys->0 || jsonb_build_object(
           'first_seen',op_checkpoints.completed_keys->0->>'first_seen',
-          'attempts',COALESCE((op_checkpoints.completed_keys->0->>'attempts')::int,0)+1)) END,
+          'attempts',COALESCE((op_checkpoints.completed_keys->0->>'attempts')::int,0)+1,
+          'repeats',(SELECT CASE WHEN same THEN repeats ELSE 1 END FROM same))) END,
         updated_at=now()
       RETURNING completed_keys`, [value.cursor_key, JSON.stringify([failure])]);
     return row.completed_keys[0];
@@ -80,7 +109,7 @@ function blobAt(gitRoot: string, commit: string, path: string): string | null {
  * failure is settled when its file exists there and the database holds a live page for it with no hold on the path, or
  * when the file is gone there and no live page claims it.
  */
-async function unsettledReason(engine: BrainEngine, run: ManagedSyncImported, failure: ManagedSyncFailure): Promise<string | null> {
+export async function unsettledReason(engine: BrainEngine, run: ManagedSyncImported, failure: Pick<ManagedSyncFailure, 'source_id' | 'source_incarnation' | 'path'>): Promise<string | null> {
   if (failure.source_id !== run.sourceId || failure.source_incarnation !== run.incarnation) return 'source_changed';
   if (failure.path.startsWith('<')) return 'no_recorded_file';
   const gitPath = syncGitPath(run, failure.path);
@@ -108,6 +137,8 @@ async function sourceFailureRows(engine: BrainEngine, sourceId: string): Promise
 /**
  * #6288: after a successful managed sync, clears this source's recorded failures under other cursor keys (a `--full` run's
  * key is never resumed by autopilot) whose cursor is finished or gone and whose file the imported commit already settles.
+ * #6518: then prunes the source's local mirror rows whose durable failure row is already gone (`mirror_only`); a failed
+ * durable read prunes nothing.
  */
 export async function clearSettledManagedSyncFailures(engine: BrainEngine, run: ManagedSyncImported): Promise<number> {
   let cleared = 0;
@@ -115,6 +146,7 @@ export async function clearSettledManagedSyncFailures(engine: BrainEngine, run: 
     if (row.unfinished || await unsettledReason(engine, run, row.failure)) continue;
     if (await deleteFailure(engine, row.key, row.failure)) cleared++;
   }
+  await pruneMirrorOnlyManagedFailures(engine, run.sourceId);
   return cleared;
 }
 
@@ -138,12 +170,12 @@ export async function acknowledgeManagedSyncFailures(engine: BrainEngine, run: M
 export async function readManagedSyncFailures(engine: BrainEngine, sourceIds?: string[]): Promise<ManagedSyncFailure[]> {
   const rows = await engine.executeRaw<{ cursor_key: string; value: { sourceId: string; incarnation: string; runId: string; index: number; target: string; pending?: { requestId: string };
       syncOptions: SyncCursorOptions | null; processingOptions: Partial<SyncProcessingOptions> | null };
-    receipt: Pick<WriteRequest, 'state' | 'request_id' | 'error_code' | 'error_message'> | null; failure: ManagedSyncFailure | null; path: string | null; updated_at: string }>(`
+    receipt: Pick<WriteRequest, 'state' | 'request_id' | 'error_code' | 'error_message' | 'error_detail'> | null; failure: ManagedSyncFailure | null; path: string | null; updated_at: string }>(`
     SELECT c.fingerprint AS cursor_key,jsonb_build_object('sourceId',s.id,'incarnation',s.incarnation,'runId',c.completed_keys->0->>'runId',
       'index',c.completed_keys->0->'index','target',c.completed_keys->0->>'target',
       'syncOptions',c.completed_keys->0->'syncOptions','processingOptions',c.completed_keys->0->'processingOptions',
       'pending',jsonb_build_object('requestId',c.completed_keys->0->'pending'->>'requestId')) AS value,
-      CASE WHEN r.id IS NULL THEN NULL ELSE jsonb_build_object('state',r.state,'request_id',r.request_id,'error_code',r.error_code,'error_message',r.error_message) END AS receipt,
+      CASE WHEN r.id IS NULL THEN NULL ELSE jsonb_build_object('state',r.state,'request_id',r.request_id,'error_code',r.error_code,'error_message',r.error_message,'error_detail',r.error_detail) END AS receipt,
       f.completed_keys->0 AS failure,m.completed_keys->((c.completed_keys->0->>'index')::int)->>'path' AS path,c.updated_at
     FROM op_checkpoints c
     JOIN sources s ON s.id=c.completed_keys->0->>'sourceId' AND s.incarnation::text=c.completed_keys->0->>'incarnation'
@@ -157,8 +189,12 @@ export async function readManagedSyncFailures(engine: BrainEngine, sourceIds?: s
   const failures: ManagedSyncFailure[] = rows.map(row => {
     const c = row.value, r = row.receipt;
     const options = { ...(c.syncOptions ? { syncOptions: c.syncOptions } : {}), ...(c.processingOptions ? { processingOptions: c.processingOptions } : {}) };
-    if (row.failure && (!r || !['failed', 'conflict', 'cancelled'].includes(r.state) || row.failure.request_id === r.request_id)) return { ...options, ...row.failure };
-    return { ...options, source_id: c.sourceId, source_incarnation: c.incarnation, path: row.path ?? '<checkpoint>', code: r?.error_code ?? 'sync_incomplete',
+    // #6513: the pending receipt's bounded public detail rides the failure it belongs to (the row's own copy, when recorded, is the same projection).
+    const detail = r?.error_detail ? publicFailureDetail(r.error_detail) : undefined;
+    if (row.failure && (!r || !['failed', 'conflict', 'cancelled'].includes(r.state) || row.failure.request_id === r.request_id)) {
+      return { ...options, ...(detail && row.failure.request_id === r?.request_id ? { write_error_detail: detail } : {}), ...row.failure };
+    }
+    return { ...options, ...(detail ? { write_error_detail: detail } : {}), source_id: c.sourceId, source_incarnation: c.incarnation, path: row.path ?? '<checkpoint>', code: r?.error_code ?? 'sync_incomplete',
       message: r?.error_message ?? 'The durable sync cursor is unfinished; resume the accepted run.', request_id: c.pending?.requestId ?? null,
       run_id: c.runId, target: c.target, cursor_key: row.cursor_key, phase: r ? 'receipt' : 'resume', state: r?.state ?? 'unfinished',
       observation_id: c.pending?.requestId ?? `${c.runId}:${c.index}`, first_seen: new Date(row.updated_at).toISOString(), attempts: 1 };
@@ -173,7 +209,19 @@ export async function readManagedSyncFailures(engine: BrainEngine, sourceIds?: s
 
 export function formatManagedSyncFailure(failure: ManagedSyncFailure): string {
   const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 1000);
-  return `source=${clean(failure.source_id)} path=${clean(failure.path)} code=${clean(failure.code)}: ${clean(failure.message)} request=${failure.request_id ?? '<not-admitted>'} run=${failure.run_id} target=${failure.target ?? '<undiscovered>'}`;
+  return `source=${clean(failure.source_id)} path=${clean(failure.path)} code=${clean(failure.code)}: ${clean(failure.message)} request=${failure.request_id ?? '<not-admitted>'} run=${failure.run_id} target=${failure.target ?? '<undiscovered>'}${publicationDetailText(failure.write_error_detail)}${rootCauseText(failure.root_cause, clean)}`;
+}
+/** #6643: the root-cause clause of a failure line: the request, page and error that caused it, or that none was recorded. */
+export function rootCauseText(root: ManagedSyncRootCause | undefined, clean: (value: string) => string = value => value): string {
+  if (!root) return '';
+  if (!root.request_id) return ' root_cause=<not recorded: this receipt predates root tracking>';
+  return ` root_cause=request ${root.request_id}${root.slug ? ` (${clean(root.slug)})` : ''}: ${root.state ?? 'missing'}${root.code ? ` ${clean(root.code)}` : ''}${root.cause ? ` cause=${root.cause}` : ''}${root.message ? ` ${clean(root.message)}` : ''}`;
+}
+const IDENT = /^[A-Za-z_][A-Za-z0-9_.:-]{0,79}$/;
+/** #6513: the fixed identifiers of a public failure detail (`raiser`, `table`) and its closed `reason`, as ` key=value` text; nothing else of it. */
+export function publicationDetailText(detail: Record<string, unknown> | undefined): string {
+  if (!detail) return '';
+  return (['raiser', 'table', 'reason'] as const).map(key => typeof detail[key] === 'string' && IDENT.test(detail[key] as string) ? ` ${key}=${detail[key]}` : '').join('');
 }
 
 /** The retry for one managed failure: same source and recorded cursor-selecting options, or an honest note when they were not recorded. */

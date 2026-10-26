@@ -105,6 +105,7 @@ const MATRIX: Row[] = [
   { name: 'entity', mode: 'skip', reason: 'MEMORY_VERBS conformance suite owns it; LLM-shaped output' },
   { name: 'synthesize', mode: 'skip', reason: 'LLM-dependent; keyless envs cannot run it — verbs conformance owns the error path' },
   { name: 'think', mode: 'skip', reason: 'LLM-dependent; think-source-isolation-pglite e2e owns its scoping' },
+  { name: 'list_write_conflicts', mode: 'skip', reason: 'needs source_changed conflict receipts from a bound canonical checkout; test/maintenance-file-drift-6643.test.ts owns its out-of-grant refusal, source-scoped window and slug-fence filtering' },
   { name: 'search_by_image', mode: 'skip', reason: 'needs image-embedding infra; cross-modal suites own it' },
   { name: 'volunteer_context', mode: 'skip', reason: 'session/reflex machinery; volunteer-context suites own scoping' },
   { name: 'context_pack', mode: 'skip', reason: 'verbs conformance owns it; budget-packed composite of scoped reads' },
@@ -126,6 +127,7 @@ const MATRIX: Row[] = [
   // Deliberately brain-wide (config / registry / identity — not source data).
   { name: 'search_modes', mode: 'brainwide', args: {}, rationale: 'reports search config knobs, no page data' },
   { name: 'get_brain_identity', mode: 'brainwide', args: {}, rationale: 'brain-level identity document by design' },
+  { name: 'get_brain_health', mode: 'skip', reason: 'returns count bands with no slug or source identity, so the beta-marker scan here would pass vacuously; test/doctor-ops-remote-6696.test.ts seeds per-source write failures and pins the handler to the scalar and federated grant' },
   { name: 'whoami', mode: 'brainwide', args: {}, rationale: 'caller identity/transport echo, no page data' },
   { name: 'sources_list', mode: 'brainwide', args: {}, rationale: 'listing sources is its purpose; exposes ids/names only' },
   { name: 'request_tools', mode: 'brainwide', args: { tools: ['get_page'] }, rationale: 'tool registry surface, no page data' },
@@ -153,6 +155,10 @@ const MATRIX: Row[] = [
   { name: 'list_pages', mode: 'isolated', args: { limit: 100 } },
   { name: 'search', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
   { name: 'query', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
+  // search_exact echoes its phrase, so the probe reads the matches and the unreadable-page sample.
+  { name: 'search_exact', mode: 'isolated', args: { phrase: 'BETAMARKER' },
+    controlSees: r => leakToken((r as any).matches) !== null,
+    expectScoped: r => { expect(leakToken({ matches: (r as any).matches, unreadable: (r as any).unreadable })).toBeNull(); } },
   { name: 'assemble_evidence', mode: 'isolated', args: { hits: [{ source_id: 'srcbeta', slug: 'notes/beta-note', chunk_id: 0 }], return_unit: 'page' } },
   { name: 'get_tags', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_links', mode: 'isolated', args: { slug: 'notes/beta-note' } },
@@ -162,9 +168,14 @@ const MATRIX: Row[] = [
   { name: 'get_versions', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_raw_data', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'resolve_slugs', mode: 'isolated', args: { partial: 'beta' } },
+  // whois echoes its query, so the probe reads the matches.
+  { name: 'whois', mode: 'isolated', args: { query: 'BETAMARKER Person' },
+    controlSees: r => leakToken((r as any).matches) !== null,
+    expectScoped: r => { expect(leakToken((r as any).matches)).toBeNull(); } },
   { name: 'get_chunks', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_ingest_log', mode: 'isolated', args: { limit: 50 } },
   { name: 'find_orphans', mode: 'isolated', args: {} },
+  { name: 'rank_entities', mode: 'isolated', args: {} },
   { name: 'wanted_pages', mode: 'isolated', args: {} },
   { name: 'takes_list', mode: 'isolated', args: { limit: 50 } },
   { name: 'takes_search', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
@@ -203,6 +214,7 @@ const MATRIX: Row[] = [
     expectScoped: () => {
       throw new Error('sources_status must fail closed (not_found) for out-of-scope ids under any untrusted ctx');
     } },
+  { name: 'sources_resolve_path', mode: 'skip', reason: 'needs a Git checkout of the source; the not_found confinement of an out-of-scope id (assertSourceInCallerScope, as sources_status) is pinned in test/sources-resolve-path.test.ts' },
   { name: 'schema_stats', mode: 'isolated', args: {} },
   { name: 'schema_review_orphans', mode: 'isolated', args: { limit: 50 } },
 

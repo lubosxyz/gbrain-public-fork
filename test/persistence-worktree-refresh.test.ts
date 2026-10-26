@@ -18,7 +18,7 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -35,13 +35,16 @@ import { runManagedSourceLifecycle } from '../src/core/persistence/source-lifecy
 import { runPersistenceAdministration } from '../src/core/persistence/administration.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { refreshWorktree, resumeWorktreeRefreshes } from '../src/core/persistence/worktree-refresh.ts';
+import { commitAndPush } from '../src/core/git/commit-push.ts';
+import { gitConvergenceCheck } from '../src/commands/doctor/checks/git-convergence.ts';
+import { MANAGED_SYNC_PASS_OP, writePassRow, type ManagedSyncPassValue } from '../src/core/persistence/sync-pass-row.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { testBackends } from './helpers/test-backends.ts';
 import { withEnv } from './helpers/with-env.ts';
-import { git, page, withRefreshFixture, type RefreshFixture } from './helpers/worktree-refresh-fixture.ts';
+import { commitFile, git, page, withRefreshFixture, type RefreshFixture } from './helpers/worktree-refresh-fixture.ts';
 
 const backends = testBackends();
 const engines: BrainEngine[] = [];
@@ -75,6 +78,24 @@ test('refresh timer bounds reject overflow and accept the maximum delay', () => 
   expect(drain.waitDrainMs).toBeGreaterThan(2 ** 31 - 1); // the drain wait is a performance.now() deadline, not a timer: still accepted
   expect((await refreshWorktree(f.engine, f.alpha, drain)).status).toBe('dry_run');
   expect((await refreshWorktree(f.engine, f.alpha, { fetchTimeoutMs: 2 ** 31 - 1, dryRun: true })).status).toBe('dry_run');
+}));
+test('GBRA-133: another HOME refuses refresh_not_owner naming the identity file and HOME it read, and mints no identity', () => each(async f => {
+  const other = mkdtempSync(join(tmpdir(), 'gbrain-refresh-other-home-'));
+  try {
+    const identity = join(other, '.gbrain', 'persistence', 'host.json');
+    await withEnv({ GBRAIN_HOME: other, HOME: other }, async () => {
+      const missing = await refusedWith(refreshWorktree(f.engine, f.alpha, { dryRun: true }), 'refresh_not_owner');
+      expect(missing.message).toContain(`no host identity at ${identity} (none was created)`);
+      expect(missing.message).toContain(`HOME=${other} and GBRAIN_HOME=${other}`);
+      expect(existsSync(identity)).toBe(false);
+      mkdirSync(join(other, '.gbrain', 'persistence'), { recursive: true });
+      const foreign = randomUUID();
+      writeFileSync(identity, JSON.stringify({ version: 1, id: foreign }));
+      const mismatch = await refusedWith(refreshWorktree(f.engine, f.alpha, { dryRun: true }), 'refresh_not_owner');
+      expect(mismatch.message).toContain(`this process has host identity ${foreign} from ${identity}`);
+    });
+    expect((await refreshWorktree(f.engine, f.alpha, { dryRun: true })).status).toBe('dry_run');
+  } finally { rmSync(other, { recursive: true, force: true }); }
 }));
 /** Requeue a committed git effect so the drain must wait for the consumer to process it again. */
 async function requeueGitEffect(f: RefreshFixture, delayMs: number): Promise<number> {
@@ -184,6 +205,61 @@ test('4. a diverged checkout is refused with no row and HEAD unchanged', () => e
   expect(f.head()).toBe(head);
 }), 120_000);
 
+test('4b. Q1: the diverged refusal names the keep-checkout publish; running it, then the refresh, brings the checkout up to date with the local commit kept', () => each(async f => {
+  f.push('alpha/two.md', page('Alpha two', 'Upstream side.'));
+  writeFileSync(join(f.root, 'beta/local.md'), page('Local', 'A local commit nobody pushed.'));
+  git(f.root, 'add', 'beta/local.md'); git(f.root, 'commit', '-qm', 'local only');
+  const local = f.head();
+  const error = await refusedWith(refreshWorktree(f.engine, f.alpha), 'refresh_diverged') as { suggestion?: string; fix?: { argv: string[]; ask_user?: boolean; actor?: string } };
+  expect(error.suggestion).toContain('1 local commit(s)');
+  expect(error.fix).toMatchObject({ argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', f.root, '--json'], ask_user: true, actor: 'user' });
+  git(f.root, 'config', 'user.name', 'Example'); git(f.root, 'config', 'user.email', 'example@example.invalid');
+  expect(commitAndPush({ repo: f.root, pushOnly: true, keepCheckout: true })).toMatchObject({ outcome: 'pushed', integrated: 1, checkout: 'unchanged' });
+  expect(f.head()).toBe(local);
+  const done = await refreshWorktree(f.engine, f.alpha);
+  expect(done).toMatchObject({ status: 'completed', old_head: local });
+  git(f.root, 'merge-base', '--is-ancestor', local, 'HEAD');
+  expect(readFileSync(join(f.root, 'alpha/two.md'), 'utf8')).toContain('Upstream side.');
+  expect((await f.engine.getPage('two', { sourceId: f.alpha }))?.compiled_truth ?? (await f.engine.getPage('alpha/two', { sourceId: f.alpha }))?.compiled_truth).toContain('Upstream side.');
+}), 120_000);
+
+test('4c. Q1: commit-push on the managed checkout commits only the named page path, fetches and pushes nothing, and keeps other dirt', () => each(async f => {
+  git(f.root, 'config', 'user.name', 'Example'); git(f.root, 'config', 'user.email', 'example@example.invalid');
+  writeFileSync(join(f.root, 'beta/agent.md'), page('Agent', 'Written by an agent script.'));
+  writeFileSync(join(f.root, 'beta/other.md'), page('Other', 'Another writer, not named.'));
+  const before = f.head(), remote = git(f.root, 'ls-remote', 'origin', 'refs/heads/main').split('\t')[0];
+  const result = commitAndPush({ repo: f.root, cwd: f.root, paths: ['beta/agent.md'], message: 'agent: file one page' });
+  expect(result).toMatchObject({ outcome: 'committed_local', paths: ['beta/agent.md'], integrated: 0, checkout: 'unchanged' });
+  expect(git(f.root, 'rev-parse', 'HEAD^').trim()).toBe(before);
+  expect(git(f.root, 'diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD').trim()).toBe('beta/agent.md');
+  expect(git(f.root, 'status', '--porcelain', '--', 'beta/other.md').trim()).toBe('?? beta/other.md');
+  expect(git(f.root, 'ls-remote', 'origin', 'refs/heads/main').split('\t')[0]).toBe(remote);
+  expect(() => commitAndPush({ repo: f.root, cwd: f.root, pending: true, message: 'pending' })).toThrow(expect.objectContaining({ code: 'commit_paths_invalid' }));
+  expect(() => commitAndPush({ repo: f.root, cwd: f.root, pushOnly: true })).toThrow(expect.objectContaining({ code: 'writer_coordinator_required' }));
+}), 120_000);
+
+test('4d. Q1: writer status and doctor name each commit a diverged managed checkout holds (sha, author, date, paths) and its porcelain', () => each(async f => {
+  f.push('alpha/two.md', page('Alpha two', 'Upstream side.'));
+  git(f.root, 'fetch', '-q', 'origin');
+  writeFileSync(join(f.root, 'beta/local.md'), page('Local', 'A commit made outside gbrain.'));
+  git(f.root, 'add', 'beta/local.md'); git(f.root, 'commit', '-qm', 'cron: bare commit');
+  const sha = f.head(), author = git(f.root, 'log', '-1', '--format=%an <%ae>').trim(), date = git(f.root, 'log', '-1', '--format=%aI').trim();
+  writeFileSync(join(f.root, 'beta/scratch.txt'), 'untracked\n');
+  const status = await runPersistenceAdministration(f.engine, 'writer_status', { source_id: f.beta }) as { checkouts: Array<Record<string, any>> };
+  expect(status.checkouts).toHaveLength(1);
+  expect(status.checkouts[0]).toMatchObject({ source_ids: [f.beta], branch: 'main', upstream: 'origin/main', ahead: 1, behind: 1, diverged: true, fetched: false,
+    unpushed_truncated: false, porcelain: { staged: 0, modified: 0, untracked: 1, conflicted: 0 } });
+  expect(status.checkouts[0]!.unpushed_commits).toEqual([{ sha, author, date, subject: 'cron: bare commit', paths: ['beta/local.md'], paths_total: 1 }]);
+  const check = await gitConvergenceCheck(f.engine);
+  expect(check?.status).toBe('warn');
+  expect(check?.message).toContain('diverged');
+  expect(check?.message).toContain(sha.slice(0, 7));
+  const root = (check?.details as { roots: Array<Record<string, any>> }).roots.find(r => r.root === f.root)!;
+  expect(root).toMatchObject({ managed: true, diverged: true, ahead: 1, behind: 1, porcelain: { untracked: 1 } });
+  expect(root.unpushed_commits[0]).toMatchObject({ sha, author, paths: ['beta/local.md'] });
+  expect(check?.fix).toMatchObject({ ask_user: true, actor: 'user', argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', f.root, '--json'] });
+}), 120_000);
+
 test('5. dirt overlapping the incoming diff refuses naming the path; unrelated dirt is preserved and listed', () => each(async f => {
   const target = f.push('alpha/one.md', page('Alpha one', 'The upstream rewrite.'));
   writeFileSync(join(f.root, 'alpha/one.md'), page('Alpha one', 'An uncommitted local edit.'));
@@ -269,6 +345,28 @@ test('9. an unexhausted managed-sync cursor refuses sync_in_progress with its re
     expect(error.suggestion).not.toContain('--retry-failed');
     expect(await f.refreshRows()).toEqual([]);
   } finally { await f.engine.executeRaw(`DELETE FROM op_checkpoints WHERE op='managed-sync' AND fingerprint=$1`, [key]); }
+}), 120_000);
+
+test('9b. #6712 PR 4b: an open non-company sync pass does not refuse the refresh (a cursor still does, test 9); the next pass converges at the new HEAD', () => each(async f => {
+  f.push('alpha/two.md', page('Alpha two', 'Upstream.'));
+  const before = f.head();
+  const [source] = await f.engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [f.beta]);
+  const passId = randomUUID();
+  const value: ManagedSyncPassValue = { source_id: f.beta, incarnation: source!.incarnation, lease_token: randomUUID(),
+    obligations: { baseline_commit: null, mismatch: {}, not_converged_streak: 0, faults: {} },
+    telemetry: { pass_id: passId, target: 'HEAD', started_at: new Date().toISOString(), ended_at: null, kind: 'full', round: 1, outcome: 'open', stop_reason: null,
+      candidates: 5, settled: 2, remaining: 3, counts: {}, duration_ms: null, timings_ms: {} } };
+  expect(await writePassRow(f.engine, value, { pin: true })).toBe(true);
+  try {
+    const result = await refreshWorktree(f.engine, f.alpha);
+    expect(result).toMatchObject({ status: 'completed', old_head: before });
+    expect(result.target_head).not.toBe(before);
+    // The refresh's own sync of the members is the next pass: it replaces the open row and converges at the new HEAD.
+    expect(result.synced).toContainEqual({ source_id: f.beta, status: 'synced', last_commit: result.target_head as string | null });
+    const [row] = await f.engine.executeRaw<{ pass_id: string; outcome: string }>("SELECT completed_keys->0->'telemetry'->>'pass_id' AS pass_id, completed_keys->0->'telemetry'->>'outcome' AS outcome FROM op_checkpoints WHERE op=$1 AND completed_keys->0->>'source_id'=$2", [MANAGED_SYNC_PASS_OP, f.beta]);
+    expect(row).toMatchObject({ outcome: 'synced' });
+    expect(row?.pass_id).not.toBe(passId);
+  } finally { await f.engine.executeRaw("DELETE FROM op_checkpoints WHERE op=$1 AND completed_keys->0->>'source_id'=$2", [MANAGED_SYNC_PASS_OP, f.beta]); }
 }), 120_000);
 
 test('10. source add and remove on the worktree during a refresh refuse refresh_in_progress', () => each(async f => {
@@ -442,3 +540,24 @@ test('admission completes a syncing refresh whose members all reached the target
   expect((await f.put(f.alpha, 'notes/caught-up', page('Caught up', 'admitted'))).state ?? 'committed').toBe('committed');
   expect((await f.refreshRows()).map(r => r.state)).toEqual(['completed']);
 }), 120_000);
+
+test('#6712 wave: a refresh completes once every member synced to a descendant of the target, and --resume completes it the same way', () => each(async f => {
+  const target = f.push('alpha/two.md', page('Alpha two', 'Upstream.'));
+  let descendant = '';
+  // A commit lands on top of the fast-forwarded target before the member syncs run, so each member syncs past the target.
+  const result = await refreshWorktree(f.engine, f.alpha, { hooks: { boundary: point => {
+    if (point === 'merged') descendant = commitFile(f.root, 'alpha/three.md', page('Alpha three', 'Committed on top of the target.'));
+  } } });
+  expect(git(f.root, 'merge-base', '--is-ancestor', target, descendant) === '' && descendant !== target).toBe(true);
+  expect(await f.lastCommit(f.alpha)).toBe(descendant);
+  expect(await f.lastCommit(f.beta)).toBe(descendant);
+  expect(result).toMatchObject({ status: 'completed', target_head: target });
+  expect(result.next).toBeUndefined();
+  expect((await f.refreshRows()).map(r => r.state)).toEqual(['completed']);
+  expect((await f.put(f.alpha, 'notes/after-descendant', page('After', 'admitted'))).state ?? 'committed').toBe('committed');
+  // A refresh left in syncing (its process died) whose members already synced past the target completes on --resume.
+  const [row] = await f.refreshRows();
+  await f.engine.executeRaw(`UPDATE persistence_worktree_refreshes SET state='syncing',completed_at=NULL WHERE id=$1::uuid`, [row.id]);
+  expect(await refreshWorktree(f.engine, f.alpha, { resume: true })).toMatchObject({ status: 'completed', refresh_id: row.id });
+  expect((await f.refreshRows()).map(r => r.state)).toEqual(['completed']);
+}), 180_000);
