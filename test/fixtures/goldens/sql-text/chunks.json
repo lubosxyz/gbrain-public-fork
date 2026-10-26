@@ -713,6 +713,20 @@
           }
         ]
       },
+      "markEmbedSkip": {
+        "source-scoped-jsonb-merge": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "string"
+            ],
+            "sql": "UPDATE pages SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || $1::jsonb WHERE slug = $2 AND source_id = $3",
+            "textSha256": "e021bfb1567701ef8740ad7ead792b950849e74fed2125ac67bb08c6a80b656a"
+          }
+        ]
+      },
       "readEmbeddingStateCounts": {
         "full": [
           {
@@ -789,20 +803,6 @@
             ],
             "sql": "SELECT ic.relname AS name FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid JOIN pg_class t ON t.oid = i.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE t.relname = 'content_chunks' AND n.nspname = current_schema() AND i.indisvalid AND i.indpred IS NOT NULL AND pg_get_expr(i.indpred, i.indrelid) = '(' || quote_ident($1) || ' IS NULL)' ORDER BY ic.relname LIMIT 1",
             "textSha256": "024a6c1f7deca626d307cb1f3566cdadb7c7ea81af23f13aeb816981efdfe79f"
-          }
-        ]
-      },
-      "markEmbedSkip": {
-        "source-scoped-jsonb-merge": [
-          {
-            "lane": "pool",
-            "params": [
-              "string",
-              "string",
-              "string"
-            ],
-            "sql": "UPDATE pages SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || $1::jsonb WHERE slug = $2 AND source_id = $3",
-            "textSha256": "e021bfb1567701ef8740ad7ead792b950849e74fed2125ac67bb08c6a80b656a"
           }
         ]
       },

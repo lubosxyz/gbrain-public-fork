@@ -171,6 +171,7 @@
           "logEvalCandidate: (input: EvalCandidateInput) => Promise<number>",
           "logEvalCaptureFailure: (reason: EvalCaptureFailureReason) => Promise<void>",
           "logIngest: (entry: IngestLogInput) => Promise<void>",
+          "markEmbedSkip: (slug: string, opts: { sourceId?: string; marker: EmbedSkipMarker; }) => Promise<void>",
           "markPagesAttendanceBlocked: (refs: Array<{ slug: string; source_id: string; revision: string; }>) => Promise<number>",
           "markPagesExtractedBatch: (refs: Array<{ slug: string; source_id: string; extractedAt?: string; }>, defaultExtractedAt: string) => Promise<number>",
           "mergeOntologyFact: (obs: OntologyObservationInput) => Promise<OntologyMergeResult>",
@@ -933,6 +934,7 @@
           "ingested_at?: Date | null | undefined",
           "ingested_via?: string | null | undefined",
           "knowledge_revision?: string | undefined",
+          "last_retrieved_at?: Date | null | undefined",
           "salience_touched_at?: Date | null | undefined",
           "slug: string",
           "source_id: string",
@@ -1181,6 +1183,7 @@
           "logEvalCandidate: (input: EvalCandidateInput) => Promise<number>",
           "logEvalCaptureFailure: (reason: EvalCaptureFailureReason) => Promise<void>",
           "logIngest: (entry: IngestLogInput) => Promise<void>",
+          "markEmbedSkip: (slug: string, opts: { sourceId?: string; marker: EmbedSkipMarker; }) => Promise<void>",
           "markPagesAttendanceBlocked: (refs: Array<{ slug: string; source_id: string; revision: string; }>) => Promise<number>",
           "markPagesExtractedBatch: (refs: Array<{ slug: string; source_id: string; extractedAt?: string; }>, defaultExtractedAt: string) => Promise<number>",
           "mergeOntologyFact: (obs: OntologyObservationInput) => Promise<OntologyMergeResult>",
@@ -1411,6 +1414,7 @@
         "kind": "interface",
         "members": [
           "emotional_weight: number",
+          "last_retrieved_at: Date | null",
           "score: number",
           "slug: string",
           "source_id: string",
@@ -3507,6 +3511,7 @@
           "logEvalCandidate: (input: EvalCandidateInput) => Promise<number>",
           "logEvalCaptureFailure: (reason: EvalCaptureFailureReason) => Promise<void>",
           "logIngest: (entry: IngestLogInput) => Promise<void>",
+          "markEmbedSkip: (slug: string, opts: { sourceId?: string; marker: EmbedSkipMarker; }) => Promise<void>",
           "markPagesAttendanceBlocked: (refs: Array<{ slug: string; source_id: string; revision: string; }>) => Promise<number>",
           "markPagesExtractedBatch: (refs: Array<{ slug: string; source_id: string; extractedAt?: string; }>, defaultExtractedAt: string) => Promise<number>",
           "mergeOntologyFact: (obs: OntologyObservationInput) => Promise<OntologyMergeResult>",
@@ -4745,14 +4750,14 @@
         "kind": "function",
         "name": "importCodeFile",
         "signature": [
-          "(engine: BrainEngine, relativePath: string, content: string, opts?: { noEmbed?: boolean; force?: boolean; sourceId?: string; prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; }) => Promise<ImportResult>"
+          "(engine: BrainEngine, relativePath: string, content: string, opts?: { noEmbed?: boolean; force?: boolean; forceRechunk?: boolean; sourceId?: string; prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; }) => Promise<ImportResult>"
         ]
       },
       {
         "kind": "variable",
         "name": "importFile",
         "signature": [
-          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; bodyPolicy?: PageBodyPolicy; }) => Promise<ImportResult>"
+          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; force?: boolean; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; bodyPolicy?: PageBodyPolicy; }) => Promise<ImportResult>"
         ]
       },
       {
@@ -4766,7 +4771,7 @@
         "kind": "function",
         "name": "importFromFile",
         "signature": [
-          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; bodyPolicy?: PageBodyPolicy; }) => Promise<ImportResult>"
+          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; force?: boolean; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; bodyPolicy?: PageBodyPolicy; }) => Promise<ImportResult>"
         ]
       },
       {
@@ -6352,6 +6357,7 @@
           "budgetUsdPerDay?: string | null | undefined",
           "clientId: string",
           "clientName?: string | undefined",
+          "companySlug?: string | undefined",
           "delegatedNamespace?: \"prefixes\" | \"job\" | undefined",
           "delegatedSlugPrefixes?: string[] | null | undefined",
           "effectiveSurface?: \"verbs\" | \"starter\" | \"full\" | undefined",
@@ -6371,7 +6377,10 @@
           "surface?: string | undefined",
           "surfaceSetBy?: string | undefined",
           "takesHoldersAllowList?: string[] | undefined",
+          "tenantScoped?: boolean | undefined",
           "token: string",
+          "tokenId?: string | undefined",
+          "tokenKind?: \"oauth\" | \"legacy\" | undefined",
           "tokenTtlSeconds?: number | null | undefined"
         ],
         "name": "AuthInfo"
@@ -6806,6 +6815,7 @@
           "logEvalCandidate: (input: EvalCandidateInput) => Promise<number>",
           "logEvalCaptureFailure: (reason: EvalCaptureFailureReason) => Promise<void>",
           "logIngest: (entry: IngestLogInput) => Promise<void>",
+          "markEmbedSkip: (slug: string, opts: { sourceId?: string; marker: EmbedSkipMarker; }) => Promise<void>",
           "markPagesAttendanceBlocked: (refs: Array<{ slug: string; source_id: string; revision: string; }>) => Promise<number>",
           "markPagesExtractedBatch: (refs: Array<{ slug: string; source_id: string; extractedAt?: string; }>, defaultExtractedAt: string) => Promise<number>",
           "mergeOntologyFact: (obs: OntologyObservationInput) => Promise<OntologyMergeResult>",
@@ -9256,6 +9266,7 @@
           "ingested_at?: Date | null | undefined",
           "ingested_via?: string | null | undefined",
           "knowledge_revision?: string | undefined",
+          "last_retrieved_at?: Date | null | undefined",
           "salience_touched_at?: Date | null | undefined",
           "slug: string",
           "source_id: string",
@@ -9482,6 +9493,7 @@
         "kind": "interface",
         "members": [
           "emotional_weight: number",
+          "last_retrieved_at: Date | null",
           "score: number",
           "slug: string",
           "source_id: string",

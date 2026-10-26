@@ -921,6 +921,8 @@ export async function dispatchToolCall(
   // #6721: a read op answers every config read from one snapshot of the table
   // (config-snapshot.ts); a write reads config live, so it sees its own writes.
   // GBRA-156: and reads the brain identity and each local writer's credential once for its pre-submission checks.
+  const tenantDenial = await tenantDispatchDenial(engine, name, operations.find(o => o.name === name), opts);
+  if (tenantDenial) return tenantDenial;
   const run = () => withRequestIdentityMemo(() => dispatchResolvedCall(engine, name, params, opts));
   if (name === 'search' || name === 'query') return withSearchConnectionBudget(() => withRequestConfigSnapshot(engine, run));
   return operations.find(o => o.name === name)?.mutating === false
@@ -957,19 +959,14 @@ async function dispatchResolvedCall(
     });
   };
 
-  const op = operations.find(o => o.name === name);
-
-  const tenantDenial = await tenantDispatchDenial(engine, name, op, opts);
-  if (tenantDenial) return tenantDenial;
-
   // [c2] surface enforcement at the SHARED layer: a hidden op is uncallable
   // on every transport, not just unlisted. Same envelope as unknown ops so
-  // the surface doesn't leak which names exist. (Runs AFTER the tenant
-  // backstop above so every tenant dispatch attempt is an audited decision.)
+  // the surface doesn't leak which names exist (after dispatchToolCall's tenant backstop).
   if (opts.allowedOps && !opts.allowedOps.has(name)) {
     return unknownToolEnvelope(name, opts, undefined, await grantBlockedNotices(engine, opts, true));
   }
 
+  const op = operations.find(o => o.name === name);
   if (!op) {
     // Always return JSON-shaped error content. v0.31 e2e tests
     // (sources-remote-mcp.test.ts) parse content via JSON.parse so a

@@ -908,8 +908,7 @@ async function runLockedMigrations(
       results.push({ version: m.version, status: result.status });
       if (result.status === 'partial') {
         doc.status = 'partial';
-        console.log(`Migration v${m.version} finished as PARTIAL. Run \`gbrain apply-migrations\` again after resolving any pending host-work items.`);
-        for (const line of failedPhaseLines(result.phases)) console.error(line);
+        console.log(`Migration v${m.version} finished as PARTIAL. Run \`gbrain apply-migrations\` again after resolving any pending host-work items.`); for (const line of failedPhaseLines(result.phases)) console.error(line);
       } else if (m.reconcile && result.pending_host_work) {
         console.log(`Migration v${m.version} mechanical checks complete; host publication or client actions remain pending.`);
       } else {

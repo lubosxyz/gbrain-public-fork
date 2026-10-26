@@ -743,6 +743,19 @@
           }
         ]
       },
+      "markEmbedSkip": {
+        "source-scoped-jsonb-merge": [
+          {
+            "paramCount": 3,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ]
+      },
       "readEmbeddingStateCounts": {
         "full": [
           {
@@ -3552,7 +3565,7 @@
       "markPagesExtractedBatch": {
         "default": [
           {
-            "paramCount": 3,
+            "paramCount": 4,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,

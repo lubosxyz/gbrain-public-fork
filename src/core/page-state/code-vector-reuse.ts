@@ -2,6 +2,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { ChunkInput } from '../types.ts';
 import type { ResolvedColumn } from '../types.ts';
 import { quoteIdentifier } from '../search/embedding-column.ts';
+import { chunkGenerationProbe } from '../search/safe-chunks.ts';
 import { planEmbeddingReuse } from '../embed-reuse.ts';
 import { parseEmbedding } from '../utils.ts';
 import { embeddingInputHash, type EmbeddingInputContext } from '../embedding-input-hash.ts';
@@ -15,7 +16,7 @@ export async function reuseCodeProjectionVectors(engine: BrainEngine, pageId: nu
     chunk_text: string; chunk_source: string; token_count: number | null; embedding: string;
     embedding_input_hash: string | null;
   } & Pick<ChunkInput, typeof metadata[number]>>(`SELECT ${metadata.join(',')},chunk_text,chunk_source,token_count,${quoteIdentifier(column.name)}::text AS embedding,embedding_input_hash
-    FROM content_chunks WHERE page_id=$1 AND model=$2 AND ${quoteIdentifier(column.name)} IS NOT NULL
+    FROM content_chunks cc WHERE page_id=$1 AND model=$2 AND ${quoteIdentifier(column.name)} IS NOT NULL AND ${chunkGenerationProbe('cc')}
       AND (embedded_text_hash IS NULL OR embedded_text_hash=md5(chunk_text)) ORDER BY chunk_index`,
   [pageId, provenance.model]);
   const stored = rows.filter(row => row.embedding_input_hash == null ? mode == null

@@ -1213,10 +1213,7 @@ const query: Operation = {
               embedQuestion: (q) => embedQueryWithPrefix(ctx.engine, q),
             });
             crag.think = {
-              // Fork: the think answer synthesizes retrieved content, so it can
-              // carry the same credential-like material redactSearchResults
-              // scrubs from the result envelope — scrub it with the same pass.
-              answer: redactCredentialLikeText(t.answer),
+              answer: redactCredentialLikeText(t.answer), // synthesized from retrieved content: same scrub as the results
               citations: t.citations.length,
               ...(t.synthesis_status ? { synthesis_status: t.synthesis_status } : {}),
               model: t.modelUsed,
@@ -1228,7 +1225,6 @@ const query: Operation = {
       }
     }
     const latency_ms = Date.now() - startedAt;
-    const safeResults = redactSearchResults(results);
 
     results = (await keepFrontmatterMatches(ctx.engine, results, where)).map(r => ({ ...r }));
     stampDeepResearchIds(results);
@@ -1250,7 +1246,7 @@ const query: Operation = {
         {
           tool_name: 'query',
           query: queryText,
-          results: safeResults,
+          results: redactSearchResults(results),
           meta,
           latency_ms,
           remote: ctx.remote ?? false,
