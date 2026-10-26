@@ -1,7 +1,7 @@
 import type { Migration } from './types.ts';
 
-export const v240: Migration = {
-    version: 240,
+export const v277: Migration = {
+    version: 277,
     name: 'fork_upstream_v150_reconciliation',
     // Converge the historical fork and upstream schema lineages. Both used
     // the same scalar versions for different idempotent DDL.

@@ -10,6 +10,17 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.469.0] - 2026-10-26
+
+### Distribution fork integration
+
+**The distribution fork now carries upstream 0.60.468.0 with its retained patch lane intact.**
+
+- Fork brains stamped at schema 240-244 by the fork's former numbering now run the upstream migrations that reuse those numbers (name lookup indexes, slug-intent request index, partial extraction input, consumer process start, chunk projected spans) before newer migrations; the fork's own reconciliation migrations moved to v277-v281 and stay idempotent.
+- Upstream's coordination lock resolver and wedged-reservation repair replace the fork's equivalents; the fork's reservation and first-claim device tests run unchanged against it.
+- Retained: tenant token auditing and revocation, credential redaction of search output, request-log retention, retrieval timestamps, permanent oversized-chunk parking (now alongside upstream heal-by-split and embedding metering), code-vector reuse on projection reinstall, managed lint source boundaries, the macOS first-claim device tolerance and the larger MCP request body limit.
+- Rollback requires restoring the matching pre-upgrade brain backup: an older binary cannot run against the newer schema.
+
 ## [0.60.468.0] - 2026-10-26
 
 **GBrain now requires Bun 1.4.4 or newer, so a sync or conversion pass over a TLS Postgres or connection pooler no longer grows until a memory guard kills it, and every supported runtime carries the Brotli fix for CVE-2026-111497.**

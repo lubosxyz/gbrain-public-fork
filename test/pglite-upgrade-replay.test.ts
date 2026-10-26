@@ -27,7 +27,7 @@
  *     differently indented template literals, so an existing brain's
  *     `prosrc` differs from a fresh brain's in whitespace only. The test pins
  *     that exact function list and proves the bodies are whitespace-equivalent;
- *     v240 appends the retained fork tenant columns to this upstream fixture,
+ *     v277 appends the retained fork tenant columns to this upstream fixture,
  *     while fresh fork schemas have them inline. The exact ordinal permutation
  *     is pinned separately; every column definition and other catalog object
  *     must match the live fresh install;
@@ -85,7 +85,7 @@ const FRESH_GOLDEN = 'pglite-upgrade-replay/catalog-before-boot';
 const WHITESPACE_ONLY_FUNCTION_DRIFT = [
   'bump_page_generation_clock_fn()',
 ];
-/** Fresh fork schema positions vs v240 additions to the pinned upstream brain. */
+/** Fresh fork schema positions vs v277 additions to the pinned upstream brain. */
 const TOKEN_COLUMN_ORDINAL_DRIFT: Record<string, [number, number]> = {
   company_slug: [8, 16], expires_at: [9, 17], minted_by: [10, 18],
   permissions: [11, 8], source_grant: [12, 9], source_id: [13, 10],

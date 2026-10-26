@@ -4670,7 +4670,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Your identity: transport, scopes and, over OAuth, client, source_id and federated_read.",
+    "description": "Transport, scopes, source_id, federated_read grants and server-verified tenant identity.",
     "params": {},
     "scope": "read",
     "cliHints": {
@@ -4862,6 +4862,81 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "hidden": true
     },
     "area": "sources"
+  },
+  {
+    "name": "token_mint_scoped",
+    "idempotent": false,
+    "outputRedaction": "no_stored_text",
+    "description": "Mint a tenant-scoped short-TTL READ-ONLY bearer token bound to a server-stored company_slug. Allowlisted minting principals only (admin scope or local CLI). The grant is exactly [\"read\"] and ttl_seconds is hard-capped at 3600 (60 minutes) — any other scope request or larger TTL is denied before any row is written. Expiry is computed from SERVER time in the database. The decision is written to the durable redacted auth audit; if the audit write fails, the mint is rolled back and the op fails (fail-closed — an unaudited credential never leaves the server). The plaintext token is returned ONCE and never stored or logged; wire it immediately.",
+    "params": {
+      "name": {
+        "type": "string",
+        "required": true,
+        "description": "Token display name (audit identity; not unique)."
+      },
+      "company_slug": {
+        "type": "string",
+        "required": true,
+        "description": "Tenant identity stored server-side on the token row ([a-z0-9-], max 63 chars). whoami reports it back as the server-verified tenant."
+      },
+      "ttl_seconds": {
+        "type": "number",
+        "description": "Expiry in seconds from server now(). Integer 1..3600; default 3600. Larger values are DENIED, not clamped."
+      },
+      "scopes": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Optional; must be exactly [\"read\"] when provided. Anything else is denied."
+      },
+      "source_id": {
+        "type": "string",
+        "description": "Optional source grant (permissions.source_id) for the minted token."
+      }
+    },
+    "mutating": true,
+    "scope": "admin",
+    "annotations": {
+      "title": "Mint tenant-scoped token",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "cliHints": {
+      "name": "token-mint-scoped",
+      "positional": [
+        "name",
+        "company_slug"
+      ]
+    },
+    "area": "identity"
+  },
+  {
+    "name": "token_revoke",
+    "idempotent": false,
+    "outputRedaction": "no_stored_text",
+    "description": "Revoke exactly one bearer token by its row id (UUID — the only safe revocation key; names are not unique). Allowlisted principals only (admin scope or local CLI). Revocation takes effect on the next verification. The decision is written to the durable redacted auth audit; because revocation only narrows access, an audit-write failure alerts but never un-revokes (`audit_ok: false` in the result).",
+    "params": {
+      "id": {
+        "type": "string",
+        "required": true,
+        "description": "access_tokens.id (UUID) to revoke."
+      }
+    },
+    "mutating": true,
+    "scope": "admin",
+    "annotations": {
+      "title": "Revoke token",
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "cliHints": {
+      "name": "token-revoke",
+      "positional": [
+        "id"
+      ]
+    },
+    "area": "identity"
   },
   {
     "name": "request_tools",

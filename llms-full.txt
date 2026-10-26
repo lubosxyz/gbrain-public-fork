@@ -9,7 +9,7 @@ For the link-only index, see `llms.txt`. Source of truth: https://github.com/gar
 
 ## docs/guides/remote-mcp.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/remote-mcp.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/guides/remote-mcp.md
 
 # Use your brain from anywhere over MCP
 
@@ -581,7 +581,7 @@ pre-mint before the service runs and pass `--token <value>`, or use the scoped
 
 ## docs/guides/grok-bot.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/grok-bot.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/guides/grok-bot.md
 
 # GBrain for Grok Bot
 
@@ -789,7 +789,7 @@ network and OAuth failures belong to the
 
 ## docs/guides/muse.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/muse.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/guides/muse.md
 
 # GBrain for Muse
 
@@ -1021,7 +1021,7 @@ old path. More errors and fixes are in the
 
 ## docs/guides/in-agent-setup.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/in-agent-setup.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/guides/in-agent-setup.md
 
 # Install GBrain inside a personal agent
 
@@ -1429,7 +1429,7 @@ policies. Those remain app-level acceptance checks in the product guides.
 
 ## docs/guides/hosted-harness-access.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/hosted-harness-access.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/guides/hosted-harness-access.md
 
 # Connect your agent to an existing hosted GBrain
 
@@ -1768,7 +1768,7 @@ As of **2026-09-09**, repository tests exercise private configuration writers, c
 
 ## AGENTS.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/AGENTS.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/AGENTS.md
 
 # Agents working on GBrain
 
@@ -2137,7 +2137,7 @@ publishing: `LLMS_REPO_BASE=https://raw.githubusercontent.com/your-org/your-fork
 
 ## CLAUDE.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/CLAUDE.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/CLAUDE.md
 
 # CLAUDE.md
 
@@ -2661,7 +2661,7 @@ installation is not proof of native use. Read
 
 ## INSTALL_FOR_AGENTS.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/INSTALL_FOR_AGENTS.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/INSTALL_FOR_AGENTS.md
 
 # GBrain Installation Guide for AI Agents
 
@@ -3509,7 +3509,7 @@ TTY-only (`GBRAIN_BANNER=1` forces it, `GBRAIN_NO_BANNER=1` hides it).
 
 ## docs/protocol/AGENT_OPERATOR_v1.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/protocol/AGENT_OPERATOR_v1.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/protocol/AGENT_OPERATOR_v1.md
 
 # AGENT_OPERATOR v1: how an agent operates gbrain
 
@@ -4788,7 +4788,7 @@ the decision table above and compare. Docs URLs are stored as
 
 ## skills/RESOLVER.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/skills/RESOLVER.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/skills/RESOLVER.md
 
 # GBrain Skill Resolver
 
@@ -4990,7 +4990,7 @@ These apply to ALL brain-writing skills:
 
 ## README.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/README.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/README.md
 
 <h1><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/brand/gbrain-wordmark-light.svg"><img src="docs/images/brand/gbrain-wordmark.svg" alt="GBrain" height="52"></picture></h1>
 
@@ -5455,7 +5455,7 @@ Community PR contributors are credited in `CHANGELOG.md` per release. Attributio
 
 ## docs/ENGINES.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/ENGINES.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/ENGINES.md
 
 # Pluggable Engine Architecture
 
@@ -6789,7 +6789,7 @@ Note: there is no SQLite engine. PGLite uses the same SQL as Postgres, so no sep
 
 ## docs/schema-author-tutorial.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/schema-author-tutorial.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/schema-author-tutorial.md
 
 # Tutorial: Build your first schema pack
 
@@ -7026,7 +7026,7 @@ gbrain schema lint --with-db
 
 ## docs/guides/live-sync.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/live-sync.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/guides/live-sync.md
 
 # Live Sync: Keep the Index Current
 
@@ -7787,7 +7787,7 @@ and `--uninstall` act only on that brain's job.
 
 ## docs/guides/cron-schedule.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/cron-schedule.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/guides/cron-schedule.md
 
 # Reference Cron Schedule
 
@@ -8309,7 +8309,7 @@ echo "Dream cycle complete at $(date)"
 
 ## docs/guides/github-source.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/github-source.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/guides/github-source.md
 
 # GitHub source kind: issues and PRs live in the brain
 
@@ -8527,7 +8527,7 @@ gbrain sources remove gh --confirm-destructive
 
 ## docs/protocol/MEMORY_VERBS_v1.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/protocol/MEMORY_VERBS_v1.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/protocol/MEMORY_VERBS_v1.md
 
 # MEMORY_VERBS v1 — the memory wire protocol
 
@@ -9754,7 +9754,7 @@ dominates (~minutes); the measured calls report p50/p99 + the ratio guard.
 
 ## docs/GBRAIN_VERIFY.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/GBRAIN_VERIFY.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/GBRAIN_VERIFY.md
 
 # GBrain Installation Verification Runbook
 
@@ -10171,7 +10171,7 @@ end-to-end sync test (4c), push a real change and verify it appears in search.
 
 ## docs/guides/troubleshooting.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/troubleshooting.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/guides/troubleshooting.md
 
 # Troubleshooting
 
@@ -11000,7 +11000,7 @@ syncs keep ending `partial` or failing has none, however many pages it imported.
 
 ## docs/guides/exit-codes.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/exit-codes.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/guides/exit-codes.md
 
 # Exit codes
 
@@ -11041,7 +11041,7 @@ the [CHANGELOG](../../CHANGELOG.md#exit-code-changes-by-command).
 
 ## docs/integrations/reliability-repair.md
 
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/integrations/reliability-repair.md
+Source: https://raw.githubusercontent.com/lubosxyz/gbrain-public-fork/master/docs/integrations/reliability-repair.md
 
 # Reliability repair
 

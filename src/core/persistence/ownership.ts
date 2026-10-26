@@ -17,7 +17,7 @@ import type { SqlEngine, WriteRequest } from './model.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
 import { acquireShared, deferToLease, exclusiveAcquired, foreignWaiterAhead, joinLease, noteWaiting, yieldLease } from './worktree-lease.ts';
 import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from './filesystem-guard.ts';
-import { assertPhysicalRoot, claimPhysicalRoot, preparePhysicalRootTransfer, readPhysicalRootReservation, restampPhysicalRoot, repairReservationCoordinationPath } from './physical-root.ts';
+import { assertPhysicalRoot, claimPhysicalRoot, preparePhysicalRootTransfer, readPhysicalRootReservation, restampPhysicalRoot } from './physical-root.ts';
 import { assertPhysicalRootReservation, readPhysicalRootStamp } from './physical-root-record.ts';
 import { nativeFilesystemPath } from './root-registry.ts';
 import { assertWriterAdminState } from './admin-intent.ts';
@@ -85,23 +85,9 @@ export async function getWorktreeBinding(engine: SqlEngine, sourceId: string, ho
   const [row] = await engine.executeRaw<WorktreeBinding>(WORKTREE_BINDING_SQL, [sourceId, hostId]);
   return row ?? null;
 }
-/**
- * Move a wedged reservation's lock out of the checkout, for every claim path. Resolving the git
- * root mirrors claimWorktree so both agree on which directory carries the reservation.
- */
-export async function repairWedgedReservation(engine: SqlEngine, path: string, hostId = localHostId()): Promise<void> {
-  let root: string;
-  try { root = realpathSync(resolve(path)); } catch { return; }
-  try { root = realpathSync(discoverGitRoot(root)); } catch { /* ordinary directory source */ }
-  const [localBrain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
-  if (!localBrain) return;
-  await repairReservationCoordinationPath(root, worktreeId => coordinationLockPath(root, worktreeId),
-    localBrain.brain_id, hostId);
-}
 /** `automatic` is only the ordinary first-write claim; the writer admin lock never blocks it. */
 export async function claimWorktree(engine: BrainEngine, sourceId: string, path: string, hostId = localHostId(), expectedAdminState?: string,
   options: { automatic?: boolean } = {}): Promise<WorktreeBinding> {
-  await repairWedgedReservation(engine, path, hostId);
   if(await managedPersistenceEnabled(engine)) {
     if(hostId!==localHostId()) throw opError('permission_denied','A source can be claimed only by the local registered host.',
       `Source ${sourceId} can only be claimed from the host that will own its checkout; nothing was claimed. Run the claim in a terminal on that host after reviewing writer status there.`,

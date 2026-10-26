@@ -154,12 +154,12 @@ export async function budgetLimitedFinding(engine: BrainEngine, signature: strin
 }
 
 type HeldListing = {
-  embedded: 0; skipped: 0; would_embed: number; total_chunks: number; pages_processed: 0; failures: 0; failure_samples: []; dryRun: boolean; chunkless_pages_healed: 0;
+  embedded: 0; skipped: 0; would_embed: number; total_chunks: number; pages_processed: 0; failures: 0; failure_samples: []; parked: 0; parked_samples: []; dryRun: boolean; chunkless_pages_healed: 0;
   held?: number; capped?: number; pages?: Array<{ slug: string; source_id: string; state: string; reason: string | null; pending_chunks: number; spent_usd: number; est_usd: number }>;
   sources?: BudgetLimitedReportSource[];
   oversized_facts?: OversizedFact[];
 };
-const emptyListing = (dryRun: boolean): HeldListing => ({ embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0, pages_processed: 0, failures: 0, failure_samples: [], dryRun, chunkless_pages_healed: 0,
+const emptyListing = (dryRun: boolean): HeldListing => ({ embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0, pages_processed: 0, failures: 0, failure_samples: [], parked: 0, parked_samples: [], dryRun, chunkless_pages_healed: 0,
   ...(dryRun ? { held: 0, capped: 0, pages: [], sources: [] } : {}) });
 
 /**

@@ -6,9 +6,9 @@ import type { SqlEngine } from './model.ts';
 import { repairWedgedReservation, resolveCoordinationLock } from './coordination-lock.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
 import { adoptTransferredRootStamp, assertNoPhysicalRootOverlap, assertPhysicalRoot, assertPhysicalRootStamp, PHYSICAL_ROOT_MARKER, physicalRootDeviceChange, physicalRootError,
-  readPhysicalRootReservation, repairReservationCoordinationPath, readPhysicalRootStamp, reservePhysicalRootRecord, restampPhysicalRootDevice, samePhysicalBirth, writePhysicalRootStamp, type PhysicalRootReservation } from './physical-root-record.ts';
+  readPhysicalRootReservation, readPhysicalRootStamp, reservePhysicalRootRecord, restampPhysicalRootDevice, samePhysicalBirth, writePhysicalRootStamp, type PhysicalRootReservation } from './physical-root-record.ts';
 
-export { assertPhysicalRoot, coordinationLockIsInsideRoot, isPhysicalRootMetadata, readPhysicalRootReservation, repairReservationCoordinationPath, reservationRepairGuardPath } from './physical-root-record.ts';
+export { assertPhysicalRoot, isPhysicalRootMetadata, readPhysicalRootReservation } from './physical-root-record.ts';
 export interface PhysicalRootClaim { hostId: string; worktreeId?: string; coordinationPath?: string; }
 async function brainIdentity(tx: SqlEngine): Promise<string> {
   const [brain] = await tx.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');

@@ -4,7 +4,7 @@
 <!-- Regenerate: bun run scripts/generate-tool-catalog.ts -->
 <!-- Freshness-guarded by scripts/check-tool-catalog-fresh.sh (bun run verify). -->
 
-Every non-localOnly operation on the MCP surface: 162 tools across 25 areas. **Starter** marks membership in the ~40-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
+Every non-localOnly operation on the MCP surface: 164 tools across 25 areas. **Starter** marks membership in the ~40-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
 
 ## admin
 
@@ -74,7 +74,9 @@ Every non-localOnly operation on the MCP surface: 162 tools across 25 areas. **S
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
 | `get_brain_identity` | Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. | read |  |  |
-| `whoami` | Your identity: transport, scopes and, over OAuth, client, source_id and federated_read. | read | yes |  |
+| `token_mint_scoped` | Mint a tenant-scoped short-TTL READ-ONLY bearer token bound to a server-stored company_slug. | admin |  |  |
+| `token_revoke` | Revoke exactly one bearer token by its row id (UUID — the only safe revocation key; names are not unique). | admin |  |  |
+| `whoami` | Transport, scopes, source_id, federated_read grants and server-verified tenant identity. | read | yes |  |
 
 ## ingest
 

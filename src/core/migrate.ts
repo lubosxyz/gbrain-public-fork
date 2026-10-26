@@ -370,7 +370,8 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
   // Historical forks used scalar versions 150, 160-161 and 166-169 for
   // different DDL. Repair skipped prerequisites BEFORE newer migrations
   // reference them (v174 already requires v169's withdrawal subject).
-  // Replay is only for pre-v240 forks; stamp only after all prerequisites succeed.
+  // Replay only on fork brains stamped below the fork's own replay migrations
+  // (now v277-v281); stamp only after all prerequisites succeed.
   if (current >= 150 && current < 240 && await engine.getConfig('fork.schema_prerequisites.v060') !== 'complete') {
     const [fork] = await engine.executeRaw<{ present: boolean }>(
       "SELECT to_regclass('public.mcp_request_log_purged') IS NOT NULL AS present");
@@ -382,6 +383,21 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
         }
       }
       await engine.setConfig('fork.schema_prerequisites.v060', 'complete');
+    }
+  }
+
+  // The fork's replay migrations once held scalar versions 240-244, which
+  // upstream now uses for different (idempotent) DDL; they moved to v277-v281.
+  // A fork brain stamped 240-244 would skip those upstream migrations, so run
+  // each one at or below its stamp before the pending loop reaches v245+.
+  if (current >= 240 && current <= 244 && await engine.getConfig('fork.schema_prerequisites.v0604') !== 'complete') {
+    const [fork] = await engine.executeRaw<{ present: boolean }>(
+      "SELECT to_regclass('public.mcp_request_log_purged') IS NOT NULL AS present");
+    if (fork?.present) {
+      for (const version of [240, 241, 242, 243, 244]) {
+        if (version <= current) await applyOneMigration(engine, MIGRATIONS.find(m => m.version === version)!);
+      }
+      await engine.setConfig('fork.schema_prerequisites.v0604', 'complete');
     }
   }
 

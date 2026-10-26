@@ -3,7 +3,6 @@ import { execFileSync } from '../spawn.ts';
 import { appendFileSync, closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { OperationError } from '../ops/contract.ts';
-import { acquireNativeLock } from './native-lock.ts';
 import { gitChildEnv } from '../git-env.ts';
 import { flushDirectory } from '../fs-durable.ts';
 import { digest, sha256 } from './digest.ts';
@@ -80,10 +79,12 @@ function createPrivate(path: string, value: unknown): boolean {
   flushDirectory(dirname(path));
   return true;
 }
+export function readPhysicalRootReservation(path: string): PhysicalRootReservation | null {
+  return readReservationRecord(canonicalFilesystemPath(path));
+}
+/** #5914: the reservation written for `recorded` as it was recorded, even when that path now resolves elsewhere through a symlink. */
 export function readRecordedPhysicalRootReservation(recorded: string): PhysicalRootReservation | null {
-  const value = readReservationIdentity(recorded);
-  if (value && coordinationLockIsInsideRoot(recorded, value.coordinationPath)) throw physicalRootError('The stable coordination lock must live outside the canonical checkout.');
-  return value;
+  return readReservationRecord(recorded);
 }
 /** Whether `path` is `root` or lies under it (both canonical). */
 export function coordinationPathInsideRoot(root: string, path: string): boolean {
@@ -95,7 +96,6 @@ function readReservationRecord(root: string, allowInsideLock = false): PhysicalR
   if (value === null) return null;
   if (value.version !== 1 || ![value.token,value.brainId,value.worktreeId,value.hostId].every(uuid)
     || value.root !== root || typeof value.coordinationPath !== 'string' || !isAbsolute(value.coordinationPath) || value.coordinationPath.includes('\0')
-    || canonicalFilesystemPath(value.coordinationPath) !== value.coordinationPath
     || ![value.initialDevice,value.initialInode,value.initialBirth].every(part => part === null || typeof part === 'string' && /^\d+$/.test(part))) throw physicalRootError();
   if (canonicalFilesystemPath(value.coordinationPath) !== value.coordinationPath) throw physicalRootError();
   if (!allowInsideLock && coordinationPathInsideRoot(root, value.coordinationPath)) throw physicalRootError('The stable coordination lock must live outside the canonical checkout. '

@@ -277,6 +277,11 @@ import { v273 } from './v273-segment-derivations.ts';
 import { v274 } from './v274-pages-withheld-source-path.ts';
 import { v275 } from './v275-rls-backfill-unguarded-tables.ts';
 import { v276 } from './v276-persistence-foreground-committed-index.ts';
+import { v277 } from './v277-fork-upstream-v150-reconciliation.ts';
+import { v278 } from './v278-fork-replay-upstream-v166-v169.ts';
+import { v279 } from './v279-fork-replay-upstream-v150-canonical-page-revisions.ts';
+import { v280 } from './v280-fork-replay-upstream-v160-projection-statistics.ts';
+import { v281 } from './v281-fork-replay-upstream-v161-pending-projection-index.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -552,4 +557,9 @@ export const MIGRATIONS: Migration[] = [
   v274,
   v275,
   v276,
+  v277,
+  v278,
+  v279,
+  v280,
+  v281,
 ];

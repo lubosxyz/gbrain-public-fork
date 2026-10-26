@@ -9,6 +9,7 @@
 
 const load_admin = () => import('./ops/admin.ts') as Promise<Record<string, unknown>>;
 const load_attribution = () => import('./ops/attribution.ts') as Promise<Record<string, unknown>>;
+const load_auth_tokens = () => import('./ops/auth-tokens.ts') as Promise<Record<string, unknown>>;
 const load_brain_membership = () => import('./ops/brain-membership.ts') as Promise<Record<string, unknown>>;
 const load_calibration = () => import('./ops/calibration.ts') as Promise<Record<string, unknown>>;
 const load_chronicle = () => import('./ops/chronicle.ts') as Promise<Record<string, unknown>>;
@@ -178,6 +179,8 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "sources_status": [load_sources, "sourcesOperations"],
   "sources_inspect": [load_sources, "sourcesOperations"],
   "sources_resolve_path": [load_sources, "sourcesOperations"],
+  "token_mint_scoped": [load_auth_tokens, "authTokenOperations"],
+  "token_revoke": [load_auth_tokens, "authTokenOperations"],
   "request_tools": [load_request_tools, "requestToolsOperations"],
   "get_recent_salience": [load_salience, "salienceOperations"],
   "find_anomalies": [load_salience, "salienceOperations"],
