@@ -1181,9 +1181,14 @@ export async function getChunksWithEmbeddings(exec: LegacyUnscopedRead, slug: st
     return rows.map((r) => rowToChunk(r, true));
   }
 
-/** Merge a permanent input rejection without replacing unrelated frontmatter. */
+/**
+ * Merge a permanent input rejection without replacing unrelated frontmatter.
+ * The patch binds as text and the cast parses it: a string bound straight to
+ * `::jsonb` arrives on Postgres as a jsonb string, and `object || string` is
+ * an array (repaired by schema migration v282).
+ */
 export async function markEmbedSkip(exec: SqlExecutor, slug: string, opts: { sourceId?: string; marker: EmbedSkipMarker }): Promise<void> {
   await exec.run(sqlFragment`UPDATE pages
-    SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || ${JSON.stringify({ [EMBED_SKIP_KEY]: opts.marker })}::jsonb
+    SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || ${JSON.stringify({ [EMBED_SKIP_KEY]: opts.marker })}::text::jsonb
     WHERE slug = ${slug} AND source_id = ${opts.sourceId ?? 'default'}`);
 }

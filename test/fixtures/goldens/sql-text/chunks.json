@@ -722,8 +722,8 @@
               "string",
               "string"
             ],
-            "sql": "UPDATE pages SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || $1::jsonb WHERE slug = $2 AND source_id = $3",
-            "textSha256": "e021bfb1567701ef8740ad7ead792b950849e74fed2125ac67bb08c6a80b656a"
+            "sql": "UPDATE pages SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || $1::text::jsonb WHERE slug = $2 AND source_id = $3",
+            "textSha256": "79b98b2dca681b660cb6e2aaefb6c60387e085d40a0b9c29b03935ff92965112"
           }
         ]
       },
