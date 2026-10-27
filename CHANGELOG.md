@@ -21,7 +21,7 @@ bun scripts/repair-embed-skip-frontmatter.ts           # lists the pages it woul
 bun scripts/repair-embed-skip-frontmatter.ts --apply   # repairs them in one transaction
 ```
 
-It rewrites only frontmatter of the exact damaged shape (an object followed by marker strings) to the original object plus the newest marker, and reports, without touching, any other array-shaped frontmatter. Set `DATABASE_URL` to target a Postgres brain explicitly; otherwise it uses the configured brain. No migration, no paid call.
+It rewrites only frontmatter of the exact damaged shape (an object followed by marker strings) to the original object plus the newest marker, and reports, without touching, any other array-shaped frontmatter. A brain that guards canonical page writes refuses the direct UPDATE and nothing changes. Set `DATABASE_URL` to target a Postgres brain explicitly; otherwise it uses the configured brain. No migration, no paid call.
 
 ### Itemized changes
 

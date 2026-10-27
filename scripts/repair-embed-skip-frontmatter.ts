@@ -18,7 +18,9 @@
  * frontmatter is reported and left untouched.
  *
  * Standalone and idempotent (a second run finds nothing to repair); this is a
- * maintenance script, not a schema migration.
+ * maintenance script, not a schema migration. On a brain that guards canonical
+ * page writes (managed persistence) the UPDATE is refused by the database guard,
+ * the transaction rolls back and nothing changes.
  *
  * Usage:
  *   bun scripts/repair-embed-skip-frontmatter.ts                 # dry run (default)
@@ -182,7 +184,11 @@ async function main(): Promise<number> {
     console.log(args.includes('--json') ? JSON.stringify(report, null, 2) : renderReport(report));
     return 0;
   } catch (e) {
-    console.error(e instanceof Error ? e.message : String(e));
+    const message = e instanceof Error ? e.message : String(e);
+    console.error(message);
+    if (message.includes('writer_coordinator_required')) {
+      console.error('This brain guards canonical page writes: a direct repair is refused and nothing was changed. Repair it through the persistence writer administration, not this script.');
+    }
     return 1;
   } finally {
     await engine.disconnect().catch(() => {});
