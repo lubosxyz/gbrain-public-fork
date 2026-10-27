@@ -76,11 +76,12 @@
       "quietMigrationNotices": "4045c32034a8f46204dd5d89e185ff5c35e8073f560f14caa8b127f8a695957c",
       "readExistingEmbeddingShape": "16d92d7cd52d8ebd7e89982f02e1bbdd8e8d08a6712a4ce57fbcf0952b7a6ca5",
       "relationsWithoutRls": "1350afca7865e0a915bfd4c6c2614361705090fca4905f25ac3b38312065c99c",
-      "repairEmbedSkipFrontmatter": "e2a44f2a27ffa57315af8bd726080a15480e9ea645870991e788d12298194357",
+      "repairEmbedSkipFrontmatter": "7d5d85cda6df54f4ccfa16888efea5f6cb366188b1bdb0d9c9776d9cbbc6895b",
       "repairLegacyClientGrants": "c1dc6b1d0c4933c041583aa1c4eacaefc0ff0ae2a67f56cfad7534f87a5ab309",
       "repairLegacyTimelineSourceRows": "405d4ae158482c020b029b93aff1ae4ac6854e6948cafaf82dbef473e6e5552e",
       "resolveSchemaLockTimeoutMs": "944eadd479e8de6c6da7dfb5208eb3b140e84b318db97a644d08ae0054d69138",
       "runMigrationStatement": "84ba969e61fe8e898dd50cf96e1643d237e521e04cd92b5ef43c5d6be75940c1",
+      "sample": "7bb18445b53686767f83fd1360091b600d62d267cbe9dd2ec7263ce11e3e601e",
       "schemaLockBlockedError": "c3e1346bc85d4e7592eaa64e262487c87011e4f4fae4c2bcca89b7d818c9a345",
       "seedConnectorDispatchAttempts": "2395a3995a6bf78776d37e72ce79b0dd15f6c6fa7f81c40612a744cb74ab01a5",
       "slugifyPath": "401dbca23580865d8b168dd8d84db4a6c708c6610d7cb61abafc7d0ee9809063",
@@ -4561,9 +4562,10 @@
           "helpers": [
             "migrationNotice",
             "quietMigrationNotices",
-            "repairEmbedSkipFrontmatter"
+            "repairEmbedSkipFrontmatter",
+            "sample"
           ],
-          "sha256": "47efbda4e9ef6d86a0d3f0d0f499c17581403753861cb6274de5ebfdacf7a93c"
+          "sha256": "a29b6eb0906e6e7f304eb244876926ebcf449fc821f6c0e80915781c731a5455"
         },
         "idempotent": true,
         "name": "fork_repair_embed_skip_frontmatter",

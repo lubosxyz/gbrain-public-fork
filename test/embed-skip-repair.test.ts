@@ -8,10 +8,13 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import { EMBED_SKIP_KEY, buildChunkTokenLimitMarker, isEmbedSkipped } from '../src/core/embed-skip.ts';
-import { doubleEncodedEmbedSkipMarker, repairEmbedSkipFrontmatter } from '../src/core/embed-skip-repair.ts';
+import { EMBED_SKIP_REPAIR_ATTEMPTS, doubleEncodedEmbedSkipMarker, repairEmbedSkipFrontmatter } from '../src/core/embed-skip-repair.ts';
 import { v282 } from '../src/core/schema-migrations/v282-fork-repair-embed-skip-frontmatter.ts';
 
-const patch = (bytes: number) => JSON.stringify({ [EMBED_SKIP_KEY]: buildChunkTokenLimitMarker(bytes) });
+const AT = new Date('2026-10-26T22:28:00.000Z');
+const patch = (bytes: number) => JSON.stringify({ [EMBED_SKIP_KEY]: buildChunkTokenLimitMarker(bytes, AT) });
+const rawPatch = (marker: unknown) => JSON.stringify({ [EMBED_SKIP_KEY]: marker });
+const marker = buildChunkTokenLimitMarker(1, AT);
 
 describe('doubleEncodedEmbedSkipMarker', () => {
   test('returns the last marker of the double-encoded shape', () => {
@@ -29,6 +32,17 @@ describe('doubleEncodedEmbedSkipMarker', () => {
       [{ a: 1 }, JSON.stringify({ other: {} })],
       [{ a: 1 }, JSON.stringify({ [EMBED_SKIP_KEY]: buildChunkTokenLimitMarker(1), extra: 1 })],
       [{ a: 1 }, JSON.stringify({ [EMBED_SKIP_KEY]: 'flat' })],
+      // `embed_skip` objects that are not the marker the parking path writes.
+      [{ keep: 'foreign' }, rawPatch({ unrelated: 'payload' })],
+      [{ a: 1 }, rawPatch({ ...marker, extra: 1 })],
+      [{ a: 1 }, rawPatch({ reason: marker.reason, bytes: marker.bytes })],
+      [{ a: 1 }, rawPatch({ ...marker, reason: 'oversized' })],
+      [{ a: 1 }, rawPatch({ ...marker, bytes: '10' })],
+      [{ a: 1 }, rawPatch({ ...marker, bytes: -1 })],
+      [{ a: 1 }, rawPatch({ ...marker, bytes: 1.5 })],
+      [{ a: 1 }, rawPatch({ ...marker, assessed_at: 'yesterday' })],
+      [{ a: 1 }, rawPatch({ ...marker, assessed_at: '2026-10-27' })],
+      [{ a: 1 }, patch(1), rawPatch({ unrelated: 'payload' })],
       [{ a: 1 }, patch(1), 7],
       ['x', 'y'],
     ]) expect(doubleEncodedEmbedSkipMarker(value)).toBeUndefined();
@@ -73,7 +87,13 @@ describe('v282 repair (PGLite)', () => {
     await seed('foreign', foreign);
     await seed('normal', { keep: 'me' });
 
-    expect(await repairEmbedSkipFrontmatter(engine)).toEqual({ repaired: 2, untouched: [{ source_id: 'default', slug: 'foreign' }] });
+    await seed('foreign-marker', [{ keep: 'foreign' }, rawPatch({ unrelated: 'payload' })]);
+
+    expect(await repairEmbedSkipFrontmatter(engine)).toEqual({
+      repaired: 2,
+      untouched: [{ source_id: 'default', slug: 'foreign' }, { source_id: 'default', slug: 'foreign-marker' }],
+      gitCanonical: [],
+    });
 
     for (const [slug, bytes] of [['two', 10], ['many', 4]] as const) {
       const fm = await frontmatterOf(slug);
@@ -86,6 +106,7 @@ describe('v282 repair (PGLite)', () => {
       expect(value[EMBED_SKIP_KEY].bytes).toBe(bytes);
     }
     expect((await frontmatterOf('foreign')).value).toEqual(foreign);
+    expect((await frontmatterOf('foreign-marker')).value).toEqual([{ keep: 'foreign' }, rawPatch({ unrelated: 'payload' })]);
     expect((await frontmatterOf('normal')).value).toEqual({ keep: 'me' });
   });
 
@@ -93,7 +114,7 @@ describe('v282 repair (PGLite)', () => {
     await seed('two', [{ a: 1 }, patch(5)]);
     await v282.handler!(engine);
     const after = await frontmatterOf('two');
-    expect(await repairEmbedSkipFrontmatter(engine)).toEqual({ repaired: 0, untouched: [] });
+    expect(await repairEmbedSkipFrontmatter(engine)).toEqual({ repaired: 0, untouched: [], gitCanonical: [] });
     expect(await frontmatterOf('two')).toEqual(after);
   });
 
@@ -110,5 +131,66 @@ describe('v282 repair (PGLite)', () => {
     const value = (await frontmatterOf('managed')).value as Record<string, any>;
     expect(value.keep).toBe('canonical');
     expect(value[EMBED_SKIP_KEY].bytes).toBe(9);
+  });
+  /** The engine with `write` run (through the real engine) just before each repair UPDATE, up to `times` times. */
+  function interleaved(write: () => Promise<unknown>, times: number): PGLiteEngine {
+    let left = times;
+    return new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop !== 'executeRaw') return Reflect.get(target, prop, receiver);
+        return async (sql: string, params?: unknown[]) => {
+          if (left > 0 && /^\s*UPDATE pages SET frontmatter/.test(sql)) { left--; await write(); }
+          return target.executeRaw(sql, params);
+        };
+      },
+    });
+  }
+
+  const appendPark = (slug: string, bytes: number) => () =>
+    engine.executeRaw('UPDATE pages SET frontmatter = frontmatter || to_jsonb($2::text) WHERE slug = $1', [slug, patch(bytes)]);
+
+  test('a row changed under the repair is re-read and repaired with its newest marker', async () => {
+    await seed('raced', [{ keep: 'me' }, patch(1)]);
+    const result = await repairEmbedSkipFrontmatter(interleaved(appendPark('raced', 2), 1));
+    expect(result).toEqual({ repaired: 1, untouched: [], gitCanonical: [] });
+    expect((await frontmatterOf('raced')).value).toEqual({ keep: 'me', [EMBED_SKIP_KEY]: JSON.parse(patch(2))[EMBED_SKIP_KEY] });
+  });
+
+  test('a row that keeps changing fails the migration and is not rewritten', async () => {
+    await seed('busy', [{ keep: 'me' }, patch(1)]);
+    let bytes = 10;
+    const racer = interleaved(() => appendPark('busy', bytes++)(), EMBED_SKIP_REPAIR_ATTEMPTS);
+    await expect(v282.handler!(racer)).rejects.toThrow(/default\/busy kept changing/);
+    const fm = await frontmatterOf('busy');
+    expect(fm.type).toBe('array');
+    expect((fm.value as unknown[]).length).toBe(2 + EMBED_SKIP_REPAIR_ATTEMPTS);
+    // Nothing else is writing now, so the next run repairs it.
+    expect((await repairEmbedSkipFrontmatter(engine)).repaired).toBe(1);
+  });
+
+  test('leaves a damaged page in a managed git-canonical source and reports it', async () => {
+    await engine.executeRaw(`INSERT INTO sources (id, name, config) VALUES ('notes-git', 'notes-git', '{"canonical":"git"}'::jsonb)`);
+    await engine.putPage('in-git', { type: 'note', title: 'in-git', compiled_truth: 'body', timeline: '', frontmatter: {} } as any, { sourceId: 'notes-git' } as any);
+    const damaged = [{ keep: 'git' }, patch(4)];
+    await engine.executeRaw(`UPDATE pages SET frontmatter = $1::text::jsonb WHERE slug = 'in-git' AND source_id = 'notes-git'`, [JSON.stringify(damaged)]);
+    await seed('plain', [{ keep: 'plain' }, patch(5)]);
+    const [{ strict }] = await engine.executeRaw<{ strict: number }>('SELECT strict_sources AS strict FROM git_canonical_brain WHERE singleton = 1');
+    expect(Number(strict)).toBe(1);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    try {
+      // The fence is live: the repair's own grant is not enough for this source.
+      await expect(engine.executeRaw(
+        `UPDATE pages SET frontmatter = '{}'::jsonb WHERE slug = 'in-git' AND set_config('gbrain.write_sources', '["notes-git"]', true) IS NOT NULL`,
+      )).rejects.toThrow(/git_protocol_required/);
+      await v282.handler!(engine);
+      expect(await repairEmbedSkipFrontmatter(engine)).toEqual({
+        repaired: 0, untouched: [], gitCanonical: [{ source_id: 'notes-git', slug: 'in-git' }],
+      });
+    } finally {
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+      await engine.executeRaw(`DELETE FROM pages WHERE source_id = 'notes-git'`);
+      await engine.executeRaw(`DELETE FROM sources WHERE id = 'notes-git'`);
+    }
+    expect((await frontmatterOf('plain')).value).toEqual({ keep: 'plain', [EMBED_SKIP_KEY]: JSON.parse(patch(5))[EMBED_SKIP_KEY] });
   });
 });
