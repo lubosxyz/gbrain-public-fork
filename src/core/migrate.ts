@@ -387,13 +387,19 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
   }
 
   // The fork's replay migrations once held scalar versions 240-244, which
-  // upstream now uses for different (idempotent) DDL; they moved to v277-v281.
-  // A fork brain stamped 240-244 would skip those upstream migrations, so run
-  // each one at or below its stamp before the pending loop reaches v245+.
+  // upstream now uses for different (idempotent) DDL; they moved to v277-v281
+  // and are now empty placeholders, because replaying old upstream DDL after
+  // newer upstream migrations reverts them. A fork brain stamped 240-244 gets
+  // the old fork replays it had not reached yet, then each upstream migration
+  // at or below its stamp, all before the pending loop reaches v245+.
   if (current >= 240 && current <= 244 && await engine.getConfig('fork.schema_prerequisites.v0604') !== 'complete') {
     const [fork] = await engine.executeRaw<{ present: boolean }>(
       "SELECT to_regclass('public.mcp_request_log_purged') IS NOT NULL AS present");
     if (fork?.present) {
+      const oldForkReplays: Array<[number, number[]]> = [[241, [166, 167, 168, 169]], [242, [150]], [243, [160]], [244, [161]]];
+      for (const [oldVersion, replayed] of oldForkReplays) {
+        if (oldVersion > current) for (const version of replayed) await applyOneMigration(engine, MIGRATIONS.find(m => m.version === version)!);
+      }
       for (const version of [240, 241, 242, 243, 244]) {
         if (version <= current) await applyOneMigration(engine, MIGRATIONS.find(m => m.version === version)!);
       }

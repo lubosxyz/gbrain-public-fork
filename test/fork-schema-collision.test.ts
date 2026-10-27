@@ -2,6 +2,14 @@ import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { LATEST_VERSION, runMigrations } from '../src/core/migrate.ts';
 
+const WITHDRAWAL_TRIGGER = "SELECT pg_get_triggerdef(oid) AS def FROM pg_trigger WHERE tgrelid = 'facts'::regclass AND tgname = 'facts_preserve_withdrawal'";
+/** Upstream v264 made the INSERT side set-based; the per-row trigger fires on UPDATE only. */
+const expectUpdateOnlyWithdrawalTrigger = async (engine: PGLiteEngine) => {
+  const [row] = await engine.executeRaw<{ def: string }>(WITHDRAWAL_TRIGGER);
+  expect(row?.def).toContain('BEFORE UPDATE OF');
+  expect(row?.def).not.toContain('INSERT');
+};
+
 let engine: PGLiteEngine;
 beforeAll(async () => { engine = new PGLiteEngine(); await engine.connect({}); }, 120_000);
 afterAll(async () => { await engine.disconnect(); });
@@ -25,6 +33,7 @@ test('a fork v169 high-water mark repairs skipped prerequisites before v174 and 
     expect(await engine.executeRaw('SELECT subject FROM fact_withdrawals LIMIT 1')).toEqual([]);
     expect(await engine.executeRaw('SELECT embedding_model,embedded_text_hash FROM facts LIMIT 1')).toEqual([]);
     expect(await engine.executeRaw('SELECT * FROM dream_synthesis_completions LIMIT 1')).toEqual([]);
+    await expectUpdateOnlyWithdrawalTrigger(engine);
     expect(await runMigrations(engine)).toEqual({ applied: 0, current: LATEST_VERSION });
 }, 120_000);
 
@@ -65,6 +74,35 @@ test('a fork brain stamped 244 by the old fork numbering gets the upstream v240-
     const after = await engine.readPageSnapshot(page.slug, { sourceId: 'default' });
     expect(after?.page.id).toBe(before?.page.id);
     expect(after?.page.compiled_truth).toBe(before?.page.compiled_truth);
+    expect(await engine.getConfig('fork.schema_prerequisites.v0604')).toBe('complete');
+    await expectUpdateOnlyWithdrawalTrigger(engine);
+    expect(await runMigrations(engine)).toEqual({ applied: 0, current: LATEST_VERSION });
+  } finally { await engine.disconnect(); }
+}, 120_000);
+
+test('a fresh schema keeps the set-based fact insert guard after the fork placeholders', async () => {
+  const engine = new PGLiteEngine(); await engine.connect({});
+  try {
+    await engine.initSchema();
+    await expectUpdateOnlyWithdrawalTrigger(engine);
+  } finally { await engine.disconnect(); }
+}, 120_000);
+
+test('a fork brain stamped 240 by the old fork numbering gets the old fork replays before newer upstream DDL', async () => {
+  const engine = new PGLiteEngine(); await engine.connect({});
+  try {
+    await engine.initSchema();
+    const page = await engine.putPage('collision-seed-240', { title: 'Synthetic seed', type: 'note', compiled_truth: 'Preserve this synthetic page.' });
+    // The old fork's v241 (upstream v166-v169 replay) had not run on a brain stamped 240.
+    await engine.executeRaw('ALTER TABLE facts DROP COLUMN embedding_model, DROP COLUMN embedded_text_hash');
+    await engine.executeRaw('DROP TABLE dream_synthesis_completions');
+    await engine.unsetConfig('fork.schema_prerequisites.v0604');
+    await engine.setConfig('version', '240');
+    expect((await runMigrations(engine)).current).toBe(LATEST_VERSION);
+    expect(await engine.executeRaw('SELECT embedding_model,embedded_text_hash FROM facts LIMIT 1')).toEqual([]);
+    expect(await engine.executeRaw('SELECT * FROM dream_synthesis_completions LIMIT 1')).toEqual([]);
+    await expectUpdateOnlyWithdrawalTrigger(engine);
+    expect((await engine.readPageSnapshot(page.slug, { sourceId: 'default' }))?.page.compiled_truth).toBe('Preserve this synthetic page.');
     expect(await engine.getConfig('fork.schema_prerequisites.v0604')).toBe('complete');
     expect(await runMigrations(engine)).toEqual({ applied: 0, current: LATEST_VERSION });
   } finally { await engine.disconnect(); }
