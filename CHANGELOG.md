@@ -10,6 +10,25 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.183.0] - 2026-10-27
+
+**Parking a page whose chunk the embedder rejects no longer corrupts its frontmatter on Postgres.** When `gbrain embed` permanently skips a page because one chunk exceeds the model's input limit, it records an `embed_skip` marker in the page's frontmatter. On Postgres brains that write stored the marker as a JSON string and concatenated it onto the frontmatter object, turning the whole frontmatter into an array (`[<original frontmatter>, "<marker>"]`, one more string per retry), so keys such as `id`, tags and content flags stopped reading as an object. PGLite was never affected. The marker is now merged as a real JSONB object on both engines, and the JSONB guard also flags the `${JSON.stringify(...)}::jsonb` interpolation with an object-literal argument, the spelling it used to miss.
+
+To take advantage of v0.60.183.0: upgrade, then repair any page already parked on a Postgres brain. The script is standalone and idempotent; the dry run is the default and changes nothing:
+
+```bash
+bun scripts/repair-embed-skip-frontmatter.ts           # lists the pages it would repair, per source
+bun scripts/repair-embed-skip-frontmatter.ts --apply   # repairs them in one transaction
+```
+
+It rewrites only frontmatter of the exact damaged shape (an object followed by marker strings) to the original object plus the newest marker, and reports, without touching, any other array-shaped frontmatter. Set `DATABASE_URL` to target a Postgres brain explicitly; otherwise it uses the configured brain. No migration, no paid call.
+
+### Itemized changes
+
+- **`markEmbedSkip` binds a JSONB object.** `src/core/engine-sql/chunks.ts` passes the marker patch through `jsonbParam` (postgres.js `sql.json`) instead of a stringified template value. Tests: `test/e2e/embed-skip-jsonb-postgres.test.ts` (real Postgres; fails on the previous write) and `test/mark-embed-skip-engine.test.ts` (PGLite).
+- **`scripts/repair-embed-skip-frontmatter.ts`.** Dry run by default, `--apply` in one transaction, `--json` report; per-source counts and slugs; foreign arrays and object frontmatter are never modified; the UPDATE re-checks the shape and aborts the transaction if a row changed. Tests run on PGLite (`test/repair-embed-skip-frontmatter.test.ts`) and Postgres (same cases, rows produced by the legacy statement).
+- **JSONB guard covers object-literal `${JSON.stringify({...})}::jsonb`.** `scripts/check-jsonb-params.mjs` balances the call's parentheses, so nested braces no longer hide the interpolation; `${JSON.stringify(x)}::text::jsonb`, comments and `jsonb-guard-ok` stay allowed. Self-test fixtures added for both guards.
+
 ## [0.60.182.0] - 2026-10-12
 
 ### Distribution fork integration
