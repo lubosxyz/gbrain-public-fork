@@ -30,7 +30,10 @@ SCAN_ROOT="${GBRAIN_GUARD_ROOT:-src/}"
 # interpolation's closing `}`, so a safe `${JSON.stringify(x)}::text::jsonb`
 # followed by a separate `${expr()}::jsonb` on the same line is not spanned
 # into a false positive (ship-review catch — the greedy `.*` variant was).
-PATTERN='\$\{JSON\.stringify\([^}]*\)\}::jsonb'
+# The argument may hold balanced `{...}` up to two levels deep, so an object
+# literal such as `JSON.stringify({ [KEY]: v })` is matched too; a lone `}`
+# still ends the match.
+PATTERN='\$\{JSON\.stringify\(([^{}]|\{([^{}]|\{[^{}]*\})*\})*\)\}::jsonb'
 
 if grep -rEn "$PATTERN" "$SCAN_ROOT" 2>/dev/null; then
   echo

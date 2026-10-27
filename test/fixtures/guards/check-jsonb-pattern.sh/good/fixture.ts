@@ -15,3 +15,12 @@ declare function getRaw(): unknown;
 export async function goodMultiInterpolation(): Promise<void> {
   await sql`UPDATE pages SET a = ${JSON.stringify(obj.get())}::text::jsonb, b = ${getRaw()}::jsonb WHERE id = 2`;
 }
+
+// Object-literal arguments on the safe text hop, alone and followed by a
+// separate ::jsonb interpolation on the same line.
+declare const KEY: string;
+declare const opts: { marker: unknown };
+export async function goodObjectLiteral(): Promise<void> {
+  await sql`UPDATE pages SET frontmatter = frontmatter || ${JSON.stringify({ [KEY]: { nested: opts.marker } })}::text::jsonb WHERE id = 3`;
+  await sql`UPDATE pages SET a = ${JSON.stringify({ k: 1 })}::text::jsonb, b = ${getRaw()}::jsonb WHERE id = 4`;
+}
