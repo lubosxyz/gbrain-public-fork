@@ -57,6 +57,7 @@ export const INTERNAL_CONFIG_STATE: readonly InternalConfigState[] = [
   { key: 'shared_skills.migration.v1.', prefix: true, reason: 'shared-skills migration checkpoints per source incarnation' },
   { key: 'shared_skills.migration.v1', reason: 'the shared-skills migration report the 0.53.0 migration writes and apply-migrations --list / doctor read for host work (#6796)' },
   { key: 'shared_skills.bridge_owner.v1.', prefix: true, reason: 'shared-brain bridge ownership claims' },
+  { key: 'fork.schema_prerequisites.', prefix: true, reason: 'once-only marker that migrate.ts replayed the upstream schema prerequisites for a brain stamped under the former fork migration numbering' },
 ];
 
 /**

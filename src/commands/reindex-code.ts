@@ -410,7 +410,7 @@ export function reindexForceHint(
 export const REINDEX_CODE_COST_FLAGS = ['--max-cost', '--max-cost-usd'] as const;
 /** Value-taking flags runReindexCodeCli reads as exact `--flag value` tokens. */
 export const REINDEX_CODE_VALUE_FLAGS = ['--source', '--workers', '--concurrency', ...REINDEX_CODE_COST_FLAGS] as const;
-/** Boolean flags runReindexCodeCli reads by exact token; a `--flag=value` form would be silently ignored. */
+/** Boolean flags runReindexCodeCli reads by exact token; a `--flag` with an attached `=value` would be silently ignored. */
 export const REINDEX_CODE_BOOLEAN_FLAGS = ['--dry-run', '--yes', '--json', '--force', '--no-embed'] as const;
 /** Flags the CLI itself handles for every command (help, brain routing, progress, job wrapper). */
 export const REINDEX_CODE_GLOBAL_FLAGS = ['--help', '--brain', '--quiet', '--progress-json', '--progress-interval', '--timeout', '--explain', '--background', '--follow'] as const;
