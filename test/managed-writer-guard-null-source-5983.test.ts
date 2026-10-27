@@ -210,7 +210,7 @@ test('upgrading a v196 brain unblocks the refused write and rerunning the curren
     const pageId = await pageIn(engine, 'default');
     await expect(guarded(engine, ['default'], INSERTS.tags, [pageId])).rejects.toThrow(REFUSED);
     const triggers = `SELECT tgrelid::regclass::text AS tbl, oid FROM pg_trigger WHERE tgname='managed_writer_guard' ORDER BY 1`;
-    // The full chain also runs fork v278, which deliberately reconciles triggers.
+    // A fork brain below 240 also gets the fork prerequisite replay, which deliberately reconciles triggers.
     // Pin its completed state; the separate v197 test pins function-only repair.
     await engine.setConfig('version', '196');
     let afterUpgrade: Record<string, unknown>[] = [];
