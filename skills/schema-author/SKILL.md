@@ -233,7 +233,7 @@ the user which version of `pack.json` wins; on `git_push_unavailable` the
 remote is unreachable (the commit is saved; rerun with `--push-only` later) or,
 when the pack repo has no remote at all, nothing was committed: commit just the
 pack locally with `git add pack.json && git commit -m "<msg>" -- pack.json`. Never fall back to
-stash, `pull --rebase` or a plain push ([outcomes](https://github.com/garrytan/gbrain/blob/master/docs/guides/shared-checkout-git.md#outcomes)).
+stash, `pull --rebase` or a plain push ([outcomes](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/guides/shared-checkout-git.md#outcomes)).
 
 If the brain daemon is running (`gbrain serve --http`), other processes
 pick up the change within 1 second (stat-mtime TTL gate in

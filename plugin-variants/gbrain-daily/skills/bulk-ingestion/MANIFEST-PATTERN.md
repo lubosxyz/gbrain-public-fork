@@ -202,7 +202,7 @@ fails the job; read its error: retry once on `commit_lock_busy`, and stop and
 tell the user on `integrate_conflict` or `writer_coordinator_required` (a
 managed brain: checkpoint pages through `put_page` instead). Never fall back to
 stash, `pull --rebase` or a plain push
-([shared-checkout git](https://github.com/garrytan/gbrain/blob/master/docs/guides/shared-checkout-git.md#outcomes)).
+([shared-checkout git](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/guides/shared-checkout-git.md#outcomes)).
 
 Shell jobs require the WORKER to be started with `gbrain jobs work --allow-shell-jobs`
 (or `GBRAIN_ALLOW_SHELL_JOBS=1` exported on the worker) — see

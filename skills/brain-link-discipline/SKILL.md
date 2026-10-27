@@ -116,7 +116,7 @@ https://<host>/<owner>/<repo>/blob/<branch>/<that-exact-path>
    retry once on `commit_lock_busy`; stop and tell the user on
    `integrate_conflict` or `writer_coordinator_required`; never fall back to
    stash, `pull --rebase` or a plain push
-   ([outcomes](https://github.com/garrytan/gbrain/blob/master/docs/guides/shared-checkout-git.md#outcomes)).
+   ([outcomes](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/guides/shared-checkout-git.md#outcomes)).
 4. **In the SAME message that reports the commit, output the link** — as a
    clickable markdown link or bare URL, never a backticked code span.
 

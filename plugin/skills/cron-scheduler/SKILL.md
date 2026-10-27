@@ -31,7 +31,7 @@ This skill guarantees:
 - Results saved as reports: `reports/{job-name}/{YYYY-MM-DD-HHMM}.md`
 - One entry point: every job, workspace script and hook calls gbrain through
   one wrapper that sets `GBRAIN_HOME` and keeps stderr and the exit code
-  ([the wrapper](https://github.com/garrytan/gbrain/blob/master/docs/guides/cron-schedule.md#calling-gbrain-unattended))
+  ([the wrapper](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/guides/cron-schedule.md#calling-gbrain-unattended))
 
 ## Phases
 
@@ -49,7 +49,7 @@ This skill guarantees:
    environment than your shell, so a bare `gbrain` (or `bun run src/cli.ts`)
    can find no database (every lookup silently empty) or act as a second host
    (`refresh_not_owner`). Register `gbrain-run <args>`, the wrapper in
-   [cron-schedule.md](https://github.com/garrytan/gbrain/blob/master/docs/guides/cron-schedule.md#calling-gbrain-unattended):
+   [cron-schedule.md](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/guides/cron-schedule.md#calling-gbrain-unattended):
    it sets `GBRAIN_HOME` (never `HOME`), loads the brain's env file and runs
    the installed binary. Log stderr to a file, check the exit code, keep hook
    output off stdout, and give each call a timeout of at least 10 s.
@@ -122,7 +122,7 @@ sources:
   `gbrain git commit-push -- <paths>`, then reconcile as the refusal says
   (`gbrain git commit-push --push-only --keep-checkout`, after the user
   agrees); never force the checkout
-  ([scripts and the managed checkout](https://github.com/garrytan/gbrain/blob/master/docs/guides/shared-checkout-git.md#scripts-and-the-managed-checkout)).
+  ([scripts and the managed checkout](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/guides/shared-checkout-git.md#scripts-and-the-managed-checkout)).
 - `--hard-deadline 13m` stays under the 15-minute interval. Managed sync takes
   no per-source lock, so a run that outlives the interval would overlap the
   next tick. A run stopped at its deadline ends `resumable` and the next tick
@@ -154,7 +154,7 @@ Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) 
 - A job's lookups all come back empty, or its log shows `no_brain` or `GBRAIN_DB_ACCESS no_url`: the job runs without the brain's config. Call gbrain through the wrapper; an empty result from a job whose stderr went to `/dev/null` is not evidence of "no notes".
 - `refresh_not_owner` from cron while the same refresh works by hand: the job resolves another gbrain home, so it is another host. The refusal names the identity file, `HOME` and `GBRAIN_HOME` it read; set the owner's `GBRAIN_HOME` in the wrapper. Never copy or delete a `host.json`.
 - A `--json` caller fails to parse gbrain's output: something the wrapper runs prints to stdout. Send that hook's output to a log file.
-- Calls time out in the job but finish by hand: a cold start takes seconds. Raise the timeout to at least 10 s in both the shell and the runtime that spawns it, and use the [warm CLI socket](https://github.com/garrytan/gbrain/blob/master/docs/guides/cli-socket.md).
+- Calls time out in the job but finish by hand: a cold start takes seconds. Raise the timeout to at least 10 s in both the shell and the runtime that spawns it, and use the [warm CLI socket](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/guides/cli-socket.md).
 - Exit 10 from a scheduled write: it was accepted and is still pending, not lost or "not found". Poll `gbrain write-request <request_id>` before retrying or reporting it.
 
 ## Anti-Patterns

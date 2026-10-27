@@ -144,7 +144,7 @@ With the operator's go-ahead, upgrade in this order:
 5. Verify: `gbrain --version` per install, and
    `gbrain doctor --only runtime_build_skew,serve_build_drift --json` ok. On a
    managed brain, `gbrain sources writer movement` must exit 0
-   ([restart and verify](https://github.com/garrytan/gbrain/blob/master/docs/guides/upgrades-auto-update.md#restart-and-verify)).
+   ([restart and verify](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/guides/upgrades-auto-update.md#restart-and-verify)).
 6. `gbrain autopilot resume`.
 
 Report the version every process runs, not just the version the upgrade
