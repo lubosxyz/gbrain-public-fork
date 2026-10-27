@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { LATEST_VERSION, runMigrations } from '../src/core/migrate.ts';
 
@@ -80,30 +80,28 @@ test('a fork brain stamped 244 by the old fork numbering gets the upstream v240-
   } finally { await engine.disconnect(); }
 }, 120_000);
 
-test('a fresh schema keeps the set-based fact insert guard after the fork placeholders', async () => {
-  const engine = new PGLiteEngine(); await engine.connect({});
-  try {
-    await engine.initSchema();
-    await expectUpdateOnlyWithdrawalTrigger(engine);
-  } finally { await engine.disconnect(); }
-}, 120_000);
+describe('fork replay placeholders', () => {
+  let fresh: PGLiteEngine;
+  beforeAll(async () => { fresh = new PGLiteEngine(); await fresh.connect({}); await fresh.initSchema(); }, 120_000);
+  afterAll(async () => { await fresh.disconnect(); });
 
-test('a fork brain stamped 240 by the old fork numbering gets the old fork replays before newer upstream DDL', async () => {
-  const engine = new PGLiteEngine(); await engine.connect({});
-  try {
-    await engine.initSchema();
-    const page = await engine.putPage('collision-seed-240', { title: 'Synthetic seed', type: 'note', compiled_truth: 'Preserve this synthetic page.' });
+  test('a fresh schema keeps the set-based fact insert guard after the fork placeholders', async () => {
+    await expectUpdateOnlyWithdrawalTrigger(fresh);
+  }, 120_000);
+
+  test('a fork brain stamped 240 by the old fork numbering gets the old fork replays before newer upstream DDL', async () => {
+    const page = await fresh.putPage('collision-seed-240', { title: 'Synthetic seed', type: 'note', compiled_truth: 'Preserve this synthetic page.' });
     // The old fork's v241 (upstream v166-v169 replay) had not run on a brain stamped 240.
-    await engine.executeRaw('ALTER TABLE facts DROP COLUMN embedding_model, DROP COLUMN embedded_text_hash');
-    await engine.executeRaw('DROP TABLE dream_synthesis_completions');
-    await engine.unsetConfig('fork.schema_prerequisites.v0604');
-    await engine.setConfig('version', '240');
-    expect((await runMigrations(engine)).current).toBe(LATEST_VERSION);
-    expect(await engine.executeRaw('SELECT embedding_model,embedded_text_hash FROM facts LIMIT 1')).toEqual([]);
-    expect(await engine.executeRaw('SELECT * FROM dream_synthesis_completions LIMIT 1')).toEqual([]);
-    await expectUpdateOnlyWithdrawalTrigger(engine);
-    expect((await engine.readPageSnapshot(page.slug, { sourceId: 'default' }))?.page.compiled_truth).toBe('Preserve this synthetic page.');
-    expect(await engine.getConfig('fork.schema_prerequisites.v0604')).toBe('complete');
-    expect(await runMigrations(engine)).toEqual({ applied: 0, current: LATEST_VERSION });
-  } finally { await engine.disconnect(); }
-}, 120_000);
+    await fresh.executeRaw('ALTER TABLE facts DROP COLUMN embedding_model, DROP COLUMN embedded_text_hash');
+    await fresh.executeRaw('DROP TABLE dream_synthesis_completions');
+    await fresh.unsetConfig('fork.schema_prerequisites.v0604');
+    await fresh.setConfig('version', '240');
+    expect((await runMigrations(fresh)).current).toBe(LATEST_VERSION);
+    expect(await fresh.executeRaw('SELECT embedding_model,embedded_text_hash FROM facts LIMIT 1')).toEqual([]);
+    expect(await fresh.executeRaw('SELECT * FROM dream_synthesis_completions LIMIT 1')).toEqual([]);
+    await expectUpdateOnlyWithdrawalTrigger(fresh);
+    expect((await fresh.readPageSnapshot(page.slug, { sourceId: 'default' }))?.page.compiled_truth).toBe('Preserve this synthetic page.');
+    expect(await fresh.getConfig('fork.schema_prerequisites.v0604')).toBe('complete');
+    expect(await runMigrations(fresh)).toEqual({ applied: 0, current: LATEST_VERSION });
+  }, 120_000);
+});

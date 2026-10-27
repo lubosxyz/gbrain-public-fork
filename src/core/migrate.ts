@@ -13,6 +13,7 @@ import {
   isStatementTimeoutError,
   isRetryableConnError,
 } from './retry-matcher.ts';
+import { repairForkSchemaPrerequisites } from './fork-schema-prerequisites.ts';
 import { repairTimelineDedupIndex } from './timeline-dedup-repair.ts';
 import { resumePageRevisionBackfill } from './page-state/revision-backfill-schema.ts';
 import { repairPagesUpsertArbiter } from './pages-upsert-arbiter.ts';
@@ -367,45 +368,7 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
   const currentStr = await engine.getConfig('version');
   const current = parseInt(currentStr || '1', 10);
 
-  // Historical forks used scalar versions 150, 160-161 and 166-169 for
-  // different DDL. Repair skipped prerequisites BEFORE newer migrations
-  // reference them (v174 already requires v169's withdrawal subject).
-  // Replay only on fork brains stamped below the fork's own replay migrations
-  // (now v277-v281); stamp only after all prerequisites succeed.
-  if (current >= 150 && current < 240 && await engine.getConfig('fork.schema_prerequisites.v060') !== 'complete') {
-    const [fork] = await engine.executeRaw<{ present: boolean }>(
-      "SELECT to_regclass('public.mcp_request_log_purged') IS NOT NULL AS present");
-    if (fork?.present) {
-      for (const version of [150, 160, 161, 166, 167, 168, 169]) {
-        if (version <= current) {
-          const prerequisite = MIGRATIONS.find(m => m.version === version)!;
-          await applyOneMigration(engine, prerequisite);
-        }
-      }
-      await engine.setConfig('fork.schema_prerequisites.v060', 'complete');
-    }
-  }
-
-  // The fork's replay migrations once held scalar versions 240-244, which
-  // upstream now uses for different (idempotent) DDL; they moved to v277-v281
-  // and are now empty placeholders, because replaying old upstream DDL after
-  // newer upstream migrations reverts them. A fork brain stamped 240-244 gets
-  // the old fork replays it had not reached yet, then each upstream migration
-  // at or below its stamp, all before the pending loop reaches v245+.
-  if (current >= 240 && current <= 244 && await engine.getConfig('fork.schema_prerequisites.v0604') !== 'complete') {
-    const [fork] = await engine.executeRaw<{ present: boolean }>(
-      "SELECT to_regclass('public.mcp_request_log_purged') IS NOT NULL AS present");
-    if (fork?.present) {
-      const oldForkReplays: Array<[number, number[]]> = [[241, [166, 167, 168, 169]], [242, [150]], [243, [160]], [244, [161]]];
-      for (const [oldVersion, replayed] of oldForkReplays) {
-        if (oldVersion > current) for (const version of replayed) await applyOneMigration(engine, MIGRATIONS.find(m => m.version === version)!);
-      }
-      for (const version of [240, 241, 242, 243, 244]) {
-        if (version <= current) await applyOneMigration(engine, MIGRATIONS.find(m => m.version === version)!);
-      }
-      await engine.setConfig('fork.schema_prerequisites.v0604', 'complete');
-    }
-  }
+  await repairForkSchemaPrerequisites(engine, current, MIGRATIONS, applyOneMigration);
 
   // Sort by version ascending so array insertion order doesn't affect
   // correctness. Migrations MUST run in version order; if v16 accidentally
