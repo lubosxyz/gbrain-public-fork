@@ -28,7 +28,8 @@ import {
   BUILTIN_PATTERNS,
   cleanSpeaker,
 } from './builtins.ts';
-import { normalizeBlockConversation } from './normalize-block.ts';
+import { blockNormalizer, normalizeBlockConversation } from './normalize-block.ts';
+import { SCAN_LINE_BUFFER_BYTES } from '../page-body/limits.ts';
 import type {
   DateContext,
   MatchedMessage,
@@ -359,6 +360,8 @@ function monthNameToIndex(name: string): number {
 // #4136 — folded-heading detection constants. The label capture is capped at
 // 48 chars (privacy: labels can carry page text into stderr/JSON) and the
 // list at 10 entries per parse.
+/** A markdown day heading (`## 2024-03-15`, levels 1-4): the date context for time-only patterns. */
+export const DAY_HEADER_RE = /^#{1,4}\s+(\d{4}-\d{2}-\d{2})\s*$/;
 const UNRECOGNIZED_HEADING_RE = /^(#{1,6})\s+(.{1,48}?)\s*:?\s*$/;
 const FENCE_RE = /^(```|~~~)/;
 const MAX_UNRECOGNIZED_HEADINGS = 10;
@@ -393,7 +396,7 @@ export function applyPattern(
   // of repeating a date on every message. Keep the caller's context immutable
   // while advancing a local date anchor as those headings are encountered.
   const runningCtx: DateContext = { ...dateCtx };
-  const dateHeaderRe = /^#{1,4}\s+(\d{4}-\d{2}-\d{2})\s*$/;
+  const dateHeaderRe = DAY_HEADER_RE;
   // #4136 — when the WINNING pattern anchors on headings, a heading-shaped
   // line whose label is outside the pattern's closed speaker set is not
   // rejected and not reported: it folds into the PREVIOUS turn's body
@@ -516,7 +519,8 @@ function getNonBlankLines(body: string, headCap?: number): string[] {
   return headCap !== undefined ? all.slice(0, headCap) : all;
 }
 
-function speakerObjectAnchorsAllowed(body: string, entry: PatternEntry): boolean[] {
+/** speakerObjectAnchorsAllowed one line at a time: line(raw) says whether that line may anchor; `invalid` voids every line. */
+function speakerObjectScanner(entry: PatternEntry): { line(raw: string): boolean; readonly invalid: boolean } {
   let fence: string | undefined;
   let inTranscript: boolean | undefined;
   let invalidRegion = false;
@@ -547,45 +551,53 @@ function speakerObjectAnchorsAllowed(body: string, entry: PatternEntry): boolean
       else if ('}])'.includes(char) && preambleClosers.length > 0 && preambleClosers.pop() !== char) malformedPreamble = true;
     }
   };
-  const allowed = body.split(/\r?\n/).map(raw => {
-    const line = raw.trim();
-    if (malformedPreamble || preambleQuote || preambleClosers.length > 0) {
-      if (entry.regex.test(line) || /^#{1,6}\s+Transcript\s*$/i.test(line)) invalidRegion = true;
-      if (!malformedPreamble) scanPreamble(line);
-      return false;
-    }
-    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(raw);
-    if (fence) {
-      if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = undefined;
-      return false;
-    }
-    if (marker) {
-      fence = marker[1];
-      return false;
-    }
-    if (!line || /^(?: {4}| *\t)/.test(raw)) return false;
-    if (/^#{1,6}\s+Transcript\s*$/i.test(line)) {
-      inTranscript = true;
-      return false;
-    }
-    if (/^#{1,4}\s+\d{4}-\d{2}-\d{2}\s*$/.test(line)) return inTranscript !== false;
-    if (/^#{1,6}\s/.test(line)) {
-      inTranscript = false;
-      scanPreamble(line);
-      return false;
-    }
-    const matches = entry.regex.test(line);
-    if (inTranscript === undefined) {
-      inTranscript = matches;
-      if (!matches) invalidRegion = true;
-    } else if (inTranscript && !matches) {
-      invalidRegion = true;
-    } else if (!inTranscript) {
-      scanPreamble(line);
-    }
-    return inTranscript && matches;
-  });
-  return invalidRegion ? allowed.fill(false) : allowed;
+  return {
+    get invalid() { return invalidRegion; },
+    line: (raw: string): boolean => {
+      const line = raw.trim();
+      if (malformedPreamble || preambleQuote || preambleClosers.length > 0) {
+        if (entry.regex.test(line) || /^#{1,6}\s+Transcript\s*$/i.test(line)) invalidRegion = true;
+        if (!malformedPreamble) scanPreamble(line);
+        return false;
+      }
+      const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(raw);
+      if (fence) {
+        if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = undefined;
+        return false;
+      }
+      if (marker) {
+        fence = marker[1];
+        return false;
+      }
+      if (!line || /^(?: {4}| *\t)/.test(raw)) return false;
+      if (/^#{1,6}\s+Transcript\s*$/i.test(line)) {
+        inTranscript = true;
+        return false;
+      }
+      if (/^#{1,4}\s+\d{4}-\d{2}-\d{2}\s*$/.test(line)) return inTranscript !== false;
+      if (/^#{1,6}\s/.test(line)) {
+        inTranscript = false;
+        scanPreamble(line);
+        return false;
+      }
+      const matches = entry.regex.test(line);
+      if (inTranscript === undefined) {
+        inTranscript = matches;
+        if (!matches) invalidRegion = true;
+      } else if (inTranscript && !matches) {
+        invalidRegion = true;
+      } else if (!inTranscript) {
+        scanPreamble(line);
+      }
+      return inTranscript && matches;
+    },
+  };
+}
+
+function speakerObjectAnchorsAllowed(body: string, entry: PatternEntry): boolean[] {
+  const scanner = speakerObjectScanner(entry);
+  const allowed = body.split(/\r?\n/).map(raw => scanner.line(raw));
+  return scanner.invalid ? allowed.fill(false) : allowed;
 }
 
 function speakerObjectScoringLines(body: string, entry: PatternEntry, headCap?: number): string[] {
@@ -608,46 +620,49 @@ function scoreFromLines(
   lines: readonly string[],
   entry: PatternEntry,
 ): number {
-  if (lines.length === 0) return 0;
-  let anchored = 0;
-  let anchorCandidates = 0;
-  let firstLineAnchored = false;
-  let firstAnchorIndex = -1;
+  const score = lineScore(entry);
+  for (const line of lines) scoreLine(score, entry, line);
+  return scoreValue(score, entry);
+}
+
+/** scoreFromLines' counters over the lines scored so far, so a body can be scored one line at a time. */
+interface LineScore { lines: number; anchored: number; candidates: number; firstLineAnchored: boolean; firstAnchorIndex: number; speakers: Set<string> | undefined }
+
+function lineScore(entry: PatternEntry): LineScore {
   // Only populated when score_continuations_min_distinct_speakers is set
   // (avoids a Set + exec() per line for every other pattern, which only
   // needs the boolean match `test()` already gave before this change).
-  const tracksDistinctSpeakers =
-    entry.score_continuations_min_distinct_speakers !== undefined;
-  const distinctSpeakers: Set<string> | undefined = tracksDistinctSpeakers
-    ? new Set()
-    : undefined;
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index];
-    if (entry.quick_reject && !entry.quick_reject.test(line)) {
-      continue;
-    }
-    anchorCandidates++;
-    let isMatch: boolean;
-    if (distinctSpeakers) {
-      const m = entry.regex.exec(line);
-      isMatch = m !== null;
-      if (m) {
-        const speaker = m[entry.captures.speaker_group];
-        if (speaker) distinctSpeakers.add(speaker);
-      }
-    } else {
-      isMatch = entry.regex.test(line);
-    }
-    if (isMatch) {
-      anchored++;
-      if (index === 0) firstLineAnchored = true;
-      if (firstAnchorIndex === -1) firstAnchorIndex = index;
-    }
-  }
+  return { lines: 0, anchored: 0, candidates: 0, firstLineAnchored: false, firstAnchorIndex: -1,
+    speakers: entry.score_continuations_min_distinct_speakers !== undefined ? new Set() : undefined };
+}
 
+function scoreLine(score: LineScore, entry: PatternEntry, line: string): void {
+  const index = score.lines++;
+  if (entry.quick_reject && !entry.quick_reject.test(line)) return;
+  score.candidates++;
+  let isMatch: boolean;
+  if (score.speakers) {
+    const m = entry.regex.exec(line);
+    isMatch = m !== null;
+    if (m) {
+      const speaker = m[entry.captures.speaker_group];
+      if (speaker) score.speakers.add(speaker);
+    }
+  } else {
+    isMatch = entry.regex.test(line);
+  }
+  if (isMatch) {
+    score.anchored++;
+    if (index === 0) score.firstLineAnchored = true;
+    if (score.firstAnchorIndex === -1) score.firstAnchorIndex = index;
+  }
+}
+
+function scoreValue(score: LineScore, entry: PatternEntry): number {
+  if (score.lines === 0) return 0;
   const distinctSpeakersOk =
     entry.score_continuations_min_distinct_speakers === undefined ||
-    (distinctSpeakers?.size ?? 0) >=
+    (score.speakers?.size ?? 0) >=
       entry.score_continuations_min_distinct_speakers;
   // Bounds how far into the body the FIRST anchor may appear before the
   // candidate-only density score activates. A genuine export's anchor
@@ -657,22 +672,23 @@ function scoreFromLines(
   // both roles are present — sits far past this bound instead.
   const preambleOk =
     entry.score_continuations_max_preamble_lines === undefined ||
-    (firstAnchorIndex !== -1 &&
-      firstAnchorIndex <= entry.score_continuations_max_preamble_lines);
+    (score.firstAnchorIndex !== -1 &&
+      score.firstAnchorIndex <= entry.score_continuations_max_preamble_lines);
 
   if (
     entry.score_continuations_as_body &&
     entry.multi_line &&
     entry.quick_reject &&
-    anchorCandidates > 0 &&
-    (anchored >= 2 || firstLineAnchored) &&
+    score.candidates > 0 &&
+    (score.anchored >= 2 || score.firstLineAnchored) &&
     distinctSpeakersOk &&
     preambleOk
   ) {
-    return anchored / anchorCandidates;
+    return score.anchored / score.candidates;
   }
-  return anchored / lines.length;
+  return score.anchored / score.lines;
 }
+
 
 /**
  * Score how well a pattern matches the first N lines of a body (D18).
@@ -704,6 +720,156 @@ export function scorePattern(body: string, entry: PatternEntry): number {
 export function scorePatternFull(body: string, entry: PatternEntry): number {
   if (entry.id === 'python-dict-utterance') return scoreFromLines(speakerObjectScoringLines(body, entry), entry);
   return scoreFromLines(getNonBlankLines(body), entry);
+}
+
+type Scored = { entry: PatternEntry; score: number; priority: number };
+
+function sortScored(arr: Scored[]): Scored[] {
+  return arr.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.priority - b.priority;
+  });
+}
+
+/**
+ * D18: score every candidate on the head; highest first. Tie-break on
+ * declared priority order (built-in declaration order; user patterns
+ * lose every tie).
+ */
+function headScores(body: string, candidates: readonly PatternEntry[]): Scored[] {
+  return sortScored(candidates.map((entry) => ({
+    entry,
+    score: scorePattern(body, entry),
+    priority: priorityOf(entry.id),
+  })));
+}
+
+/**
+ * The built-in pattern a page's head picks by parseConversation's head
+ * pass, or null when that pass would not decide alone: the best head
+ * score is below the full-body fallback threshold, or the winner needs a
+ * full-body re-score. Segmented pages choose their message-anchor cut
+ * pattern with it once, from a bounded head (page-body/segmenter.ts).
+ */
+export function pickHeadPattern(head: string): string | null {
+  if (!head) return null;
+  const top = headScores(head, BUILTIN_PATTERNS)[0];
+  if (!top || top.score < SCORING_HEAD_TRIGGER_THRESHOLD || top.entry.score_full_body) return null;
+  return top.entry.id;
+}
+
+/**
+ * parseConversation's pattern choice over a body fed in pieces (a segmented page's occurrences, in order), holding
+ * counters instead of the body: the same block-format collapse (when any block header appears), head pass over the first
+ * SCORING_HEAD_LINES non-blank lines, full-body re-score, acceptance floor and structure gate, over the built-in
+ * patterns. `finish()` returns the pattern id parseConversation(body).matched_pattern_id would, or null. A line over
+ * SCAN_LINE_BUFFER_BYTES characters is scored by its first that many characters (every pattern anchors at the line's
+ * start) and the rest is never held (a block message's body is held up to that many characters), so the detector retains
+ * at most that much text between pieces.
+ */
+export function createPatternDetector(): { push(text: string): void; finish(): string | null } {
+  const raw = scoringTrack();
+  const block = scoringTrack();
+  const normalizer = blockNormalizer(line => block.line(line), { maxBodyChars: SCAN_LINE_BUFFER_BYTES });
+  let partial = '';
+  let oversized: string | null = null;
+  const line = (text: string) => {
+    const scored = text.length > SCAN_LINE_BUFFER_BYTES ? text.slice(0, SCAN_LINE_BUFFER_BYTES) : text;
+    normalizer.line(scored);
+    raw.line(scored.endsWith('\r') ? scored.slice(0, -1) : scored);
+  };
+  return {
+    push(text: string) {
+      let rest = text;
+      if (oversized !== null) {
+        const end = rest.indexOf('\n');
+        if (end < 0) return;
+        line(oversized);
+        oversized = null;
+        rest = rest.slice(end + 1);
+      }
+      const lines = (partial + rest).split('\n');
+      partial = lines.pop()!;
+      for (const l of lines) line(l);
+      if (partial.length > SCAN_LINE_BUFFER_BYTES) { oversized = Buffer.from(partial.slice(0, SCAN_LINE_BUFFER_BYTES)).toString(); partial = ''; }
+    },
+    finish() {
+      line(oversized ?? partial);
+      partial = '';
+      oversized = null;
+      normalizer.end();
+      return (normalizer.headers > 0 ? block : raw).finish();
+    },
+  };
+}
+
+/** One normalized body's scores, fed line by line (createPatternDetector). */
+function scoringTrack(): { line(raw: string): void; finish(): string | null } {
+  const speakerObject = BUILTIN_PATTERNS.find((p) => p.id === 'python-dict-utterance');
+  const scanner = speakerObject ? speakerObjectScanner(speakerObject) : null;
+  const head = BUILTIN_PATTERNS.map((entry) => lineScore(entry));
+  const full = BUILTIN_PATTERNS.map((entry) => lineScore(entry));
+  // The structure gate's input: each anchored message's speaker, until one repeats.
+  const gates = BUILTIN_PATTERNS.map((entry) => (entry.repeat_speaker_min_turns === undefined ? null : { turns: 0, speakers: new Set<string>(), repeated: false }));
+  let nonBlank = 0;
+  return {
+    line(raw: string) {
+      const allowed = scanner ? scanner.line(raw) : true;
+      const line = raw.trim();
+      if (!line) return;
+      nonBlank++;
+      BUILTIN_PATTERNS.forEach((entry, i) => {
+        const scored = entry === speakerObject && !allowed ? '' : line;
+        if (nonBlank <= SCORING_HEAD_LINES) scoreLine(head[i]!, entry, scored);
+        scoreLine(full[i]!, entry, scored);
+        const gate = gates[i];
+        if (!gate || gate.repeated || DAY_HEADER_RE.test(line) || (entry.quick_reject && !entry.quick_reject.test(line))) return;
+        const m = entry.regex.exec(line);
+        if (!m) return;
+        gate.turns++;
+        const speaker = cleanSpeaker(m[entry.captures.speaker_group] ?? '', entry.speaker_clean);
+        if (gate.speakers.has(speaker)) { gate.repeated = true; gate.speakers.clear(); } else gate.speakers.add(speaker);
+      });
+    },
+    finish() {
+      const value = (scores: LineScore[], i: number) => (scanner?.invalid && BUILTIN_PATTERNS[i] === speakerObject ? 0 : scoreValue(scores[i]!, BUILTIN_PATTERNS[i]!));
+      const ranked = (scores: LineScore[]) => sortScored(BUILTIN_PATTERNS.map((entry, i) => ({ entry, score: value(scores, i), priority: priorityOf(entry.id) })));
+      let scored = ranked(head);
+      let fullBodyScored = false;
+      if (scored[0]!.score < SCORING_HEAD_TRIGGER_THRESHOLD) {
+        scored = ranked(full);
+        fullBodyScored = true;
+      }
+      const top = scored[0]!;
+      const i = BUILTIN_PATTERNS.indexOf(top.entry);
+      const score = top.entry.score_full_body && !fullBodyScored ? value(full, i) : top.score;
+      if (score < SCORING_MIN_ACCEPTANCE) return null;
+      const gate = gates[i];
+      if (gate && !gate.repeated && gate.turns >= top.entry.repeat_speaker_min_turns!) return null;
+      return top.entry.id;
+    },
+  };
+}
+
+/**
+ * Whether `line` opens a message under built-in pattern `patternId`, as
+ * applyPattern reads it (trimmed; quick_reject, then the anchor regex), and
+ * the inline date it carries when the pattern has one. Null when it does not
+ * open one (day headers never do) or the id is unknown.
+ */
+export function matchAnchorLine(patternId: string, line: string): { date: string | null } | null {
+  const entry = BUILTIN_PATTERNS.find((p) => p.id === patternId);
+  const text = line.trim();
+  if (!entry || !text) return null;
+  if (entry.quick_reject && !entry.quick_reject.test(text)) return null;
+  const m = entry.regex.exec(text);
+  if (!m) return null;
+  const group = entry.captures.date_group;
+  return { date: group === undefined ? null : m[group] ?? null };
+}
+
+export function isAnchorLine(patternId: string, line: string): boolean {
+  return matchAnchorLine(patternId, line) !== null;
 }
 
 /**
@@ -741,21 +907,7 @@ export function parseConversation(
     return { messages: [], phase: 'no_match' };
   }
 
-  // D18: score every candidate; pick the highest. Tie-break on
-  // declared priority order (built-in declaration order; user patterns
-  // lose every tie).
-  type Scored = { entry: PatternEntry; score: number; priority: number };
-  const sortScored = (arr: Scored[]) =>
-    arr.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return a.priority - b.priority;
-    });
-  let scored: Scored[] = candidates.map((entry) => ({
-    entry,
-    score: scorePattern(body, entry),
-    priority: priorityOf(entry.id),
-  }));
-  sortScored(scored);
+  let scored = headScores(body, candidates);
 
   // REGRESSION (closes #1533 + Codex P1 #1): meeting pages have
   // ## Summary + blockquote + ## Transcript ahead of the chat. The

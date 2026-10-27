@@ -14,6 +14,9 @@
  * malformed fences removed) for every caller, at most EXCERPT_PAGE_CHARS per
  * page and EXCERPT_CARD_CHARS per card; a page that did not fit is listed in
  * `identity_excerpt_omitted`. The excerpt adds nothing to the mention index.
+ * A segmented page (body stored in segments) is excerpted from its trusted,
+ * withdrawal-overlaid lead, the first EXCERPT_LEAD_BYTES of its compiled truth
+ * ending on a whole line, so lines past that window are not considered.
  */
 
 import type { BrainEngine } from '../engine.ts';
@@ -22,10 +25,18 @@ import type { PageSnapshot } from '../page-state/types.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import { ALIAS_ORIGIN_RANK, declarationsIn, titleName, type AliasOrigin } from '../mentions/aliases.ts';
 import { readIdentitySiblings, SIBLING_GROUP_CAP } from '../mentions/siblings.ts';
+import type { MentionPolicy, PackTypes } from '../mentions/policy.ts';
 import type { Notice } from '../agent-output.ts';
+import type { RecordGroupView } from './entity-references.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
+import { truthLead } from '../page-body/segment-blocks.ts';
+import { boundedRawPrefix } from '../page-window/bounded-lead.ts';
+import { BOUNDED_PREFIX_BYTES } from '../page-window/document.ts';
 
 export const EXCERPT_PAGE_CHARS = 600;
 export const EXCERPT_CARD_CHARS = 1200;
+/** How much of a segmented page's compiled truth the excerpt reads: the bounded lead every other lead reader uses. */
+export const EXCERPT_LEAD_BYTES = BOUNDED_PREFIX_BYTES;
 const EXCERPT_LINE_CHARS = 300;
 const NOT_NAMES = new Set(['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'ARR', 'MRR', 'TBD', 'N/A', 'NA', 'CEO', 'CFO', 'CTO', 'COO', 'VP', 'UTC', 'PST', 'PDT', 'EST', 'ID']);
 const NAME_RUN_RE = /\b[A-Z][\p{L}\p{N}&'’-]*(?:\s+[A-Z][\p{L}\p{N}&'’-]*)+/gu;
@@ -97,7 +108,8 @@ export function excerptLines(body: string, title: string, budget = EXCERPT_PAGE_
 
 export interface CardIdentity {
   aka_sources: Array<{ origin: string; slug: string }>;
-  identity_siblings?: { pages: Array<{ slug: string; title: string; type: string | null; aka: string[] }>; capped: boolean };
+  /** Each sibling page; `records` (the full card's record view for that sibling) only when record types are enrolled. */
+  identity_siblings?: { pages: Array<{ slug: string; title: string; type: string | null; aka: string[]; records?: RecordGroupView[] }>; capped: boolean };
   identity_excerpt?: IdentityExcerptLine[];
   identity_excerpt_omitted?: string[];
   alias_guidance?: { text: string; requires_surface?: 'starter' };
@@ -109,33 +121,67 @@ const GUIDANCE = 'aka lists names gbrain recognized as declared on this page (ak
 const GUIDANCE_VERBS = 'aka lists names gbrain recognized as declared on this page (aka_sources says where); it is not proof the list is complete. '
   + 'Before a history or as-of answer, also look for records under every name shown in aka, identity_siblings and identity_excerpt; searching needs the search tool on the starter surface.';
 
+export interface SiblingIdentity {
+  /** Alias rows of the page and its siblings, by alias_norm. */
+  aliasRows: Array<{ slug: string; alias_norm: string; origin: string | null; alias_text: string | null }>;
+  /** The siblings with their own aliases; absent when there is no group and no cap. */
+  identity_siblings?: NonNullable<CardIdentity['identity_siblings']>;
+}
+
+/**
+ * The identity siblings of `row` with their own aliases (the `entity names[]`
+ * rows read only these). `policy` and `pack`, when a batch already read them,
+ * skip the per-page reads. Fail-soft.
+ */
+export async function readSiblingIdentity(engine: BrainEngine, sourceId: string, row: { slug: string; title: string | null },
+  opts: { excludePrivate: boolean; excludeQuarantined?: boolean; policy?: MentionPolicy; pack?: PackTypes | null }): Promise<SiblingIdentity> {
+  const siblings = await readIdentitySiblings(engine, sourceId, row, opts);
+  const aliasRows = await engine.executeRaw<SiblingIdentity['aliasRows'][number]>(
+    `SELECT slug, alias_norm, origin, alias_text FROM page_aliases WHERE source_id = $1 AND slug = ANY($2::text[]) ORDER BY alias_norm`,
+    [sourceId, [row.slug, ...siblings.pages.map(p => p.slug)]]).catch(() => []);
+  if (!siblings.pages.length && !siblings.capped) return { aliasRows };
+  return {
+    aliasRows,
+    identity_siblings: {
+      pages: siblings.pages.map(p => ({ ...p, aka: [...new Set(aliasRows.filter(a => a.slug === p.slug).map(a => a.alias_text ?? a.alias_norm))] })),
+      capped: siblings.capped,
+    },
+  };
+}
+
+/**
+ * The body an excerpt is cut from: the compiled truth, or a segmented page's lead (EXCERPT_LEAD_BYTES, cut back to a
+ * whole line when the truth goes on), read at the snapshot's revision.
+ */
+async function excerptSource(engine: BrainEngine, snapshot: PageSnapshot): Promise<string> {
+  const { page } = snapshot;
+  if (!isSegmentedPage(page)) return page.compiled_truth ?? '';
+  const lead = await truthLead(engine, page.id, EXCERPT_LEAD_BYTES, { revision: snapshot.revision, generation: snapshot.bodyGeneration });
+  const bounded = boundedRawPrefix(lead, EXCERPT_LEAD_BYTES);
+  if (bounded.length === lead.length && lead.length < EXCERPT_LEAD_BYTES) return lead;
+  return bounded.slice(0, Math.max(0, bounded.lastIndexOf('\n')));
+}
+
 /** The card's identity fields for `row`. Fail-soft: a failed read leaves the field out. */
 export async function readCardIdentity(engine: BrainEngine, sourceId: string,
   row: { slug: string; title: string | null; compiled_truth: string | null },
   opts: { excludePrivate: boolean; excludeQuarantined?: boolean; surfaceCeiling?: 'verbs' | 'starter' | 'full'; aka: string[] }): Promise<CardIdentity> {
-  const siblings = await readIdentitySiblings(engine, sourceId, row, { excludePrivate: opts.excludePrivate, excludeQuarantined: opts.excludeQuarantined });
-  const slugs = [row.slug, ...siblings.pages.map(p => p.slug)];
-  const aliasRows = await engine.executeRaw<{ slug: string; alias_norm: string; origin: string | null; alias_text: string | null }>(
-    `SELECT slug, alias_norm, origin, alias_text FROM page_aliases WHERE source_id = $1 AND slug = ANY($2::text[]) ORDER BY alias_norm`,
-    [sourceId, slugs]).catch(() => []);
+  const { aliasRows, identity_siblings } = await readSiblingIdentity(engine, sourceId, row, { excludePrivate: opts.excludePrivate, excludeQuarantined: opts.excludeQuarantined });
+  const siblingPages = identity_siblings?.pages ?? [];
+  const slugs = [row.slug, ...siblingPages.map(p => p.slug)];
   const own = aliasRows.filter(a => a.slug === row.slug);
   const bestOrigin = (norm: string) => own.filter(a => a.alias_norm === norm).map(a => a.origin ?? 'frontmatter')
     .sort((x, y) => (ALIAS_ORIGIN_RANK[x as AliasOrigin] ?? 0) - (ALIAS_ORIGIN_RANK[y as AliasOrigin] ?? 0))[0] ?? 'frontmatter';
   const aka_sources = opts.aka.map(norm => ({ origin: bestOrigin(norm), slug: row.slug }));
   const out: CardIdentity = { aka_sources };
-  if (siblings.pages.length || siblings.capped) {
-    out.identity_siblings = {
-      pages: siblings.pages.map(p => ({ ...p, aka: [...new Set(aliasRows.filter(a => a.slug === p.slug).map(a => a.alias_text ?? a.alias_norm))] })),
-      capped: siblings.capped,
-    };
-  }
+  if (identity_siblings) out.identity_siblings = identity_siblings;
   // Snapshot reads carry the withdrawal overlay get_page shows, so a forgotten fence row is struck and the sanitizer drops it.
   const { snapshots } = await engine.readPageSnapshotsBatch(slugs.map(slug => ({ slug, sourceId })))
     .catch(() => ({ snapshots: new Map<string, PageSnapshot>() }));
   const bodies = new Map<string, { title: string; body: string }>();
   for (const slug of slugs) {
     const snapshot = snapshots.get(pageSnapshotKey(sourceId, slug));
-    if (snapshot) bodies.set(slug, { title: snapshot.page.title ?? slug, body: snapshot.page.compiled_truth ?? '' });
+    if (snapshot) bodies.set(slug, { title: snapshot.page.title ?? slug, body: await excerptSource(engine, snapshot).catch(() => '') });
   }
   const excerpt: IdentityExcerptLine[] = [];
   const omitted: string[] = [];
@@ -150,7 +196,7 @@ export async function readCardIdentity(engine: BrainEngine, sourceId: string,
   }
   if (excerpt.length) out.identity_excerpt = excerpt;
   if (omitted.length) out.identity_excerpt_omitted = omitted;
-  if (opts.aka.length || siblings.pages.length || excerpt.length) {
+  if (opts.aka.length || siblingPages.length || excerpt.length) {
     out.alias_guidance = opts.surfaceCeiling === 'verbs' ? { text: GUIDANCE_VERBS, requires_surface: 'starter' } : { text: GUIDANCE };
   }
   return out;

@@ -6,6 +6,7 @@
 import type { BrainEngine } from '../../core/engine.ts';
 import type { Check } from '../doctor.ts';
 import type { MisroutedResult } from '../../core/multi-source-drift.ts';
+import { boundUnknownDetails } from './bounded-unknown.ts';
 import { statSync } from 'node:fs';
 import { redactConnectionInfo } from '../../core/audit/redact-connection-info.ts';
 import { formatPackBytes, OVERSIZED_PACK_RUNBOOK, schemaPackMaxBytes } from '../../core/schema-pack/loader.ts';
@@ -181,13 +182,20 @@ export async function checkSchemaPackConsistency(
   };
 }
 
-export async function checkSchemaPackSourceDrift(engine: BrainEngine): Promise<Check> {
+export async function checkSchemaPackSourceDrift(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
     // Compare per-source schema_pack overrides (tier 3 DB config) to detect
     // multi-source brains where different sources point at conflicting packs.
-    const rows = await engine.executeRaw<{ key: string; value: string }>(
-      `SELECT key, value FROM config WHERE key LIKE 'schema_pack.source.%'`,
-    );
+    // A remote caller's grant confines the comparison to its own sources'
+    // override keys, so it never counts another source's override.
+    const rows = opts.sourceIds
+      ? await engine.executeRaw<{ key: string; value: string }>(
+        `SELECT key, value FROM config WHERE key = ANY($1::text[])`,
+        [opts.sourceIds.map((id) => `schema_pack.source.${id}`)],
+      )
+      : await engine.executeRaw<{ key: string; value: string }>(
+        `SELECT key, value FROM config WHERE key LIKE 'schema_pack.source.%'`,
+      );
     if (rows.length === 0) {
       return { name: 'schema_pack_source_drift', status: 'ok', message: 'No per-source pack overrides — drift N/A.' };
     }
@@ -284,15 +292,24 @@ export function multiSourceDriftCheck(
       `. Fix the path or permissions (\`gbrain sources status\`), then re-run \`gbrain doctor\`.`
     : '';
   if (result.walk_truncated) {
+    // #7145: a walk stopped at its bound did not compare every file, so drift is unknown, not detected and not clear;
+    // slugs already found before the bound are a floor, kept so the bound does not hide them.
+    const bound = result.truncated_by === 'time' ? 'time' : 'files';
+    const which = bound === 'files'
+      ? `its file limit (${result.limit} files per source, GBRAIN_DRIFT_LIMIT)`
+      : `its time limit (${result.timeout_ms} ms, GBRAIN_DRIFT_TIMEOUT_MS)`;
+    const found = result.count > 0
+      ? ` At least ${result.count} misrouted slug(s) were already found before it stopped (e.g., ${result.sample.map((s) => `${s.slug} (intended=${s.intended_source})`).join(', ')}).`
+      : '';
     return {
       name: 'multi_source_drift',
       status: 'warn',
       message:
-        `Multi-source drift not verified — the FS walk hit its bound (${result.limit} files / ${result.timeout_ms} ms)` +
-        (host === 'remote' ? ' on the brain server' : '') +
-        `. Re-run with a larger bound: \`GBRAIN_DRIFT_LIMIT=<files> GBRAIN_DRIFT_TIMEOUT_MS=<ms> gbrain doctor\`.` +
+        `Multi-source drift unknown: the FS walk stopped at ${which}` + (host === 'remote' ? ' on the brain server' : '') +
+        ` before comparing every file, so health is unknown, not clear (bounds: ${result.limit} files / ${result.timeout_ms} ms).${found}` +
+        ` Re-run with a larger bound: \`GBRAIN_DRIFT_LIMIT=<files> GBRAIN_DRIFT_TIMEOUT_MS=<ms> gbrain doctor --only multi_source_drift\`.` +
         unreadableNote,
-      details: { ...details, code: 'not_verified', verified: false },
+      details: { ...details, ...boundUnknownDetails(bound), code: 'not_verified', verified: false, drift_found_so_far: result.count },
     };
   }
   if (result.count > 0) {

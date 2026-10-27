@@ -57,6 +57,24 @@ export const SNOOZE_DURATIONS_MS = [
 
 export type SelfUpgradeMode = 'auto' | 'notify' | 'off';
 
+/**
+ * The release line an install follows. `latest` is every published release (the `latest-stable` tag release.yml
+ * advances); `stable` is the newest release a maintainer promoted after the production-shaped soak passed on its
+ * exact tree (the `stable` tag .github/workflows/promote-stable.yml advances). Set per brain home with
+ * `gbrain config set self_upgrade.channel stable`; `gbrain upgrade --channel <name>` overrides it for one run.
+ */
+export type ReleaseChannel = 'latest' | 'stable';
+export const RELEASE_CHANNELS: readonly ReleaseChannel[] = ['latest', 'stable'];
+
+export function normalizeChannel(raw: unknown): ReleaseChannel | null {
+  return raw === 'latest' || raw === 'stable' ? raw : null;
+}
+
+/** The configured channel (file plane), else `latest`. */
+export function resolveReleaseChannel(cfg: { self_upgrade?: { channel?: string } } | null | undefined): ReleaseChannel {
+  return normalizeChannel(cfg?.self_upgrade?.channel) ?? 'latest';
+}
+
 export type SelfUpgradeChannel = 'invocation' | 'autopilot';
 
 /**
@@ -188,14 +206,22 @@ export function decideSelfUpgrade(inp: DecideSelfUpgradeInputs): SelfUpgradeDeci
  * startup (the relaunched daemon included, before it can reconcile the
  * breadcrumb) and an unattended host has nothing that upgrades Bun (#5855).
  * The target is NOT recorded known-bad, so the first tick after the cause
- * clears applies it. Pure.
+ * clears applies it. #6828: the version the install would actually get (a
+ * bun-link clone follows master, a moving tag can pass the checked version)
+ * is also checked against `failedVersions`, so a release recorded known-bad
+ * under its installed version is not reinstalled while the check names
+ * another one. Pure.
  */
 export function gateOnTargetRuntime(
   decision: SelfUpgradeDecision,
   target: TargetFloor,
   host: HostBun | null,
+  failedVersions: readonly string[] = [],
 ): SelfUpgradeDecision {
   if (decision.action !== 'apply') return decision;
+  if (target.version && target.version !== decision.latest && failedVersions.includes(target.version)) {
+    return { ...decision, action: 'known_bad', reason: `the install would get ${target.version}, which previously failed; not retrying` };
+  }
   const verdict = evaluateBunFloor(target, host, decision.latest);
   if (verdict.ok) return decision;
   const retry = verdict.kind === 'unreadable' ? ' The next quiet-hours tick retries.' : '';
@@ -457,11 +483,59 @@ export function releaseRefreshLock(lockPath: string): void {
   }
 }
 
+// ── Swap receipt (what `gbrain upgrade --swap-only` actually installed) ──────
+
+/**
+ * #6828: the autopilot channel names a file in this env var; `gbrain upgrade`
+ * writes what its swap installed there. Exit 0 alone cannot tell a swap from
+ * a no-op (`bun update` on a tag whose head is already installed exits 0 and
+ * changes nothing), and a no-op must never relaunch or record known-bad.
+ */
+export const SWAP_RECEIPT_ENV = 'GBRAIN_SWAP_RECEIPT';
+
+/**
+ * - `installed`: a newer version is on disk and passed the post-swap smoke.
+ * - `not_installed`: the version did not change (the install step failed, or
+ *   succeeded without installing anything newer).
+ * - `installed_broken`: a newer version is on disk and does not start.
+ */
+export interface SwapReceipt {
+  outcome: 'installed' | 'not_installed' | 'installed_broken';
+  from: string;
+  /** What `gbrain --version` reported after the swap; null when unreadable. */
+  installed: string | null;
+}
+
+/** Write the receipt when the caller asked for one. Best-effort. */
+export function writeSwapReceipt(receipt: SwapReceipt): void {
+  const path = process.env[SWAP_RECEIPT_ENV];
+  if (!path) return;
+  try {
+    atomicWrite(path, JSON.stringify(receipt) + '\n');
+  } catch {
+    /* the channel falls back to the exit status */
+  }
+}
+
+/** Read a receipt; null when missing or malformed (the channel then trusts the exit status). */
+export function readSwapReceipt(path: string): SwapReceipt | null {
+  try {
+    const r = JSON.parse(readFileSync(path, 'utf8')) as Partial<SwapReceipt>;
+    if (r.outcome !== 'installed' && r.outcome !== 'not_installed' && r.outcome !== 'installed_broken') return null;
+    if (typeof r.from !== 'string') return null;
+    const installed = typeof r.installed === 'string' && isValidVersionString(r.installed) ? r.installed : null;
+    return { outcome: r.outcome, from: r.from, installed };
+  } catch {
+    return null;
+  }
+}
+
 // ── Breadcrumb reconciliation (attribution for crash-on-launch) ──────────────
 
 /** The mutable slice of `config.self_upgrade` the autopilot channel manages. */
 export interface SelfUpgradeState {
   mode?: SelfUpgradeMode;
+  channel?: ReleaseChannel;
   mode_prompted?: boolean;
   quiet_hours?: { start?: number; end?: number; tz?: string };
   failed_versions?: string[];
@@ -524,6 +598,11 @@ export function reconcileBreadcrumb(
   return { state, transition: 'failed' };
 }
 
+/** The audit reason the boot reconcile writes when it records a version known-bad (core/self-upgrade-recovery.ts matches on it, #6828). */
+export const CRASH_ON_LAUNCH_REASON_PREFIX = 'crash-on-launch:';
+/** The audit reason the channel writes when its swap installed a newer version and it exits for relaunch. */
+export const SWAPPED_REASON = 'swapped; exiting for supervisor relaunch';
+
 // ── Mode resolution (file plane; no DB on the hot path) ──────────────────────
 
 function normalizeMode(raw: unknown): SelfUpgradeMode | null {
@@ -576,6 +655,7 @@ export function resolveQuietHoursWindow(
  * would be accepted and never read (#5489). */
 export const SELF_UPGRADE_CONFIG_LEAVES = [
   'mode',
+  'channel',
   'mode_prompted',
   'quiet_hours',
   'failed_versions',
@@ -676,6 +756,10 @@ export function parseSelfUpgradeConfigValue(leaf: SelfUpgradeConfigLeaf, raw: st
     case 'mode': {
       const mode = normalizeMode(raw.trim());
       return mode ? { ok: true, value: mode } : { ok: false, error: `must be auto, notify or off (got '${raw}')` };
+    }
+    case 'channel': {
+      const channel = normalizeChannel(raw.trim());
+      return channel ? { ok: true, value: channel } : { ok: false, error: `must be latest or stable (got '${raw}')` };
     }
     case 'mode_prompted': {
       if (isConfigTruthy(raw)) return { ok: true, value: true };

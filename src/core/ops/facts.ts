@@ -1,9 +1,10 @@
 import { searchAnswerFeedback } from '../feedback/record.ts';
+import { recordFunnelEvent, recordRecallOutcome } from '../funnel.ts';
 import { parseRelationalPlan } from '../search/relational-plan.ts';
 import { loadSearchModeConfig, resolveSearchMode } from '../search/mode.ts';
 import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 import { parseWriteRequestId } from '../persistence/preconditions.ts';
-import { deliverEvidence, effectivePlan, resolveEvidencePlan, type DeliveryMeta, type EvidencePlan } from '../search/evidence-delivery.ts';
+import { countEvidenceTokens, deliverEvidence, effectivePlan, resolveEvidencePlan, type DeliveryMeta, type EvidencePlan } from '../search/evidence-delivery.ts';
 import { withFactDateHeaders } from '../search/evidence-date.ts';
 import { randomUUID } from 'node:crypto';
 import { readHolders } from './context.ts';
@@ -27,7 +28,7 @@ import { OperationError, opError, verbError } from './contract.ts';
 import { invalidParam, paramUse } from './op-fix.ts';
 import { assertExplicitSourceLive, federatedSearchScope, parseSourceIdParam, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
 import { markKeywordHits } from '../search/evidence.ts';
-import { hybridSearchCached, stampContentFlags } from '../search/hybrid.ts';
+import { hybridSearchCached, stampContentFlags, type HybridSearchOpts } from '../search/hybrid.ts';
 import { dedupResults } from '../search/dedup.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { packToBudget, estimateTokens, resultTokens } from '../search/token-budget.ts';
@@ -39,7 +40,8 @@ import { ENTITY_HINTS_CAP } from '../facts/extract.ts';
 import { parseTtlShorthand } from '../facts/ttl-parse.ts';
 import { MEMORY_VERBS_VERSION } from '../verbs.ts';
 import type { SearchResult } from '../types.ts';
-import type { BrainEngine, FactRow } from '../engine.ts';
+import { MAX_SEARCH_LIMIT, type BrainEngine, type FactRow } from '../engine.ts';
+import { collapseFactReads } from '../facts/capture-dedup.ts';
 import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
 import { hasScope } from '../scope.ts';
 import { renderTrustedText } from '../eligibility/labels.ts';
@@ -49,6 +51,7 @@ import { activationSuppressionNotice, suppressionSummary } from '../eligibility/
 import { stampPageTrust, stampRowTrust } from '../eligibility/stamp.ts';
 import type { TrustTier } from '../trust/tier.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
+import { parseSinceParam } from '../facts/since-parse.ts';
 import { parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
 
 // ============================================================
@@ -107,8 +110,8 @@ const extract_facts: Operation = {
     // [ENG-8] Explicit caller value wins; UNSET resolves through the shared
     // facts.default_visibility helper (the old ternary coerced unset →
     // 'private' before any config default could run). Garbage stays 'private'.
-    const { resolveVisibilityParam } = await import('../facts/visibility.ts');
-    const visibility: 'private' | 'world' = await resolveVisibilityParam(ctx.engine, p.visibility);
+    const { resolveVisibilityParam, tightenToPage } = await import('../facts/visibility.ts');
+    let visibility: 'private' | 'world' = await resolveVisibilityParam(ctx.engine, p.visibility);
 
     // #4206: optional event-time + provenance threading. An unparseable
     // valid_from fails LOUD — silently defaulting to now() is exactly the
@@ -127,6 +130,12 @@ const extract_facts: Operation = {
       typeof p.source_slug === 'string' && p.source_slug.trim().length > 0
         ? p.source_slug.trim()
         : undefined;
+    // A turn taken from a private page yields private facts, even when the caller asked for world. A remote caller's
+    // facts are also private when it cannot see the source page, so a hidden page and a missing one look the same.
+    if (visibility === 'world' && sourceSlug) {
+      const origin = await ctx.engine.readPageSnapshot(sourceSlug.replace(/\.md$/, ''), { sourceId });
+      visibility = ctx.remote !== false && !origin ? 'private' : tightenToPage(visibility, origin?.page);
+    }
 
     const r = await runFactsPipeline(p.turn_text as string, {
       engine: ctx.engine,
@@ -191,6 +200,9 @@ const extract_facts: Operation = {
       superseded: r.superseded,
       fact_ids: r.fact_ids,
       ...(r.write_requests ? { write_requests: r.write_requests } : {}),
+      ...(r.withdrawn_skipped ? { withdrawn_skipped: r.withdrawn_skipped } : {}),
+      ...(r.refused?.length ? { refused: r.refused } : {}),
+      ...(r.would_dedup_same_page ? { would_dedup_same_page: r.would_dedup_same_page } : {}),
       ...hintAccounting,
     };
   },
@@ -201,9 +213,29 @@ function packingArm<T>(candidates: T[], kept: T[], cost: (item: T) => number) {
   return { candidates: candidates.length, kept: kept.length, dropped: candidates.length - kept.length, used: kept.reduce((sum, r) => sum + cost(r), 0) };
 }
 
+/**
+ * A result row's cost in recall's packing. A delivered block costs what delivery counted (its text and title in
+ * delivery's tokenizer), so recall never re-cuts a set delivery already fit using a different estimator.
+ */
+function recallResultCost(delivery: DeliveryMeta | undefined): (r: SearchResult) => number {
+  if (!delivery) return resultTokens;
+  return r => r.delivered ? r.delivered.tokens + countEvidenceTokens(r.title ?? '', delivery.tokenizer) : resultTokens(r);
+}
+
+/**
+ * Facts pack first under a budget (every policy but query_first), so delivery gets only what they leave.
+ * Sized to the whole budget, delivery filled it and recall then dropped whole delivered blocks after the facts.
+ * Null when the facts leave nothing: delivery is skipped and the results arm packs empty.
+ */
+function recallDeliveryPlan(plan: EvidencePlan | null, policy: unknown, queryText: string | null, budgetTokens: number | null, rows: Array<{ fact: string }>): EvidencePlan | null {
+  if (!plan || budgetTokens === null || (policy === 'query_first' && queryText !== null)) return plan;
+  const left = Math.min(plan.budgetTokens, budgetTokens - packToBudget(rows, r => estimateTokens(r.fact), budgetTokens).meta.used);
+  return left > 0 ? { ...plan, budgetTokens: left } : null;
+}
+
 /** recall's budget_packing meta: only policy-supplied calls carry it. */
 function recallBudgetPacking<F extends { fact: string }>(policy: unknown, queryText: string | null, budgetTokens: number | null,
-  arms: { rows: F[]; packedFacts: F[]; searchResults: SearchResult[]; packedResults: SearchResult[] }) {
+  arms: { rows: F[]; packedFacts: F[]; searchResults: SearchResult[]; packedResults: SearchResult[] }, resultCost: (r: SearchResult) => number) {
   if (policy !== 'facts_first' && policy !== 'query_first') return undefined;
   const queryFirst = policy === 'query_first' && queryText !== null && budgetTokens !== null;
   const { rows, packedFacts, searchResults, packedResults } = arms;
@@ -217,7 +249,7 @@ function recallBudgetPacking<F extends { fact: string }>(policy: unknown, queryT
             : packedFacts.length + packedResults.length === 0 ? 'first_items_exceed_budget'
               : 'packed',
     facts: packingArm(rows, packedFacts, r => estimateTokens(r.fact)),
-    results: packingArm(searchResults, packedResults, resultTokens),
+    results: packingArm(searchResults, packedResults, resultCost),
   };
 }
 
@@ -240,23 +272,23 @@ const recall: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: { retrieval: { localVerbatim: ['facts'] } },
-  description: 'MEMORY VERB (v1): read saved facts by entity, since or session_id; `query` also searches pages. Remote callers see world facts only. One card: entity; reasoning: synthesize.',
+  description: 'Read facts by entity, since or session_id; `query` also searches pages. Remote callers: world facts only. One card: entity; reasoning: synthesize.',
   params: {
     entity: { type: 'string', description: 'Entity slug; its facts.' },
     question: { type: 'string', description: 'Rank facts by relevance to it.' },
     query: { type: 'string', description: 'Also search pages (results[]).' },
     budget_tokens: { type: 'number', description: 'Token budget; facts pack first.' },
-    budget_policy: { type: 'string', enum: ['facts_first', 'query_first'], description: 'Default facts_first.' },
-    source_id: { type: 'string', description: 'One source you may read.' },
+    budget_policy: { type: 'string', enum: ['facts_first', 'query_first'], description: 'Default facts_first.', fullSurfaceOnly: true },
+    source_id: { type: 'string', description: 'One readable source.' },
     since: { type: 'string', description: 'ISO 8601 or "8 hours ago".' },
     session_id: { type: 'string', description: "This session's facts." },
-    include_expired: { type: 'boolean', description: 'Include expired.' },
-    supersessions: { type: 'boolean', description: 'Supersession log only.' },
-    limit: { type: 'number', description: 'Per-arm max (default 50, cap 100).' },
-    grep: { type: 'string', description: 'Text substring.' },
-    include_pending: { type: 'boolean', description: 'Pending count.' },
-    return_unit: { type: 'string', enum: ['chunk', 'window', 'section', 'page', 'auto'], description: 'results[] unit (see search).' },
-    return_window: { type: 'number', description: 'Window size 1-3.' },
+    include_expired: { type: 'boolean', description: 'Also expired; question ranks them.', fullSurfaceOnly: true },
+    supersessions: { type: 'boolean', description: 'Supersession log only.', fullSurfaceOnly: true },
+    limit: { type: 'number', description: 'Per-arm max (default 50, cap 100).', fullSurfaceOnly: true },
+    grep: { type: 'string', description: 'Text substring.', fullSurfaceOnly: true },
+    include_pending: { type: 'boolean', description: 'Pending count.', fullSurfaceOnly: true },
+    return_unit: { type: 'string', enum: ['chunk', 'window', 'section', 'page', 'auto'], description: 'results[] unit (see search).', fullSurfaceOnly: true },
+    return_window: { type: 'number', description: 'Window 1-3.', fullSurfaceOnly: true },
     min_trust: MIN_TRUST_PARAM,
   },
   scope: 'read',
@@ -313,7 +345,7 @@ const recall: Operation = {
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote); // #4352: fact and page arms alike
     const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust }); // #5575 floor + quarantine/rederive hiding
 
-    type FactRows = Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>>;
+    type FactRows = Array<Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>>[number] & { entity_slugs?: string[]; collapsed_count?: number }>;
     type FactRowItem = FactRows[number];
     // Per-arm merge key: each arm's engine query ORDERs by a different column
     // (supersessions by COALESCE(expired_at, valid_until) — #3014, entity by
@@ -332,7 +364,7 @@ const recall: Operation = {
         k: toTime(keyOf(r as unknown as Record<string, unknown>)),
       }));
       decorated.sort((a, b) => b.k - a.k);
-      return decorated.slice(0, limit).map(d => d.r);
+      return decorated.slice(0, MAX_SEARCH_LIMIT).map(d => d.r);
     };
     const byCreated = (rec: Record<string, unknown>) => rec.created_at ?? rec.since_date;
     // The since-arms below pass eventTime:true (COALESCE(valid_from,
@@ -353,7 +385,7 @@ const recall: Operation = {
       throw verbError(
         'invalid_params',
         `since is not a parseable timestamp or duration: "${String(p.since).slice(0, 60)}"`,
-        'Pass an ISO 8601 datetime (e.g. "2026-08-11T00:00:00Z"), Unix epoch millis, or a duration such as "8 hours ago" / "2d".',
+        'Pass an ISO 8601 datetime (e.g. "2026-08-11T00:00:00Z"), Unix epoch millis, a duration such as "8 hours ago" / "2d", or a relative phrase such as "6 weeks ago" / "last month".',
       );
     }
     const question = parseQuestionParam(p);
@@ -365,17 +397,17 @@ const recall: Operation = {
     // LIMIT, so a hidden newest row never consumes a slot).
     const listOpts = {
       activeOnly: !includeExpired,
-      limit,
+      limit: MAX_SEARCH_LIMIT,
       visibility, excludePrivate,
       grep: grep ?? undefined,
       excludeAuditRows: true, eligibility,
     };
 
     if (question !== null) {
-      ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep,
+      ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep, includeExpired,
         scope: { sourceIds: factSources, remote: ctx.remote !== false, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
       ({ rows, ambiguousEntity } = ranking);
-      for (const notice of questionRecallNotices(ranking)) ctx.emitNotice?.(notice);
+      for (const notice of questionRecallNotices(ranking, ctx.brainId)) ctx.emitNotice?.(notice);
     } else if (p.supersessions === true) {
       // Visibility filters at the ENGINE level (before each source's LIMIT),
       // same as the sibling fact-list arms — a post-merge filter would let a
@@ -398,7 +430,7 @@ const recall: Operation = {
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
       const resolvedLists = await Promise.all(factSources.map(async (src) => {
         const entitySlug = entityParam ? ((await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam) : undefined;
-        const rows = await readEntityFacts(ctx, src, entitySlug, limit,
+        const rows = await readEntityFacts(ctx, src, entitySlug, MAX_SEARCH_LIMIT,
           s => ctx.engine.listFactsSince(src, since, { ...listOpts, eventTime: true, entitySlug: s, sessionId: sessionParam ?? undefined }));
         return { slug: entitySlug, rows };
       }));
@@ -408,7 +440,7 @@ const recall: Operation = {
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
       const resolvedLists = await Promise.all(factSources.map(async (src) => {
         const slug = (await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam;
-        return { slug, rows: await readEntityFacts(ctx, src, slug, limit, s => ctx.engine.listFactsByEntity(src, s!, listOpts)) };
+        return { slug, rows: await readEntityFacts(ctx, src, slug, MAX_SEARCH_LIMIT, s => ctx.engine.listFactsByEntity(src, s!, { ...listOpts, sessionId: sessionParam ?? undefined })) };
       }));
       ambiguousEntity = await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug }))));
       rows = ambiguousEntity ? [] : mergeNewest(resolvedLists.map(l => l.rows), (rec) => rec.valid_from ?? rec.created_at);
@@ -443,6 +475,8 @@ const recall: Operation = {
       rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
     }
 
+    // #7043: copies of one claim (the fact arms read MAX_SEARCH_LIMIT rows) collapse after the visibility filters, before the limit cut.
+    if (!ranking) rows = (await collapseFactReads(ctx.engine, rows)).slice(0, limit);
     // v0.32: optional pending-consolidation count piggy-backed on the recall
     // response. Single round trip on thin-client; omitted when not requested
     // so existing callers see no shape change. Sums over the SAME factSources
@@ -479,6 +513,7 @@ const recall: Operation = {
     let searchDegraded: string | undefined;
     let delivery: DeliveryMeta | undefined;
     const evidencePlan = queryText ? await recallEvidencePlan(ctx, p) : null;
+    const rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'> = evidencePlan?.rankCut ? { pageRankCut: evidencePlan.rankCut } : {};
     if (queryText) {
       // #3242 parity (#4707): the page-search arm widens an unqualified
       // no-grant caller across the transport-computed federated set, exactly
@@ -490,7 +525,7 @@ const recall: Operation = {
       // untrusted callers with the excludePrivate resolved above.
       const keywordOnly = await recallKeywordOnlyReason(ctx);
       if (keywordOnly) {
-        searchResults = await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope);
+        searchResults = await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope, rankCutOpts);
         searchDegraded = keywordOnly;
       } else {
         searchResults = await hybridSearchCached(ctx.engine, queryText, {
@@ -500,10 +535,11 @@ const recall: Operation = {
           requireSafeChunks: ctx.remote !== false,
           takesHoldersAllowList: readHolders(ctx),
           ...searchScope,
+          ...rankCutOpts,
         });
       }
       bumpLastRetrievedAt(ctx.engine, searchResults.map(r => r.page_id));
-      const applied = effectivePlan(evidencePlan, searchResults);
+      const applied = recallDeliveryPlan(effectivePlan(evidencePlan, searchResults), p.budget_policy, queryText, budgetTokens, rows);
       if (applied) ({ results: searchResults, delivery } = await deliverEvidence(ctx.engine, searchResults, applied, { ...searchScope, excludePrivate, requireSafeChunks: ctx.remote !== false }));
       searchResults = await stampPageTrust(ctx.engine, searchResults, eligibility.floor);
     }
@@ -520,7 +556,7 @@ const recall: Operation = {
     const queryFirst = p.budget_policy === 'query_first' && queryText !== null && budgetTokens !== null;
     if (queryFirst) {
       const resultsPack = budgetTokens > 0
-        ? packToBudget(searchResults, resultTokens, budgetTokens)
+        ? packToBudget(searchResults, recallResultCost(delivery), budgetTokens)
         : { items: [] as SearchResult[], meta: { used: 0, dropped: searchResults.length } };
       packedResults = resultsPack.items;
       const remaining = budgetTokens - resultsPack.meta.used;
@@ -536,16 +572,16 @@ const recall: Operation = {
       const remaining = budgetTokens - factsPack.meta.used;
       const resultsPack =
         remaining > 0
-          ? packToBudget(searchResults, resultTokens, remaining)
+          ? packToBudget(searchResults, recallResultCost(delivery), remaining)
           : { items: [] as SearchResult[], meta: { budget: 0, used: 0, dropped: searchResults.length, kept: 0 } };
       packedResults = resultsPack.items;
       budgetUsed = factsPack.meta.used + resultsPack.meta.used;
       droppedCount = factsPack.meta.dropped + resultsPack.meta.dropped;
     }
 
-    const budgetPacking = recallBudgetPacking(p.budget_policy, queryText, budgetTokens, { rows, packedFacts, searchResults, packedResults });
+    const budgetPacking = recallBudgetPacking(p.budget_policy, queryText, budgetTokens, { rows, packedFacts, searchResults, packedResults }, recallResultCost(delivery));
 
-    return {
+    const out = {
       facts: await withFactDateHeaders(ctx.engine, await stampRowTrust(ctx.engine, 'facts', packedFacts.map(r => ({ // #5575 A6: + trust_tier, origin, unconfirmed
         id: r.id,
         fact: r.fact,
@@ -576,11 +612,13 @@ const recall: Operation = {
         // is the protocol name for the stored source attribution.
         fact_id: String(r.id),
         provenance: r.source, ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}),
+        ...(r.entity_slugs ? { entity_slugs: r.entity_slugs } : {}), ...(r.collapsed_count ? { collapsed_count: r.collapsed_count } : {}),
         ...(ranking ? { relevance: ranking.relevance.get(r.id) } : {}),
       })), f => f.id)),
       total: packedFacts.length,
       facts_order: ranking ? 'relevance' : 'newest',
       ...(ranking?.degraded ? { facts_degraded: ranking.degraded } : {}),
+      ...(ranking?.calibration ? { facts_calibration: ranking.calibration } : {}),
       ...(ambiguousEntity ? { ambiguous_entity: { candidates: ambiguousEntity, suggestion: AMBIGUOUS_ENTITY_SUGGESTION } } : {}),
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
       // MEMORY_VERBS v1 envelope (G1B superset — additive on every response).
@@ -610,6 +648,8 @@ const recall: Operation = {
       ...(budgetPacking ? { budget_packing: budgetPacking } : {}),
       ...(delivery ? { delivery } : {}),
     };
+    recordRecallOutcome(out);
+    return out;
   },
 };
 
@@ -656,20 +696,29 @@ async function withProvenance<T extends { id: number }>(engine: BrainEngine, sou
   return facts.map((f) => ({ ...f, provenance: byId.get(f.id) ?? null }));
 }
 
+/** context_pack `intent` values; pinned equal to proactive-brief.ts BRIEF_INTENTS by test (kept literal so this module stays import-light). */
+export const BRIEF_INTENTS = ['meeting', 'reply'] as const;
+
 const context_pack: Operation = {
   name: 'context_pack',
   mutating: false,
   idempotent: true,
   outputRedaction: { retrieval: { localVerbatim: ['facts'] } },
-  description: 'MEMORY VERB (v1): core memory, budget-packed cards, open threads and hot facts for up to 8 entities, zero LLM. Call at session start and after compaction.',
+  description: 'Core memory, budget-packed cards, open threads and hot facts for up to 8 entities, zero LLM. Call at session start and after compaction.',
   params: {
     entities: { type: 'string', description: 'Comma-separated names or slugs (max 8).' },
     budget_tokens: { type: 'number', description: 'Token budget; cards pack first.' },
-    since: { type: 'string', description: 'Only open-thread events after this ISO time.' },
-    session_id: { type: 'string', description: 'Opaque session id.' },
-    include_private: { type: 'boolean', description: 'Local trusted callers only.' },
+    since: { type: 'string', description: 'Open-thread events after this ISO time.', fullSurfaceOnly: true },
+    session_id: { type: 'string', description: 'Opaque session id.', fullSurfaceOnly: true },
+    include_private: { type: 'boolean', description: 'Local trusted callers only.', fullSurfaceOnly: true },
     min_trust: MIN_TRUST_PARAM,
     include_quarantined: { type: 'boolean', description: 'Admin or memory_confirm: quarantined cards.', fullSurfaceOnly: true },
+    counterparty: { type: 'string', description: 'Person or company (name or slug): adds a pulled brief of dated items about them.', fullSurfaceOnly: true },
+    intent: { type: 'string', enum: [...BRIEF_INTENTS], description: 'With counterparty: the task the brief is for.', fullSurfaceOnly: true },
+    source_id: { type: 'string', description: 'Resolve entities in this source only. Default: your source first, then every source you can read.', fullSurfaceOnly: true },
+    entity_refs: { type: 'array', items: { type: 'object', properties: { source_id: { type: 'string' }, slug: { type: 'string' } } },
+      description: 'Source-qualified entities: [{"source_id":"wiki","slug":"people/alice-example"}].', fullSurfaceOnly: true },
+    prefer_source_id: { type: 'string', description: 'Source to try first (thin clients send .gbrain-source here); never narrows.', fullSurfaceOnly: true },
   },
   scope: 'read',
   verb: true,
@@ -677,7 +726,7 @@ const context_pack: Operation = {
   annotations: { title: 'context_pack (boundary bundle)', readOnlyHint: true },
   handler: async (ctx, p) => {
     const { assembleContextPack, renderPack, isAfter, PACK_DEFAULT_MAX_ENTITIES, renderCardLine, renderThreadLine, renderFactLine, packHeaderCost,
-      renderNewerMentionLines } = await import('../context/turn-context.ts');
+      renderNewerMentionLines, ENTITY_FACTS_HEADER } = await import('../context/turn-context.ts');
     const { NEWER_MENTIONS_HEADER } = await import('../mentions/newer-mentions.ts');
     const sourceId = ctx.sourceId ?? 'default';
     const rawSince = typeof p.since === 'string' && p.since.trim() ? p.since : undefined;
@@ -693,7 +742,12 @@ const context_pack: Operation = {
     // Echo the CAPPED list (pre-landing review): the assembler bundles at most
     // PACK_DEFAULT_MAX_ENTITIES, so echoing more would claim entities were
     // bundled that produced no cards.
-    const entities = parseEntityList(p.entities).slice(0, PACK_DEFAULT_MAX_ENTITIES);
+    const names = parseEntityList(p.entities).slice(0, PACK_DEFAULT_MAX_ENTITIES);
+    // #6723: names resolve across the readable sources (home first) unless source_id pins one; entity_refs name their source.
+    const { ambientMissNotice, entityRefs, entitySources } = await import('../verbs/entity-source.ts');
+    const walk = await entitySources(ctx, p, 'context_pack');
+    const refs = (await entityRefs(ctx, p.entity_refs, PACK_DEFAULT_MAX_ENTITIES)).slice(0, PACK_DEFAULT_MAX_ENTITIES - names.length);
+    const entities = [...names, ...refs.map((r) => r.name)];
     // Fail-closed: private only when EXPLICITLY requested AND the caller is
     // trusted-local (ctx.remote === false). A remote caller never widens.
     const includePrivate = p.include_private === true && ctx.remote === false;
@@ -703,18 +757,26 @@ const context_pack: Operation = {
         : null;
     // #5575 (CEO-20, CEO-18): a proactive surface under the connection's floor.
     const eligibility = await proactiveEligibility(ctx, 'context_pack', { minTrust: p.min_trust });
+    const includeQuarantined = p.include_quarantined === true && (ctx.remote === false || hasScope(ctx.auth?.scopes ?? [], 'admin') || hasScope(ctx.auth?.scopes ?? [], MEMORY_CONFIRM_SCOPE));
+    // Wave 5 D5 pull brief: only when the caller names a counterparty (the
+    // push switch is not read; nothing changes for a caller that does not
+    // pass it). Open loops are trusted-local only; the change arm is
+    // world-only unless a trusted caller widened with include_private.
+    const pullBrief = await (await import('../context/pack-brief.ts')).contextPackBrief(ctx, p, { sourceId, includePrivate, eligibility });
     const res = entities.length === 0
       ? { cards: [], facts: [], text: '', pointers: [], factsCount: 0 } as unknown as Awaited<ReturnType<typeof assembleContextPack>>
       : await assembleContextPack(ctx.engine, {
         sourceId,
-        entities,
         since,
+        entities: names,
+        sources: walk.sources,
+        entityRefs: refs,
         sessionId: typeof p.session_id === 'string' ? p.session_id : undefined,
         includePrivate,
         maxEntities: PACK_DEFAULT_MAX_ENTITIES,
         eligibility,
         // #5575 ENG-15: same rule as get_page: quarantined cards only on an authorized explicit ask.
-        includeQuarantined: p.include_quarantined === true && (ctx.remote === false || hasScope(ctx.auth?.scopes ?? [], 'admin') || hasScope(ctx.auth?.scopes ?? [], MEMORY_CONFIRM_SCOPE)),
+        includeQuarantined,
       });
     // Always-loaded core tier (core-memory.ts): owner-designated pages of
     // `default` plus this source, inside the caller's grant; it packs first.
@@ -731,9 +793,37 @@ const context_pack: Operation = {
     // Pack, price and render the redacted presentation sets (one echo
     // dictionary); local callers get the delivered facts back raw below.
     const rawFacts = await withProvenance(ctx.engine, sourceId, res.facts ?? []);
-    const view = redactRetrievalOutput([{ cards: res.cards ?? [], facts: rawFacts }], {}).results[0];
+    // F1 records (pull verb only; the ambient push path never reads them): the count and enrolled-type records of each card.
+    const { readPackReferences, renderRecordLines, RECORDS_HEADER } = await import('../verbs/entity-references.ts');
+    type PackRefs = Awaited<ReturnType<typeof readPackReferences>>;
+    const packRefs: PackRefs = await readPackReferences(ctx.engine, sourceId, res.cards ?? [], { remote: !includePrivate, eligibility, surfaceCeiling: ctx.surfaceCeiling,
+      emitNotice: (n) => ctx.emitNotice?.(n) })
+      .catch((): PackRefs => ({ bySlug: new Map(), notice: null }));
+    if (packRefs.notice) ctx.emitNotice?.(packRefs.notice);
+    const ambientNotice = ambientMissNotice('context_pack', walk, (res.cards ?? []).filter((c) => c.entity.source_id !== walk.ambient?.sourceId && !refs.some((r) => r.sourceId === c.entity.source_id && r.name === c.entity.slug))
+      .map((c) => ({ name: c.entity.title, foundIn: c.entity.source_id })));
+    if (ambientNotice) ctx.emitNotice?.(ambientNotice);
+    // F3 (`entity.row_page_status`, default on): each card and newer-mentions row carries its page's frontmatter `status` (pull verb only).
+    const { readRowPageStatus } = await import('../entity-references-config.ts');
+    const { readPageStatusByRef } = await import('../mentions/referrers.ts');
+    // #6723: every card, and its newer-mention rows, reads its own source.
+    const statusRefs = (res.cards ?? []).flatMap((c) => [c.entity.slug, ...(c.newer_mentions?.rows ?? []).map((r) => r.slug)].map((slug) => ({ source_id: c.entity.source_id, slug })));
+    const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+    const pageStatus = statusRefs.length && await readRowPageStatus(ctx.engine)
+      ? await readPageStatusByRef(ctx.engine, statusRefs, { excludePrivate: await resolveExcludePrivatePages(ctx.engine, includePrivate ? false : undefined), includeQuarantined })
+        .catch(() => new Map<string, string>())
+      : new Map<string, string>();
+    const statusOf = (src: string, slug: string) => { const value = pageStatus.get(`${src}:${slug}`); return value ? { page_status: value } : {}; };
+    const withRefs = (res.cards ?? []).map((c) => ({
+      ...c, ...packRefs.bySlug.get(`${c.entity.source_id}:${c.entity.slug}`), ...statusOf(c.entity.source_id, c.entity.slug),
+      ...(c.newer_mentions ? { newer_mentions: { ...c.newer_mentions, rows: c.newer_mentions.rows.map((r) => ({ ...r, ...statusOf(c.entity.source_id, r.slug) })) } } : {}),
+    }));
+    // #6724: the packed cards' own facts (each read in its card's source, world-only for a remote caller).
+    const rawEntityFacts = res.entityFacts ?? [];
+    const view = redactRetrievalOutput([{ cards: withRefs, facts: rawFacts, entity_facts: rawEntityFacts }], {}).results[0];
     let cards = view.cards;
     let facts = view.facts;
+    let entityFacts = view.entity_facts;
     // The SAME since filter the assembler applied (pre-landing review: the raw
     // flatMap silently dropped the documented `since` contract from the
     // structured array whenever budget packing ran) — shared with the card
@@ -744,31 +834,48 @@ const context_pack: Operation = {
     if (budgetTokens !== null) {
       // #4761: reserve the envelope + headers, then price each card as its
       // rendered line plus its rendered (since-filtered) thread lines.
-      const itemBudget = budgetTokens - packHeaderCost() - coreTokens;
+      const itemBudget = budgetTokens - packHeaderCost() - coreTokens - (pullBrief?.text ? estimateTokens(pullBrief.text) : 0);
       const cardCost = (c: (typeof cards)[number]) =>
-        lineCost(renderCardLine(c)) + threadsOf(c).reduce((n, t) => n + lineCost(renderThreadLine(t)), 0);
+        lineCost(renderCardLine(c, walk.home)) + threadsOf(c).reduce((n, t) => n + lineCost(renderThreadLine(t)), 0);
       const cardPack = itemBudget > 0 ? packToBudget(cards, cardCost, itemBudget) : dropAll(cards);
       cards = cardPack.items;
-      const remaining = itemBudget - cardPack.meta.used;
-      const factPack = remaining > 0 ? packToBudget(facts, (f) => lineCost(renderFactLine(f)), remaining) : dropAll(facts);
+      // #6724: a dropped card's facts go with it; entity facts pack before hot memory, and a fact in both is priced once.
+      const packed = new Set(cards.map((c) => `${c.entity.source_id}:${c.entity.slug}`));
+      const ofPacked = entityFacts.filter((e) => packed.has(`${e.source_id}:${e.slug}`));
+      const entityBudget = itemBudget - cardPack.meta.used - (ofPacked.length ? lineCost('') + lineCost(ENTITY_FACTS_HEADER) : 0);
+      const entityPack = entityBudget > 0 ? packToBudget(ofPacked, (e) => lineCost(renderFactLine(e)), entityBudget) : dropAll(ofPacked);
+      entityFacts = entityPack.items;
+      const shown = new Set(entityFacts.map((e) => e.id));
+      const remaining = entityBudget - entityPack.meta.used;
+      const factPack = remaining > 0 ? packToBudget(facts, (f) => (shown.has(f.id) ? 0 : lineCost(renderFactLine(f))), remaining) : dropAll(facts);
       facts = factPack.items;
       // Newer mentions pack last, into what cards and facts left; a card whose block does not fit keeps its card line.
       const mentionBudget = remaining - factPack.meta.used - lineCost('') - lineCost(NEWER_MENTIONS_HEADER);
       const withMentions = cards.filter((c) => c.newer_mentions);
       const mentionPack = mentionBudget > 0
-        ? packToBudget(withMentions, (c) => renderNewerMentionLines(c).reduce((n, l) => n + lineCost(l), 0), mentionBudget)
+        ? packToBudget(withMentions, (c) => renderNewerMentionLines(c, walk.home).reduce((n, l) => n + lineCost(l), 0), mentionBudget)
         : dropAll(withMentions);
       const keptMentions = new Set(mentionPack.items);
       cards = cards.map((c) => (c.newer_mentions && !keptMentions.has(c) ? { ...c, newer_mentions: undefined } : c));
-      droppedCount = cardPack.meta.dropped + factPack.meta.dropped;
+      // Records pack last, into what everything else left; a card whose records do not fit keeps its count.
+      const recordBudget = mentionBudget - mentionPack.meta.used - lineCost('') - lineCost(RECORDS_HEADER);
+      const withRecords = cards.filter((c) => renderRecordLines(c).length);
+      const recordPack = recordBudget > 0
+        ? packToBudget(withRecords, (c) => renderRecordLines(c).reduce((n, l) => n + lineCost(l), 0), recordBudget)
+        : dropAll(withRecords);
+      const keptRecords = new Set(recordPack.items);
+      cards = cards.map((c) => (renderRecordLines(c).length && !keptRecords.has(c) ? { ...c, records: undefined, sibling_records: undefined } : c));
+      droppedCount = cardPack.meta.dropped + (view.entity_facts.length - entityFacts.length) + factPack.meta.dropped;
     }
     const open_threads = cards.flatMap(threadsOf);
     // Re-render the injectable block from the FINAL sets (adversarial review):
     // `text` is what harnesses inject, so it must honor the same budget the
     // structured arrays report — the assembler's pre-budget rendering would
     // overrun the declared budget_tokens. budget_used reports that text.
-    const packText = entities.length === 0 ? '' : budgetTokens !== null ? renderPack(cards, open_threads, facts) : res.text;
-    const text = [coreText, packText].filter(Boolean).join('\n\n');
+    const recordLines = cards.flatMap(renderRecordLines);
+    const basePack = entities.length === 0 ? '' : budgetTokens !== null ? renderPack(cards, open_threads, facts, undefined, walk.home, entityFacts) : res.text;
+    const packText = recordLines.length ? [basePack, ['', RECORDS_HEADER, ...recordLines].join('\n')].filter(Boolean).join('\n') : basePack;
+    const text = [coreText, pullBrief?.text ?? '', packText].filter(Boolean).join('\n\n');
     const budgetUsed = budgetTokens !== null ? estimateTokens(text) : undefined;
 
     return {
@@ -776,8 +883,10 @@ const context_pack: Operation = {
       entities,
       cards: cards.map((c) => ({
         slug: c.entity.slug,
+        source_id: c.entity.source_id,
         title: c.entity.title,
         type: c.entity.type,
+        ...(c.page_status ? { page_status: c.page_status } : {}),
         summary: c.quarantined && c.summary ? renderTrustedText(c.summary, { trust_tier: 'external_untrusted', origin: 'quarantined' }) : c.summary,
         open_threads: c.open_threads,
         edges: c.edges,
@@ -787,6 +896,10 @@ const context_pack: Operation = {
         ...(c.quarantined ? { quarantined: true } : {}),
         ...(c.unconfirmed ? { unconfirmed: true } : {}),
         ...(c.newer_mentions ? { newer_mentions: c.newer_mentions } : {}),
+        ...(c.referenced_by_count !== undefined ? { referenced_by_count: c.referenced_by_count } : {}),
+        ...(c.records ? { records: c.records } : {}),
+        ...(c.sibling_records ? { sibling_records: c.sibling_records } : {}),
+        ...(c.references_unavailable ? { references_unavailable: c.references_unavailable } : {}),
       })),
       open_threads,
       facts: (ctx.remote === false ? rawFacts.slice(0, facts.length) : facts).map((f) => ({
@@ -802,7 +915,13 @@ const context_pack: Operation = {
         provenance: f.provenance,
         ...(f.trust_tier ? { trust_tier: f.trust_tier, origin: f.origin } : {}),
       })),
+      entity_facts: entityFacts.map((f) => ({
+        source_id: f.source_id, slug: f.slug, fact_id: String(f.id), fact: f.fact, kind: f.kind, entity_slug: f.entity_slug, valid_from: f.valid_from,
+        context: f.context ?? null, confidence: f.confidence, attributed_to: f.attributed_to ?? null, provenance: f.provenance,
+        ...(f.trust_tier ? { trust_tier: f.trust_tier, origin: f.origin } : {}),
+      })),
       text,
+      ...(pullBrief ? { brief: pullBrief.view } : {}),
       ...(withheld ? { suppressed: suppressionSummary(withheld) } : {}),
       ...(core && core.enabled ? { core: { text: core.text, chars_used: core.chars_used, chars_limit: core.chars_limit, pages: core.pages,
         truncated: core.truncated, revision: core.revision } } : {}),
@@ -811,7 +930,7 @@ const context_pack: Operation = {
         ? { budget_tokens: budgetTokens, budget_used: budgetUsed, dropped_count: droppedCount }
         : {}),
       // C4: optional pinned answers (fresh sentences) and the withheld count (src/core/questions/service.ts).
-      ...(await (await import('../questions/service.ts')).pinnedAnswersForPack(ctx, [...new Set([...(res.cards ?? []).map((c) => c.entity.slug), ...entities])])
+      ...(await (await import('../questions/service.ts')).pinnedAnswersForPack(ctx, (res.cards ?? []).map((c) => ({ source_id: c.entity.source_id, slug: c.entity.slug })))
         .catch(() => null)),
     };
   },
@@ -822,23 +941,24 @@ const delta: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: { retrieval: { localVerbatim: ['facts'] } },
-  description: 'MEMORY VERB (v1): pages, facts, thread events changed since a cursor, zero LLM. Pass session_id, cursor or since.',
+  description: 'Pages, facts, thread events changed since a cursor, zero LLM. Pass session_id, cursor or since.',
   params: {
     since: { type: 'string', description: 'ISO 8601 start time.' },
-    since_slug: { type: 'string', description: 'Legacy: next_cursor.slug.' },
+    since_slug: { type: 'string', description: 'Legacy: next_cursor.slug.', fullSurfaceOnly: true },
     cursor: { type: 'string', description: 'next_cursor.cursor (exact).' },
-    entities: { type: 'string', description: 'Entities for thread events (max 8).' },
+    entities: { type: 'string', description: 'Entities for thread events (max 8).', fullSurfaceOnly: true },
     budget_tokens: { type: 'number', description: 'Token budget; pages pack first.' },
     session_id: { type: 'string', description: 'Session id; keeps a cursor.' },
-    include_private: { type: 'boolean', description: 'Local trusted callers only.' },
+    include_private: { type: 'boolean', description: 'Local trusted callers only.', fullSurfaceOnly: true },
     min_trust: MIN_TRUST_PARAM,
+    beliefs: { type: 'boolean', fullSurfaceOnly: true, description: 'Add `beliefs`: each belief that changed in the window, before and after, with cause and evidence (belief ledger); entities narrows it.' },
   },
   scope: 'read',
   verb: true,
   cliHints: { name: 'delta' },
   annotations: { title: 'delta (what changed since)', readOnlyHint: true },
   handler: async (ctx, p) => {
-    const { assembleDeltaContext, renderDelta, PACK_DEFAULT_MAX_ENTITIES, renderPageLine, renderFactLine, renderThreadLine, deltaHeaderCost } =
+    const { assembleDeltaContext, renderDelta, PACK_DEFAULT_MAX_ENTITIES, renderPageLine, renderFactLine, renderThreadLine, deltaHeaderCost, TURN_CONTEXT_ENVELOPE } =
       await import('../context/turn-context.ts');
     const { readDeltaSessionState, upsertSessionContextState, gcSessionContextState } = await import('../context/session-state.ts');
     const cur = await import('../context/delta-cursor.ts');
@@ -951,6 +1071,7 @@ const delta: Operation = {
         next_cursor: { since: now, slug: '', cursor: cur.encodeDeltaCursor(first) },
         ...(wrote.ok ? {} : { degraded_reason: 'session_state' }),
         ...(budgetTokens !== null ? { budget_tokens: budgetTokens, budget_used: 0, dropped_count: 0 } : {}),
+        ...(p.beliefs === true ? { beliefs: { source_id: sourceId, since: now, until: now, coverage_from: null, changes: [], truncated: false } } : {}),
       };
     }
 
@@ -982,6 +1103,7 @@ const delta: Operation = {
     let droppedCount: number | undefined;
     let factsDropped = 0;
     let itemBudget = 0;
+    let beliefBudget = 0;
     const fetchedPages = pages.length;
     const fetchedFacts = facts.length;
     if (budgetTokens !== null) {
@@ -996,6 +1118,7 @@ const delta: Operation = {
       const remaining = itemBudget - pagePack.meta.used;
       const factPack = remaining > 0 ? packToBudget(facts, (f) => lineCost(renderFactLine(f)), remaining) : dropAll(facts);
       facts = factPack.items;
+      beliefBudget = remaining - factPack.meta.used;
       droppedCount = pagePack.meta.dropped + factPack.meta.dropped;
       factsDropped = factPack.meta.dropped;
     }
@@ -1090,7 +1213,10 @@ const delta: Operation = {
     // Re-render the injectable block from the FINAL sets (adversarial review):
     // `text` must honor the budget AND the boundary-tie exclusion the
     // structured arrays reflect — the assembler's render predates both.
-    const text = renderDelta(pages, facts, threads, effectiveSince);
+    let text = renderDelta(pages, facts, threads, effectiveSince);
+    const diff = p.beliefs === true ? await (await import('../belief/changes.ts')).deltaBeliefs(ctx.engine, { sourceId, since: effectiveSince, until: horizon,
+      remote: !includePrivate, takesHolders: readHolders(ctx), entities: parseEntityList(p.entities) }, budgetTokens !== null ? beliefBudget : null, text, TURN_CONTEXT_ENVELOPE) : null;
+    if (diff) text = diff.text;
     const budgetUsed = budgetTokens !== null ? estimateTokens(text) : undefined;
 
     return {
@@ -1126,6 +1252,7 @@ const delta: Operation = {
       ...(budgetTokens !== null
         ? { budget_tokens: budgetTokens, budget_used: budgetUsed, dropped_count: droppedCount }
         : {}),
+      ...(diff ? { beliefs: diff.beliefs } : {}),
     };
   },
 };
@@ -1219,7 +1346,9 @@ const forget_fact: Operation = {
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'forget_fact', id: p.id };
     const { submitForgetMutation } = await import('../persistence/memory-mutations.ts');
-    return submitForgetMutation(ctx, 'forget_fact', p);
+    const out = await submitForgetMutation(ctx, 'forget_fact', p);
+    recordFunnelEvent('withdrawal');
+    return out;
   },
 };
 
@@ -1236,36 +1365,7 @@ export function clampRecallLimit(raw: unknown): number {
   return Math.min(raw, 100);
 }
 
-/**
- * Parse a `since` parameter into a Date. Accepts ISO 8601, plain duration
- * shorthand ("8 hours ago", "3 days ago", "30m", "1h", "2d", "7d"), or
- * Unix epoch millis. Returns null on unparseable input.
- */
-function parseSinceParam(raw: unknown): Date | null {
-  if (raw == null) return null;
-  if (typeof raw === 'number' && Number.isFinite(raw)) return new Date(raw);
-  if (typeof raw !== 'string') return null;
-  const s = raw.trim();
-  if (!s) return null;
-
-  // Try ISO first.
-  const iso = Date.parse(s);
-  if (Number.isFinite(iso)) return new Date(iso);
-
-  // "N (minutes|hours|days) ago" or compact forms.
-  const ago = s.match(/^(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hr|hours?|d|days?)(?:\s+ago)?$/i);
-  if (ago) {
-    const n = parseInt(ago[1], 10);
-    const unit = ago[2].toLowerCase();
-    const ms =
-      unit.startsWith('s') ? n * 1000 :
-      unit.startsWith('m') ? n * 60 * 1000 :
-      unit.startsWith('h') ? n * 60 * 60 * 1000 :
-      n * 24 * 60 * 60 * 1000;
-    return new Date(Date.now() - ms);
-  }
-  return null;
-}
+export { parseSinceParam } from '../facts/since-parse.ts';
 
 /**
  * MEMORY_VERBS v1 — parse the `remember` verb's `ttl` param into a
@@ -1330,11 +1430,12 @@ async function recallKeywordOnlyReason(ctx: OperationContext): Promise<string | 
 async function keylessRecallRows(
   ctx: OperationContext, queryText: string, limit: number, excludePrivate: boolean,
   searchScope: { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier },
+  rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'> = {},
 ): Promise<SearchResult[]> {
   if (await keylessChainQuestion(ctx, queryText)) {
     return hybridSearchCached(ctx.engine, queryText, {
       limit, expansion: false, excludePrivate, requireSafeChunks: ctx.remote !== false,
-      takesHoldersAllowList: readHolders(ctx), ...searchScope,
+      takesHoldersAllowList: readHolders(ctx), ...searchScope, ...rankCutOpts,
     });
   }
   const rows = dedupResults(await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope }));

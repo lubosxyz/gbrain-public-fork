@@ -13,12 +13,14 @@ import { assertPersistenceAccepting, waitForWrite, writeResponse } from './servi
 import { digest, requireUuid, sha256, stableJson } from './digest.ts';
 import { mergeReconcile, reconcileCanonical, reconcileDecisions, strictReconcileKeys } from './reconcile-merge.ts';
 import { additiveDecisions, assertAutoDecisions, classifyDrift, type AutoDecision, type DriftClassification } from './reconcile-additive.ts';
-import { assertReconcilePins, readReconcileState, reconcilePreviewAdopts, staleReconcile, validateReconcileArtifact, type ReconcileArtifact, type ReconcileState } from './reconcile-state.ts';
+import { assertReconcilePins, readReconcileState, reconcilePreviewAdopts, reconcileReadOptions, staleReconcile, validateReconcileArtifact, type ReconcileArtifact, type ReconcileState } from './reconcile-state.ts';
 import { prepareReconcileResult } from './reconcile-prepare.ts';
 import { assertReconcileOutputPath, assertReconcileSize, manageReconcileBackups, retainReconcileBackup } from './reconcile-backup.ts';
 import type { LocalGrant } from './identity.ts';
-import { isTerminal } from './model.ts';
+import { isTerminal, type WriteRequest } from './model.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
+import { liveFileDrift } from './drift-conflicts.ts';
+import { clearGitHold, GIT_HOLD_OP, gitHoldFingerprint, outOfAttemptsHold, readGitHold } from './sync-holds.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 
@@ -28,7 +30,8 @@ export type { ReconcileArtifact } from './reconcile-state.ts';
 function grantFix(): Action {
   return readFix('Shows the CLI writer registration and its sources, operations and slug-prefix grant.', { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'] });
 }
-async function authorize(engine: BrainEngine, sourceId: unknown, slug: unknown) {
+/** The trusted CLI grant check every reconcile entry point (and `gbrain repair file-drift`'s preview) runs per page. */
+export async function authorizeReconcile(engine: BrainEngine, sourceId: unknown, slug: unknown) {
   const verified = currentVerifiedLocalWriter();
   if (!verified || verified.remote || verified.principal.kind !== 'local_cli') throw trustedCliRequired('Reconciliation requires a verified trusted local CLI caller.');
   if (typeof sourceId !== 'string' || !isValidSourceId(sourceId) || typeof slug !== 'string' || !slug) throw opError('invalid_params', 'One explicit source ID and page slug are required.',
@@ -99,7 +102,7 @@ export async function runReconcilePreview(engine: BrainEngine, params: Record<st
   }
   if (auto && params.decisions !== undefined) throw opError('invalid_params', 'auto_additive computes its own decisions; omit decisions, or resolve manually without auto_additive.',
     'Drop decisions, or drop auto_additive and resolve the preview with decisions.');
-  const { sourceId, slug } = await authorize(engine, params.source_id, params.slug);
+  const { sourceId, slug } = await authorizeReconcile(engine, params.source_id, params.slug);
   if (params.output_path !== undefined) {
     if (typeof params.output_path !== 'string') throw opError('invalid_params', 'output_path must be an absolute private file path.',
       'Pass output_path (CLI: --out) as an absolute path to a new file outside every source checkout.');
@@ -143,16 +146,52 @@ export async function runReconcilePreview(engine: BrainEngine, params: Record<st
     result_digest: preview.result_digest, preview };
 }
 export async function runReconcileApply(engine: BrainEngine, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-  strictReconcileKeys(params, ['source_id', 'slug', 'preview', 'request_id']);
-  const { sourceId, slug, authority } = await authorize(engine, params.source_id, params.slug);
+  strictReconcileKeys(params, ['source_id', 'slug', 'preview', 'request_id', 'keep_file_bytes'], ['source_id', 'slug', 'preview', 'request_id']);
+  if (params.keep_file_bytes !== undefined && params.keep_file_bytes !== true) throw opError('invalid_params', 'keep_file_bytes is true or absent.',
+    'Pass keep_file_bytes: true to leave a canonical file that already holds the resolved result byte for byte, or omit it.');
+  const { sourceId, slug, authority } = await authorizeReconcile(engine, params.source_id, params.slug);
   const artifact = validateReconcileArtifact(params.preview);
   artifact.decisions = reconcileDecisions(artifact.decisions);
   const requestId = requireUuid(params.request_id as string);
+  return admitReconcileArtifact(engine, { sourceId, slug, authority, artifact, requestId, keepFileBytes: params.keep_file_bytes === true }, async (row, replayed) => {
+    const settled = replayed && isTerminal(row) ? row : await waitForWrite(engine, row, await config(engine));
+    const cleared = settled.state === 'committed' ? await clearAgreedStallHold(engine, sourceId, slug) : null;
+    return { ...writeResponse(settled), ...(cleared ? { cleared_hold: cleared } : {}) };
+  });
+}
+
+/**
+ * #7364: a committed reconcile whose page and canonical file now agree clears that file's out-of-attempts hold
+ * (`preparation_stalled`, `write_interrupted`: the write owner stalled, not the file), which no other repair path clears.
+ * A file that still differs keeps its hold, and so does a hold written after the one this read.
+ */
+async function clearAgreedStallHold(engine: BrainEngine, sourceId: string, slug: string): Promise<{ op: string; fingerprint: string; code: string } | null> {
+  const live = await liveFileDrift(engine, sourceId, slug);
+  if (live.still_present !== false || !live.path) return null;
+  const [source] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [sourceId]);
+  const hold = source ? await readGitHold(engine, sourceId, source.incarnation, live.path) : null;
+  if (!hold || !outOfAttemptsHold(hold.code)) return null;
+  const cleared = await engine.transaction(tx => clearGitHold(tx, { sourceId, incarnation: source!.incarnation, path: hold.path, observedAt: hold.observed_at }));
+  return cleared ? { op: GIT_HOLD_OP, fingerprint: gitHoldFingerprint(sourceId, source!.incarnation, hold.path), code: hold.code } : null;
+}
+
+/**
+ * Admits one ready reconcile artifact for an authorized page (`authorizeReconcile`): it re-reads the page and file, checks
+ * the preimages, retains the backup and admits the request, replaying a prior request under the same id. `settle` runs on
+ * the admitted or replayed row inside the same refusal handling. `intentExtra` rides the stored intent without entering the
+ * digest; `transaction` wraps the admission transaction (`admitWrite`). #6712 PR 4b: the sync pass's keep_db admission
+ * (repair/keep-db-policy.ts) uses both and settles without waiting for publication.
+ */
+export async function admitReconcileArtifact<T>(engine: BrainEngine, input: { sourceId: string; slug: string; authority: Awaited<ReturnType<typeof authorizeReconcile>>['authority'];
+  artifact: ReconcileArtifact; requestId: string; keepFileBytes?: boolean; intentExtra?: Record<string, unknown>;
+  transaction?: <U>(fn: (tx: BrainEngine) => Promise<U>) => Promise<U> }, settle: (row: WriteRequest, replayed: boolean) => Promise<T>): Promise<T> {
+  const { sourceId, slug, authority, artifact, requestId } = input;
   if (artifact.preconditions.source_id !== sourceId || artifact.preconditions.slug !== slug || artifact.status !== 'ready' || artifact.conflicts.length) {
     throw opError('invalid_params', 'Apply requires a ready preview for this exact source and page.',
       `Nothing was submitted. Resolve every conflict first (preview with --from and --decisions until status is ready), then apply that resolved preview for ${slug} in '${sourceId}'.`);
   }
-  const callerIntent = { kind: 'canonical_reconcile', preview: artifact };
+  // #6643: `gbrain repair file-drift --prefer file` keeps the file's own bytes when they already parse to the resolved result.
+  const callerIntent = { kind: 'canonical_reconcile', preview: artifact, ...(input.keepFileBytes ? { keep_file_bytes: true } : {}) };
   const expectedDigest = intentDigest({ operation: 'put_page', sourceId, slug, callerIntent });
   await assertPageRequestIdentity(engine, authority.principal, requestId);
   const replay = async () => {
@@ -160,14 +199,14 @@ export async function runReconcileApply(engine: BrainEngine, params: Record<stri
     if (!prior) return null;
     assertReplayIntent(prior, expectedDigest);
     await authorizeStoredRequest(engine, prior);
-    return writeResponse(isTerminal(prior) ? prior : await waitForWrite(engine, prior, await config(engine)));
+    return settle(prior, true);
   };
   const prior = await replay();
   if (prior) return prior;
   try {
     assertPersistenceAccepting(engine);
     await assertReconcileSize(engine, artifact);
-    const adopt = { adoptSlugPath: reconcilePreviewAdopts(artifact) };
+    const adopt = reconcileReadOptions(artifact);
     const state = await readReconcileState(engine, sourceId, slug, artifact.preconditions.assessment_at, adopt);
     assertPreimages(artifact, state);
     assertAutoDecisions(artifact.auto_decisions ?? [], state.file, reconcileCanonical(state.snapshot.page, state.snapshot.tags), artifact.decisions);
@@ -183,8 +222,8 @@ export async function runReconcileApply(engine: BrainEngine, params: Record<stri
     const row = await admitWrite(engine, { principal: authority.principal, operation: 'put_page', sourceId,
       sourceIncarnation: state.pins.source_incarnation, slug, pageId: state.pins.page_id, worktreeId: state.pins.worktree_id,
       topologyGeneration: state.binding.topology_generation, requestId, authority, callerIntent,
-      intent: { ...callerIntent, backup_reference: reference } });
-    return writeResponse(await waitForWrite(engine, row, await config(engine)));
+      intent: { ...callerIntent, ...input.intentExtra, backup_reference: reference } }, undefined, input.transaction);
+    return await settle(row, false);
   } catch (error) {
     const racedReplay = await replay();
     if (racedReplay) return racedReplay;
@@ -195,7 +234,7 @@ export async function runReconcileApply(engine: BrainEngine, params: Record<stri
 
 export async function runReconcileBackups(engine: BrainEngine, params: Record<string, unknown>): Promise<Record<string, unknown>> {
   strictReconcileKeys(params, ['source_id', 'slug', 'action', 'backup_reference', 'after', 'limit'], ['source_id', 'slug', 'action']);
-  const { slug, authority } = await authorize(engine, params.source_id, params.slug);
+  const { slug, authority } = await authorizeReconcile(engine, params.source_id, params.slug);
   if (!['list', 'remove'].includes(String(params.action)) || params.action === 'remove' &&
     (typeof params.backup_reference !== 'string' || params.after !== undefined || params.limit !== undefined) ||
     params.action === 'list' && params.backup_reference !== undefined || params.limit !== undefined &&

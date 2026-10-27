@@ -237,12 +237,28 @@ function contentPolicy400Reason(responseBody: string): string | undefined {
   return error?.message === 'Content Exists Risk' ? 'content_exists_risk' : undefined;
 }
 
+/**
+ * #6816: Claude Code reports a usage-policy refusal as an error envelope with no API status, which the claude-cli
+ * adapter surfaces as `claude-cli reported error: API Error: ...`. The wordings it has used all link the policy:
+ * "<model> can't help with this. Start a new session to continue. ... https://www.anthropic.com/legal/aup",
+ * "<model>'s safeguards flagged this message (https://www.anthropic.com/legal/aup)" and, before 2.1.219,
+ * "Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup)".
+ * Only that adapter error counts: the anchored prefix, no API status, the policy link and one of the refusal phrases.
+ */
+const CLAUDE_CLI_REFUSAL_RE = /^claude-cli reported error: API Error: (?=[\s\S]*https:\/\/www\.anthropic\.com\/legal\/aup)[\s\S]*(?:can['\u2019]t help with this|violate our Usage Policy|safeguards flagged this)/;
+
+function claudeCliRefusal(value: { name?: unknown; message?: unknown; apiErrorStatus?: unknown }): boolean {
+  return value.name === 'ClaudeCliProcessError' && value.apiErrorStatus === undefined
+    && typeof value.message === 'string' && CLAUDE_CLI_REFUSAL_RE.test(value.message);
+}
+
 /** A provider refusal tied to the prompt, even when the SDK wraps its response. */
 export function providerContentBlockReason(err: unknown): string | undefined {
   for (let depth = 0; depth < 8 && err != null; depth++) {
     try {
       if (typeof err !== 'object') break;
-      const value = err as { responseBody?: unknown; statusCode?: unknown; status?: unknown; cause?: unknown };
+      const value = err as { responseBody?: unknown; statusCode?: unknown; status?: unknown; cause?: unknown; name?: unknown; message?: unknown; apiErrorStatus?: unknown };
+      if (claudeCliRefusal(value)) return 'claude_cli_usage_policy';
       if (typeof value.responseBody === 'string' && (value.statusCode === 400 || value.status === 400)) {
         const reason = contentPolicy400Reason(value.responseBody);
         if (reason) return reason;
@@ -266,6 +282,26 @@ export function providerContentBlockReason(err: unknown): string | undefined {
     }
   }
   return undefined;
+}
+
+const CONTEXT_OVERFLOW_RE = /context[_ ]length|maximum context|prompt is too long|too many (?:input )?tokens|input (?:is )?too long/i;
+
+/**
+ * GBRA-130: a provider refusal of one request's own input, which fails the same
+ * way until that input changes: a content-policy block (`content_rejected`), or
+ * a 413 / a context-length 400 (`request_too_large`). A 400 without a
+ * context-length phrase can be a malformed request every call shares, so it
+ * stays unclassified.
+ */
+export function providerItemRefusal(err: unknown): 'content_rejected' | 'request_too_large' | null {
+  if (providerContentBlockReason(err)) return 'content_rejected';
+  const { status } = readProviderFailureSignals(err);
+  if (status === 413) return 'request_too_large';
+  if (status !== 400) return null;
+  for (const layer of wrappedErrorLayers(err)) {
+    if (typeof layer.message === 'string' && CONTEXT_OVERFLOW_RE.test(layer.message)) return 'request_too_large';
+  }
+  return null;
 }
 
 /** Whole-run LLM failure classes — see classifyGlobalLlmError. */
@@ -293,11 +329,11 @@ const PER_ITEM_HTTP_STATUSES = new Set([400, 408, 413, 422]);
 // EMBEDDING_QUOTA regex (which matches bare /billing/): a global-error hit
 // halts an entire cycle phase, so a stray word inside a raw-output slice
 // must not trip it. Only specific provider phrasings qualify.
-const BILLING_MESSAGE_RE =
+export const BILLING_MESSAGE_RE =
   /insufficient_quota|quota exceeded|exceeded your (?:current )?quota|credit balance is too low|spend limit|billing_not_active|billing hard limit|payment required/i;
 const AUTH_MESSAGE_RE =
-  /authentication_error|permission_error|invalid (?:x-)?api[-_ ]?key|api key (?:is )?(?:invalid|expired|missing)|unauthorized/i;
-const RATE_MESSAGE_RE = /rate[-_ ]?limit(?:ed|_error)?\b|too many requests/i;
+  /authentication_error|permission_error|invalid (?:x-)?api[-_ ]?key|api key (?:is )?(?:invalid|expired|missing)|unauthorized|failed to authenticate|oauth session expired/i;
+export const RATE_MESSAGE_RE = /rate[-_ ]?limit(?:ed|_error)?\b|too many requests/i;
 // Provider phrasings for an unknown or inaccessible model: OpenAI
 // `model_not_found` / "does not exist or you do not have access" (404),
 // Anthropic `not_found_error`, and the project-level access denial OpenAI
@@ -316,7 +352,7 @@ const STRUCTURED_JSON_STATUS_RE =
 const STRUCTURED_PROSE_STATUS_RE =
   /(?:\bHTTP[ /]|\bstatus(?:\s+code)?\s*[:= ]\s*)(401|402|403|429)\b/i;
 
-function numericStatusOf(e: unknown): number | undefined {
+export function numericStatusOf(e: unknown): number | undefined {
   const anyErr = e as Record<string, unknown> | null | undefined;
   for (const key of ['status', 'statusCode', 'apiErrorStatus', 'api_error_status']) {
     const v = anyErr?.[key];
@@ -332,7 +368,7 @@ function numericStatusOf(e: unknown): number | undefined {
  * only, and the walk stops after `limit` layers or at a layer already seen,
  * so a self-referencing chain cannot loop.
  */
-function* wrappedErrorLayers(err: unknown, limit = 5): Generator<Record<string, unknown>> {
+export function* wrappedErrorLayers(err: unknown, limit = 5): Generator<Record<string, unknown>> {
   const seen = new Set<object>();
   let layer = err;
   while (layer !== null && typeof layer === 'object' && seen.size < limit && !seen.has(layer)) {

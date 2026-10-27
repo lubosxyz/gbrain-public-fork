@@ -122,21 +122,23 @@ Retrieve saved facts and (with `query`) budget-packed page snippets.
 - `entity` scopes the FACTS arm; `query` runs the hybrid-search arm over
   pages; both present ⇒ both arms run.
 - `since`: ISO 8601 date/datetime — filters the FACTS arm only in v1. (The
-  reference implementation also accepts relative phrases like `"8 hours ago"`
-  as a convenience; only ISO 8601 is part of the frozen contract.) The window
+  reference implementation also accepts relative phrases like `"8 hours ago"`,
+  `"6 weeks ago"` and `"last month"` as a convenience; only ISO 8601 is part
+  of the frozen contract.) The window
   is measured on event time (`valid_from`, falling back to `created_at`) and
   composes with `entity` and `session_id` in the same query, before the
   per-arm limit. An unparseable value is rejected with `invalid_params`.
 - `limit` is a PER-ARM cap (facts and search results each).
 - `question`: optional string (at most 2,000 characters). The FACTS arm then
-  returns active facts ranked by relevance to the question instead of newest
+  returns active facts (every fact, expired and superseded included, with
+  `include_expired: true`) ranked by relevance to the question instead of newest
   first: cosine to the question's embedding plus whole-word term share, plus
   0.1 when the fact carries a writer-supplied date. Facts below the admission
   rule are not returned, so an empty `facts[]` is a valid answer. `entity`,
   `session_id`, `since` and `grep` filter before ranking. `question` does not
-  search pages; `query` does, and both may be passed. `supersessions: true` or
-  `include_expired: true` with `question` is `invalid_params` (ranking covers
-  active facts only); the error's `fix.mcp` is the call without them. One query
+  search pages; `query` does, and both may be passed. `supersessions: true`
+  with `question` is `invalid_params` (the supersession log is not ranked); the
+  error's `fix.mcp` is the call without it. One query
   embedding per call, no model call. Without an embedding provider, with
   embeddings turned off, or when the embed fails, facts rank by term share and
   `facts_degraded.reason` says why. A server without question ranking ignores
@@ -186,6 +188,7 @@ Response — an additive SUPERSET of the plain facts envelope on EVERY call
 | `facts_order` | string | `relevance` (question passed) or `newest` |
 | `facts[].relevance` | number? | question calls only: the ranking score (about 0 to 2.1); not a probability and not comparable across calls |
 | `facts_degraded` | object? | question calls only: `reason` (`keyword_only_no_embedding_provider`, `keyword_only_embedding_disabled`, `embed_timeout`, `embed_unavailable`, `no_query_terms`, `facts_embedding_column_missing`) and `unembedded` (facts in scope without a comparable embedding; the `facts_unembedded` notice carries the `gbrain embed --stale --facts` preview) |
+| `facts_calibration` | object? | question calls only, informational (additive since #6590): present when semantic matching ranked the facts on an embedding model whose fact admission floors were never measured; `status` (`unmeasured`) and `model_key` (`provider:model@dims`, the key doctor `fact_admission_floors` reports). A short or empty `facts[]` is then weaker evidence of "nothing matched". It never replaces `facts_degraded`; one `facts_calibration_unmeasured` notice (kind `info`) per brain per session explains it |
 | `budget_tokens` / `budget_used` / `dropped_count` | int? | present for a positive finite numeric budget, including when its floor is zero |
 | `budget_packing` | object? | present only when a valid `budget_policy` is supplied; effective policy and per-arm accounting |
 
@@ -283,7 +286,13 @@ Save ONE fact with mandatory attribution.
   (default).
 - `visibility`: `world` (DEFAULT — readable by every agent connected to this
   brain; required for the remote remember→recall round-trip) \| `private`
-  (local CLI reads only). The init quickstart carries the consent line.
+  (local CLI reads only; session hooks push world facts only, so a private
+  fact never reaches a new agent session, and a local private save carries the
+  `private_fact_not_pushed` notice saying so). The init quickstart carries the
+  consent line. An omitted `visibility` saves `private` when the target page is
+  private (by `visibility` or a privacy alias such as `access: private`) or the
+  operator set `facts.default_visibility` to private; a save never lands wider
+  than the page it is written into.
 
 Response: `{ id, status, status_text, entity_slug, valid_until,
 protocol_version }` (+ `degraded_dedup: true` when no embedding provider —
@@ -322,13 +331,16 @@ suggestion are unchanged.
 old fact is no longer current (the texts need not mean the same). Zero model calls; the cosine rule does
 not apply. The target must be an active fact in the same source, with the same
 visibility (world only for remote callers, else `not_found`) and the same
-entity, on the same entity page. A target saved without an entity may be
+entity, on the same entity page. A local call that leaves `visibility` unset
+takes a private target's visibility, so the replacement stays private. A target saved without an entity may be
 replaced by a fact with an entity: that links it (the unlinked fact is
 superseded, not forgotten, so the claim stays rememberable). Refusals come back as `invalid_params` with a
 code prefix and a `suggestion`: `target_withdrawn` (forgotten facts are not
 replaceable; remember without `replaces`), `target_superseded` (names the fact
 that replaced it), `target_expired`, `replaces_entity_mismatch`,
-`replaces_cross_page` (forget the old fact, then remember), and
+`replaces_cross_page` (forget the old fact, then remember),
+`replaces_visibility_mismatch` (an explicit `visibility` that differs from the
+target's; pass the target's visibility), and
 `replaces_duplicate` (another active fact already states the new claim). New
 text equal to the target is `status: duplicate` and changes nothing. On success
 `status` is `superseded`, `superseded_fact_id` names the replaced fact and
@@ -374,9 +386,8 @@ Optional response fields; clients must ignore any they do not know.
 `items` (1 to 20) replaces `fact` for a batch, typically right before
 context compaction. Each item is a fact string or an object with `fact` plus
 optional `entity`, `kind`, `ttl`, `visibility`, `provenance`,
-`infer_entity` and `replaces`; top-level `provenance`,
-`kind`, `ttl`, `visibility` and `infer_entity` are the defaults, so top-level
-`provenance` is optional when every item carries its own. `replaces` names one
+`content_origin`, `valid_from`, `infer_entity` and `replaces`; each but
+`replaces` is also a top-level default for items that omit it, so top-level `provenance` is optional when every item carries its own. `replaces` names one
 fact, so it goes on its item; passing both `fact` and `items`, or a top-level
 `replaces` with `items`, is `invalid_params`.
 
@@ -430,13 +441,75 @@ row is `{ name, found: true, slug, title, type, aka[], lead, siblings? }` or
 `{ name, found: false, suggestions? }` (up to 3 `{slug, title}`). `lead` is the
 page's opening prose, up to 200 characters (headings, table rows, private
 fences and secrets removed); `siblings` lists the identity siblings with their
-own `slug`, `title`, `type`, `aka` and `lead`. Rows carry no references, facts
-or open threads: call `entity` with `name` for the full card.
+own `slug`, `title`, `type`, `aka` and `lead`. Rows carry no facts or open
+threads: call `entity` with `name` for the full card.
+
+#### entity names reference fields and records (additive)
+
+Every found row and each of its `siblings` carries `referenced_by_count` (the
+full card's count, every link source) and a row-level `next`, `{ tool: "entity",
+arguments: { name: <slug> } }`, the call that returns that page's full card,
+under `entity.names_references` (default on; `false` drops both). When
+`entity.record_types` names page types (empty by default, so records are off),
+each found row and sibling also carries `records[]` (below). The found page and
+each sibling get their own count and records, side by side, never merged. When
+a row carries either field, the source's `mention_index` coverage notice rides
+the response as on the full card.
+
+#### entity records: record types enrolled by config (additive)
+
+`entity.record_types` is a comma-separated list of canonical page types that
+count as records (a stored alias is read as its pack type). When it names
+types, `entity` names rows and siblings, the full card (`card.records`, and
+`records` on each `identity_siblings.pages[]` entry) and `context_pack` cards
+list the referring pages of those types:
+
+- `records[]`: one group per type with at least one record, `{ canonical_type,
+  total, rows[], capped?, next? }`, groups ordered by their newest row. An
+  enrolled entity with no records has `records: []`.
+- A row is exactly `{ slug, title, date, date_source, page_status?, amends?,
+  supersedes? }`. `date` is the page's own date (`COALESCE(effective_date,
+  updated_at)`, `date_source` says which), not when its terms take effect.
+  `page_status` is the page's own frontmatter `status` when it is a string of
+  at most 40 characters (search rows carry the same value as raw `status`; link
+  rows' temporal relationship `status` is a different field). `amends[]` is
+  `{ slug, since? }` per page this one amends through an `amends` link, `since`
+  only when the link records a terms-start date (frontmatter `amends: [{ name,
+  since }]`); `supersedes[]` is `{ slug }` per page this one replaces as a
+  whole. Each list holds at most 5 entries; absent fields mean nothing is
+  recorded.
+- Rows are newest page date first. The order never says which record governs:
+  compare `amends[].since` and the documents themselves with the date asked
+  about. No validity status is computed.
+- Bounded: 5 rows per page (all of them when it has 5 or fewer), 24 per call,
+  allotted in input order, a page repeated in the call counted once. A group
+  with `rows.length < total` carries `capped` (`per_page`, or `per_call` when
+  earlier entities took the call's rows, including a group with no rows) and
+  `next`, `{ tool: "get_backlinks", arguments: { slug, source_id, type, group:
+  "page", limit, cursor? } }`, which returns exactly the remaining records of
+  that type (with the same `page_status` / `amends` / `supersedes` fields);
+  on a verbs-only connection it carries `requires_surface: "starter"`.
+- Records use the referrer read's visibility: an untrusted caller never sees a
+  private, derived-private or quarantined referrer, a link whose origin page is
+  private, an `amends` target it cannot read, or a `since` whose only evidence
+  is private.
+- Unavailable is not empty: when the count or records read fails or misses its
+  2-second deadline, the row carries `references_unavailable: "deadline" |
+  "read_failed"` instead of the fields, and one `[gbrain notice
+  references_unavailable]` (degraded) block rides the response. The full
+  card's `referenced_by` follows the same rule. An enrolled type that neither
+  the schema pack declares nor any page uses adds a `record_types_undeclared`
+  info notice.
+
+Check which pages count as records without calling an agent: `gbrain config
+get entity.record_types`, then `get_backlinks {slug, type: <record type>,
+group: "page"}` or `list_pages {type: <record type>}`.
 
 #### entity references and coverage (additive)
 
 The `entity` verb adds three optional card fields (ambient callers,
-`context_pack` and `delta`, do not compute them):
+`context_pack` and `delta`, do not compute them; `context_pack` adds only the
+record view, below):
 
 - `referenced_by_count` — distinct pages with any inbound link to the entity,
   every link source included (`backlink_count` keeps excluding mentions).
@@ -469,6 +542,32 @@ verbatim name-like lines from the remote-sanitized body, 600 characters per
 page and 1,200 per card, `identity_excerpt_omitted[]`); `alias_guidance`
 (`{ text, requires_surface? }`). `recent_facts[]` (`{ id, fact, kind, valid_from, entity_slug? }`, the 5 newest active saved facts, also those saved under an identity sibling or the bare subject slug, which carry that `entity_slug`); `active_fact_count` and `recall {entity}` cover the same slugs.
 
+#### entity source resolution and `source_id` (additive)
+
+Without `source_id`, `name` and each of `names` resolve across every source
+the caller can read: the home source first (the connection's source, or the
+ambient GBRAIN_SOURCE / .gbrain-source binding), then the other readable
+sources sorted by id, so one brain always resolves a name the same way. The
+first source with a hit owns the card, and every read behind it (aliases,
+facts, edges, references, identity) uses that source; sources outside the
+caller's grant are never read and look like a miss. A remote `__all__` names
+no source and still resolves nothing.
+
+`source_id` (one readable source) pins the lookup. A pin outside the grant,
+for a removed source or with a malformed id is refused with recall's selector
+errors: `scope_denied`, `not_found`, `invalid_params`. `prefer_source_id`
+reorders the walk without narrowing it (thin clients send their
+.gbrain-source there). When the ambient binding's source has no match, a
+`source_binding_narrowed` notice names where each name resolved.
+The starter MCP tool list does not advertise `source_id`, `prefer_source_id`
+or `context_pack`'s `entity_refs` (it keeps the list inside its size budget);
+the full surface does, and every surface accepts them.
+
+Every card carries `card.entity.source_id`, every `names` row `source_id`,
+and each suggestion its `source_id`: `(source_id, slug)` is the entity's
+identity, and two pages sharing a slug in two sources are two entities. A
+row's `next` names `source_id` when the page is outside the home source.
+
 #### entity open_threads loop backing (additive)
 
 On brains running the open-loop engine, `open_threads` entries may
@@ -489,7 +588,10 @@ pending-decision loops — the ADDITIVE-FOREVER optional fields disambiguate:
 
 All five are absent on threads not backed by a loop row and on servers that
 do not implement them; a server that omits them still certifies. Same propagation to the
-per-entity cards and top-level `open_threads` of `context_pack`.
+per-entity cards and top-level `open_threads` of `context_pack`. Loop rows carry
+no visibility or source grant of their own, so only the trusted local caller's
+cards derive threads from them (`entity`, and `context_pack` / `delta` with
+`include_private`); a remote caller's card has no loop-backed entries.
 - `edges`: top ~10 typed edges, mentions excluded, out-edges first, live relationships first. Additive fields: `status` (`live`, `ended`, `ended_unknown_date`, `event`, …), `since` / `until` (latest stint). `relationship_note` (additive) summarizes current and ended relationships and flags a summary that still names an ended one ([temporal edges](../guides/temporal-edges.md)).
 - The p99 < 100ms promise is op-layer latency (transport excluded), CI-gated
   on a 20K-page corpus. 200K validation recipe below.
@@ -760,6 +862,9 @@ semantics: removing a materialized timeline bullet removes its timeline row.
 
 Success returns the committed receipt with the new `revision` and `diff`, a
 unified diff of your view capped at 8 KB (`diff_truncated: true` when cut).
+On a large page only the changed region is diffed; when that region is over
+4 million old-by-new line pairs the diff is one hunk replacing it whole and
+the receipt says `diff_coarse: true`.
 Refusals name the edit and never include protected text:
 
 | Error | `detail` | Fix |
@@ -785,7 +890,7 @@ Refusals name the edit and never include protected text:
 
 From the CLI: `gbrain call edit_page '{"slug":"projects/example","expected_revision":"…","edits":[{"old_text":"…","new_text":"…"}]}'`.
 
-### context_pack(entities, budget_tokens?, since?, session_id?, include_private?) — read, zero LLM
+### context_pack(entities, budget_tokens?, since?, session_id?, include_private?, counterparty?, intent?) — read, zero LLM
 
 One deterministic, budget-packed bundle for a set of standing
 entities — entity cards + open threads + hot facts. Built for **session
@@ -802,14 +907,84 @@ synced to a cloud model). `include_private` widens ALL arms in
 lockstep, and is honored ONLY for trusted-local callers (`remote === false`); a
 remote caller never widens (fail-closed).
 
-Response: `{ protocol_version, entities, cards[], open_threads[], facts[], text,
-degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core?, pinned_questions?, withheld? }`. `text` is the
+Response: `{ protocol_version, entities, cards[], open_threads[], facts[], entity_facts[], text,
+degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core?, pinned_questions?, withheld?, brief? }`. `text` is the
 envelope-wrapped injectable block, rendered from the packed sets within `budget_tokens`.
 
-`entities` scopes cards and threads, not the hot facts (the session's recent
+`entities` scopes cards, threads and `entity_facts`, not the hot facts (the session's recent
 memory), so other facts can appear; `recall` with `entity` reads one entity
 strictly. `facts[]` here and in `delta` carry `fact_id` (what `forget` takes)
 and `provenance` (the stored source), never rendered into `text`.
+
+#### context_pack sources: `source_id`, `entity_refs` (additive)
+
+`entities` resolve like `entity` names: across the caller's readable sources,
+home first then by id, unless `source_id` pins one (same selector errors;
+`prefer_source_id` reorders only). `entity_refs`
+(`[{"source_id": "wiki", "slug": "people/alice-example"}]`, inside the same cap
+of 8 after `entities`) packs source-qualified entities, each read only in its
+own source and checked like a pin. Every card carries `source_id`; a card
+from outside the home source renders as `slug` (source <id>) in `text`, and
+its newer-mention continuation names the source. Each card's activation
+verdict, newer mentions, records and `page_status` come from its own source,
+never from a same-slug page in another source, and cards are deduplicated by
+`(source_id, slug)`. `pinned_questions` carries a published pin only when its
+source and `scope_entity` match an accepted card's `(source_id, slug)`.
+
+#### context_pack entity_facts (additive)
+
+`entity_facts[]` holds the packed entities' own facts: up to 5 per card, newest
+first, read in the card's own source with the card's visibility (world-only
+unless a trusted-local caller passed `include_private`) and eligibility. Each
+row is `{ source_id, slug, fact_id, fact, kind, entity_slug, valid_from?,
+context, confidence, attributed_to, provenance, trust_tier?, origin? }`, where
+`(source_id, slug)` names the card. `facts[]` is unchanged hot memory, so a
+fact can appear in both arrays. `text` renders entity facts under `## Entity
+facts (about the standing entities)` before hot memory, and a fact in both
+renders once, there. Under `budget_tokens` entity facts pack after cards and
+before hot facts, leave with a dropped card (counted in `dropped_count`), and
+a hot fact already shown as an entity fact costs nothing.
+
+#### context_pack records (additive)
+
+When `entity.record_types` names page types, each card of the `context_pack`
+pull verb (never the ambient push hook, which stays unchanged) carries
+`referenced_by_count`, `records[]` (the entity records view, same row shape,
+caps, continuations and visibility) and `sibling_records[]` (`{ slug, title,
+referenced_by_count, records[] }` per identity sibling, side by side), or
+`references_unavailable` with its degraded notice. `text` renders them last,
+after newer mentions, under `## Records that reference these entities (page
+date = when the page was written, newest first; …)`, one line per record:
+`- <entity>: <type> <slug> "<title>" — page date <YYYY-MM-DD> (<date_source>);
+status: <page_status>; amends <slug> (terms start <since>); supersedes <slug>`.
+Under `budget_tokens` records pack into what cards, facts and newer mentions
+left; a card whose records do not fit keeps its count. With nothing enrolled,
+cards carry none of these fields, so `context_pack` still computes no
+references by default. `backlink_count` keeps excluding mentions;
+`referenced_by_count` counts every link source.
+
+#### page_status on context_pack and get_backlinks rows (additive)
+
+Under `entity.row_page_status` (default `true`), each `context_pack` card
+carries `page_status` for its own page, and each `newer_mentions.rows[]` entry
+for the referring page; `get_backlinks` adds it to every link row (the
+referring page's status) and every `group: "page"` row. Absent when the page
+has no status. A private page (for an untrusted caller) or a quarantined page
+(unless the caller may read quarantined pages) shows none. `text` is unchanged:
+the field rides the structured rows only. `false` removes it from these rows;
+record rows (`records[]`, and a record type's `get_backlinks` continuation)
+keep their `page_status` either way.
+
+`page_status` is the page's own frontmatter `status`, copied only when it is set
+to a string: trimmed, at most 40 characters (longer or non-string values are not
+shown). It is never inferred from a title, subject or text, and it does not make
+a page lesser evidence. The documented convention for a record that is not in
+force yet is `status: draft` or `status: unsigned`; any other string is passed
+through as written. Search rows carry the same frontmatter value as raw
+`status` (`frontmatter->>'status'`, unbounded and untrimmed), so a search row's
+`status` and a pack or backlink row's `page_status` agree whenever the value is
+a string of 40 characters or fewer. A link row's `status` is the relationship's
+temporal state, a different field, and the `status` input filter is unchanged.
 
 #### context_pack core memory (additive)
 
@@ -819,7 +994,33 @@ always-loaded core block (owner-designated pages loaded in every session,
 `text` starts with the core block, and core tokens count inside
 `budget_tokens`. `entities` may be omitted to fetch core alone.
 
-### delta(since?, since_slug?, cursor?, entities?, budget_tokens?, session_id?, include_private?) — read, zero LLM
+#### context_pack brief: `counterparty`, `intent` (additive)
+
+`counterparty` (a person or company name, or an exact page slug) asks for a
+pulled brief of at most three dated items about them; `intent` (`meeting` |
+`reply`, optional) labels the task. Without `counterparty` the response is
+unchanged. The brief is pull, not push, and says so: `text` gains a
+`## Before you start (pulled on request)` block after the core block, counted
+inside `budget_tokens`, and the response gains
+`brief: { delivery: "pull", intent, counterparty: { slug, display } | null,
+items: [{ id, kind, date, due?, slug, source_id, text, counterparty,
+confidence }], withheld_arms?, reason? }`.
+
+A name resolves only on the alias or title arm at ≥ 0.8, to a person or company
+page, never through a common word. An unresolved name returns
+`reason: "counterparty_unresolved"` and no items; an invalid `intent` is
+`invalid_params`. Items are open loops (`L<id>`, trusted-local callers only;
+remote callers get `withheld_arms: ["loops"]`), the newest dated fact
+(`F<id>`), and the counterparty page's newest dated edit (`kind: "edit"`: the
+lines a revision added, `Ev<page version id>`, or a timeline entry,
+`Et<timeline entry id>`), dropped when it repeats a fact or loop of the same
+brief. Visibility follows the `include_private` rule above, with
+private-provenance facts excluded unless widened; an edit's page (and a
+timeline entry's event page) follows the same page rule, and facts and takes
+fence rows never count as an edit. The same assembler serves
+the off-by-default hook push ([push context](../guides/push-context.md)).
+
+### delta(since?, since_slug?, cursor?, entities?, budget_tokens?, session_id?, include_private?, beliefs?) — read, zero LLM
 
 "What changed since T" for heartbeats — pages updated after
 the cursor (oldest first) + facts recorded after the cursor + open-thread
@@ -890,6 +1091,32 @@ are still returned and `budget_used` (the token estimate of `text`) reports the
 real rendered size, which then exceeds the budget. `since` is always
 normalized ISO (never the raw input string). Replay recipe:
 [ambient recall guide](../guides/ambient-recall.md#replay-after-a-degraded-wake).
+
+**Belief changes (`beliefs: true`, full surface only).** Adds `beliefs`: each
+belief that ended the window different from how it started, read from the
+belief ledger for the same window as the wake (`since` to the wake's horizon).
+`{ source_id, since, until, coverage_from, changes[], truncated, not_recorded? }`;
+each change is `{ kind, slug, change, subject, before, after, before_known,
+upper_bound?, cause, evidence: { event_id, recorded_at, slug, row? }, trust_tier }`.
+An edit and its revert in the window report nothing. `before_known: false`
+means the earlier value is unknown (no body answers at `since`), never that
+it was empty; `upper_bound: true` marks a relationship end the nightly check
+inferred, so it ended on or before that date. `coverage_from` is set when the
+ledger starts after `since` (earlier changes are unknown, not absent), and
+`not_recorded` when the source has no ledger coverage. `entities` narrows the
+list to changes on or about the named slugs. A caller without
+`include_private` (every remote caller) gets the world view: events that were
+world-visible when recorded, on pages visible now, and takes of the holders
+the caller may read (the takes surfaces' allow-list, `world` by default).
+Under `budget_tokens` the belief lines pack into what pages, facts and threads
+leave, and `truncated` reports a cut; `text` gains a
+`## Belief changes since <since>` section. The diff is a read of the window,
+not a cursor arm: it does not set `has_more` or hold a `session_id` cursor,
+so lines a cut dropped are not delivered on the next wake; read them with an
+explicit `since` (or `gbrain beliefs changes`). `min_trust` does not filter
+it; each change carries its `trust_tier`. The
+CLI twin is `gbrain beliefs changes [<entity>...] [--since 7d]`. Design:
+[BELIEF_LEDGER.md section 15](../designs/BELIEF_LEDGER.md#15-w4-as-built-the-weekly-change-diff).
 
 ## Latency classes (per verb)
 

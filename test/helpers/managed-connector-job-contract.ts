@@ -148,6 +148,7 @@ export const HANDLER_COVERAGE: Record<string, { covered: ContractCase } | { exem
   'lint': { exempt: 'filesystem lint for checkout sources' },
   'lint-fix': { exempt: 'filesystem lint fix for checkout sources' },
   'orphans': { exempt: 'read-only orphan report' },
+  'doctor-refresh': { exempt: 'read-only doctor checks; records last known results in op_checkpoints (#7142)' },
   'patterns': { exempt: 'dream patterns phase over synthesis output, not connector pages' },
   'purge': { exempt: 'operator purge of deleted pages; covered by purge tests' },
   'recompute_emotional_weight': { exempt: 'writes pages.emotional_weight, a physical projection column outside the guard' },
@@ -946,7 +947,7 @@ const cases: Record<ContractCase, (state: CaseState) => Promise<void>> = {
     let exit: number | string | undefined;
     try {
       await runExtract(engine, ['timeline', '--source', 'db', '--source-id', state.sourceId]);
-    } finally { exit = process.exitCode; process.exitCode = exitBefore; }
+    } finally { exit = process.exitCode; process.exitCode = exitBefore ?? 0; }
     const findings = await detectorFindings(state);
     if (findings.length) throw new Error(`${findings.join('; ')} (exit ${String(exit ?? 0)}, timeline rows ${await count()})`);
     expect(await count()).toBe(1);

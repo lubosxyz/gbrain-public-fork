@@ -30,12 +30,13 @@
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { managedFilesystemRootFor } from '../persistence/filesystem-guard.ts';
 import { submitPageMutation } from '../persistence/page-mutations.ts';
+import { unpurgePage } from '../persistence/page-purge.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
 import { pendingReceiptOf, pollCommand, resolveCliWriteWaitMs, WRITE_WAIT_ENV } from '../persistence/write-wait.ts';
 import { maintenanceAttribution } from '../persistence/attribution.ts';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../spawn.ts';
 import { join, resolve } from 'node:path';
 
 import type { BrainEngine } from '../engine.ts';
@@ -207,6 +208,11 @@ async function sweepProbeLeftovers(engine: BrainEngine, ws: string, sourceId: st
  * engine primitives. A managed brain (#5280) purges each probe through the
  * coordinator (`delete_page --purge`, bound to its revision, which also removes
  * its canonical file) and removes the probe facts in a coordinated transaction.
+ * #6634: the probe bodies are constant, so a purge tombstone would refuse the
+ * next run's put_page as `purged_content`; each probe's tombstones (page, and
+ * the fact/take purges of the same request) are cleared through the host-only
+ * unpurge path after its purge, and on every sweep, which also clears leftovers
+ * of earlier runs. Probe pages are not user content.
  */
 async function removeProbes(engine: BrainEngine, ws: string, sourceId: string): Promise<string[]> {
   const warnings: string[] = [];
@@ -222,6 +228,11 @@ async function removeProbes(engine: BrainEngine, ws: string, sourceId: string): 
       }
     } catch (e) {
       warnings.push(`${slug}: ${(e as Error).message}`);
+    }
+    try {
+      await unpurgePage(localCtx(engine, sourceId), { slug, source_id: sourceId });
+    } catch {
+      /* page_purges may not exist on a pre-migration brain — doctor_green names that */
     }
     if (managed) continue;
     try {
@@ -278,12 +289,12 @@ function checkTokenSweep(ws: string): VerifyCheck {
       return { id, ok: true, warn: true, detail: 'template clone (initialized:false) — placeholder tokens are expected; render before verifying for real' };
     }
     const offenders: string[] = [];
-    for (const t of BOOTSTRAP_TEMPLATES) {
-      const p = join(ws, t.dest);
+    for (const dest of BOOTSTRAP_TEMPLATES.flatMap((t) => (t.openclawDest ? [t.dest, t.openclawDest] : [t.dest]))) {
+      const p = join(ws, dest);
       if (!existsSync(p)) continue;
       const raw = readFileSync(p, 'utf8');
       const tokens = [...raw.matchAll(TOKEN_RE)].map((m) => m[1]);
-      if (tokens.length > 0) offenders.push(`${t.dest} (${[...new Set(tokens)].join(', ')})`);
+      if (tokens.length > 0) offenders.push(`${dest} (${[...new Set(tokens)].join(', ')})`);
     }
     if (offenders.length > 0) {
       return { id, ok: false, detail: `unresolved {{TOKEN}}s in rendered files: ${offenders.join('; ')} — finish the interview and re-run render` };
@@ -351,8 +362,8 @@ function trackedWorkspaceFiles(ws: string): { files: string[]; via: 'git' | 'fal
     /* not a repo — fallback below */
   }
   const files: string[] = [];
-  for (const t of BOOTSTRAP_TEMPLATES) {
-    if (existsSync(join(ws, t.dest))) files.push(t.dest);
+  for (const dest of BOOTSTRAP_TEMPLATES.flatMap((t) => (t.openclawDest ? [t.dest, t.openclawDest] : [t.dest]))) {
+    if (existsSync(join(ws, dest))) files.push(dest);
   }
   if (existsSync(join(ws, 'state', 'interview.json'))) files.push(join('state', 'interview.json'));
   return { files, via: 'fallback' };
@@ -847,13 +858,16 @@ async function runRoundtrip(
     }
 
     // 2. Sweep — the `gbrain sweep --once` equivalent, run in-process because
-    // verify's caller holds the engine [CX2-5].
+    // verify's caller holds the engine [CX2-5]. #6786: passes 1 and 2 only.
+    // The probes never need the corpus pass, and verify's engine runs without
+    // the gateway extraction would use: every pending transcript came back
+    // chat_unavailable and was marked ingested with zero facts.
     const caps = opts.capabilities ?? detectCapabilities();
     try {
       const report = await runMaintenanceSweep(engine, {
         sourceId,
         budgetMs: opts.sweepBudgetMs ?? 20_000,
-        capabilities: caps,
+        corpus: false,
         log: opts.log,
       });
       opts.log?.(`[verify] sweep: facts=${report.factsReconciled} links=${report.linksExtracted} timeline=${report.timelineExtracted}`);

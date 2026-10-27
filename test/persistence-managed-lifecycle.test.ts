@@ -151,7 +151,7 @@ test('a file that replaces its vanished origin at the same slug takes over the p
 
 test('two new files whose paths differ only by case are refused rather than guessed', async () => withEnv({ GBRAIN_HOME: home }, async () => {
   for (const engine of engines) {
-    const f = await fixture(engine, { 'notes/Case.md': note('Upper', 'Upper case spelling.') });
+    const f = await fixture(engine, { 'notes/Case.md': note('Upper', 'Upper case spelling.'), 'notes/other.md': note('Other', 'An unrelated note.') });
     // Git trees can contain both spellings even when the checkout filesystem
     // cannot. Stage the second blob directly so the fixture never overwrites
     // its first file on case-insensitive hosts.
@@ -159,11 +159,14 @@ test('two new files whose paths differ only by case are refused rather than gues
     const blob = execFileSync('git', ['-C', f.root, 'hash-object', '-w', '--stdin'], { input: lower, encoding: 'utf8' }).trim();
     git(f.root, 'update-index', '--add', '--cacheinfo', `100644,${blob},notes/case.md`);
     git(f.root, '-c', 'user.name=Example', '-c', 'user.email=example@example.invalid', 'commit', '-qm', 'case collision');
-    expect(git(f.root, 'ls-tree', '-r', '--name-only', 'HEAD', 'notes')).toBe('notes/Case.md\nnotes/case.md');
-    expect(git(f.root, 'show', 'HEAD:notes/Case.md')).toContain('Upper case spelling.');
-    expect(git(f.root, 'show', 'HEAD:notes/case.md')).toContain('Lower case spelling.');
-    await expect(performManagedSync(engine, { sourceId: f.id, noPull: true })).rejects.toMatchObject({ code: 'page_identity_changed' });
+    expect(git(f.root, 'ls-tree', '-r', '--name-only', 'HEAD', 'notes')).toBe('notes/Case.md\nnotes/case.md\nnotes/other.md');
+    // GBRA-130 B-3 (was: the sync refused page_identity_changed): each spelling is held alone, nothing is imported at either
+    // spelling or their slug, and the rest of the source imports.
+    const result = await performManagedSync(engine, { sourceId: f.id, noPull: true });
+    expect(result.held?.map(hold => [hold.path, hold.code, hold.reason]).sort()).toEqual([['notes/Case.md', 'page_identity_changed', 'spelling'], ['notes/case.md', 'page_identity_changed', 'spelling']]);
     expect(await engine.getPage('notes/case', { sourceId: f.id })).toBeNull();
+    expect(await engine.getPage('notes/other', { sourceId: f.id })).not.toBeNull();
+    expect(await engine.executeRaw("SELECT 1 FROM persistence_requests WHERE source_id=$1 AND intent->>'path' IN ('notes/Case.md','notes/case.md')", [f.id])).toEqual([]);
   }
 }), 180_000);
 

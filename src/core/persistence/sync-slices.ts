@@ -29,20 +29,15 @@ export function syncCursorOptions(opts: SyncOpts): SyncCursorOptions {
 }
 const sliceFingerprint = (sourceId: string, incarnation: string, options: SyncCursorOptions) => `${sourceId}:${incarnation}:${digest(options)}`;
 
-export async function readSyncSlice(engine: Exec, sourceId: string, incarnation: string, options: SyncCursorOptions): Promise<SyncSliceCursor | null> {
-  const [row] = await engine.executeRaw<{ record: SyncSliceCursor }>('SELECT completed_keys->0 AS record FROM op_checkpoints WHERE op=$1 AND fingerprint=$2',
-    [SYNC_SLICE_OP, sliceFingerprint(sourceId, incarnation, options)]);
-  const record = row?.record;
-  if (!record || (record.phase !== 'import' && record.phase !== 'delete') || typeof record.target !== 'string' || typeof record.head !== 'string') return null;
-  return { phase: record.phase, after: typeof record.after === 'string' ? record.after : null, head: record.head, target: record.target };
-}
 export async function writeSyncSlice(tx: Exec, sourceId: string, incarnation: string, options: SyncCursorOptions, slice: SyncSliceCursor): Promise<void> {
   await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb)
     ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()`,
   [SYNC_SLICE_OP, sliceFingerprint(sourceId, incarnation, options), JSON.stringify([{ ...slice, recorded_at: new Date().toISOString() }])]);
 }
-export async function clearSyncSlice(tx: Exec, sourceId: string, incarnation: string, options: SyncCursorOptions): Promise<void> {
-  await tx.executeRaw('DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2', [SYNC_SLICE_OP, sliceFingerprint(sourceId, incarnation, options)]);
+/** `target` (#6834) clears the record only while it still names that target. */
+export async function clearSyncSlice(tx: Exec, sourceId: string, incarnation: string, options: SyncCursorOptions, target?: string): Promise<void> {
+  await tx.executeRaw("DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 AND ($3::text IS NULL OR completed_keys->0->>'target'=$3)",
+    [SYNC_SLICE_OP, sliceFingerprint(sourceId, incarnation, options), target ?? null]);
 }
 
 /** Code-unit order: the cursor's `after` must compare the same way on every host, which `localeCompare` does not promise. */

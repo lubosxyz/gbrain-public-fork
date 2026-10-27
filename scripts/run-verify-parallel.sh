@@ -18,6 +18,8 @@
 #
 # Env overrides:
 #   GBRAIN_VERIFY_TIMEOUT       per-check wallclock cap, seconds (default 120)
+#   GBRAIN_VERIFY_SKIP_TYPECHECK=1  leave typecheck out: test.yml's typecheck job
+#                               runs tsc in parallel under its own measured timeout
 #   GBRAIN_VERIFY_LOG_DIR       where to write per-check logs (default tempdir,
 #                               removed on success and kept on failure)
 #   GBRAIN_TEST_RECEIPT_DIR     also write the verify receipt (X2): one JUnit
@@ -141,9 +143,11 @@ CHECKS=(
   "check:fixture-privacy"
   "check:source-scope-onboard"
   "check:getpage-scope"
+  "check:origin-assignment"
   "check:no-double-retry"
   "check:batch-audit-site"
   "check:engine-dynamic-import"
+  "check:file-url-pathname"
   "check:grok-pin"
   "check:opencode-pin"
   "check:pin-doc-privacy"
@@ -162,6 +166,9 @@ CHECKS=(
   # W5 (refactor wave 1): per-function line ratchet over src/**/*.ts (TS AST,
   # ~1.5s); baseline scripts/function-size-baseline.tsv.
   "check:function-size"
+  # GBRA-130: per-item catches that test an error code against a list and
+  # rethrow the rest only shrink; baseline scripts/item-allowlist-catches-baseline.tsv.
+  "check:item-allowlist-catches"
   # EO10 (refactor wave 1): engine-sql/ and schema-migrations/ never import
   # back up into the engine façades or migrate.ts (ESM TDZ cycles).
   "check:layering"
@@ -171,12 +178,24 @@ CHECKS=(
   # #5595/#5475: no fsync of a read-only descriptor outside src/core/fs-durable.ts
   # (Windows refuses it with EPERM).
   "check:durable-flush"
+  # Wave 18b: a missing column/table reads as "pre-migration" only when the
+  # handler names it (isMissingSchemaObject); broad predicates are allowlisted.
+  "check:schema-error-predicates"
   # #4992: subprocess launches go through src/core/spawn.ts (windowsHide
   # default); NOT_YET_MIGRATED is a ratchet that only shrinks.
   "check:windows-hide"
   # Goal (a) (refactor wave 1): engine SQL only shrinks; baseline
   # scripts/engine-sql-baseline.tsv.
   "check:engine-sql-ratchet"
+  # GBRA-161: derived-retire writers only shrink; reviewed ceilings in
+  # docs/architecture/derived-census.tsv.
+  "check:derived-census"
+  # Wave B segmented storage (spec 1.5 layer 4): whole-body page readers only
+  # shrink; baseline scripts/page-body-readers-baseline.tsv.
+  "check:page-body-readers"
+  # Wave B large pages: every content_chunks reader applies the chunk-visibility
+  # predicate or carries a reason; baseline scripts/chunk-visibility-baseline.tsv only shrinks.
+  "check:chunk-visibility"
   # CQ3 / EO17 (refactor wave 1): engine-sql splices only constant text, no
   # composed $n, no expanded IN lists.
   "check:engine-sql-dynamic"
@@ -191,13 +210,24 @@ CHECKS=(
   # W7 (refactor wave 1): workflow phrases the wave retired stay out of the
   # docs agents follow (CLAUDE.md, AGENTS.md, CONTRIBUTING.md, docs/, skills/).
   "check:retired-phrases"
+  # #6530: skills, recipes, templates, docs, plugin trees and agent docs never
+  # teach git pull --rebase, stash, autostash, repo-wide add/commit, reset
+  # --hard or a bare/force push for a shared brain checkout (~0.5s).
+  "check:shared-tree-git"
   "check:schema-migration-order"
+  # A since: 'TBD' BEHAVIOR_CHANGES row never ships: refused on a stamped tree
+  # (VERSION has a CHANGELOG header and differs from origin/master's) and on master.
+  "check:behavior-since"
+  # CHANGELOG.md keeps every release heading origin/master has (a cut file is refused).
+  "check:changelog-headings"
   "check:structural-manifest"
   # Every generated artifact's freshness in one place (GBRA-47 B8); its Fix
   # line is `bun run regen:all`, the same code path that regenerates them.
   "check:regen-all"
   # v0.50.5.0 security wave: compiled binaries must not autoload a cwd bunfig.toml.
   "check:compile-autoload"
+  # The vendored postgres driver's three copies equal pinned upstream plus its patch (networked; a recorded skip offline).
+  "check:vendor-postgres"
 )
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -215,6 +245,11 @@ SOLO_CHECKS=(
   # Budget: 30 s wall clock (scripts/guard-self-test.sh BUDGET_SECONDS).
   "check:guard-self-test"
 )
+if [ "${GBRAIN_VERIFY_SKIP_TYPECHECK:-}" = "1" ]; then
+  KEPT=()
+  for c in "${CHECKS[@]}"; do [ "$c" = "typecheck" ] || KEPT+=("$c"); done
+  CHECKS=("${KEPT[@]}")
+fi
 ALL_CHECKS=("${CHECKS[@]}" "${SOLO_CHECKS[@]}")
 
 if [ "${#CHECKS[@]}" -eq 0 ]; then

@@ -174,9 +174,23 @@ export const SECTIONS: DocSection[] = [
         path: "docs/guides/live-sync.md",
       },
       {
+        title: "docs/guides/on-commit-sync.md",
+        description: "Opt-in on-commit sync in gbrain serve (sync.on_commit) and the per-source commit→searchable/embedded latency.",
+        path: "docs/guides/on-commit-sync.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/shared-checkout-git.md",
+        description:
+          "Committing and pushing when several agents share one brain checkout: `gbrain git commit-push` / `scripts/brain-commit-push.sh` (writer lock, path-scoped commit, in-memory merge, fast-forward-only advance), the outcome table, conflict resolution with --resolve, recovering a stuck rebase, the lock contract for host daemons, and the git commands never to run there.",
+        path: "docs/guides/shared-checkout-git.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/guides/sync-unblock-runbook.md",
         description: "Operator-agent loop for a managed catch-up on a live checkout: gbrain sync status --json (cursor, committed_last_10m, each hold and the last error with class / safe_actions / needs_human), gbrain sync unblock --apply, and the decision table (page / connection / systemic) behind them.",
         path: "docs/guides/sync-unblock-runbook.md",
+        includeInFull: false,
       },
       {
         title: "docs/guides/cron-schedule.md",
@@ -199,12 +213,16 @@ export const SECTIONS: DocSection[] = [
         title: "docs/guides/quiet-hours.md",
         description: "Notification hold + timezone-aware delivery.",
         path: "docs/guides/quiet-hours.md",
+        // Linked, not inlined: the Wave B PR 2 master merge put llms-full.txt over FULL_SIZE_BUDGET.
+        includeInFull: false,
       },
       {
         title: "docs/guides/scaling-skills.md",
         description:
           "Three-tier architecture for agents with 300+ skills: always-loaded, resolver-routed, and dormant. Per-turn token math, the compact list-format resolver, and the `gbrain doctor` safety net. 306 skills, ~21K tokens freed per turn, zero capability loss.",
         path: "docs/guides/scaling-skills.md",
+        // Linked, not inlined: the operator-lessons wave (cron wrapper, managed checkout, identity) put llms-full.txt over FULL_SIZE_BUDGET.
+        includeInFull: false,
       },
       {
         title: "docs/guides/life-chronicle.md",
@@ -232,6 +250,8 @@ export const SECTIONS: DocSection[] = [
         description:
           "Push-based context: the brain volunteers confidence-gated pages from the rolling conversation window. Three channels (ambient reflex, volunteer_context op, gbrain watch), config knobs, and the volunteered-vs-used feedback loop.",
         path: "docs/guides/push-context.md",
+        // Linked, not inlined: same budget trim as scaling-skills.md.
+        includeInFull: false,
       },
       {
         title: "docs/guides/time-aware-recall.md",
@@ -329,6 +349,7 @@ export const SECTIONS: DocSection[] = [
         title: "docs/guides/minions-fix.md",
         description: "Troubleshooting the Minions job queue.",
         path: "docs/guides/minions-fix.md",
+        includeInFull: false,
       },
       {
         title: "docs/guides/repair.md",

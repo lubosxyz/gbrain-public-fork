@@ -7,7 +7,7 @@ import { NO_SOURCES } from '../source-id.ts';
 import { hasScope } from '../scope.ts';
 import { normalizeTokenScopes } from '../legacy-token-scope.ts';
 import { authSourcesFromGrant, grantFromTokenRow } from '../grants/model.ts';
-import { readLocalWriter, currentVerifiedLocalWriter, verifyLocalWriter, type LocalGrant } from './identity.ts';
+import { readLocalWriter, currentVerifiedLocalWriter, takeRegisteredWriterRow, verifyLocalWriter, type LocalGrant } from './identity.ts';
 import type { Principal, SqlEngine, WriteAuthority, WriteRequest } from './model.ts';
 import { authorizePageVisibility, excludesPrivateWrites } from './page-visibility.ts';
 import { pipelined, transactionMemo } from '../page-state/transactions.ts';
@@ -77,8 +77,13 @@ export async function submissionAuthority(ctx: OperationContext, operation: stri
   return a;
 }
 
-/** #5984: one local-writer read per transaction; a FOR SHARE read also answers a plain one. */
-function localWriterRow(engine: SqlEngine, id: string, lock: boolean) {
+/**
+ * #5984: one local-writer read per transaction; a FOR SHARE read also answers a plain one. #6712 PR 4b: the read the
+ * registration check just made answers the authorization that follows it (`withRegisteredLocalWriter`, once).
+ */
+function localWriterRow(engine: SqlEngine, id: string, lock: boolean): Promise<Array<{ lane: string; revoked_at: unknown; grant_ceiling: LocalGrant }>> {
+  const registered = lock ? undefined : takeRegisteredWriterRow(id);
+  if (registered) return Promise.resolve([registered]);
   const key = `local-writer:${id}`;
   return transactionMemo(engine, lock ? [`${key}:share`] : [key, `${key}:share`],
     () => engine.executeRaw<{ lane: string; revoked_at: unknown; grant_ceiling: LocalGrant }>(
@@ -117,6 +122,16 @@ async function replayedAuthority(engine: SqlEngine, stored: WriteAuthority, oper
   return a;
 }
 
+/**
+ * #6517: whether a receipt may name another page's slug to this writer: the trusted local owner always; a remote
+ * writer only when the slug is inside its prefix grant (and delegated namespace) and visible to it.
+ */
+export async function slugDisclosable(engine: SqlEngine, a: WriteAuthority, slug: string): Promise<boolean> {
+  if (!a.remote) return true;
+  if (!prefixAllowed(a.slugPrefixes, slug)) return false;
+  if ((a.delegated || a.restrictedNamespace) && !matchesSlugAllowList(slug, a.delegatedPrefixes ?? [])) return false;
+  return authorizePageVisibility(engine, a, slug).then(() => true, () => false);
+}
 /** Caller holds source guards first. FOR SHARE serializes publication against revocation. */
 export async function authorizeWrite(engine: SqlEngine, a: WriteAuthority, operation: string, slug: string, lock = false): Promise<void> {
   if (a.version !== 1 || !a.principal || !a.sourceId || !a.sourceIncarnation) deny('Missing durable write authority.');

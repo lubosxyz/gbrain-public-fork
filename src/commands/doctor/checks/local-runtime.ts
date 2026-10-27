@@ -11,6 +11,9 @@ import { loadCompletedMigrations } from '../../../core/preferences.ts';
 import { MIGRATION_OPT_OUT_KEYS, declinedMigrations, indexCompletedEntries, isFreshInstallStamp, migrationLedgerSummary, trailingPartialCount } from '../../../core/migration-ledger.ts';
 import { VERSION } from '../../../version.ts';
 import { pendingFreshInstallCheck } from './pending-fresh-install.ts';
+import { autopilotInstallPendingCheck } from './autopilot-install-pending.ts';
+import { migrationHostWorkCheck } from './migration-host-work.ts';
+import { hostWorkMigrations } from '../../../core/shared-skills/migration-host-work.ts';
 import { compareVersions } from '../../migrations/index.ts';
 import { bootstrapDoctorChecks } from '../bootstrap-checks.ts';
 import { buildMemorableRelayCheck } from './integrations-memorable.ts';
@@ -220,6 +223,10 @@ async function runMinionsMigration(ctx: DoctorContext): Promise<Check[]> {
       const setup = pendingFreshInstallCheck();
       if (setup) checks.push(setup);
     }
+    const hostWork = migrationHostWorkCheck(history, declined, engine ? await hostWorkMigrations(engine).catch(() => new Set<string>()) : new Set<string>());
+    if (hostWork) checks.push(hostWork);
+    const skippedInstall = autopilotInstallPendingCheck();
+    if (skippedInstall) checks.push(skippedInstall);
     // Note: the "no preferences.json but schema is v7+" case is detected
     // in the DB section below (needs schema version).
   } catch (e) {

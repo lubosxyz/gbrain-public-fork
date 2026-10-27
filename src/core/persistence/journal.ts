@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { WRITE_SWITCHES, writeSwitchOn } from './switches.ts';
 import type { BrainEngine } from '../engine.ts';
+import { getCode } from '../retry-matcher.ts';
 import { assertRecoveryStagingAbsent } from './staging.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
@@ -11,16 +12,28 @@ import { journalLimitKey, oneYearCapacity, readJournalLimits, readReceiptRetenti
 import { outstandingCapacityDetail, retryWriteAdmission } from './admission-retry.ts';
 import { PreadmitBrainChanged } from './preadmit-cache.ts';
 import { pipelined } from '../page-state/transactions.ts';
+import { backgroundPaused, backgroundWorktreeInactive, declaredBackground, readBackgroundPauseShare, resolveAdmissionOrigin, type AdmissionOrigin } from './admission-origin.ts';
+import { EFFECT_BYTES_SQL, RECEIPT_RESERVATION_FLOOR, receiptReservation, retainedReceiptBytes, TRUE_UP_CLAMP_SQL } from './receipt-bytes.ts';
 import { writeHealth, type WriteHealthFacts } from './health.ts';
+import { assertBackgroundOwner } from './owner-verification.ts';
 import { writerStamp } from './writer-versions.ts';
 import { intentCarriesContent, intentCarriesPurgedContent, PURGE_PRESENCE_COLUMNS } from './purged-intent.ts';
-import { claimPhaseStamp, startClaimPhase } from './claim-phase.ts';
-import { consumerIdentity } from './consumer-heartbeat.ts';
+import { hostname } from 'node:os';
+import { claimOwner, claimOwnerKind, claimPhaseStamp, startClaimPhase } from './claim-phase.ts';
+import { consumerIdentity, RESIDENT_CONSUMER_KINDS } from './consumer-heartbeat.ts';
+import { classifyHolderLiveness, syncLockId } from '../db-lock.ts';
 import { publicFailureDetail } from './publication-failure.ts';
 import { catalogueError } from '../error-catalogue.ts';
 import { ACTIVE_REFRESH_STATES_SQL, refreshFenceClear } from './worktree-refresh-schema.ts';
-import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
+import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, declarePersistenceProtocol, isPersistenceDeclaration, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertGraduationAdmission } from './graduation-custody.ts';
+import { schemaAdmissionRefusal } from './schema-admission.ts';
+import { CAPACITY_VERIFY } from './capacity-verify.ts';
+import { readManagedMode } from './managed-mode.ts';
+import { localHostId } from './identity.ts';
+import { MANAGED_SYNC_PASS_OP } from './sync-pass-row.ts';
+import { BACKOFF_ELAPSED } from './transient-retry.ts';
+import { segmentWriteScope } from '../page-body/ingest.ts';
 import {
   isTerminal, principalKey, requestPrincipal, recoveryFiles,
   type JournalLimits, type Principal, type RecoveryRecord, type RequestState,
@@ -38,6 +51,8 @@ export interface WriteAdmission {
   pageId?: number | null;
   worktreeId?: string | null;
   topologyGeneration?: string | number | null;
+  /** #6712 PR 4b: the worktree owner epoch the caller resolved; admission refuses `source_changed` when it moved. */
+  ownerEpoch?: string | number | null;
   requestId?: string;
   /** F6: the client's non-UUID request_id, stored beside the canonical id and never digested. */
   clientRequestId?: string;
@@ -46,6 +61,8 @@ export interface WriteAdmission {
   intent: Record<string, unknown>;
   authority: WriteAuthority;
   terminalReservation?: number;
+  /** #6696 (A5): who the write is for; unset is background unless a surrounding `withAdmissionOrigin` scope says otherwise. */
+  origin?: AdmissionOrigin;
   /** Phase 4.2: the brain the cached pre-admission reads came from; admission under another brain throws PreadmitBrainChanged. */
   brainId?: string;
 }
@@ -65,6 +82,20 @@ function ownerStatusFix(sourceId: string): Action {
 }
 const lifecycleIdConflict = (requestId: string) => opError('idempotency_conflict', 'This request_id belongs to a source lifecycle operation.',
   `Request ID ${requestId} is already recorded for a source lifecycle change of this CLI writer, so this page write was not admitted and nothing changed. Submit the page write with a new request_id.`);
+/** #6696 (A5): a background admission of `ids` requests and `bytes` reservation refuses past the pause line of any locked counter. */
+async function assertBackgroundRoom(tx: SqlEngine, counters: Counter[], limits: JournalLimits, ids: number, bytes: number): Promise<void> {
+  const share = await readBackgroundPauseShare(tx);
+  for (const row of counters) {
+    const scope = row.key === 'brain' ? 'brain' : 'principal';
+    for (const [resource, setting, used, need] of [['lifetime_ids', `${scope}LifetimeIds`, Number(row.lifetime_ids), ids],
+      ['terminal_bytes', `${scope}TerminalBytes`, Number(row.terminal_bytes), bytes]] as const) {
+      const limit = limits[setting];
+      if (used + need <= Math.floor(limit * share)) continue;
+      throw backgroundPaused(row.key, resource, used, limit, share, journalLimitKey(setting),
+        await oneYearCapacity(tx, row.key, resource === 'lifetime_ids' ? 'LifetimeIds' : 'TerminalBytes', used, limit));
+    }
+  }
+}
 /**
  * `outstanding` (#6278): the outstanding-request cap carries its counts on `detail`
  * (`outstandingCapacityDetail`), so a caller that can wait for the other
@@ -76,15 +107,30 @@ export function capacityError(resource: string, outstanding?: { used: number; li
   if (outstanding) error.detail = outstandingCapacityDetail(outstanding.used, outstanding.limit);
   return error;
 }
-/** Cumulative caps name their config key and a value that covers one more year at the current admission rate. */
+/**
+ * #6696 (A6): a cumulative cap refusal is `write_quota_exhausted` (host only;
+ * waiting does not free a permanent id, and receipt bytes free only as
+ * receipts compact). It names the config key and a value that covers one more
+ * year at the current admission rate; `detail` keeps the limit key, `reason`
+ * the resource.
+ */
 async function cumulativeCapacityError(tx: SqlEngine, resource: string, scope: string, setting: keyof JournalLimits, used: number, limit: number): Promise<OperationError> {
   const key = journalLimitKey(setting);
-  const value = await oneYearCapacity(tx, scope, setting.endsWith('LifetimeIds') ? 'LifetimeIds' : 'TerminalBytes', used, limit);
-  const error = new OperationError('queue_capacity', `Write capacity exhausted: ${resource} (${used} used of ${limit}).`,
-    `Run on the brain host: gbrain config set ${key} ${value} (covers about one more year at the current admission rate). ` +
-    'Keep the same request_id and retry after the change. Accepted request IDs and retained receipts are never evicted.');
-  error.detail = key.slice('persistence.limits.'.length);
-  return error;
+  const ids = setting.endsWith('LifetimeIds');
+  const value = await oneYearCapacity(tx, scope, ids ? 'LifetimeIds' : 'TerminalBytes', used, limit);
+  return quotaExhausted(resource, key, value, used, limit, ids ? 'lifetime_ids' : 'terminal_bytes');
+}
+/** The `write_quota_exhausted` refusal for config key `key`; the fix is the reversible raise, verified by the capacity check. */
+export function quotaExhausted(resource: string, key: string, value: number, used: number, limit: number, reason: 'lifetime_ids' | 'terminal_bytes'): OperationError {
+  return opError('write_quota_exhausted', `Write capacity exhausted: ${resource} (${used} used of ${limit}).`,
+    `Run on the brain host: gbrain config set ${key} ${value} (covers about one more year at the current admission rate; undo with gbrain config unset ${key}). ` +
+    `Keep the same request_id and retry after the change. Accepted request IDs and retained receipts are never evicted.${reason === 'terminal_bytes'
+      ? ' Then gbrain repair receipt-compaction previews the retained receipt bytes compaction would free.' : ''}`,
+    { reason, detail: key.slice('persistence.limits.'.length), docs: 'docs/guides/write-refusals.md#write_quota_exhausted',
+      fix: { argv: ['gbrain', 'config', 'set', key, String(value)], consent: [], actor: 'host_admin', requires_exclusive: false,
+        why: reason === 'lifetime_ids' ? 'Request ids are permanent, so only a larger cap admits more writes; the raise is reversible.'
+          : 'The raise unblocks writes at once and is reversible; compaction frees reserved bytes only over time.',
+        verify: CAPACITY_VERIFY, docs: 'docs/guides/concurrent-writes.md#quota-near-exhaustion' } });
 }
 /**
  * Up-front refusal for a backfill that will admit `needed` new requests: when
@@ -93,17 +139,57 @@ async function cumulativeCapacityError(tx: SqlEngine, resource: string, scope: s
  * the caller mutates anything.
  */
 export async function assertLifetimeIdHeadroom(engine: SqlEngine, principal: Principal, needed: number): Promise<void> {
-  if (needed <= 0) return;
+  await assertWriteHeadroom(engine, principal, { ids: needed });
+}
+/**
+ * #6696 (A7): a bulk run's preflight. `needed` is the run's estimate (new
+ * request ids, and receipt bytes at `receiptReservation` each); `share` is the
+ * producer's pause line (`backgroundPauseShare`) or 1 for an interactive run.
+ * A cap already full refuses `write_quota_exhausted`; a cap that still admits
+ * writes but cannot cover the run refuses `write_quota_insufficient`, both
+ * with the config value that covers the run and one more year.
+ */
+export async function assertWriteHeadroom(engine: SqlEngine, principal: Principal, needed: { ids: number; bytes?: number }, share = 1): Promise<void> {
+  if (needed.ids <= 0 && !needed.bytes) return;
   const limits = await readJournalLimits(engine);
   const keys = ['brain', principalKey(principal)];
-  const rows = await engine.executeRaw<{ key: string; lifetime_ids: number | string }>(
-    'SELECT key,lifetime_ids FROM persistence_counters WHERE key=ANY($1::text[])', [keys]);
+  const rows = await engine.executeRaw<{ key: string; lifetime_ids: number | string; terminal_bytes: number | string }>(
+    'SELECT key,lifetime_ids,terminal_bytes FROM persistence_counters WHERE key=ANY($1::text[])', [keys]);
   for (const key of keys) {
     const scope = key === 'brain' ? 'brain' : 'principal';
-    const used = Number(rows.find(row => row.key === key)?.lifetime_ids ?? 0);
-    const limit = limits[`${scope}LifetimeIds`];
-    if (used + needed > limit) throw await cumulativeCapacityError(engine, `${scope} permanent request IDs`, key, `${scope}LifetimeIds`, used, limit);
+    for (const [resource, setting, need, label] of [['lifetime_ids', `${scope}LifetimeIds`, needed.ids, 'permanent request IDs'],
+      ['terminal_bytes', `${scope}TerminalBytes`, needed.bytes ?? 0, 'reserved receipt bytes']] as const) {
+      if (need <= 0) continue;
+      const used = Number(rows.find(row => row.key === key)?.[resource] ?? 0);
+      const limit = limits[setting];
+      if (used + need <= Math.floor(limit * share)) continue;
+      if (used + (resource === 'lifetime_ids' ? 1 : RECEIPT_RESERVATION_FLOOR) > limit) {
+        throw await cumulativeCapacityError(engine, `${scope} ${label}`, key, setting, used, limit);
+      }
+      const configKey = journalLimitKey(setting);
+      const value = Math.max(Math.ceil((used + need) / share) + 1, await oneYearCapacity(engine, key, resource === 'lifetime_ids' ? 'LifetimeIds' : 'TerminalBytes', used, limit));
+      throw opError('write_quota_insufficient', `This run needs ${need} more ${scope} ${label} than the ${Math.floor(limit * share) - used} left before its limit (${used} used of ${limit}${share < 1 ? `, pausing at ${Math.round(share * 100)}%` : ''}).`,
+        `Nothing was started and other writes still work. Run on the brain host: gbrain config set ${configKey} ${value} (undo with gbrain config unset ${configKey}), then rerun the same command.`,
+        { reason: resource, detail: configKey.slice('persistence.limits.'.length), docs: 'docs/guides/write-refusals.md#write_quota_insufficient',
+          fix: { argv: ['gbrain', 'config', 'set', configKey, String(value)], consent: [], actor: 'host_admin', requires_exclusive: false,
+            why: 'Covers this run and about one more year at the current rate; reversible.', verify: CAPACITY_VERIFY } });
+    }
   }
+}
+/**
+ * #6884: how many more requests `principal` can have outstanding before the tighter of its own and the brain's
+ * outstanding caps, each taken at `share` (a background run stops at the pause line), with that cap's counts.
+ */
+export async function readOutstandingRoom(engine: SqlEngine, principal: Principal, share = 1): Promise<{ room: number; scope: 'brain' | 'principal'; used: number; limit: number }> {
+  const limits = await readJournalLimits(engine);
+  const rows = await engine.executeRaw<{ key: string; outstanding_count: number | string }>('SELECT key,outstanding_count FROM persistence_counters WHERE key=ANY($1::text[])',
+    [['brain', principalKey(principal)]]);
+  const room = (scope: 'brain' | 'principal', key: string, cap: number) => {
+    const used = Number(rows.find(row => row.key === key)?.outstanding_count ?? 0), limit = Math.floor(cap * share);
+    return { room: limit - used, scope, used, limit };
+  };
+  const brain = room('brain', 'brain', limits.brainOutstanding), own = room('principal', principalKey(principal), limits.principalOutstanding);
+  return brain.room < own.room ? brain : own;
 }
 /** Creates and locks the counter rows in key order: two statements for any number of keys (#5984 round-trip diet). */
 /** Creates missing counter rows; takes no lock on existing ones. Keys sorted. */
@@ -155,7 +241,7 @@ export function assertReplayIntent(row: WriteRequest, expectedDigest: string): W
   return row;
 }
 export async function admitWrite(engine: BrainEngine, input: WriteAdmission, overrides?: Partial<JournalLimits>,
-  transaction: <T>(fn: (tx: BrainEngine) => Promise<T>) => Promise<T> = fn => engine.transaction(fn)): Promise<WriteRequest> {
+  transaction: <T>(fn: (tx: BrainEngine) => Promise<T>) => Promise<T> = fn => engine.transaction(fn, { pipelineFirst: isPersistenceDeclaration })): Promise<WriteRequest> {
   const { requestId, apply } = await prepareAdmission(engine, input, overrides);
   // #6355: a lent connection (the consumer's warm lane) whose session dropped is dead for every later attempt, so the
   // re-run takes a transaction from the engine's pool after the pool itself is rebuilt.
@@ -164,7 +250,7 @@ export async function admitWrite(engine: BrainEngine, input: WriteAdmission, ove
     const brain = await declareDurablePersistence(tx, `${Math.min(100, remaining)}ms`, `${remaining}ms`);
     if (input.brainId !== undefined && brain !== input.brainId) throw new PreadmitBrainChanged();
     return apply(tx);
-  }), undefined, async error => { run = fn => engine.transaction(fn); await engine.reconnect({ error }); });
+  }), undefined, async error => { run = fn => engine.transaction(fn, { pipelineFirst: isPersistenceDeclaration }); await engine.reconnect({ error }); });
 }
 /** Caller owns the transaction and retries its entire unit of work after rollback. */
 export async function admitWriteInTransaction(tx: BrainEngine, input: WriteAdmission, overrides?: Partial<JournalLimits>): Promise<WriteRequest> {
@@ -175,9 +261,12 @@ async function prepareAdmission(engine: BrainEngine, input: WriteAdmission, over
   const requestId = requireUuid(input.requestId ?? randomUUID());
   const fingerprint = intentDigest(input);
   const bytes = jsonBytes(input.intent) + jsonBytes(input.authority);
-  const terminalBytes = input.terminalReservation ?? Math.max(16_384,jsonBytes(input.authority)+8192);
+  const terminalBytes = Math.max(input.terminalReservation ?? 0, receiptReservation(input));
   if (!Number.isSafeInteger(terminalBytes) || terminalBytes < 1024) throw new TypeError('Invalid terminal receipt reservation.');
   const stamp = writerStamp();
+  const origin = resolveAdmissionOrigin(input.origin);
+  // #6741 C: a declared background producer is refused before any receipt when the source's owner fails its verification.
+  if (input.worktreeId && declaredBackground(input.origin)) await assertBackgroundOwner(engine, input.sourceId, ownerStatusFix);
   return { requestId, apply: async (tx: BrainEngine): Promise<WriteRequest> => {
     await declarePersistenceProtocol(tx);
     // The guards are sent together in lock order (worktree, source, writer, counters) and judged in
@@ -210,6 +299,9 @@ async function prepareAdmission(engine: BrainEngine, input: WriteAdmission, over
       }
       return assertReplayIntent(prior, fingerprint);
     }
+    // #6904: only after a replay returned, so an accepted request id reconciles whatever the schema reads.
+    const schemaRefusal = await schemaAdmissionRefusal(tx);
+    if (schemaRefusal) throw schemaRefusal;
     if (input.targetKind === 'skill_bundle') await assertSharedSkillPersistence(tx, input.sourceId);
     for (const row of counters) {
       const brain = row.key === 'brain';
@@ -222,14 +314,15 @@ async function prepareAdmission(engine: BrainEngine, input: WriteAdmission, over
       if (Number(row.terminal_bytes) + terminalBytes > limits[`${scope}TerminalBytes`]) throw await cumulativeCapacityError(tx, `${scope} reserved receipt bytes`,
         row.key, `${scope}TerminalBytes`, Number(row.terminal_bytes), limits[`${scope}TerminalBytes`]);
     }
+    if (origin === 'background') await assertBackgroundRoom(tx, counters, limits, 1, terminalBytes);
     // The request row and its counter reservation in one statement; the counters are already locked.
     const [row] = await tx.executeRaw<WriteRequest>(`WITH reserved AS (UPDATE persistence_counters SET outstanding_count=outstanding_count+1,
       intent_bytes=intent_bytes+$14,lifetime_ids=lifetime_ids+1,terminal_bytes=terminal_bytes+$15 WHERE key=ANY($20::text[]))
       INSERT INTO persistence_requests
       (principal_kind,principal_id,request_id,operation,source_id,source_incarnation,page_id,slug,
        worktree_id,topology_generation,digest,intent,authority,intent_bytes,terminal_reservation,target_kind,protocol_version,
-       admitter_version,admitter_host_id,client_request_id)
-      VALUES($1,$2,$3::uuid,$4,$5,$6::uuid,$7,$8,$9::uuid,$10,$11,$12::text::jsonb,$13::text::jsonb,$14,$15,$16,$17,$18,$19::uuid,$21)
+       admitter_version,admitter_host_id,client_request_id,admitter_segment_reader)
+      VALUES($1,$2,$3::uuid,$4,$5,$6::uuid,$7,$8,$9::uuid,$10,$11,$12::text::jsonb,$13::text::jsonb,$14,$15,$16,$17,$18,$19::uuid,$21,true)
       RETURNING *`, [input.principal.kind, input.principal.id, requestId, input.operation, input.sourceId,
       input.sourceIncarnation, input.pageId ?? null, input.slug, input.worktreeId ?? null, input.topologyGeneration ?? null,
       fingerprint, JSON.stringify(input.intent), JSON.stringify(input.authority), bytes, terminalBytes, input.targetKind ?? 'page', input.protocolVersion ?? 1,
@@ -255,8 +348,9 @@ export async function admitWriteGroupInTransaction(tx: BrainEngine, inputs: Writ
   }
   const stamp = writerStamp();
   const items = inputs.map(input => ({ input, requestId: requireUuid(input.requestId ?? randomUUID()), fingerprint: intentDigest(input),
-    bytes: jsonBytes(input.intent) + jsonBytes(input.authority), terminalBytes: input.terminalReservation ?? Math.max(16_384, jsonBytes(input.authority) + 8192) }));
+    bytes: jsonBytes(input.intent) + jsonBytes(input.authority), terminalBytes: Math.max(input.terminalReservation ?? 0, receiptReservation(input)) }));
   assertMutationProtocol({ target_kind: 'page', protocol_version: 1 });
+  if (first.worktreeId && declaredBackground(first.origin)) await assertBackgroundOwner(tx, first.sourceId, ownerStatusFix);
   const ids = items.map(item => item.requestId);
   // #5984: the checks are independent reads and share locks, so they go out back to back in the order they always
   // had (protocol, graduation, worktree, source, writer, counters); a failure is raised in that order.
@@ -290,6 +384,8 @@ export async function admitWriteGroupInTransaction(tx: BrainEngine, inputs: Writ
   }
   const fresh = items.filter(item => !priors.has(item.requestId));
   if (fresh.length) {
+    const schemaRefusal = await schemaAdmissionRefusal(tx);
+    if (schemaRefusal) throw schemaRefusal;
     const bytes = fresh.reduce((sum, item) => sum + item.bytes, 0), terminalBytes = fresh.reduce((sum, item) => sum + item.terminalBytes, 0);
     for (const row of counters) {
       const brain = row.key === 'brain', scope = brain ? 'brain' : 'principal';
@@ -301,12 +397,13 @@ export async function admitWriteGroupInTransaction(tx: BrainEngine, inputs: Writ
       if (Number(row.terminal_bytes) + terminalBytes > limits[`${scope}TerminalBytes`]) throw await cumulativeCapacityError(tx, `${scope} reserved receipt bytes`,
         row.key, `${scope}TerminalBytes`, Number(row.terminal_bytes), limits[`${scope}TerminalBytes`]);
     }
+    if (resolveAdmissionOrigin(first.origin) === 'background') await assertBackgroundRoom(tx, counters, limits, fresh.length, terminalBytes);
     const [rows] = await pipelined(tx, [() => tx.executeRaw<WriteRequest>(`INSERT INTO persistence_requests
       (principal_kind,principal_id,request_id,operation,source_id,source_incarnation,page_id,slug,
        worktree_id,topology_generation,digest,intent,authority,intent_bytes,terminal_reservation,target_kind,protocol_version,
-       admitter_version,admitter_host_id,client_request_id)
+       admitter_version,admitter_host_id,client_request_id,admitter_segment_reader)
       SELECT $1,$2,(e->>'request_id')::uuid,$3,$4,$5::uuid,(e->>'page_id')::integer,e->>'slug',$6::uuid,$7,e->>'digest',e->'intent',$8::text::jsonb,
-        (e->>'intent_bytes')::bigint,(e->>'terminal_reservation')::bigint,'page',1,$9,$10::uuid,e->>'client_request_id'
+        (e->>'intent_bytes')::bigint,(e->>'terminal_reservation')::bigint,'page',1,$9,$10::uuid,e->>'client_request_id',true
       FROM jsonb_array_elements($11::text::jsonb) WITH ORDINALITY AS t(e,n) ORDER BY n
       RETURNING *`, [first.principal.kind, first.principal.id, first.operation, first.sourceId, first.sourceIncarnation, first.worktreeId ?? null,
       first.topologyGeneration ?? null, JSON.stringify(first.authority), stamp.version, stamp.hostId,
@@ -328,24 +425,52 @@ export async function admitWriteGroupInTransaction(tx: BrainEngine, inputs: Writ
  */
 /**
  * The publication group key of a request: a bulk sync's `intent.group`, the
- * batch id of a `put_pages` child (`intent.page_batch.id`, #6007), or the
- * batch id of a managed file import (`intent.import_batch`). Null when it
- * publishes alone.
+ * batch id of a `put_pages` child or of an `add_timeline_entry` admitted in
+ * the same batch (`intent.page_batch.id`, #6007), the batch id of a managed
+ * file import (`intent.import_batch`), the batch id of a maintenance run's
+ * page publications (`intent.maintenance_batch`, G6), or the activation id of
+ * a managed atom generation (its page members and its activation, G6). Null
+ * when it publishes alone. GROUP_KEY_SQL below is the same function in SQL.
+ *
+ * Every key is an independent group (`independentGroup`): one member's failure
+ * never cancels another. A maintenance batch is a set of unrelated page
+ * rewrites. An atom generation is already published one request at a time and
+ * crash-tolerant member by member (generations/managed.ts): creates land before
+ * the activation (an activation that never happens leaves orphan candidates),
+ * and overwrite and retire members each refuse unless pending on the live
+ * activated generation, a crash between them resuming on the next run. So a
+ * generation may activate with some members still pending; a member that fails
+ * in its group publishes or fails alone, exactly as it would ungrouped.
  */
 export function publicationGroupKey(row: Pick<WriteRequest, 'operation' | 'intent'>): string | null {
   if (typeof row.intent?.group === 'string') return `sync:${row.intent.group}`;
-  if (row.operation !== 'put_page') return null;
-  if (row.intent?.kind === 'managed_file_import') return typeof row.intent.import_batch === 'string' ? `import:${row.intent.import_batch}` : null;
+  const kind = row.intent?.kind;
+  if (row.operation === 'submit_job') {
+    if (kind === 'managed_maintenance_page') return typeof row.intent!.maintenance_batch === 'string' ? `maintenance:${row.intent!.maintenance_batch}` : null;
+    const atom = kind === 'managed_atom_page' || kind === 'managed_atom_delete'
+      || kind === 'managed_generation_activate' && (row.intent!.key as { kind?: unknown } | undefined)?.kind === 'atom';
+    return atom && typeof row.intent!.activationId === 'string' ? `generation:${row.intent!.activationId}` : null;
+  }
+  if (row.operation === 'put_page' && kind === 'managed_file_import') return typeof row.intent!.import_batch === 'string' ? `import:${row.intent!.import_batch}` : null;
+  if (row.operation !== 'put_page' && row.operation !== 'add_timeline_entry') return null;
   const batch = row.intent?.page_batch as { id?: unknown } | undefined;
-  return !row.intent?.kind && typeof batch?.id === 'string' ? `batch:${batch.id}` : null;
+  return !kind && typeof batch?.id === 'string' ? `batch:${batch.id}` : null;
 }
-/** Groups whose members are independent page writes: one member's failure never cancels the others. */
+/** Groups whose members are independent page writes: one member's failure never cancels the others (see publicationGroupKey). */
 export function independentGroup(key: string | null): boolean {
-  return key !== null && (key.startsWith('batch:') || key.startsWith('import:'));
+  return key !== null && ['batch:', 'import:', 'maintenance:', 'generation:'].some(prefix => key.startsWith(prefix));
 }
-const GROUP_KEY_SQL = `CASE WHEN intent ? 'group' THEN 'sync:'||(intent->>'group')
+/** #6712: a bulk managed-sync group key; such a group claims up to its admitted size (63 followers) and prepares four members at a time. */
+export function syncGroup(key: string | null): boolean {
+  return key !== null && key.startsWith('sync:');
+}
+/** publicationGroupKey in SQL, over a persistence_requests row (test/git-door-g6-publication-groups.test.ts holds them equal). */
+export const GROUP_KEY_SQL = `CASE WHEN jsonb_typeof(intent->'group')='string' THEN 'sync:'||(intent->>'group')
+  WHEN operation='submit_job' AND intent->>'kind'='managed_maintenance_page' AND jsonb_typeof(intent->'maintenance_batch')='string' THEN 'maintenance:'||(intent->>'maintenance_batch')
+  WHEN operation='submit_job' AND (intent->>'kind' IN ('managed_atom_page','managed_atom_delete')
+    OR intent->>'kind'='managed_generation_activate' AND intent->'key'->>'kind'='atom') AND jsonb_typeof(intent->'activationId')='string' THEN 'generation:'||(intent->>'activationId')
   WHEN operation='put_page' AND intent->>'kind'='managed_file_import' AND jsonb_typeof(intent->'import_batch')='string' THEN 'import:'||(intent->>'import_batch')
-  WHEN operation='put_page' AND NOT (intent ? 'kind') AND jsonb_typeof(intent->'page_batch'->'id')='string' THEN 'batch:'||(intent->'page_batch'->>'id') END`;
+  WHEN operation IN ('put_page','add_timeline_entry') AND NOT (intent ? 'kind') AND jsonb_typeof(intent->'page_batch'->'id')='string' THEN 'batch:'||(intent->'page_batch'->>'id') END`;
 export async function claimGroupFollowers(engine: BrainEngine, head: WriteRequest, group: string, max: number, leaseMs = 30_000): Promise<WriteRequest[]> {
   if (!head.worktree_id || max <= 0) return [];
   return engine.transactionDirect(async tx => {
@@ -353,9 +478,11 @@ export async function claimGroupFollowers(engine: BrainEngine, head: WriteReques
     // #5984 G6: only the group's candidate prefix is locked. Locking every next row also held a foreground write's row
     // (the first non-member) for the claim's round trips, so its recovery record and reads waited on the lane.
     const next = await tx.executeRaw<{ id: string; state: string; grp: string | null; recovering: boolean; claim_phase: unknown }>(`WITH next AS (
-        SELECT id,sequence,state,${GROUP_KEY_SQL} AS grp,recovery IS NOT NULL AS recovering FROM persistence_requests
+        SELECT id,sequence,state,${GROUP_KEY_SQL} AS grp,recovery IS NOT NULL AS recovering,NOT ${BACKOFF_ELAPSED('persistence_requests')} AS backoff,transient_interruptions>0 AS charged FROM persistence_requests
         WHERE worktree_id=$1::uuid AND sequence>$2 AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) ORDER BY sequence LIMIT $3),
-      bound AS (SELECT min(sequence) AS sequence FROM next WHERE grp IS DISTINCT FROM $4 OR state<>'queued' OR recovering)
+      -- v261: a member still in its transient backoff ends the group's prefix like a non-member, and so does one already
+      -- charged a transient interruption: it publishes alone, so a batch that overruns only as a whole is not retried as one.
+      bound AS (SELECT min(sequence) AS sequence FROM next WHERE grp IS DISTINCT FROM $4 OR state<>'queued' OR recovering OR backoff OR charged)
       SELECT r.id,r.state,${GROUP_KEY_SQL} AS grp,r.recovery IS NOT NULL AS recovering,r.claim_phase
       FROM persistence_requests r WHERE r.id IN (SELECT id FROM next WHERE sequence<COALESCE((SELECT sequence FROM bound),9223372036854775807))
       ORDER BY r.sequence FOR UPDATE OF r`, [head.worktree_id, head.sequence, max, group]);
@@ -368,10 +495,13 @@ export async function claimGroupFollowers(engine: BrainEngine, head: WriteReques
     }
     if (!members.length) return [];
     const tokens = members.map(() => randomUUID());
-    // #6278: a follower carries no stamp of its claim until its wave dispatches it (`markDispatched`), so an undispatched follower is never charged.
+    // #6278: a follower carries no phase until its wave dispatches it (`markDispatched`), so an undispatched follower is never
+    // charged. #6650: it does carry its token, owner and claim time, so a consumer that proves the owner dead reclaims it with
+    // the head, and writer status and doctor age the claim from when it was taken.
     return tx.executeRaw<WriteRequest>(`UPDATE persistence_requests r SET state='running',execution_token=t.token,
-      claim_expires_at=now()+($3::double precision*interval '1 millisecond'),updated_at=now(),blocked_reason=NULL,claim_phase=NULL
-      FROM unnest($1::uuid[],$2::uuid[]) AS t(id,token) WHERE r.id=t.id AND r.state='queued' RETURNING r.*`, [members, tokens, leaseMs])
+      claim_expires_at=now()+($3::double precision*interval '1 millisecond'),updated_at=now(),blocked_reason=NULL,
+      claim_phase=jsonb_build_object('token',t.token::text,'owner',$4::text::jsonb,'claimed_at',to_jsonb(now()))
+      FROM unnest($1::uuid[],$2::uuid[]) AS t(id,token) WHERE r.id=t.id AND r.state='queued' RETURNING r.*`, [members, tokens, leaseMs, JSON.stringify(claimOwner())])
       .then(rows => rows.sort((a, b) => Number(BigInt(a.sequence) - BigInt(b.sequence))).map(row => ({ ...row, previous_claim_phase: previous.get(row.id) })));
   });
 }
@@ -437,18 +567,20 @@ export async function chargePreparationAttempt(engine: SqlEngine, row: WriteRequ
  */
 async function assertWorktreeAdmission(tx: BrainEngine, input: WriteAdmission): Promise<void> {
   // Sent together: the server takes the share lock before it reads the fence and the binding.
-  const [, [state]] = await pipelined(tx, [
-    () => tx.executeRaw('SELECT id FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [input.worktreeId]),
+  const [[worktree], [state]] = await pipelined(tx, [
+    () => tx.executeRaw<{ state: string; owner_epoch: string }>('SELECT state,owner_epoch::text AS owner_epoch FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [input.worktreeId]),
     () => tx.executeRaw<{ refresh: { id: string; state: string; source_ids: string[] } | string | null; bound: boolean }>(`SELECT
       (SELECT row_to_json(f) FROM (SELECT id,state,source_ids FROM persistence_worktree_refreshes
         WHERE worktree_id=$3::uuid AND state IN ${ACTIVE_REFRESH_STATES_SQL} LIMIT 1) f) AS refresh,
       EXISTS (SELECT 1 FROM persistence_source_bindings WHERE source_id=$1
         AND source_incarnation=$2::uuid AND worktree_id=$3::uuid AND topology_generation=$4) AS bound`,
     [input.sourceId, input.sourceIncarnation, input.worktreeId, input.topologyGeneration]),
-  ]) as [unknown, Array<{ refresh: { id: string; state: string; source_ids: string[] } | string | null; bound: boolean }>];
+  ]) as [Array<{ state: string; owner_epoch: string }>, Array<{ refresh: { id: string; state: string; source_ids: string[] } | string | null; bound: boolean }>];
   const refresh = typeof state?.refresh === 'string' ? JSON.parse(state.refresh) as { id: string; state: string; source_ids: string[] } : state?.refresh ?? null;
   if (refresh) await assertWorktreeNotRefreshing(tx, input, refresh);
-  if (!state?.bound) throw opError('source_changed', 'The source binding changed during admission.',
+  // #6741 C: a background producer never takes a permanent request id against a worktree in recovery (a draining owner still replays).
+  if (worktree?.state === 'recovering' && resolveAdmissionOrigin(input.origin) === 'background') throw backgroundWorktreeInactive(input.sourceId, worktree.state, ownerStatusFix(input.sourceId));
+  if (!state?.bound || input.ownerEpoch != null && worktree && worktree.owner_epoch !== String(input.ownerEpoch)) throw opError('source_changed', 'The source binding changed during admission.',
     `Source ${input.sourceId}'s worktree binding changed (a claim, transfer or lifecycle change) while this write was being admitted, so nothing was accepted. Check the owner with the command in fix, then submit the write again; reusing the same request_id is safe because nothing was recorded.`,
     { fix: ownerStatusFix(input.sourceId) });
 }
@@ -476,7 +608,7 @@ async function assertWorktreeNotRefreshing(tx: BrainEngine, input: WriteAdmissio
  * database-only incarnation) is matched by the caller with columns the pending indexes cover,
  * so each probe is an index range scan rather than a walk of every pending row.
  */
-const EARLIER_HEAD = (earlier: string, r: string, priority: string, laneRoots: string) => `${earlier}.sequence<${r}.sequence
+export const EARLIER_HEAD = (earlier: string, r: string, priority: string, laneRoots: string) => `${earlier}.sequence<${r}.sequence
         AND ${earlier}.state IN ('queued','running','recovering') AND NOT ${PASSES_QUEUED_SYNC(earlier, r, priority, laneRoots)}`;
 /**
  * The rows `claimNextWrite` may claim, over `persistence_requests r LEFT JOIN
@@ -486,7 +618,7 @@ const EARLIER_HEAD = (earlier: string, r: string, priority: string, laneRoots: s
  * unfinished withdrawal mirror of its page (of every page, for an untargeted
  * mirror), so the mirror never rewrites a file under an accepted request.
  */
-const SYNC_KIND = (row: string) => `COALESCE(${row}.intent->>'kind','') LIKE 'managed_sync_%'`;
+export const SYNC_KIND = (row: string) => `COALESCE(${row}.intent->>'kind','') LIKE 'managed_sync_%'`;
 /** Whether sync row `sync` names the page of request `write`: its slug, page id or rename source. */
 const NAMES_PAGE = (sync: string, write: string) => `(${sync}.source_id=${write}.source_id AND (${sync}.slug=${write}.slug
   OR ${sync}.page_id=${write}.page_id OR ${sync}.intent->'renameFrom'->>'slug'=${write}.slug))`;
@@ -515,6 +647,7 @@ export const claimableWriteSql = (priority: string, laneRoots = "'{}'::text[]") 
         AND mirror.kind='withdrawal-mirror' AND mirror.state IN ('queued','running')
         AND (NOT (mirror.data ? 'targets') OR mirror.data->'targets' @> jsonb_build_array(jsonb_build_object('slug',r.slug))))
       AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked WHERE blocked.worktree_id=r.worktree_id AND blocked.recovery IS NOT NULL)
+      AND ${BACKOFF_ELAPSED('r')}
       AND NOT EXISTS (SELECT 1 FROM persistence_requests earlier
         WHERE r.worktree_id IS NOT NULL AND earlier.worktree_id=r.worktree_id AND ${EARLIER_HEAD('earlier', 'r', priority, laneRoots)})
       AND NOT EXISTS (SELECT 1 FROM persistence_requests earlier
@@ -551,32 +684,78 @@ export async function hasClaimableWrite(engine: SqlEngine, hostId: string, exclu
  * `fifoRoots` (#5984 Phase 4.5) are roots where this consumer owes the sync side a turn: a foreground write it
  * claimed ahead of a queued sync row (`passed_sync`) committed since it last claimed a sync row, so there the claim is plain FIFO.
  */
+/**
+ * #6712 PR 2 (Garry, 2026-10-16, via GBRA-40): while a source's drain lease is live, only the lease holder publishes that
+ * source's managed-sync requests. A non-resident consumer (a short-lived command such as `put` or `remember`, waiting on its
+ * own write) ranks a sync row whose source's lease another process holds after every other row and claims it only when that
+ * holder is provably dead (a killed same-host sync whose TTL has not lapsed yet), so it never publishes a live drainer's pages
+ * or breaks up its lane groups. With no live lease nothing changes: a crashed drainer's rows still drain through any consumer.
+ * The holder is read only when the head row is a sync row, so a foreground write's claim costs no extra statement.
+ */
+const LEASE_HELD = `EXISTS (SELECT 1 FROM gbrain_cycle_locks l WHERE ${SYNC_KIND('r')} AND l.id=$7::text||r.source_id
+  AND l.ttl_expires_at>now() AND NOT (l.holder_pid=$8::integer AND l.holder_host IS NOT DISTINCT FROM $9::text))`;
+/**
+ * #5984 Phase 4.5: the worktrees (`f.worktree_id`) where a foreground write that may go first waits, so no new sync head
+ * is claimed there: one queued or recovering, or claimed by another process (claim owner nonce other than `nonce`) that
+ * has not begun to publish (it cannot publish while this process's sync group holds the worktree, so it releases the claim
+ * and this process takes it), and not waiting on an earlier sync row that names its page. A non-sync request committed on
+ * the worktree after sequence `seen` (the newest sequence when this process last claimed a sync head there) earns the sync
+ * side one head, so a stream of writes cannot starve it. Uncorrelated with the candidate row, so a claim reads it once.
+ * The FIFO claim holds back only sync rows the write would pass (sequence below it): an earlier unfinished write is the
+ * head-of-root rules' business, and one stalled in another process must not stop the sync behind it.
+ */
+const FOREGROUND_WAITING_ON = (nonce: string, seen: string, worktree = 'TRUE') => `SELECT f.worktree_id, f.sequence FROM persistence_requests f
+    WHERE ${worktree} AND f.state IN ('queued','running','recovering') AND (f.state<>'running' OR (NOT f.publication_started
+      AND f.claim_phase->'owner'->>'nonce' IS DISTINCT FROM ${nonce}))
+    AND f.recovery IS NULL AND NOT ${SYNC_KIND('f')}
+    AND NOT EXISTS (SELECT 1 FROM persistence_requests named WHERE named.worktree_id=f.worktree_id AND named.sequence<f.sequence
+      AND named.state IN ('queued','running','recovering') AND ${SYNC_KIND('named')} AND ${NAMES_PAGE('named', 'f')})
+    AND NOT EXISTS (SELECT 1 FROM persistence_requests c WHERE c.sequence>COALESCE(${seen},0) AND c.worktree_id=f.worktree_id
+      AND c.state='committed' AND NOT ${SYNC_KIND('c')})`;
+
+/**
+ * `syncSeen` maps a worktree id to the newest request sequence when this process last claimed a sync head there: a
+ * sync row is not claimed while a foreground write that may go first waits on its worktree (`FOREGROUND_WAITING`), so
+ * a write its own process is claiming (its row skipped as locked) or has claimed is not overtaken. A claimed sync row
+ * returns `seen_sequence`.
+ */
 export async function claimNextWrite(engine: BrainEngine, hostId: string, leaseMs = 30_000, excludeRoots: string[] = [], fifoRoots: string[] = [],
-  laneRoots: string[] = []): Promise<(WriteRequest & { passed_sync?: boolean }) | null> {
+  laneRoots: string[] = [], syncSeen: Record<string, string> = {}): Promise<(WriteRequest & { passed_sync?: boolean; seen_sequence?: string | null }) | null> {
   const first = `(${foregroundPrioritySql()}) AND NOT (COALESCE(r.worktree_id::text,'db:'||r.source_incarnation::text)=ANY($3::text[]))`;
+  const holderOnly = !RESIDENT_CONSUMER_KINDS.includes(claimOwnerKind());
   return engine.transactionDirect(async tx => {
     // The protocol declaration and the FIFO head read are sent together.
     const [, [row]] = await pipelined(tx, [
       () => declarePersistenceProtocol(tx),
-      () => tx.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
+      () => tx.executeRaw<WriteRequest>(`WITH waiting AS MATERIALIZED (SELECT f.worktree_id, max(f.sequence) AS last
+        FROM (${FOREGROUND_WAITING_ON('$5::text', "($6::text::jsonb->>f.worktree_id::text)::bigint")}) f GROUP BY f.worktree_id)
+      SELECT r.* FROM persistence_requests r
       LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id
       WHERE ${claimableWriteSql(`(${first})`, '$4::text[]')}
         -- On a root whose lane groups run in this process only a foreground write is claimed (beside them).
         AND NOT (r.worktree_id::text=ANY($4::text[]) AND (${SYNC_KIND('r')} OR NOT (${first})))
-      ORDER BY ${CLAIM_ORDER(`(${first})`)} LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, excludeRoots, fifoRoots, laneRoots]),
+        AND NOT (${SYNC_KIND('r')} AND ${first} AND EXISTS (SELECT 1 FROM waiting g WHERE g.worktree_id=r.worktree_id AND g.last>r.sequence))
+      ORDER BY ${holderOnly ? `${LEASE_HELD}, ` : ''}${CLAIM_ORDER(`(${first})`)} LIMIT 1 FOR UPDATE OF r SKIP LOCKED`,
+      [hostId, excludeRoots, fifoRoots, laneRoots, consumerIdentity().nonce, JSON.stringify(syncSeen), ...(holderOnly ? [syncLockId(''), process.pid, hostname()] : [])]),
     ]) as [unknown, WriteRequest[]];
     if (!row) return null;
+    if (holderOnly && String(row.intent?.kind ?? '').startsWith('managed_sync_')) {
+      const [lease] = await tx.executeRaw<{ holder_pid: number; holder_host: string | null }>(`SELECT holder_pid, holder_host FROM gbrain_cycle_locks
+        WHERE id=$1::text AND ttl_expires_at>now() AND NOT (holder_pid=$2::integer AND holder_host IS NOT DISTINCT FROM $3::text)`, [syncLockId(row.source_id), process.pid, hostname()]);
+      if (lease && classifyHolderLiveness(lease.holder_pid, lease.holder_host ?? '', 0, { graceMs: 0 }) !== 'dead_eligible') return null;
+    }
     // `passed_sync`: the claimed row went ahead of a queued sync row of its root.
     // #6278: the claim stamps its own `preparing` phase, so a kill before the first renewal is charged like any other.
     const token = randomUUID();
-    const [claimed] = await tx.executeRaw<WriteRequest & { passed_sync: boolean }>(`UPDATE persistence_requests SET state='running',
+    const [claimed] = await tx.executeRaw<WriteRequest & { passed_sync: boolean; seen_sequence: string | null }>(`UPDATE persistence_requests SET state='running',
       execution_token=$2::uuid,claim_expires_at=now()+($3::double precision*interval '1 millisecond'),
       updated_at=now(),blocked_reason=NULL,claim_phase=$4::text::jsonb WHERE id=$1::uuid RETURNING *,EXISTS (SELECT 1 FROM persistence_requests earlier
         WHERE earlier.worktree_id=persistence_requests.worktree_id AND earlier.sequence<persistence_requests.sequence
-        AND earlier.state='queued' AND ${SYNC_KIND('earlier')}) AS passed_sync`,
+        AND earlier.state='queued' AND ${SYNC_KIND('earlier')}) AS passed_sync,
+        CASE WHEN ${SYNC_KIND('persistence_requests')} THEN (SELECT max(sequence) FROM persistence_requests)::text END AS seen_sequence`,
     [row.id, token, leaseMs, claimPhaseStamp(startClaimPhase(), token)]);
     return claimed ? { ...claimed, previous_claim_phase: row.claim_phase } : null;
-  });
+  }, { pipelineFirst: isPersistenceDeclaration });
 }
 /**
  * #5984 lanes: claims the head of the next admitted group of lane run `run` in
@@ -598,7 +777,7 @@ export async function claimNextLaneHead(engine: BrainEngine, hostId: string, wor
     await declarePersistenceProtocol(tx);
     const [row] = await tx.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
       JOIN persistence_worktrees w ON w.id=r.worktree_id
-      WHERE r.worktree_id=$2::uuid AND r.state='queued' AND r.intent->>'lane'=$3 AND r.intent->>'group'=r.request_id::text
+      WHERE r.worktree_id=$2::uuid AND r.state='queued' AND ${BACKOFF_ELAPSED('r')} AND r.intent->>'lane'=$3 AND r.intent->>'group'=r.request_id::text
         AND w.owner_host_id=$1::uuid AND w.state='active' AND ${refreshFenceClear('r')}
         AND NOT EXISTS (SELECT 1 FROM persistence_effects blocked WHERE blocked.worktree_id=r.worktree_id AND blocked.recovery IS NOT NULL)
         AND NOT EXISTS (SELECT 1 FROM persistence_effects mirror WHERE mirror.worktree_id=r.worktree_id
@@ -606,19 +785,9 @@ export async function claimNextLaneHead(engine: BrainEngine, hostId: string, wor
         AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked WHERE blocked.worktree_id=r.worktree_id AND blocked.recovery IS NOT NULL)
         AND NOT EXISTS (SELECT 1 FROM persistence_requests earlier WHERE earlier.worktree_id=r.worktree_id AND earlier.sequence<r.sequence
           AND (earlier.state IN ('queued','recovering') OR (earlier.state='running' AND COALESCE(earlier.intent->>'lane','')<>$3)))
-        -- #5984 Phase 4.5: no new lane head while a foreground write that may go first waits to be claimed (a claimed
-        -- one publishes beside the lanes), except one head after each foreground commit since this run's last head
-        -- claim, so a stream of writes cannot starve the drain. A write another process claimed but has not begun to
-        -- publish still waits: it cannot publish while this process's lanes hold the worktree, so it releases the claim
-        -- and this process takes it.
-        AND NOT ((${foregroundPrioritySql()}) AND EXISTS (SELECT 1 FROM persistence_requests f WHERE f.worktree_id=r.worktree_id
-            AND (f.state IN ('queued','recovering') OR (f.state='running' AND NOT f.publication_started
-              AND f.claim_phase->'owner'->>'nonce' IS DISTINCT FROM $5::text))
-            AND f.recovery IS NULL AND NOT ${SYNC_KIND('f')}
-            AND NOT EXISTS (SELECT 1 FROM persistence_requests named WHERE named.worktree_id=f.worktree_id AND named.sequence<f.sequence
-              AND named.state IN ('queued','running','recovering') AND ${SYNC_KIND('named')} AND ${NAMES_PAGE('named', 'f')}))
-          AND NOT EXISTS (SELECT 1 FROM persistence_requests c WHERE c.sequence>COALESCE($4::bigint,0) AND c.worktree_id=r.worktree_id
-            AND c.state='committed' AND NOT ${SYNC_KIND('c')}))
+        -- #5984 Phase 4.5: no new lane head while a foreground write that may go first waits (a claimed one publishes
+        -- beside the lanes), except one head after each foreground commit since this run's last head claim.
+        AND NOT ((${foregroundPrioritySql()}) AND r.worktree_id IN (SELECT f.worktree_id FROM (${FOREGROUND_WAITING_ON('$5::text', '$4::bigint', 'f.worktree_id=$2::uuid')}) f))
       ORDER BY r.sequence LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, worktreeId, run, seenSequence, consumerIdentity().nonce]);
     if (!row) return null;
     const token = randomUUID();
@@ -646,12 +815,20 @@ export async function releaseUnpublishedClaim(engine: SqlEngine, row: WriteReque
     AND state='running' AND recovery IS NULL AND publication_started=false AND ${PERSISTENCE_PROTOCOL_PREDICATE}`, [row.id, row.execution_token, reason, opts.charge === true]);
 }
 
+/** A recovery larger than a budget: names both budgets and the bytes needed, since a configured budget is the user's. */
+function recoveryTooLarge(bytes: number, limits: JournalLimits): OperationError {
+  const worktree = journalLimitKey('worktreeRecoveryBytes'), brain = journalLimitKey('brainRecoveryBytes');
+  return new OperationError('request_too_large',
+    `This request needs ${bytes} bytes of recovery space, more than the recovery budget (${worktree} ${limits.worktreeRecoveryBytes}, ${brain} ${limits.brainRecoveryBytes}); nothing was changed.`,
+    `A configured budget is the user's choice: ask them before raising it with gbrain config set, or unset ${worktree} for the default, which holds the largest page stored in segments.`);
+}
+
 /** Called while holding the root lock; the durable record precedes any rename. */
 export async function prepareRecovery(engine: BrainEngine, row: WriteRequest, recovery: RecoveryRecord, bytes: number,
   overrides?: Partial<JournalLimits>): Promise<void> {
   const limits = await readJournalLimits(engine,overrides);
   if (!row.worktree_id) throw new TypeError('Filesystem recovery requires a worktree.');
-  if (bytes > limits.worktreeRecoveryBytes || bytes > limits.brainRecoveryBytes) throw new OperationError('request_too_large', 'This request exceeds the configured recovery capacity.', 'Increase recovery capacity before submitting a new request.');
+  if (bytes > limits.worktreeRecoveryBytes || bytes > limits.brainRecoveryBytes) throw recoveryTooLarge(bytes, limits);
   await engine.transaction(async tx => {
     // A crash after rename must never lose the earlier recovery reservation,
     // even when the deployment defaults ordinary transactions to async commit.
@@ -696,9 +873,8 @@ export async function prepareRecoveries(engine: BrainEngine, members: { row: Wri
   if (!worktree || members.some(member => member.row.worktree_id !== worktree)) throw new TypeError('Grouped filesystem recovery requires one worktree.');
   const limits = knownLimits ?? await readJournalLimits(engine);
   const total = members.reduce((sum, member) => sum + member.bytes, 0);
-  if (members.some(member => member.bytes > limits.worktreeRecoveryBytes || member.bytes > limits.brainRecoveryBytes)) {
-    throw new OperationError('request_too_large', 'This request exceeds the configured recovery capacity.', 'Increase recovery capacity before submitting a new request.');
-  }
+  const largest = Math.max(...members.map(member => member.bytes));
+  if (largest > limits.worktreeRecoveryBytes || largest > limits.brainRecoveryBytes) throw recoveryTooLarge(largest, limits);
   await transaction(async tx => {
     const [, counters] = await pipelined(tx, [() => declareDurablePersistence(tx), () => lockCounters(tx, ['brain', `worktree:${worktree}`])]) as [unknown, Counter[]];
     for (const c of counters) if (Number(c.recovery_bytes) + total > (c.key === 'brain' ? limits.brainRecoveryBytes : limits.worktreeRecoveryBytes)) throw capacityError('recovery bytes currently reserved by other requests');
@@ -734,12 +910,13 @@ export async function clearResolvedRecoveries(engine: BrainEngine, rows: WriteRe
   for (const row of resolved) if (!cleared.has(row.id)) await clearResolvedRecovery(engine, row.id);
 }
 
-/** #6007: claims again a request this owner pass released to the queue itself, while it still holds the worktree's native lock. */
+/** #6007: claims again a request this owner pass released to the queue itself, while it still holds the worktree's native lock; never before its backoff (LPH b). */
 export async function reclaimReleasedWrite(engine: BrainEngine, id: string, leaseMs = 30_000): Promise<WriteRequest | null> {
   const token = randomUUID();
   const [claimed] = await engine.executeRawDirect<WriteRequest>(`UPDATE persistence_requests SET state='running',execution_token=$2::uuid,
     claim_expires_at=now()+($3::double precision*interval '1 millisecond'),updated_at=now(),blocked_reason=NULL,claim_phase=$4::text::jsonb
-    WHERE id=$1::uuid AND state='queued' AND recovery IS NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING *`, [id, token, leaseMs, claimPhaseStamp(startClaimPhase(), token)]);
+    WHERE id=$1::uuid AND state='queued' AND recovery IS NULL AND ${BACKOFF_ELAPSED('persistence_requests')} AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING *`,
+  [id, token, leaseMs, claimPhaseStamp(startClaimPhase(), token)]);
   return claimed ?? null;
 }
 
@@ -761,6 +938,9 @@ export async function completeWrite(tx: SqlEngine, row: WriteRequest, state: 'co
     `The journal row of request ${row.request_id} in source ${row.source_id} disappeared before its completion was recorded, so no outcome was saved. Inspect the source's requests with the command in fix before submitting anything again.`,
     { fix: ownerStatusFix(row.source_id) });
   if (isTerminal(current)) return current;
+  // G7b: a strict write whose door commit landed before its row keeps naming that commit when it ends without committing.
+  const landed = (current.outcome as { persistence?: { landed_before_row?: boolean } } | null)?.persistence;
+  if (state !== 'committed' && landed?.landed_before_row === true && !('persistence' in outcome)) outcome = { ...outcome, persistence: landed };
   if (row.execution_token !== current.execution_token) throw opError('write_claim_lost', 'Write claim changed before completion.',
     `Another owner pass claimed request ${row.request_id} in source ${row.source_id} before this pass recorded its outcome, so this pass's completion was discarded; the current claim records the final outcome. Inspect the request with the command in fix instead of resubmitting it.`,
     { fix: requestInspectFix(row) });
@@ -770,19 +950,28 @@ export async function completeWrite(tx: SqlEngine, row: WriteRequest, state: 'co
   // releases its outstanding counters; no row means the encoding exceeds the reservation and nothing changed.
   const resultBytes = jsonBytes(outcome) + jsonBytes(current.authority) + 1024 + Buffer.byteLength(error?.message ?? '') + (error?.detail ? jsonBytes(error.detail) : 0);
   const probePurges = intentCarriesContent(current.intent);
-  const [terminal] = await tx.executeRaw<WriteRequest & { purge_has_facts?: boolean; purge_has_pages?: boolean }>(`WITH effects AS (SELECT COALESCE(SUM(octet_length(data::text)+octet_length(kind)+1024),0) AS bytes
-      FROM persistence_effects WHERE request_id=$1::uuid),
+  // #6696 (A1): the true-up sizes the reservation down to what the receipt keeps, once no effect is unfinished.
+  const retained = retainedReceiptBytes({ intent: current.intent, authority: current.authority, outcome, error_message: error?.message ?? null,
+    error_detail: error?.detail ?? current.error_detail, client_request_id: current.client_request_id }, { stage: 'terminal' });
+  const [terminal] = await tx.executeRaw<WriteRequest & { purge_has_facts?: boolean; purge_has_pages?: boolean }>(`WITH effects AS (SELECT COALESCE(SUM(${EFFECT_BYTES_SQL}),0) AS bytes,
+      COALESCE(bool_or(state<>'committed'),false) AS unfinished FROM persistence_effects WHERE request_id=$1::uuid),
     done AS (UPDATE persistence_requests SET state=$2,outcome=$3::text::jsonb,
       error_code=$4,error_message=$5,error_detail=COALESCE($8::text::jsonb,error_detail),completed_at=now(),updated_at=now(),claim_expires_at=NULL,blocked_reason=NULL,
       consumer_version=CASE WHEN $2='committed' THEN $6 ELSE consumer_version END,
       consumer_host_id=CASE WHEN $2='committed' THEN $7::uuid ELSE consumer_host_id END,
+      consumer_segment_reader=CASE WHEN $2='committed' THEN true ELSE consumer_segment_reader END,
       published_at=CASE WHEN $2='committed' THEN now() ELSE published_at END,
-      preparation_attempts=CASE WHEN $2='committed' THEN 0 ELSE preparation_attempts END
+      preparation_attempts=CASE WHEN $2='committed' THEN 0 ELSE preparation_attempts END,
+      terminal_reservation=CASE WHEN (SELECT unfinished FROM effects) THEN terminal_reservation
+        ELSE LEAST(terminal_reservation,$12::bigint+(SELECT bytes FROM effects)) END
       WHERE id=$1::uuid AND $9::bigint+(SELECT bytes FROM effects)<=terminal_reservation RETURNING *),
-    released AS (UPDATE persistence_counters SET outstanding_count=outstanding_count-1,intent_bytes=intent_bytes-$11
-      WHERE key=ANY($10::text[]) AND EXISTS (SELECT 1 FROM done))
+    released AS (UPDATE persistence_counters c SET outstanding_count=c.outstanding_count-1,intent_bytes=c.intent_bytes-$11,
+      terminal_bytes=c.terminal_bytes-LEAST($13::bigint-done.terminal_reservation,c.terminal_bytes)
+      FROM done WHERE c.key=ANY($10::text[])),
+    ${TRUE_UP_CLAMP_SQL('SELECT count(*) FROM persistence_counters c, done WHERE c.key=ANY($10::text[]) AND $13::bigint-done.terminal_reservation>c.terminal_bytes')}
     SELECT done.*${probePurges ? `, ${PURGE_PRESENCE_COLUMNS}` : ''} FROM done`, [row.id, state, JSON.stringify(outcome), error?.code ?? null, error?.message ?? null, stamp.version, stamp.hostId,
-      error?.detail ? JSON.stringify(error.detail) : null, resultBytes, ['brain', principalKey(requestPrincipal(row))], Number(current.intent_bytes)]);
+      error?.detail ? JSON.stringify(error.detail) : null, resultBytes, ['brain', principalKey(requestPrincipal(row))], Number(current.intent_bytes),
+      retained, Number(current.terminal_reservation)]);
   if (!terminal) throw capacityError('terminal result and effects exceed their reserved bounded encoding');
   const { purge_has_facts: purgeFacts, purge_has_pages: purgePages, ...doneRow } = terminal;
   const done = doneRow as WriteRequest;
@@ -790,7 +979,15 @@ export async function completeWrite(tx: SqlEngine, row: WriteRequest, state: 'co
   // reason first, or committed as a no-op after the overlay dropped the purged rows) keeps no copy of it; replay answers
   // from the stored outcome, and the intent bytes were released above.
   if (error && PURGED_REFUSAL.test(`${error.code}: ${error.message}`) || probePurges && await intentCarriesPurgedContent(tx as BrainEngine, current, { facts: purgeFacts === true, pages: purgePages === true })) {
-    const [redacted] = await tx.executeRaw<WriteRequest>('UPDATE persistence_requests SET intent=NULL,compacted=true WHERE id=$1::uuid RETURNING *', [row.id]);
+    // #6696: the redaction compacts the receipt, so its reservation shrinks to what is left (no intent) once no effect is unfinished.
+    const left = retainedReceiptBytes({ ...done, intent: null }, { stage: 'terminal' });
+    const [redacted] = await tx.executeRaw<WriteRequest>(`WITH effects AS (SELECT COALESCE(SUM(${EFFECT_BYTES_SQL}),0) AS bytes,
+        COALESCE(bool_or(state<>'committed'),false) AS unfinished FROM persistence_effects WHERE request_id=$1::uuid),
+      r AS (UPDATE persistence_requests SET intent=NULL,compacted=true,terminal_reservation=CASE WHEN (SELECT unfinished FROM effects) THEN terminal_reservation
+        ELSE LEAST(terminal_reservation,$2::bigint+(SELECT bytes FROM effects)) END WHERE id=$1::uuid RETURNING *),
+      released AS (UPDATE persistence_counters c SET terminal_bytes=c.terminal_bytes-LEAST($3::bigint-r.terminal_reservation,c.terminal_bytes)
+        FROM r WHERE c.key=ANY($4::text[]))
+      SELECT * FROM r`, [row.id, left, Number(done.terminal_reservation), ['brain', principalKey(requestPrincipal(row))]]);
     return redacted ?? done;
   }
   // Recovery bytes remain reserved until physical cleanup has been verified.
@@ -839,6 +1036,14 @@ export async function markRecovering(engine: SqlEngine, row: WriteRequest, reaso
 }
 const PERSISTENCE_QUEUE_TABLES = ['persistence_requests', 'persistence_effects', 'persistence_counters', 'page_projection_jobs', 'page_write_guards'];
 /**
+ * Lets timers and I/O run between PGLite statement chains. Every PGLite statement runs synchronously and resolves as a
+ * microtask, so a chain of them never returns to the event loop on its own and holds every request until it ends. It
+ * resumes from the timer queue: a check-phase resume (setImmediate) runs the next chain before timers that came due
+ * during the last one, so two chains back to back held a waiting request through both.
+ */
+export const yieldToEventLoop = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+
+/**
  * PGLite has no autovacuum. The resident owner reclaims queue churn and keeps
  * planner statistics current, so receipt lookups keep using the request-id
  * index and claims do not walk dead queue entries. A queue table is vacuumed
@@ -854,12 +1059,71 @@ export async function vacuumPersistenceQueues(engine: BrainEngine): Promise<numb
     `SELECT c.relname FROM pg_class c WHERE c.relname = ANY($1::text[]) AND c.relkind = 'r' AND c.relnamespace = 'public'::regnamespace
        AND pg_relation_size(c.oid) / current_setting('block_size')::int > c.relpages * 1.1 + 8`, [PERSISTENCE_QUEUE_TABLES]);
   const tables = PERSISTENCE_QUEUE_TABLES.filter(table => grown.some(row => row.relname === table));
-  if (tables.length) await engine.executeRaw(`VACUUM (ANALYZE) ${tables.join(', ')}`);
+  for (const table of tables) {
+    await yieldToEventLoop();
+    await engine.executeRaw(`VACUUM (ANALYZE) ${table}`);
+  }
   const [requests] = await engine.executeRaw<{ rows: number }>("SELECT GREATEST(reltuples,0)::float8 AS rows FROM pg_class WHERE oid='persistence_requests'::regclass");
   return Number(requests?.rows ?? 0);
 }
 
+/**
+ * Wave B segment GC (spec 3.5), run by the resident owner next to the queue
+ * vacuum: expires body stagings past their deadlines (their staged manifest
+ * and chunk rows go with them), deletes retired chunk rows and manifest rows
+ * no retained generation needs, and unreferenced segment texts past the grace
+ * window. On a managed brain it collects only the sources this host owns, each
+ * in a coordinated write. A brain that never staged a segment pays one
+ * existence probe.
+ */
+export async function sweepSegmentStorage(engine: BrainEngine): Promise<void> {
+  const [row] = await engine.executeRaw<{ present: boolean }>(
+    'SELECT EXISTS (SELECT 1 FROM page_body_stagings) OR EXISTS (SELECT 1 FROM page_segment_texts) AS present');
+  if (!row?.present) return;
+  if (!await readManagedMode(engine)) { await engine.sweepSegments({ expireStagings: true }); return; }
+  const owned = await engine.executeRaw<{ source_id: string }>(`SELECT s.source_id FROM persistence_source_bindings s
+    JOIN persistence_worktrees w ON w.id=s.worktree_id WHERE w.owner_host_id=$1::uuid AND w.state='active'`, [localHostId()]);
+  for (const { source_id: sourceId } of owned) {
+    const writes = await segmentWriteScope(engine, sourceId);
+    await writes(exec => exec.sweepSegments({ sourceId, expireStagings: true }));
+  }
+}
+
+/**
+ * #6696 (A9): compaction drops the intent, and a sync receipt's `intent.runId`
+ * is how a resumed run finds what it committed. A receipt of a run whose
+ * managed-sync cursor is still open (not done) is never compacted, nor the newest
+ * committed sync receipt of its worktree.
+ * #6712 PR 4b (design v3.2 §3.7): a pass's receipts carry `intent.passId`
+ * instead; one whose pass row is open (`telemetry.outcome = 'open'`, its
+ * `pass_id` equal) is kept the same way, and the newest committed sync receipt
+ * is kept whether it names a run or a pass.
+ */
+const OPEN_SYNC_PASS_SQL = (r: string) => `${r}.intent ? 'passId' AND EXISTS (SELECT 1 FROM op_checkpoints p
+      WHERE p.op='${MANAGED_SYNC_PASS_OP}' AND p.completed_keys->0->'telemetry'->>'pass_id'=${r}.intent->>'passId' AND p.completed_keys->0->'telemetry'->>'outcome'='open')`;
+export const OPEN_SYNC_CURSOR_EXCLUSION = (r: string) => `AND NOT (${r}.intent ? 'runId' AND EXISTS (SELECT 1 FROM op_checkpoints c
+      WHERE c.op='managed-sync' AND c.completed_keys->0->>'runId'=${r}.intent->>'runId' AND COALESCE(c.completed_keys->0->>'done','false')<>'true'))
+    AND NOT (${OPEN_SYNC_PASS_SQL(r)})`;
+/**
+ * GBRA-130 A-14: `newestSyncReceipt` as a selection filter, so a compaction pass's window is never filled by receipts
+ * `compactReceipt` keeps (one per worktree, retired ones included); the per-row check still re-reads it under the lock.
+ */
+export const NEWEST_SYNC_RECEIPT_EXCLUSION = (r: string) => `AND NOT (${r}.state='committed' AND ${r}.worktree_id IS NOT NULL AND (${r}.intent ? 'runId' OR ${r}.intent ? 'passId')
+      AND COALESCE(${r}.intent->>'kind','') LIKE 'managed_sync_%' AND ${r}.id=(SELECT n.id FROM persistence_requests n WHERE n.worktree_id=${r}.worktree_id
+        AND n.state='committed' AND COALESCE(n.intent->>'kind','') LIKE 'managed_sync_%' ORDER BY n.completed_at DESC, n.sequence DESC LIMIT 1))`;
+export async function newestSyncReceipt(tx: SqlEngine, row: Pick<WriteRequest, 'id' | 'state' | 'intent' | 'worktree_id'>): Promise<boolean> {
+  const intent = row.intent as { runId?: unknown; passId?: unknown; kind?: unknown } | null;
+  if (row.state !== 'committed' || !row.worktree_id || (typeof intent?.runId !== 'string' && typeof intent?.passId !== 'string') || !String(intent?.kind ?? '').startsWith('managed_sync_')) return false;
+  const [newest] = await tx.executeRaw<{ id: string }>(`SELECT id FROM persistence_requests WHERE worktree_id=$1::uuid AND state='committed'
+    AND COALESCE(intent->>'kind','') LIKE 'managed_sync_%' ORDER BY completed_at DESC, sequence DESC LIMIT 1`, [row.worktree_id]);
+  return newest?.id === row.id;
+}
+/** What one compaction pass did (#6696 A11): receipts compacted, reservation bytes it freed, candidates it left and why. */
+export interface ReceiptCompactionResult { compacted: number; freed_bytes: number; skipped_by_reason: Record<string, number> }
 export async function compactWriteReceipts(engine: BrainEngine, retentionDays?: number): Promise<number> {
+  return (await compactWriteReceiptsDetailed(engine, retentionDays)).compacted;
+}
+export async function compactWriteReceiptsDetailed(engine: BrainEngine, retentionDays?: number): Promise<ReceiptCompactionResult> {
   retentionDays ??= await readReceiptRetentionDays(engine);
   if (!Number.isFinite(retentionDays) || retentionDays < 0) throw new TypeError('Invalid receipt retention.');
   // Receipts with unfinished effects stay retained; filtering them before the
@@ -868,24 +1132,58 @@ export async function compactWriteReceipts(engine: BrainEngine, retentionDays?: 
     WHERE state IN ('committed','conflict','failed','cancelled') AND recovery IS NULL AND NOT compacted
     AND completed_at < now()-($1::double precision*interval '1 day')
     AND NOT EXISTS (SELECT 1 FROM persistence_effects e WHERE e.request_id=r.id AND e.state<>'committed')
+    ${OPEN_SYNC_CURSOR_EXCLUSION('r')}
+    ${NEWEST_SYNC_RECEIPT_EXCLUSION('r')}
     ORDER BY sequence LIMIT 100`, [retentionDays]);
-  let count=0;
-  for(const row of rows) count+=await engine.transaction(async tx=>{
+  const result: ReceiptCompactionResult = { compacted: 0, freed_bytes: 0, skipped_by_reason: {} };
+  for (const row of rows) {
+    const done = await compactReceipt(engine, row).catch(error => {
+      if (['55P03', '57014'].includes(getCode(error) ?? '')) return { skipped: 'lock_timeout' };
+      throw error;
+    });
+    if ('skipped' in done) result.skipped_by_reason[done.skipped] = (result.skipped_by_reason[done.skipped] ?? 0) + 1;
+    else { result.compacted++; result.freed_bytes += done.freed_bytes; }
+  }
+  return result;
+}
+/** Terminal states a compaction may take; the receipt-compaction repair keeps failures unless asked. */
+export const COMPACTABLE_STATES = ['committed', 'conflict', 'failed', 'cancelled'] as const;
+/**
+ * Compacts one terminal receipt in its own short transaction (#6696 A9, A11): counters locked first in key order, then
+ * the request row, with transaction-local lock and statement timeouts so a concurrent admission waits at most that
+ * long. Every eligibility rule is rechecked under the lock: terminal, no recovery, not compacted, `states`,
+ * `completedBefore`, no unfinished effect, no open sync cursor for its run, no open pass for its pass id (#6712 PR 4b), not
+ * the worktree's newest sync receipt.
+ */
+export async function compactReceipt(engine: BrainEngine, row: Pick<WriteRequest, 'id' | 'principal_kind' | 'principal_id'>,
+  opts: { states?: readonly string[]; completedBefore?: string } = {}): Promise<{ freed_bytes: number } | { skipped: string }> {
+  return engine.transaction(async tx => {
     await declarePersistenceProtocol(tx);
-    const keys=['brain',principalKey(requestPrincipal(row))];
-    await lockCounters(tx,keys);
-    const [current]=await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid FOR UPDATE',[row.id]);
-    if(!current || current.compacted || current.recovery || !isTerminal(current)) return 0;
-    const unfinished=await tx.executeRaw("SELECT 1 FROM persistence_effects WHERE request_id=$1::uuid AND state<>'committed' LIMIT 1",[row.id]);
-    if(unfinished.length) return 0;
-    const [effects]=await tx.executeRaw<{bytes:string}>(`SELECT COALESCE(SUM(octet_length(data::text)+octet_length(kind)+1024),0)::text AS bytes
-      FROM persistence_effects WHERE request_id=$1::uuid`,[row.id]);
-    const retained=Math.min(Number(current.terminal_reservation),jsonBytes(current.authority)+jsonBytes(current.outcome??{})+(current.error_detail?jsonBytes(current.error_detail):0)+(current.client_request_id?.length??0)+Number(effects.bytes)+1024);
-    await tx.executeRaw('UPDATE persistence_requests SET intent=NULL,compacted=true,error_message=NULL,terminal_reservation=$2 WHERE id=$1::uuid',[row.id,retained]);
-    for(const key of keys) await tx.executeRaw('UPDATE persistence_counters SET terminal_bytes=terminal_bytes-$2 WHERE key=$1',[key,Number(current.terminal_reservation)-retained]);
-    return 1;
+    await tx.executeRaw("SET LOCAL lock_timeout = '2s'");
+    await tx.executeRaw("SET LOCAL statement_timeout = '15s'");
+    const keys = ['brain', principalKey(requestPrincipal(row as WriteRequest))];
+    await lockCounters(tx, keys);
+    const [current] = await tx.executeRaw<WriteRequest & { eligible_age: boolean; open_cursor: boolean; open_pass: boolean }>(`SELECT r.*,
+        ($2::timestamptz IS NULL OR r.completed_at < $2::timestamptz) AS eligible_age,
+        EXISTS (SELECT 1 FROM op_checkpoints c WHERE r.intent ? 'runId' AND c.op='managed-sync' AND c.completed_keys->0->>'runId'=r.intent->>'runId'
+          AND COALESCE(c.completed_keys->0->>'done','false')<>'true') AS open_cursor,
+        COALESCE(${OPEN_SYNC_PASS_SQL('r')}, false) AS open_pass
+      FROM persistence_requests r WHERE r.id=$1::uuid FOR UPDATE OF r`, [row.id, opts.completedBefore ?? null]);
+    if (!current || current.compacted || current.recovery || !isTerminal(current)) return { skipped: 'changed' };
+    if (!(opts.states ?? COMPACTABLE_STATES).includes(current.state) || !current.eligible_age) return { skipped: 'changed' };
+    const unfinished = await tx.executeRaw("SELECT 1 FROM persistence_effects WHERE request_id=$1::uuid AND state<>'committed' LIMIT 1", [row.id]);
+    if (unfinished.length) return { skipped: 'unfinished_effect' };
+    if (current.open_cursor) return { skipped: 'open_sync_cursor' };
+    if (current.open_pass) return { skipped: 'open_sync_pass' };
+    if (await newestSyncReceipt(tx, current)) return { skipped: 'newest_sync_receipt' };
+    const [effects] = await tx.executeRaw<{ bytes: string }>(`SELECT COALESCE(SUM(${EFFECT_BYTES_SQL}),0)::text AS bytes
+      FROM persistence_effects WHERE request_id=$1::uuid`, [row.id]);
+    const retained = Math.min(Number(current.terminal_reservation), retainedReceiptBytes(current, { stage: 'compacted', effects: Number(effects.bytes) }));
+    const freed = Number(current.terminal_reservation) - retained;
+    await tx.executeRaw('UPDATE persistence_requests SET intent=NULL,compacted=true,error_message=NULL,terminal_reservation=$2 WHERE id=$1::uuid', [row.id, retained]);
+    await tx.executeRaw('UPDATE persistence_counters SET terminal_bytes=terminal_bytes-LEAST($2::bigint,terminal_bytes) WHERE key=ANY($1::text[])', [keys, freed]);
+    return { freed_bytes: freed };
   });
-  return count;
 }
 export function receiptFor(row: WriteRequest, facts?: WriteHealthFacts, now = Date.now()) {
   return {

@@ -3,6 +3,7 @@ import type { BrainEngine } from '../engine.ts';
 import { opError, OperationError } from '../ops/contract.ts';
 import type { WriteAttribution } from './attribution.ts';
 import { readPersistenceBrain } from './managed-mode.ts';
+import { settleAtCommit } from '../page-state/transactions.ts';
 import { isTrustTier, nestWriteTrust, trustRankSql, type TrustTier, type WriteTrust } from '../trust/tier.ts';
 import type { TrustTable } from '../trust/schema.ts';
 
@@ -59,10 +60,12 @@ export async function withCoordinatedWrite<T>(engine: BrainEngine, sourceIds: st
   // #6007: the persistence identity, the enclosing settings and the new settings in one round trip;
   // nothing is set when the identity row is missing. The OFFSET 0 subquery reads the enclosing values first.
   // A declared trust tier nests as min(outer, inner) (ranks compared in SQL); an undeclared one leaves the enclosing settings.
-  const names = ['gbrain.write_sources', ...ATTRIBUTION_SETTINGS, ...TRUST_SETTINGS];
+  // G7a: `gbrain.git_protocol` declares that this build applies the git-canonical rules (git-declared.ts); the managed
+  // writer guard refuses rows of a git-canonical source from a writer without it (an older gbrain).
+  const names = ['gbrain.write_sources', ...ATTRIBUTION_SETTINGS, ...TRUST_SETTINGS, 'gbrain.git_protocol'];
   const [tier, origin] = trustValues(attribution.trust ?? null);
   const [brain] = await engine.executeRaw<Record<string, string | null>>(`SELECT b.brain_id,prev.*,
-      CASE WHEN b.brain_id IS NOT NULL THEN concat(set_config('gbrain.write_sources',$1,true),
+      CASE WHEN b.brain_id IS NOT NULL THEN concat(set_config('gbrain.write_sources',$1,true),set_config('gbrain.git_protocol','1',true),
         set_config('gbrain.write_request',CASE WHEN prev.s2<>'' THEN prev.s1 ELSE $2 END,true),
         set_config('gbrain.write_principal_kind',CASE WHEN prev.s2<>'' THEN prev.s2 ELSE $3 END,true),
         set_config('gbrain.write_principal_id',CASE WHEN prev.s2<>'' THEN prev.s3 ELSE $4 END,true),
@@ -87,7 +90,8 @@ export async function withCoordinatedWrite<T>(engine: BrainEngine, sourceIds: st
     });
   } catch (error) { failed = true; throw error; }
   finally {
-    try { await applySettings(engine, names, previous); }
+    // GBRA-133: after a success on Postgres the restore shares the transaction's COMMIT round trip (settleAtCommit).
+    try { await (failed ? applySettings(engine, names, previous) : settleAtCommit(engine, applySettings(engine, names, previous))); }
     catch (error) { if (!failed) throw error; }
   }
 }

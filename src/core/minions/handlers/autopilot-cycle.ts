@@ -4,6 +4,7 @@
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionHandler } from '../types.ts';
 import { resolveJobPull } from './job-pull.ts';
+import { reportJobProgress } from './job-progress.ts';
 import { isConnectorSourceKind } from '../../persistence/connector-identity.ts';
 import { CONNECTOR_SOURCE_PHASES } from '../../cycle/phase-scope.ts';
 
@@ -50,6 +51,7 @@ export function makeAutopilotCycleHandler(engine: BrainEngine): MinionHandler {
     // source's `local_path` here and use it as the cycle's brainDir below.
     let sourceLocalPath: string | null = null;
     let connectorSource = false;
+    let lastSourceCycleAt: string | null = null;
     if (rawSourceId !== undefined && rawSourceId !== null) {
       if (typeof rawSourceId !== 'string') {
         throw new Error(`autopilot-cycle: invalid source_id (not a string): ${JSON.stringify(rawSourceId)}`);
@@ -65,8 +67,10 @@ export function makeAutopilotCycleHandler(engine: BrainEngine): MinionHandler {
       // immediately if source is gone or archived; runCycle never even
       // acquires a lock. Also fetches local_path so FS phases bind to the
       // source's own checkout (the #2227/#2194 mixed-scope fix).
-      const rows = await engine.executeRaw<{ archived: boolean | null; local_path: string | null; kind: string | null }>(
-        `SELECT archived, local_path, config->>'kind' AS kind FROM sources WHERE id = $1`,
+      const rows = await engine.executeRaw<{ archived: boolean | null; local_path: string | null; kind: string | null; last_cycle: string | null }>(
+        `SELECT archived, local_path, config->>'kind' AS kind,
+                CASE WHEN config->'last_source_cycle_window_at' IS NOT NULL THEN NULLIF(config->>'last_source_cycle_window_at', '')
+                     ELSE COALESCE(config->>'last_source_cycle_at', config->>'last_full_cycle_at') END AS last_cycle FROM sources WHERE id = $1`,
         [rawSourceId],
       );
       if (rows.length === 0) {
@@ -86,6 +90,7 @@ export function makeAutopilotCycleHandler(engine: BrainEngine): MinionHandler {
       sourceId = rawSourceId;
       // #5673: a connector source's local_path is never a brain directory.
       connectorSource = isConnectorSourceKind(rows[0].kind);
+      lastSourceCycleAt = rows[0].last_cycle && Number.isFinite(Date.parse(rows[0].last_cycle)) ? rows[0].last_cycle : null;
       sourceLocalPath = !connectorSource && typeof rows[0].local_path === 'string' && rows[0].local_path.length > 0
         ? rows[0].local_path
         : null;
@@ -153,7 +158,11 @@ export function makeAutopilotCycleHandler(engine: BrainEngine): MinionHandler {
       deadlineAtMs: job.deadlineAtMs, // #2781: phases budget sub-work from remaining time
       privateQueueOwnerJobId: job.id,
       ...(sourceId ? { sourceId } : {}),
+      // #6803: a connector cycle has no sync phase; its incremental set is the source's pages changed since its last cycle.
+      ...(connectorSource ? { sourceChangedSince: lastSourceCycleAt } : {}),
       ...(effectivePhases !== undefined ? { phases: effectivePhases as any } : {}),
+      // #7241: the phase in progress, for `gbrain jobs get` / get_job_progress while the cycle runs.
+      onPhaseStart: (phase, index, count) => reportJobProgress(job, { phase, phase_index: index, phase_count: count, started_at: new Date().toISOString() }),
       yieldBetweenPhases: async () => {
         // Yield to the event loop so worker lock-renewal can fire.
         await new Promise<void>(r => setImmediate(r));

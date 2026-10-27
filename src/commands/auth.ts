@@ -26,14 +26,14 @@ import type { BrainEngine } from '../core/engine.ts';
 import { assertAllowedScopes } from '../core/scope.ts';
 import { isTrustTier, TRUST_TIERS, type TrustTier } from '../core/trust/tier.ts';
 import { setMinTrust, setTokenMinTrust } from '../core/trust/min-trust.ts';
-import { generateToken, isUndefinedColumnError, isUndefinedTableError } from '../core/utils.ts';
+import { generateToken, isMissingSchemaObject } from '../core/utils.ts';
 import { TOKEN_ID_RE, insertUnifiedToken } from '../core/token-mint.ts';
 import { normalizeTokenScopes } from '../core/legacy-token-scope.ts';
 import { sqlQueryForEngine, type SqlQuery } from '../core/sql-query.ts';
 import { writeAuthAudit } from '../core/auth-audit.ts';
 import { readClientGrant, rescopeClientGrant, resolveGrantProfile, type GrantPatch } from '../core/grants/service.ts';
 import { parseClientRescopeArgs, parseRescopeGrantArgs, splitRescopeTarget, type RescopeGrantArgs } from '../core/grants/cli.ts';
-import { GRANT_PROFILES, GrantError, TOKEN_TTL_MAX_SECONDS, TOKEN_TTL_MIN_SECONDS, grantFromClient } from '../core/grants/model.ts';
+import { GRANT_PROFILES, GrantError, TOKEN_TTL_MAX_SECONDS, TOKEN_TTL_MIN_SECONDS, grantFromClient, type ClientGrant } from '../core/grants/model.ts';
 import { cliRenderContext, renderAction, type RenderedAction } from '../core/agent-output.ts';
 import { migrateLegacyTokens, parseRescopeTokenArgs, renderLegacyGrantAxis, rescopeLegacyToken, resolveRescopeTarget, type MigrateLegacyResult, type RescopeTokenResult } from '../core/grants/legacy-token.ts';
 
@@ -858,17 +858,36 @@ async function runRescope(args: string[], clientParser?: (args: string[]) => Res
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const grantError = error instanceof GrantError ? error : undefined;
+    const fix = grantError?.code === 'client_not_found' ? renderAction(CLIENT_NOT_FOUND_FIX, cliRenderContext()) : undefined;
     if (json) {
-      const grantError = error instanceof GrantError ? error : undefined;
-      console.log(JSON.stringify({ error: { code: grantError?.code ?? 'rescope_failed', reasons: grantError?.reasons ?? [], message } }, null, 2));
+      console.log(JSON.stringify({ error: { code: grantError?.code ?? 'rescope_failed', reasons: grantError?.reasons ?? [], message, ...(fix ? { fix, docs: 'docs/guides/error-codes.md#client_not_found' } : {}) } }, null, 2));
     }
     console.error('Error:', message);
+    if (fix) console.error('Fix: Run gbrain auth clients --json on this brain, then retry with an existing client id. No grants or tokens changed.');
     process.exit(1);
   }
 }
 
+const CLIENT_NOT_FOUND_FIX = {
+  argv: ['gbrain', 'auth', 'clients', '--json'], consent: [], actor: 'agent' as const, requires_exclusive: false,
+  why: 'Read-only: lists the OAuth clients registered on this brain so the call can be retried with an existing client id. No grants or tokens changed.',
+  verify: { argv: ['gbrain', 'auth', 'clients', '--json'] },
+};
+
 async function rescopeClientWith(engine: BrainEngine, clientId: string, parsed: RescopeGrantArgs) {
   const existing = await readClientGrant(engine, clientId);
+  if (parsed.printOnly) {
+    if (parsed.json) {
+      console.log(JSON.stringify({ before: existing, after: existing, revision: existing.revision, dryRun: true, changed: false, written: false, principal_grant: grantFromClient(existing) }, null, 2));
+      return;
+    }
+    console.log(`OAuth client grants: ${existing.clientName} (${clientId})`);
+    console.log(`  Revision: ${existing.revision}`);
+    printClientGrantAxes(existing);
+    console.log(`No change made. To change a grant, pass a grant flag, for example: gbrain auth rescope --client ${clientId} --sources default --dry-run`);
+    return;
+  }
   const profile = parsed.profile ? resolveGrantProfile({
     profile: parsed.profile, existing, sourceId: parsed.patch.sourceId ?? existing.sourceId ?? 'default',
     boundTools: parsed.patch.boundTools ?? undefined,
@@ -884,13 +903,17 @@ async function rescopeClientWith(engine: BrainEngine, clientId: string, parsed: 
   if (parsed.json) { console.log(JSON.stringify({ ...result, principal_grant: grantFromClient(result.after) }, null, 2)); return; }
   console.log(`OAuth client ${parsed.dryRun ? 'grant preview' : 'rescoped'}: ${result.after.clientName} (${clientId})`);
   console.log(`  Revision: ${result.before.revision} -> ${result.after.revision}`);
-  console.log(`  Scopes: ${result.after.scopes.join(' ') || '<none>'}`);
-  console.log(`  Write source: ${result.after.sourcesNone ? 'none (every read and write refused)' : result.after.sourceId}`);
-  console.log(`  Federated reads: ${result.after.federatedRead.join(', ') || '<none>'}`);
-  console.log(`  Takes holders: ${result.after.takesHolders === null ? 'world (default)' : result.after.takesHolders.join(', ') || 'none (every take hidden)'}`);
-  console.log(`  Tool surface: ${result.after.surface ?? '<server default>'}`);
-  console.log(`  Delegated spending: ${result.after.budgetUsdPerDay === null ? 'unlimited' : '$' + result.after.budgetUsdPerDay + '/day'}`);
+  printClientGrantAxes(result.after);
   console.log('Restrictions apply on the next request. Added scopes require a new access token; the client secret is unchanged.');
+}
+
+function printClientGrantAxes(grant: ClientGrant) {
+  console.log(`  Scopes: ${grant.scopes.join(' ') || '<none>'}`);
+  console.log(`  Write source: ${grant.sourcesNone ? 'none (every read and write refused)' : grant.sourceId}`);
+  console.log(`  Federated reads: ${grant.federatedRead.join(', ') || '<none>'}`);
+  console.log(`  Takes holders: ${grant.takesHolders === null ? 'world (default)' : grant.takesHolders.join(', ') || 'none (every take hidden)'}`);
+  console.log(`  Tool surface: ${grant.surface ?? '<server default>'}`);
+  console.log(`  Delegated spending: ${grant.budgetUsdPerDay === null ? 'unlimited' : '$' + grant.budgetUsdPerDay + '/day'}`);
 }
 
 function printTokenRescope(result: RescopeTokenResult, json: boolean) {
@@ -913,13 +936,17 @@ function printTokenRescope(result: RescopeTokenResult, json: boolean) {
   }
   if (result.migrated) console.log('  Migrated to the unified grant columns; the permissions JSON is kept as a mirror for older gbrain binaries.');
   if (result.refresh) {
-    const { available, added, unregistered } = result.refresh;
-    console.log(`  New operations available: ${available.length ? available.join(', ') : 'none'}`);
+    const { available, added, unregistered, materialized } = result.refresh;
+    if (materialized) {
+      console.log('  This token has no operation snapshot: it reaches every operation its scopes allow except membership operations, which need explicit approval.');
+      console.log('  Adding one writes a snapshot of every operation its scopes allow today plus the ones you add; operations later upgrades add then need --refresh-operations.');
+    }
+    console.log(`  ${materialized ? 'Operations that need approval' : 'New operations available'}: ${available.length ? available.join(', ') : 'none'}`);
     if (unregistered.length) console.log(`  Granted but no longer registered: ${unregistered.join(', ')}`);
     if (added.length) console.log(`  Added: ${added.join(', ')}`);
     else if (available.length) {
       const add = available.length <= 8 ? `--add ${available.join(',')}` : '--add <op,...>';
-      console.log(`  Nothing widened. Grant them with: gbrain auth rescope --token ${result.name} --refresh-operations ${add} (or --all-new)`);
+      console.log(`  Nothing widened. Grant them with: gbrain auth rescope --token ${result.name} --refresh-operations ${add}${materialized ? '' : ' (or --all-new)'}`);
     }
   }
   if (result.changed && !result.dryRun) console.log('Grants apply on the next request; the token secret is unchanged.');
@@ -1047,12 +1074,10 @@ export function clientOperationsLines(row: ClientRow): string[] {
  * for the unit suite.
  */
 export async function listClientRows(engine: BrainEngine): Promise<ClientRow[]> {
-  // The columns each degrade tier drops. isUndefinedColumnError matches any
-  // 42703 by code; the column list covers message-only (code-less) variants.
+  // The columns each degrade tier drops; any other missing object rethrows.
   const isSchemaShapeError = (e: unknown): boolean =>
-    isUndefinedTableError(e) ||
-    ['allowed_operations', 'deleted_at', 'surface', 'surface_set_by', 'source_id', 'federated_read']
-      .some(col => isUndefinedColumnError(e, col));
+    isMissingSchemaObject(e, 'table', 'oauth_clients') ||
+    isMissingSchemaObject(e, 'column', ['allowed_operations', 'deleted_at', 'surface', 'surface_set_by', 'source_id', 'federated_read']);
   try {
     return await engine.executeRaw<ClientRow>(
       `SELECT client_id, client_name, scope, surface, surface_set_by, source_id, federated_read, allowed_operations, deleted_at
@@ -1095,7 +1120,7 @@ export async function tokenLifetimeClampedClients(engine: BrainEngine): Promise<
     );
     return new Set(rows.map(r => r.client_id));
   } catch (e) {
-    if (isUndefinedTableError(e)) return new Set();
+    if (isMissingSchemaObject(e, 'table', 'oauth_grant_audit')) return new Set();
     throw e;
   }
 }
@@ -1402,5 +1427,9 @@ export async function runAuth(args: string[]): Promise<void> {
 // Direct-script entry point — only runs when this file is invoked as the main module
 // (e.g. `bun run src/commands/auth.ts ...`). When imported by cli.ts, this block is skipped.
 if (import.meta.main) {
-  await runAuth(process.argv.slice(2));
+  const { directEntryArgs } = await import('../cli/flag-equals.ts');
+  const { exitCliError } = await import('../cli/cli-error.ts');
+  const argv = await directEntryArgs('auth', process.argv.slice(2)).catch((e: unknown) => exitCliError(e, 'auth'));
+  if ('refusal' in argv) exitCliError(argv.refusal, 'auth', { legacy: argv.legacy });
+  else await runAuth(argv.args);
 }

@@ -180,6 +180,81 @@ for. Re-pointing an existing source at a different calendar (its
 re-lists the new calendar from a fresh window instead of replaying the old
 calendar's delta. Pages already imported from the previous calendar stay in
 the brain until you remove them — they are not reconciled automatically.
+`gbrain sources set-calendar <source> <calendar-id>` makes that change in one
+step and prints the sync to run. On a managed brain the source's sync cursor
+is keyed by its configuration, so when the source also syncs Gmail or
+Contacts the change makes their next sync re-read history from the start; the
+command then refuses with `confirmation_required` (exit 3) until you re-run
+it with `--yes`.
+
+### Unreadable calendar
+
+When Google answers the sweep's calendar read with HTTP 403 or 404, the
+account cannot read the calendar the source names (a calendar id from another
+account, a calendar that was unshared or deleted). Before #5012 that sweep
+looked like an empty calendar. Now:
+
+- the sync records `calendar_unreadable` (with the calendar id and HTTP
+  status) in the source's state and logs
+  `[google] calendar_unreadable: <account> cannot read calendar "<id>"`
+  with both fix commands. The run itself does not fail, so Gmail and Contacts
+  keep syncing; a readable list clears the record;
+- `gbrain google status` probes each linked calendar live (one `events.list`
+  read; `--no-probe` reports what the last sync recorded instead), names the
+  unreadable one with the fix, and reports `ok: false` and exits 1;
+- `gbrain doctor` warns `google_calendar_readable` from the recorded state,
+  with no network call.
+
+The fix: list the calendars the account can read, then point the source at
+one.
+
+```bash
+gbrain google calendars --account you@example.com
+gbrain sources set-calendar <source> <calendar-id>   # e.g. primary
+gbrain sync --source <source>
+gbrain doctor --only google_calendar_readable --json # verify
+```
+
+### API access
+
+Each service reads through its own Google Cloud API: Gmail through
+`gmail.googleapis.com`, Calendar through `calendar-json.googleapis.com` and
+Contacts through `people.googleapis.com`. Every one must be enabled once in
+the project that owns your OAuth client, and its scope must be granted at
+consent. When one is not:
+
+- `gbrain google setup` probes every service it is about to register before
+  it registers anything. A disabled API or an ungranted scope stops setup
+  with one report (exit 2, `status: api_access_blocked` under `--json`)
+  that names each API, the Google Cloud project, and the enable link from
+  Google's own error, plus the narrower `--services` command for the
+  services that already work;
+- `gbrain google status` probes the services each linked source syncs
+  (every granted service when no source is linked yet) and reports them under
+  `accounts[].api_access` (`problems` and a `fix`), with `ok: false` and
+  exit 1 while any remains;
+- the sync records the services it could not reach in the source's state.
+  The other services keep syncing and the run is `partial`; a service leaves
+  the record once its sweep reaches the API again. `gbrain doctor` warns
+  `google_api_access` from that record, with no network call.
+
+The fix's `next` is `ask_user` when an API is disabled (only the project
+owner can enable it in the console) and `tell_user_to_run` with
+`gbrain google connect --reauth <email>` when only a scope is missing.
+
+```bash
+gbrain google status --json   # names every disabled API with its enable link
+# enable each one at its link, or reauth for a missing scope, then:
+gbrain google status --json   # verify: api_access.problems is empty
+gbrain sync --source <source>
+```
+
+A managed source resolves its account before any service runs. When no
+enabled service can name the account (Gmail profile, Calendar primary
+calendar, People `me`), it asks the OAuth userinfo endpoint, which the
+`email` scope gbrain always requests can read. So a disabled API is reported
+as itself, and `connector_account_changed` means a credential that resolved
+to a different account than the source is pinned to.
 
 ## Calendar window
 
@@ -315,6 +390,21 @@ skipped silently:
 - for Gmail, `gbrain waiting` returns `completeness: "partial"` and names each
   held thread from the last 14 days (or with an unknown date).
 
+Contacts and Calendar items are held the same way, keyed
+`contact:<resource name>` and `event:<calendar id>:<event id>`. One failing
+contact or event no longer stops its sweep: the other contacts and events, and
+the Gmail sweep, still land. Only a failure that repeats until the item changes
+(for example a contact email or event attendee carrying text the brain cannot
+store, `invalid_connector_text`) counts toward a hold; a transient failure is
+retried on the next sync and never held. While the failing item is not held,
+that service's sync token stays where it is, so the next sync lists the item
+again; once it is held, the token moves past it. On a managed brain a failed
+coordinator write still ends the run, as before, and `--retry-failed`
+re-admits it. Because a sync token never lists an
+unchanged item again, `gbrain sources retry-held` re-fetches a held contact or
+event by its id on the next sync. Contacts and Calendar holds do not change the
+coverage `gbrain waiting` reports, which is about mail.
+
 A held item does not block the source's freshness stamp. To re-attempt:
 
 ```bash
@@ -372,8 +462,8 @@ gbrain sources add gmail-work --kind google --account you@example.com \
 What changes vs the vault flow: `gbrain google status`'s refresh probe and
 `gbrain doctor`'s `google_oauth` check cover vault accounts only (your
 external tool owns token health); the scope preflight trusts `--services`
-(a token missing a scope surfaces as `api_not_enabled`/`upstream` per sweep
-instead of `scope_missing`); send-as aliases are fetched live when the token
+(a token missing a scope surfaces per sweep as Google's 403, reported as
+`scope_missing`, rather than up front); send-as aliases are fetched live when the token
 allows it, otherwise identity degrades to the account address alone. The
 token command runs locally at sync time with your shell — it lives in local
 source config, is never reachable over MCP, and is the same trust class as a
@@ -404,11 +494,12 @@ attached. The catalog (also emitted as structured JSON with `--json`):
 | `code_reused` | Authorization code used twice | Re-run connect (codes are single-use) |
 | `invalid_client` | Client secret rotated/deleted in the console | Download the current JSON, reconnect |
 | `no_refresh_token` | Google returned no refresh token | Re-run connect; if persistent, revoke at <https://myaccount.google.com/permissions> and reconnect |
-| `api_not_enabled` | An API isn't enabled in your project | The error carries the exact enable link (project pre-selected) |
+| `api_not_enabled` | An API isn't enabled in your project | The error carries the project and the enable link from Google's error; `gbrain google status` names every disabled API at once (see [API access](#api-access)) |
 | `rate_limited` | Google quota hit | Automatic backoff; nothing to do |
-| `scope_missing` | Connected with narrower `--scopes` than needed | `gbrain google connect --reauth <email>` |
+| `scope_missing` | Connected with narrower `--scopes` than needed, or Google answered a request with "insufficient authentication scopes" | `gbrain google connect --reauth <email>` |
 | `relay_unreachable` / `relay_session_expired` / `claim_already_used` / `relay_disabled` | Hosted fast-path (gbrain.io relay) issues | BYO connect always works: `gbrain google connect` |
 | `not_connected` | No vault entry for the account | `gbrain google connect` |
+| `calendar_unreadable` | Google answered the source's calendar read with HTTP 403 or 404: the account cannot read that calendar | `gbrain google calendars --account <email>`, then `gbrain sources set-calendar <source> <calendar-id>`; see [Unreadable calendar](#unreadable-calendar) |
 | `upstream` | Google returned an unexpected error | Retry; if it persists, run `gbrain google status --json` and file the output |
 | `access_command_failed` | The `--access command` token command exited non-zero, timed out, or printed nothing token-shaped | Run it by hand; it must print a bare token or JSON with `token`/`access_token` |
 | `access_env_missing` | The `--access env` variable is unset/blank in this process | Export a live token into it (refresh externally), or switch back to the vault flow |

@@ -74,7 +74,12 @@ export interface PageSnapshot {
   withdrawals: PageWithdrawal[];
   /** Subject-'*' purges, listed in `withdrawals` only when the stored text names them. Absent when the source has none under the read's filter. */
   globalPurges?: GlobalPurgeMarker;
+  /** A segmented page's body generation at `revision` (readPageSnapshot): what a read that follows this snapshot pins. */
+  bodyGeneration?: number;
 }
+
+/** A stale expected revision; stored on receipts (#7602 matches it for fact entity requests refused before the fix). */
+export const PAGE_CHANGED_AFTER_READ_MESSAGE = 'The page changed after it was read. Read its current revision before retrying.';
 
 /**
  * The three revision refusals. `expectedRevision` is the caller's precondition: a revision (stale → `revision_conflict`),
@@ -88,7 +93,7 @@ export class PageRevisionConflictError extends Error {
     super(currentRevision === null ? 'The page no longer exists at the expected revision.'
       : expectedRevision === undefined ? 'The page already exists; an expected revision is required.'
       : expectedRevision === null ? 'The page was created after it was read. Read its current revision before retrying.'
-      : 'The page changed after it was read. Read its current revision before retrying.');
+      : PAGE_CHANGED_AFTER_READ_MESSAGE);
     this.name = 'PageRevisionConflictError';
     this.code = expectedRevision === undefined && currentRevision !== null ? 'revision_required' : 'revision_conflict';
   }

@@ -91,25 +91,35 @@
     "getCallersOf#chunkId": {},
     "getCallersOf#default": {},
     "getCallersOf#sourceId": {},
-    "getChunkWindows#default": {},
-    "getChunkWindows#scopedPrivateSafe": {},
-    "getChunks#default": {
+    "getChunkPage#default": {
+      "raw": 2
+    },
+    "getChunkPage#sourceIds+excludePrivate": {
+      "raw": 2
+    },
+    "getChunkWindows#default": {
       "raw": 1
+    },
+    "getChunkWindows#scopedPrivateSafe": {
+      "raw": 1
+    },
+    "getChunks#default": {
+      "raw": 2
     },
     "getChunks#excludePrivate": {
-      "raw": 1
+      "raw": 2
     },
     "getChunks#includeEmbedding": {
-      "raw": 1
+      "raw": 2
     },
     "getChunks#includeUnsealed": {
-      "raw": 1
+      "raw": 2
     },
     "getChunks#requireSafeChunks": {
-      "raw": 1
+      "raw": 2
     },
     "getChunks#sourceIds": {
-      "raw": 1
+      "raw": 2
     },
     "getChunksWithEmbeddings#default": {},
     "getChunksWithEmbeddings#sourceId+includeUnsealed": {},
@@ -193,6 +203,12 @@
     "listCorpusSample#seed": {
       "tx": 1
     },
+    "listEmbeddingStateRows#default": {
+      "raw": 1
+    },
+    "listEmbeddingStateRows#sourceIds": {
+      "raw": 1
+    },
     "listEnrichCandidates#default": {},
     "listEnrichCandidates#sourceId": {},
     "listEnrichCandidates#sourceIds+reenrich": {},
@@ -262,21 +278,32 @@
     "mergeOntologyFact#corroborate": {},
     "mergeOntologyFact#insert": {},
     "mergeOntologyFact#supersede": {},
-    "migrateFactsToCanonical#default": {},
+    "migrateFactsToCanonical#default": {
+      "raw": 1
+    },
     "purgeDeletedPages#default": {},
     "purgeDeletedPages#dryRun": {},
     "putContradictionCacheEntry#default": {},
     "putPage#blankBody": {
-      "raw": 4,
+      "raw": 5,
       "tx": 1
     },
     "putPage#default": {
-      "raw": 4,
+      "raw": 5,
       "tx": 1
     },
     "putPage#expectedRevision": {
-      "raw": 4,
+      "raw": 5,
       "tx": 1
+    },
+    "readEmbeddingStateCounts#full": {
+      "raw": 1
+    },
+    "readEmbeddingStateCounts#full+sourceIds": {
+      "raw": 1
+    },
+    "readEmbeddingStateCounts#ops": {
+      "raw": 1
     },
     "readPageSnapshot#default": {},
     "readPageSnapshot#sourceId": {},
@@ -294,11 +321,11 @@
       "tx": 1
     },
     "replaceDerivedLinks#default": {
-      "raw": 12,
+      "raw": 13,
       "tx": 1
     },
     "replaceDerivedLinksBatch#default": {
-      "raw": 12,
+      "raw": 13,
       "tx": 1
     },
     "resolveSlugWithAlias#default": {},
@@ -311,8 +338,14 @@
     "resolveSlugs#sourceIds": {},
     "resolveSlugsByPaths#default": {},
     "resolveTake#default": {},
-    "restorePage#default": {},
-    "restorePage#sourceId": {},
+    "restorePage#default": {
+      "raw": 1,
+      "tx": 1
+    },
+    "restorePage#sourceId": {
+      "raw": 1,
+      "tx": 1
+    },
     "revertToVersion#default": {},
     "revertToVersion#sourceId": {},
     "searchKeyword#cjk": {
@@ -324,9 +357,11 @@
       "tx": 1
     },
     "searchKeywordChunks#cjk": {
+      "raw": 1,
       "tx": 1
     },
     "searchKeywordChunks#cjk+sourceId": {
+      "raw": 1,
       "tx": 1
     },
     "searchTakes#default": {},
@@ -371,11 +406,11 @@
     "traversePathsDetailed#out+sourceId+linkType": {},
     "updatePageContextualRetrievalState#default": {},
     "updateSlug#moved": {
-      "raw": 10,
+      "raw": 13,
       "tx": 1
     },
     "updateSlug#noop": {
-      "raw": 1,
+      "raw": 2,
       "tx": 1
     },
     "updateSourceConfig#default": {},

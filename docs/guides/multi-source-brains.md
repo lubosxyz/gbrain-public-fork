@@ -137,6 +137,82 @@ still go to the bound source only.
 rule: an explicit `source_id` must be inside the connection's own source or
 grant.
 
+### Narrow one request with `source_ids`
+
+`search` and `query` take `source_ids`, a list of source ids (CLI:
+`--source-ids source-a,source-b`). The request reads only those sources:
+
+- Each id is checked exactly like an explicit `source_id`. A remote agent
+  naming a source outside its grant gets `permission_denied` for the whole
+  request, and a removed or archived source gets `unknown_source`. So the
+  list can narrow a request but never widen it.
+- Omitting `source_ids`, or passing `[]` or a blank string, reads every
+  source the caller can read, as before.
+- With `source_id` as well, the request reads the sources in both
+  (`source_id: "__all__"` keeps the list). If none are left, nothing is
+  searched: the result is empty with an `empty_retrieval` notice, never a
+  fallback to the wider scope.
+- `__all__` and malformed ids in the list are `invalid_params`.
+
+Every part of the request reads the narrowed sources: keyword, vector and
+title matches, other names, entity anchoring, saved facts, the CRAG re-run,
+think escalation and evidence delivery.
+
+**Say to your agent:** *"Search my brain for the acme-example renewal, but
+only in source-a."*
+
+### A bot acting for many members
+
+A shared brain often holds one source per member or project, with one bot
+answering for several people. Give each member their own token, granted only
+the sources that member may read, and send each member's requests with that
+member's token:
+
+```bash
+gbrain auth create bot-alice-example
+gbrain auth rescope --token bot-alice-example --sources source-a
+# OAuth client instead of a bearer token:
+gbrain auth rescope --client <client_id> --sources source-a
+```
+
+The token's grant is the security boundary: the server scopes every call to
+the grant of the token that made it, whatever the call's arguments say.
+`source_ids` is a convenience inside that boundary. A bot holding one token
+granted several sources can pass `source_ids` to keep one request to the
+current member's sources, but a prompt-injected or buggy bot can omit it, so
+it does not separate members who must not see each other's pages. Use
+per-member tokens for that, and `source_ids` to narrow further.
+
+### Lay out sources by who may read them
+
+gbrain enforces access per source, never per page. Two pages in one source are
+readable by exactly the same tokens. So put content in sources by who may read
+it, before any member's bot connects:
+
+- **One source per channel, team or member.** Give a channel's pages a source
+  of their own (`channel-a`), a team's documents theirs (`team-a`), and each
+  member a private one (`private-alice-example`). Content everyone may read
+  goes in a shared source (`public`).
+- **One grant per member.** Grant each member's token or client every source
+  that member may read, and nothing else:
+
+  ```bash
+  gbrain auth rescope --token bot-alice-example --sources private-alice-example,channel-a,team-a,public
+  gbrain auth rescope --client <client_id> --sources private-alice-example,channel-a,team-a,public
+  ```
+
+  The first id is the token's write source, so a member's saved memories land
+  in their own private source.
+
+> **Warning: one shared source has no boundary inside it.** A bot that answers
+> everyone with one unscoped token over a single source exposes everything in
+> that source to every requester. Neither `source_ids` nor a search limit can
+> narrow a read inside one source: `source_ids` chooses whole sources, and a
+> limit only shortens a ranked list, which can still start with a page the
+> requester should not see. Semantic search makes this more visible, because
+> it returns related pages that a keyword search would not match. Split the
+> content into sources first, then grant per member.
+
 ### Links, backlinks and the graph across sources
 
 `gbrain links`, `gbrain backlinks` and `gbrain graph` (MCP: `get_links`,
@@ -156,6 +232,12 @@ gbrain backlinks companies/acme-example --source business   # one source
 gbrain links people/alice-example --all-sources --json      # every source
 gbrain graph people/alice-example --depth 2 --all-sources
 ```
+
+Each call returns at most 500 rows (`--limit N`, up to 5000), merged across
+sources and identity members in link order before the cut. When more match, the
+last row carries `truncated: true` and `next_cursor`; continue with
+`--cursor <next_cursor>` and the same flags, or pass `--all` to page through
+every row.
 
 `get_links` keeps working as an alias of `links`. Passing `--source` together
 with `--source-id` or `--all-sources` is an error. A source that does not exist
@@ -191,7 +273,17 @@ predate unknown-parameter warnings cannot be detected; upgrade the host first.
 
 The most-used subcommands (run `gbrain sources --help` for the full,
 always-current reference — it also covers `status`, `current`,
-`set-cr-mode`, and the `push`/`pull` durability surface):
+`set-cr-mode`, and the `push`/`pull` durability surface).
+
+Changing the contextual retrieval mode, per source with `gbrain sources
+set-cr-mode <id> <mode>` or brain-wide with `gbrain config set
+search.contextual_retrieval <mode>`, does not restamp existing pages: each
+keeps the mode recorded when it was imported, and the new mode applies to
+pages imported from then on. Both commands print this after the write, with
+`gbrain repair contextual-mode [--source <id>] --apply` for pages that have no
+recorded mode (preview it first without `--apply`; see
+[repair](repair.md)).
+
 
 ```
 gbrain sources add <id> --path <p> [--name <n>] [--federated|--no-federated] [--force]
@@ -224,7 +316,37 @@ gbrain sources mirror-readonly <id>
 gbrain sources mirror-writable <id>
 gbrain sources refresh <id> [--dry-run] [--resume|--abandon]   Managed brains: fast-forward the checkout and sync.
 gbrain sources set-strategy <id> <markdown|code|auto>
+gbrain sources set-sync <id> <on|off> [--dry-run] [--expect <on|off>]
+                               Include or exclude the source from automatic sync
+                               (config.syncEnabled; an explicit gbrain sync --source
+                               still runs). --dry-run prints the apply command, which
+                               carries --expect; a moved state refuses preview_changed.
+gbrain sources host-repo <id> --dir <path> [--push-remote <url>] [--dry-run | --expect <plan_hash>]
+                               Managed brains: host a new, empty source in a bare
+                               repository under <path> (see below). Previews without --expect.
 ```
+
+### Hosted repositories
+
+`gbrain sources host-repo` gives a new, empty source its own bare repository
+(`<path>/repo.git`) that people clone and fetch from, and checks it out once
+as a linked worktree gbrain owns (`<path>/worktree`), claimed as the source's
+canonical worktree like any other. The source becomes git-canonical
+(`canonical: git`), so every page write, remote ones included, commits there
+through the door before the database indexes it. A pre-receive hook refuses
+every push into the repository; `--push-remote` names a repository of your own
+that the push effect publishes to once Git durability is enabled
+(`gbrain sources writer git-durability <id> --enable`).
+
+It runs only from the trusted local CLI on the brain host. The preview says in
+words that the source becomes strict and prints the apply command with its
+`--expect <plan_hash>`; a plan that moved refuses `preview_changed`. It refuses
+a source that is bound or already has pages (moving existing pages into a
+hosted repository is conversion, a later wave), and a directory that is not
+empty or sits inside a checkout or another source's directory. On a hosted
+source the preview reports the hook and the worktree link, and the apply
+reinstalls a missing or changed hook. An agent runs it on a production brain
+only with the user's explicit yes, one source at a time.
 
 ### Read-only mirror sources
 
@@ -302,7 +424,7 @@ Fix it with:
 
 ```bash
 git -C <path> init
-git -C <path> add -A
+git -C <path> add -A   # gbrain-allow-shared-tree-git: first commit of a brand-new repo nobody else writes yet
 git -C <path> commit -m "initial import"
 gbrain sources add <id> --path <path>
 ```
@@ -380,7 +502,7 @@ rewrites it on the next import. No command is needed.
 files, for example `~/vault/notes/people/alice-example.md` and
 `~/vault/notes/notes/people/alice-example.md`, sync refuses instead of
 guessing. Rename or move one of the two files, commit, then run
-`gbrain sync --source vault-notes --no-pull --retry-failed`. The other
+`gbrain sync --source vault-notes --no-pull`. The other
 refusal reasons are listed in [write refusal reasons](write-refusals.md).
 
 ## Citation format for agents
@@ -459,25 +581,38 @@ gbrain sources unharden wiki
 
 What hardening guarantees:
 
-- **Pull-first, conflict-safe.** Every pull is a divergence-safe rebase. A
-  dirty working tree is skipped (your in-progress edits are never touched; the
-  pull runs with `--no-autostash`, so a `rebase.autoStash` setting never
-  stashes and replays edits under it); a rebase conflict is aborted cleanly and
-  flagged for attention, never left half-applied. A brain whose intermediate
-  snapshot commits conflict under rebase replay while the two tips merge
-  cleanly can record `gbrain sources set-pull-strategy <id> merge`: pulls of
-  that source then fast-forward when possible and otherwise make a merge
-  commit, and a real conflict is aborted with `merge --abort`. The setting
-  lives in the source's config (`sources list --json` shows `pull_strategy`),
-  so a repository or global `pull.rebase` never changes it; `--path` pulls with
-  no source row keep `rebase`.
+- **Pull-first, safe in a shared checkout.** Nothing rebases or stashes the
+  working tree. A pull fetches, then, under the checkout's writer lock,
+  fast-forwards, or for a diverged branch merges the remote commits in memory
+  into a merge commit (`gbrain: merge origin/<branch> into <branch>`) and
+  fast-forwards to it. A real conflict changes nothing and is flagged for
+  attention ([conflicts](shared-checkout-git.md#conflicts)). `gbrain sources
+  pull`, which the unattended 30-minute cron runs, keeps its conservative
+  rule: a checkout with any local edit is skipped (`skipped_dirty`), so it
+  never moves files under a writer, and a checkout whose writer lock is busy
+  is skipped until the next run. An explicit `scripts/brain-commit-push.sh --pull`
+  (or `gbrain git commit-push --pull`) advances a dirty checkout unless a
+  dirty file is one the pull must change; then it changes nothing and its
+  notice names the files. `gbrain sources set-pull-strategy <id> <rebase|merge>`
+  is still accepted and recorded, but both strategies now integrate by merge,
+  because the shared tree is never rebased. A force-pushed upstream is never
+  merged: `gbrain sync` reports `upstream_rewritten` and, after the user
+  agrees, `gbrain sources reset-upstream <id> --expect-local <sha> --expect-upstream <sha>`
+  moves the checkout to the new upstream and keeps the old history under a
+  backup ref ([upstream rewritten](troubleshooting.md#upstream-rewritten)).
 - **Push is never deferred.** `scripts/brain-commit-push.sh "<msg>" <path>`
-  commits and pushes, and refuses to report success without a successful push
-  or confirmation that the exact destination branch at every effective origin
-  push URL contains the attempted commit. A rejected push can still succeed when another process
-  already pushed that commit; a stale local tracking ref is not confirmation.
-  The post-commit hook is a best-effort background fallback; the helper is
-  the guarantee.
+  delegates to `gbrain git commit-push`: it takes the checkout's writer lock,
+  commits only the named paths, merges a rejected push in memory, and refuses
+  to report success without a push the remote accepted. Other agents'
+  uncommitted files are never staged, stashed or touched. The post-commit
+  hook is a best-effort background fallback (it only publishes, never pulls);
+  the helper is the guarantee. Outcomes and what to do on each:
+  [shared-checkout git](shared-checkout-git.md#outcomes).
+- **One writer at a time per checkout.** Harden also sets
+  `rebase.autoStash=false`, `merge.autoStash=false` and `pull.ff=only` in the
+  checkout's local git config, so a stray `git pull` refuses instead of
+  autostashing. Host daemons that commit the same checkout join through the
+  [lock contract](shared-checkout-git.md#lock-contract).
 - **No silent staleness.** A 30-minute background pull keeps an idle session
   current. It runs DB-free, so it never contends with a live brain for the
   PGLite single-writer lock.

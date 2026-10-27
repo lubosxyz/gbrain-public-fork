@@ -104,12 +104,14 @@ describe('fork/upstream v131+v132 reconciliation (fork v128+tenant lanes replaye
     expect(rows.length).toBe(1);
   });
 
-  test('replay migration re-applies upstream v150 (canonical page revisions) for fork brains that skipped it', () => {
+  test('the former v150 replay keeps its ledger slot but runs nothing after newer upstream migrations', () => {
+    // runMigrations() replays upstream v150 for historical fork brains before newer upstream DDL.
     const replay = replayV150();
     expect(replay!.version).toBeGreaterThan(reconciliation()!.version);
     expect(replay?.name).toBe('fork_replay_upstream_v150_canonical_page_revisions');
     expect(replay?.idempotent).toBe(true);
-    expect(replay?.sql).toBe(MIGRATIONS.find((x) => x.version === 150)!.sql);
+    expect(replay?.sql).toBe('');
+    expect(replay?.handler).toBeUndefined();
   });
 
   test('re-running the migration SQL is a no-op (idempotent CREATE TABLE IF NOT EXISTS)', async () => {

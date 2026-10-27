@@ -1,16 +1,19 @@
 import type { BrainEngine } from './engine.ts';
 import type { Migration } from './schema-migrations/types.ts';
 import { isLockTimeoutError } from './retry-matcher.ts';
-import { resolveSchemaLockTimeoutMs, schemaLockBlockedError, withSchemaLockTimeout } from './postgres-engine/schema-lock-timeout.ts';
+import { resolveSchemaLockTimeoutMs, schemaLockBlockedError } from './postgres-engine/schema-lock-timeout.ts';
 import { MIGRATIONS } from './schema-migrations/registry.generated.ts';
 import { hasPendingMigrations } from './migrate-pending.ts';
-import { setQuietMigrationNotices } from './schema-migrations/helpers.ts';
+import { runMigrationStatement, setQuietMigrationNotices } from './schema-migrations/helpers.ts';
+import { MIGRATION_PRELUDES, runMigrationPrelude } from './migration-preludes.ts';
+import { clearMigrationTimeout, migrationStatementTimeoutMs, recordMigrationTimeout } from './migration-timeout.ts';
 // runMigrations executes while an initialized engine is live. Keep its helper
 // modules in the static graph rather than importing them from async handlers.
 import {
   isStatementTimeoutError,
   isRetryableConnError,
 } from './retry-matcher.ts';
+import { repairForkSchemaPrerequisites } from './fork-schema-prerequisites.ts';
 import { repairTimelineDedupIndex } from './timeline-dedup-repair.ts';
 import { resumePageRevisionBackfill } from './page-state/revision-backfill-schema.ts';
 import { repairPagesUpsertArbiter } from './pages-upsert-arbiter.ts';
@@ -172,6 +175,7 @@ async function runMigrationSQLWithRetry(
           }
         }
       }
+      await runMigrationPrelude(engine, m.version);
       await runMigrationSQL(engine, m, sql);
       return;
     } catch (err: unknown) {
@@ -215,7 +219,7 @@ export async function runMigrationSQL(
       await engine.transaction(async (tx) => {
         if (engine.kind === 'postgres') {
           try {
-            await tx.runMigration(m.version, "SET LOCAL statement_timeout = '600000'");
+            await tx.runMigration(m.version, `SET LOCAL statement_timeout = '${migrationStatementTimeoutMs()}'`);
             // #5227 (W14 P1.6): a real transaction, so SET LOCAL binds the lock wait to this migration only.
             await tx.runMigration(m.version, `SET LOCAL lock_timeout = '${resolveSchemaLockTimeoutMs()}ms'`);
           } catch {
@@ -229,30 +233,7 @@ export async function runMigrationSQL(
       throw error;
     }
   } else {
-    // Postgres + transaction:false → can't use SET LOCAL (needs a txn),
-    // can't use plain SET on the pooled connection (leaks to other
-    // queries). Instead: reserve a dedicated backend, set session-level
-    // statement_timeout on just that connection, run the DDL there.
-    //
-    // On Supabase (both PgBouncer 6543 and direct 5432) a server-level
-    // statement_timeout of ~2 min is enforced. Without this override a
-    // CREATE INDEX CONCURRENTLY on a large table (e.g. 500K pages) hits
-    // the timeout and aborts. SET on the reserved connection cleanly
-    // overrides because the GUC scope is connection-local (session-scope
-    // is fine when nobody else uses the connection).
-    //
-    // The reserved-connection primitive is new in PR #356. See
-    // BrainEngine.withReservedConnection.
-    await engine.withReservedConnection(async (conn) => {
-      try {
-        await conn.executeRaw("SET statement_timeout = '600000'");
-      } catch {
-        // Non-fatal: some managed Postgres may restrict this GUC.
-        // Falling through means the DDL runs with the server default.
-      }
-      // #5227 (W14 P1.6): no transaction here, so the lock bound is session-level on this reserved backend and restored after.
-      await withSchemaLockTimeout({ unsafe: (query: string) => conn.executeRaw(query) }, () => conn.executeRaw(sql), { step: `migration v${m.version}` });
-    }, { selfContained: true });
+    await runMigrationStatement(engine, m.version, sql);
   }
 }
 
@@ -387,23 +368,7 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
   const currentStr = await engine.getConfig('version');
   const current = parseInt(currentStr || '1', 10);
 
-  // Historical forks used scalar versions 150, 160-161 and 166-169 for
-  // different DDL. Repair skipped prerequisites BEFORE newer migrations
-  // reference them (v174 already requires v169's withdrawal subject).
-  // Replay is only for pre-v240 forks; stamp only after all prerequisites succeed.
-  if (current >= 150 && current < 240 && await engine.getConfig('fork.schema_prerequisites.v060') !== 'complete') {
-    const [fork] = await engine.executeRaw<{ present: boolean }>(
-      "SELECT to_regclass('public.mcp_request_log_purged') IS NOT NULL AS present");
-    if (fork?.present) {
-      for (const version of [150, 160, 161, 166, 167, 168, 169]) {
-        if (version <= current) {
-          const prerequisite = MIGRATIONS.find(m => m.version === version)!;
-          await applyOneMigration(engine, prerequisite);
-        }
-      }
-      await engine.setConfig('fork.schema_prerequisites.v060', 'complete');
-    }
-  }
+  await repairForkSchemaPrerequisites(engine, current, MIGRATIONS, applyOneMigration);
 
   // Sort by version ascending so array insertion order doesn't affect
   // correctness. Migrations MUST run in version order; if v16 accidentally
@@ -516,6 +481,9 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
         // Quiet fresh-install replay: name the failing migration — without the
         // per-step lines, the error would otherwise be anonymous.
         if (quietReplay) process.stderr.write(`  [${m.version}] ${m.name} failed\n`);
+        // #7108: apply-migrations and doctor read this to name the migration and the step that helps.
+        const timedOut = err instanceof MigrationRetryExhausted ? isStatementTimeoutError(err.lastError) : isStatementTimeoutError(err);
+        if (timedOut) await recordMigrationTimeout(engine, m, MIGRATION_PRELUDES.has(m.version), err instanceof MigrationRetryExhausted ? err.lastBlockers.map(b => b.pid) : []);
         throw err;
       }
 
@@ -527,6 +495,7 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
     // covers every exit path from here on (incl. the pre-flight probe).
     setQuietMigrationNotices(false);
   }
+  await clearMigrationTimeout(engine);
   await backfill();
   return { applied, current: LATEST_VERSION };
 }
@@ -558,13 +527,14 @@ async function applyOneMigration(engine: BrainEngine, m: Migration): Promise<voi
             console.error('');
           } else {
             console.error('');
-            console.error('   Cause: another connection holds a lock on the target table, or the');
-            console.error('   server statement_timeout (~2 min on Supabase) is too short for this DDL.');
+            console.error(`   Cause: no idle-in-transaction session was open, and a lock wait stops at the lock timeout, so its own work`);
+            console.error(`   outlasted its ${Math.round(migrationStatementTimeoutMs() / 60_000)}-minute statement budget on this brain; every attempt rolled back.`);
+            console.error('   A plain rerun with this release repeats the failure (#7108).');
             console.error('');
             console.error('   Fix:');
-            console.error('     1. gbrain doctor --locks    # find idle-in-transaction blockers');
-            console.error('     2. Terminate blocker(s) shown by step 1 via pg_terminate_backend(<pid>)');
-            console.error('     3. gbrain apply-migrations --yes  # re-run from the version that failed');
+            console.error('     1. gbrain doctor --locks    # confirm no session holds a lock on the table');
+            console.error('     2. If a newer release exists: gbrain upgrade, then gbrain apply-migrations --yes');
+            console.error("     3. Otherwise, with the user's agreement: gbrain apply-migrations --yes --statement-timeout 120, and report it");
             console.error('');
           }
           console.error('   Verify:');

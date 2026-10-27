@@ -1,5 +1,6 @@
 import { withConnectorSync, rethrowConnectorWriteError, pendingConnectorResult, type ManagedConnectorSync } from '../persistence/connector-sync.ts';
 import { resolveGoogleAccount } from '../persistence/connector-account.ts';
+import { googleApiProblem, googleUserinfo } from './api-access.ts';
 import { ConnectorHoldSession, connectorHoldsResult } from '../connectors/connector-hold-session.ts';
 import { carryLegacyFailCounts } from '../connectors/item-holds.ts';
 /**
@@ -56,13 +57,15 @@ import {
 import { renderThreadPage, threadRelPath } from './google-render.ts';
 import {
   ALL_GOOGLE_SERVICES,
+  isGmailHoldKey,
   type GmailThreadData,
+  type GoogleApiProblem,
   type GoogleService,
   type GoogleSourceConfig,
   type GoogleSourceState,
 } from './types.ts';
 import { LOOPS_EXTRACT_WINDOW_DAYS, loopExtractionEligibility } from './loops-extract.ts';
-import { recordGraceVerdict, runLoopsCatchup, seedGraceBackfill, settleDueGraceHolds, type LoopsEnqueueReport } from './loop-catchup.ts';
+import { recordGraceVerdict, recordWithheldVerdict, runLoopsCatchup, seedGraceBackfill, seedLoopRechecks, settleDueGraceHolds, type LoopsEnqueueReport } from './loop-catchup.ts';
 
 export type { GoogleSourceConfig } from './types.ts';
 export { runGoogleAttachmentBackfill } from './attachment-backfill.ts';
@@ -152,7 +155,9 @@ async function saveGoogleState(deps: GoogleSyncDeps, state: GoogleSourceState): 
 
 /** #5867/#5868 state a partial managed run still publishes (E20): never the Gmail cursor. */
 function loopRecoveryState(state: GoogleSourceState): Record<string, unknown> {
-  const fields = { loop_grace_holds: state.loop_grace_holds, loop_grace_backfill_done: state.loop_grace_backfill_done, loops_catchup: state.loops_catchup };
+  const fields = { loop_grace_holds: state.loop_grace_holds, loop_grace_backfill_done: state.loop_grace_backfill_done, loops_catchup: state.loops_catchup,
+    loop_withheld_senders: state.loop_withheld_senders, loop_automated_backfill_done: state.loop_automated_backfill_done, calendar_unreadable: state.calendar_unreadable,
+    api_access: state.api_access };
   return Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined));
 }
 
@@ -187,6 +192,8 @@ async function processThread(
   deps.processedThreads.add(thread.threadId);
   const verdict = await applyLoopDetection(deps, thread, slug);
   if (verdict && deps.loopState) recordGraceVerdict(deps.loopState, thread, verdict, slug, myAddressSet(deps.entry), deps.log, deps.exclusion);
+  if (verdict && deps.loopState) recordWithheldVerdict(deps.loopState, verdict);
+  if (verdict?.withheld) summary.loopsWithheld[verdict.withheld.reason] = (summary.loopsWithheld[verdict.withheld.reason] ?? 0) + 1;
   // LLM extraction candidates: trickle + the bounded recent window only —
   // the deep historical backfill is never extracted (spend honesty, F9).
   const newestMs = thread.messages[thread.messages.length - 1]?.internalDateMs ?? 0;
@@ -408,11 +415,11 @@ async function sweepGmail(g: GmailSweep, onCurrent?: () => Promise<void>): Promi
   // Held threads no listing of this run reached: re-attempt those retry-held
   // asked for or whose transient reconsideration is due. A failure keeps the
   // hold and never blocks the cursor.
-  for (const tid of g.holds.dueHeldKeys()) {
+  for (const tid of g.holds.dueHeldKeys().filter(isGmailHoldKey)) {
     if (deps.opts.signal?.aborted) return false;
     await attemptThread(g, tid, null);
   }
-  if (await settleGraceHolds(g) === 'aborted') return false;
+  if (await settleGraceHolds(g, cutoffMs) === 'aborted') return false;
   const isCurrent = (): boolean => {
     if (delta !== 'done' || state.gmail_gap_floor_ms != null) return false;
     if (state.gmail_backfill_done) return true;
@@ -442,13 +449,18 @@ async function sweepGmail(g: GmailSweep, onCurrent?: () => Promise<void>): Promi
  * A re-fetch goes straight through processThread (never the item holds), so
  * a failed grace re-fetch keeps the grace hold and is not an item failure.
  */
-async function settleGraceHolds(g: GmailSweep): Promise<'aborted' | void> {
+async function settleGraceHolds(g: GmailSweep, cutoffMs: number): Promise<'aborted' | void> {
   const { deps, state } = g;
   try {
     await seedGraceBackfill(deps.engine, deps.sourceId, state, deps.log);
     deps.graceBackfillSeeded = true;
   } catch (e) {
     deps.log(`[google] loop grace backfill failed (retried next sweep): ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    await seedLoopRechecks(deps.engine, deps.sourceId, state, deps.log, Date.now(), state.gmail_backfill_done ? null : cutoffMs);
+  } catch (e) {
+    deps.log(`[google] loop re-check seeding failed (retried next sweep): ${e instanceof Error ? e.message : String(e)}`);
   }
   const settled = await settleDueGraceHolds({ engine: deps.engine, sourceId: deps.sourceId, state, log: deps.log, signal: deps.opts.signal,
     exclusion: deps.exclusion, processed: deps.processedThreads, refetch: async (tid) => {
@@ -655,6 +667,8 @@ async function runExtractAndEmbed(
       const sub = await submitEmbedBackfill(deps.engine, deps.sourceId, { reason: 'google_sync_defer' });
       if (sub.status === 'submitted') {
         process.stderr.write(`[google] large sync (${totalChanges} pages); embeds deferred to embed-backfill job ${sub.jobId} — or ${drainHint}\n`);
+      } else if (sub.status === 'embedding_disabled') {
+        process.stderr.write(`[google] large sync (${totalChanges} pages); embed-backfill not queued: embedding is disabled on this brain (keyless by choice)\n`);
       } else {
         process.stderr.write(`[google] large sync (${totalChanges} pages); embed-backfill not queued (${sub.status}) — ${drainHint}\n`);
       }
@@ -743,6 +757,7 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
     threadsSeen: 0,
     attachmentInspection: {},
     extractEligibility: {},
+    loopsWithheld: {},
     failedFiles: 0,
   };
   const countedSlugs = new Set<string>();
@@ -777,7 +792,7 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
   const activeServices = grantedScopes.length > 0 ? grantedServices : cfg.services;
   // #5686: every enabled service reads as the pinned account; checked before any service runs.
   if (managed) {
-    const email = await resolveGoogleAccount({ gmail, calendar, people }, activeServices, opts.signal);
+    const { email } = await resolveGoogleAccount({ gmail, calendar, people, userinfo: googleUserinfo(tokens, fetchImpl ?? fetch) }, activeServices, opts.signal);
     await managed.assertAccount(email ? { kind: 'google', email } : null);
   }
 
@@ -793,13 +808,22 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
 
   try {
     const serviceErrors: string[] = [];
+    // #7073: services this run could not reach, and those it reached, for the stored api_access record.
+    const apiProblems: GoogleApiProblem[] = (grantedScopes.length > 0 ? missingServices : []).flatMap((svc) => googleApiProblem(svc, new CredentialError('scope_missing')) ?? []);
+    const reached = new Set<GoogleService>();
+    const serviceFailed = (svc: GoogleService, e: unknown): void => {
+      const problem = googleApiProblem(svc, e);
+      if (problem) apiProblems.push(problem);
+    };
 
     if (activeServices.includes('contacts')) {
       const stop = startHeartbeat(progress, 'contacts sweep');
       try {
-        await sweepContacts(deps, people, state, activePack, summary, countedSlugs);
+        await sweepContacts(deps, people, state, activePack, summary, countedSlugs, holds);
+        reached.add('contacts');
       } catch (e) {
         if (managed) rethrowConnectorWriteError(e);
+        serviceFailed('contacts', e);
         serviceErrors.push(`contacts: ${e instanceof Error ? e.message : String(e)}`);
         summary.status = 'partial';
         if (isCredentialError(e)) log(e.toHuman());
@@ -812,9 +836,11 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
     if (activeServices.includes('calendar')) {
       const stop = startHeartbeat(progress, 'calendar sweep');
       try {
-        await sweepCalendar(deps, calendar, state, activePack, summary, countedSlugs);
+        await sweepCalendar(deps, calendar, state, activePack, summary, countedSlugs, holds);
+        reached.add('calendar');
       } catch (e) {
         if (managed) rethrowConnectorWriteError(e);
+        serviceFailed('calendar', e);
         serviceErrors.push(`calendar: ${e instanceof Error ? e.message : String(e)}`);
         summary.status = 'partial';
         if (isCredentialError(e)) log(e.toHuman());
@@ -838,9 +864,11 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
             await managed.saveState(state, true, new Date(state.gmail_newest_ms ?? Date.now()).toISOString());
           }
         });
+        reached.add('gmail');
         if (opts.full) await reconcileGmailDeletes(deps, gmail, summary);
       } catch (e) {
         if (managed) rethrowConnectorWriteError(e);
+        serviceFailed('gmail', e);
         serviceErrors.push(`gmail: ${e instanceof Error ? e.message : String(e)}`);
         summary.status = 'partial';
         if (isCredentialError(e)) log(e.toHuman());
@@ -851,6 +879,11 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
     }
 
     summary.pagesAffected = [...new Set(summary.pagesAffected)];
+    const settled = new Set<GoogleService>([...reached, ...apiProblems.map((p) => p.service)]);
+    const keptProblems = (state.api_access?.problems ?? []).filter((p) => !settled.has(p.service) && cfg.services.includes(p.service));
+    const problems = [...apiProblems, ...keptProblems];
+    if (problems.length > 0 && JSON.stringify(problems) !== JSON.stringify(state.api_access?.problems)) state.api_access = { problems, at: new Date().toISOString() };
+    else if (problems.length === 0 && state.api_access) state.api_access = null;
     if (grantedScopes.length > 0 && missingServices.length > 0) summary.status = 'partial';
     if (opts.signal?.aborted) summary.status = 'partial';
     if (opts.full && summary.status === 'synced') state.last_full_at = new Date().toISOString();
@@ -899,6 +932,9 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
             .map(([k, v]) => `${k}=${v}`)
             .join(' ')}`,
         );
+      }
+      if (Object.keys(summary.loopsWithheld).length > 0) {
+        log(`[google] reply-owed loops withheld: ${Object.entries(summary.loopsWithheld).map(([k, v]) => `${k}=${v}`).join(' ')}`);
       }
     }
 

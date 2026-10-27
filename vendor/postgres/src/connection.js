@@ -65,6 +65,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     onnotify,
     onparameter,
     max_pipeline,
+    transaction_pipeline,
     keep_alive,
     backoff,
     target_session_attrs
@@ -76,7 +77,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       , idleTimer = timer(end, options.idle_timeout)
       , lifeTimer = timer(end, options.max_lifetime)
       , connectTimer = timer(connectTimedOut, options.connect_timeout)
-      , inflightTimer = timer(inflightTimedOut, options.inflight_timeout)
+      , inflightTimer = budgetTimer('idle')
+      , ageTimer = budgetTimer('age')
 
   let socket = null
     , cancelMessage
@@ -114,12 +116,18 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     , nonce = null
     , query = null
     , queryStart = 0
+    , received = 0
+    , localBudget = undefined
+    , sessionBudget = undefined
+    , recovering = null
     , final = null
+    , inTransactionAfterSent = false
 
   const connection = {
     queue: queues.closed,
     idleTimer,
     inflightSince: 0,
+    inflightCap: 0,
     connect(query) {
       initial = query
       reconnect()
@@ -175,6 +183,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     if (q.cancelled)
       return
 
+    let mayPipeline = !q.options.onexecute
     try {
       q.state = backend
       query
@@ -182,13 +191,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
         : (query = q, query.active = true, armInflight())
 
       build(q)
+      mayPipeline = mayPipeline || q.options.onexecute(connection)
+      noteBudget(q)
+      noteTransaction(q)
       lastWritten = q
-      lastExecuted = q
-      const mayPipeline = !q.options.onexecute || q.options.onexecute(connection)
+      lastExecuted = { string: q.string, strings: q.strings }
       return write(toBuffer(q))
         && !q.describeFirst
         && !q.cursorFn
-        && sent.length < max_pipeline
+        && sent.length < pipelineLimit()
         && mayPipeline
     } catch (error) {
       // GBrain (#6383), the approach of porsager/postgres#1236: q already has its place in the queue of
@@ -202,16 +213,54 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       q.retried = error
       q.describeFirst = false
       q.cursorFn = null
+      // GBrain (#6543): the stock `return true` let the pool route more statements behind q whatever max_pipeline and
+      // onexecute said, so a pool built not to pipeline (a transaction-mode pooler) pipelined after every build failure.
+      // onexecute (a transaction's begin) ran only if q built; a begin that failed to build is never pipelined behind.
       options.onbuilderror && reportBuildError(q, error)
-      write(Unbuildable)
-      return true
+      return write(Unbuildable)
+        && sent.length < max_pipeline
+        && mayPipeline
     }
+  }
+
+  // GBrain (#6930): a transaction-mode pooler cannot carry statements pipelined across a transaction boundary (#6543,
+  // max_pipeline 0), but it pins one server connection from BEGIN until the transaction ends. So on a connection its
+  // owner holds (sql.begin, sql.reserve) a statement may follow others still in flight when every one of them leaves the
+  // connection inside a transaction: the last ReadyForQuery said T or E, or an in-flight statement began one, and none
+  // since may end it (COMMIT, ROLLBACK, END, ABORT, PREPARE TRANSACTION). Nothing is ever sent behind a statement that
+  // may end a transaction, so the next owner's statements never reach the server connection this one held.
+  function noteTransaction(q) {
+    const control = transactionControl(q.string || '')
+    control === 'end'
+      ? inTransactionAfterSent = false
+      : control === 'begin'
+        ? inTransactionAfterSent = true
+        : q === query && (inTransactionAfterSent = connection.status === 84 || connection.status === 69)
+  }
+
+  function pipelineLimit() {
+    return transaction_pipeline > max_pipeline && inTransactionAfterSent && connection.reserved
+      ? transaction_pipeline
+      : max_pipeline
   }
 
   function reportBuildError(q, error) {
     try {
-      options.onbuilderror(error && error.code ? error.code : 'BUILD_FAILED', statementText(q))
+      options.onbuilderror(error && error.code ? error.code : 'BUILD_FAILED', statementText(q), error && error.parameter)
     } catch (_) {}
+  }
+
+  // GBrain (#6930): 'begin' when the text opens a transaction, 'end' when any statement in it may end one.
+  function transactionControl(text) {
+    let control = null
+    for (const part of text.replace(/^(?:\s|\/\*[\s\S]*?\*\/|--[^\n]*(?:\n|$))*/, '').split(';')) {
+      const statement = part.replace(/^(?:\s|\/\*[\s\S]*?\*\/|--[^\n]*(?:\n|$))*/, '')
+      if (/^(?:commit|end|abort|rollback(?!\s+to\b)|prepare\s+transaction)\b/i.test(statement))
+        return 'end'
+      if (/^(?:begin|start\s+transaction)\b/i.test(statement))
+        control = 'begin'
+    }
+    return control
   }
 
   // The statement's text with $n placeholders, never its parameter values.
@@ -224,16 +273,76 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   // byte the server sends and stops at ReadyForQuery. A statement that outlives options.inflight_timeout with
   // nothing coming back (a desynced connection, a pooler that swallowed a CancelRequest, a dead peer) has no
   // server-side timeout left to save it: the connection is retired instead of holding its queue forever.
+  //
+  // GBrain (#6543 A4): a second clock, `ageTimer`, is not restarted by received bytes, so a statement that keeps
+  // streaming (or keeps receiving notices) past its budget is retired too (`reason: 'age'`; `'idle'` when nothing came
+  // back). Both budgets are derived per statement from the statement_timeout the operation itself declared on this
+  // connection (`SET [LOCAL] statement_timeout`, `set_config('statement_timeout', ...)`, tracked client-side so it
+  // holds behind a transaction-mode pooler that never applies it): max(the pool's budget, the declared timeout) plus
+  // `inflight_grace`, and none at all for a declared timeout of 0 (an index build, a bulk copy).
   function armInflight() {
     queryStart = connection.inflightSince = performance.now()
+    received = 0
+    query.inflightCaps || (query.inflightCaps = inflightCaps())
+    connection.inflightCap = query.inflightCaps.age
     inflightTimer.start()
+    ageTimer.start()
   }
 
-  function inflightTimedOut() {
+  function budgetTimer(kind) {
+    let handle = null
+    return {
+      cancel() {
+        handle && (clearTimeout(handle), handle = null)
+      },
+      start() {
+        handle && clearTimeout(handle)
+        const ms = query && query.inflightCaps ? query.inflightCaps[kind] : 0
+        handle = ms ? setTimeout(() => (handle = null, inflightTimedOut(kind)), ms) : null
+      }
+    }
+  }
+
+  function inflightCaps() {
+    const declared = localBudget !== undefined ? localBudget : sessionBudget
+    if (declared === 0)
+      return { idle: 0, age: 0 }
+    const raised = declared === undefined ? 0 : declared + (options.inflight_grace || 0) * 1000
+    return {
+      idle: options.inflight_timeout ? Math.max(options.inflight_timeout * 1000, raised) : 0,
+      age: options.inflight_max ? Math.max(options.inflight_max * 1000, raised) : 0
+    }
+  }
+
+  // The statement_timeout changes a statement makes on this connection; a later statement is budgeted by them.
+  function noteBudget(q) {
+    const text = q.string || ''
+    if (localBudget === undefined && sessionBudget === undefined && !/statement_timeout/i.test(text))
+      return
+    for (const change of statementTimeoutChanges(text, q.parameters)) {
+      change.kind === 'end'
+        ? localBudget = undefined
+        : change.kind === 'reset'
+          ? localBudget = sessionBudget = undefined
+          : change.kind === 'set' && (change.local ? localBudget = change.ms : (sessionBudget = change.ms, localBudget = undefined))
+    }
+    q.inflightCaps = inflightCaps()
+    if (q === query) {
+      connection.inflightCap = q.inflightCaps.age
+      inflightTimer.start()
+      ageTimer.start()
+    }
+  }
+
+  function inflightTimedOut(kind = 'idle') {
     if (!query)
       return
-    const stuck = { age_ms: Math.round(performance.now() - queryStart), queued: sent.length, statement: statementText(query) }
+    inflightTimer.cancel()
+    ageTimer.cancel()
+    const reason = kind === 'age' && received > 0 ? 'age' : 'idle'
+    const stuck = { age_ms: Math.round(performance.now() - queryStart), queued: sent.length, statement: statementText(query), reason, budget_ms: query.inflightCaps ? query.inflightCaps[kind] : 0 }
     const s = socket
+    recovering = recovering || 'stuck'
     error(Errors.connection('CONNECTION_STUCK', options, socket))
     query = null
     connection.inflightSince = 0
@@ -367,7 +476,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   function data(x) {
-    query && inflightTimer.start()
+    query && (received += x.length, inflightTimer.start())
     if (incomings) {
       incomings.push(x)
       remaining -= x.length
@@ -399,6 +508,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       remaining = 0
       incomings = null
     }
+
+    if (incoming.length === 0)
+      incoming = Buffer.alloc(0)
   }
 
   async function connect() {
@@ -435,6 +547,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     try {
       statements = {}
       needsTypes = options.fetch_types
+      inTransactionAfterSent = false
       statementId = Math.random().toString(36).slice(2)
       statementCount = 1
       lifeTimer.start()
@@ -465,7 +578,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       cancelError = err
     stream && (stream.destroy(err), stream = null)
     query && queryError(query, err)
+    initial && recovering && recoveryFailed(err)
     initial && (queryError(initial, err), initial = null)
+  }
+
+  // GBrain (#6543 A6): a connection retired by an incident (stuck, desync, closed under statements) that completes a
+  // new startup is `recovered`; one whose reconnect fails is `recovery_failed` (it stays marked until one succeeds).
+  function recoveryFailed(err) {
+    try {
+      options.onrecoveryfailed && options.onrecoveryfailed({ connection: id, cause: recovering, code: String(err && err.code || 'CONNECTION_ERROR') })
+    } catch (_) {}
   }
 
   function queryError(query, err) {
@@ -512,6 +634,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     incoming = Buffer.alloc(0)
     remaining = 0
     incomings = null
+    lastWritten = null
     clearImmediate(nextWriteTimer)
     // GBrain (#6355): bytes still waiting for the cleared immediate belonged to this socket. Left in place, the next
     // connection's StartupMessage is appended to them and never scheduled for writing (the timer handle is not
@@ -523,7 +646,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     lifeTimer.cancel()
     connectTimer.cancel()
     inflightTimer.cancel()
-    connection.inflightSince = 0
+    ageTimer.cancel()
+    connection.inflightSince = connection.inflightCap = 0
+    localBudget = sessionBudget = undefined
 
     socket.removeAllListeners()
     socket = null
@@ -543,8 +668,19 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       return reconnect()
     }
 
-    !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
-    query = null
+    // GBrain (#6543 A6): a socket that closed under statements is a recovery the next completed startup reports.
+    ;(query || sent.length) && (recovering = recovering || 'closed')
+    // GBRA-133: a socket error rejects the statements in flight, but their rejection handlers run before 'close' and may
+    // issue more on this connection (a transaction's settings restore in its finally). Skipped on hadError, those stayed
+    // queued: the next socket's startup ReadyForQuery made one the current statement without ever sending it, so it hung
+    // until the in-flight watchdog (330 s) and the reservation waiting for that startup never got its connection.
+    ;(query || sent.length || deferredRetries.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
+    // GBrain (#6543): the dead socket's ErrorResponse (a FATAL 57P01, a pooler's XX000) and its partial result belonged
+    // to statements that just failed. Left in place, the replacement connection's startup ReadyForQuery handed that
+    // error to its first statement, and a stale row count left holes at the start of the next result.
+    query = errorResponse = results = null
+    result = new Result()
+    rows = 0
     closedTime = performance.now()
     hadError && options.shared.retries++
     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
@@ -606,9 +742,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   function desynced(x) {
     const s = socket
     const info = { message: String.fromCharCode(x), connection: id, statement: lastExecuted ? statementText(lastExecuted) : '' }
+    recovering = recovering || 'desync'
     error(Errors.connection('CONNECTION_DESYNC', options, socket))
+    inflightTimer.cancel()
+    ageTimer.cancel()
     query = null
-    connection.inflightSince = 0
+    connection.inflightSince = connection.inflightCap = 0
     ondesync(connection, info)
     terminate()
     if (s && !s.destroyed) {
@@ -663,7 +802,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   function ReadyForQuery(x) {
     connection.status = x[5]
     query && query === lastWritten && (lastWritten = null)
-    connection.inflightSince = 0
+    connection.inflightSince = connection.inflightCap = 0
+    // A transaction that ended takes its SET LOCAL statement_timeout with it.
+    x[5] === 73 && !sent.length && (localBudget = undefined)
     if (query) {
       options.shared.completed++
       if (errorResponse) {
@@ -685,10 +826,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       errored(errorResponse)
     }
 
+    // GBrain: a statement that streamed rows and then failed (a cancel, a timeout or an error after its first rows) never
+    // reached CommandComplete, which is where the row count resets. Left in place, the next statement on this connection
+    // stored its rows after that many empty slots: a one-row read came back as [empty, row], so a reader that requires
+    // exactly one row refused and `const [row] = rows` read nothing.
     query = results = errorResponse = null
     result = new Result()
+    rows = 0
     connectTimer.cancel()
     inflightTimer.cancel()
+    ageTimer.cancel()
 
     if (initial) {
       if (target_session_attrs) {
@@ -696,6 +843,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
           return fetchState()
         else if (tryNext(target_session_attrs, backendParameters))
           return terminate()
+      }
+
+      // GBrain (#6930): the array types a pool for this database already fetched are applied without a round trip.
+      if (needsTypes && options.array_types && options.array_types.rows) {
+        needsTypes = false
+        options.array_types.rows.forEach(([oid, typarray]) => addArrayType(oid, typarray))
       }
 
       if (needsTypes) {
@@ -707,6 +860,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       initial && !reserving && execute(initial)
       options.shared.retries = retries = 0
       initial = null
+      if (recovering) {
+        const cause = recovering
+        recovering = null
+        try {
+          options.onrecovered && options.onrecovered({ connection: id, cause })
+        } catch (_) {}
+      }
       if (!reserving)
         return
     }
@@ -939,6 +1099,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       return
     }
     types.forEach(({ oid, typarray }) => addArrayType(oid, typarray))
+    options.array_types && (options.array_types.rows = types.map(({ oid, typarray }) => [oid, typarray]))
   }
 
   function addArrayType(oid, typarray) {
@@ -1210,6 +1371,59 @@ function xor(a, b) {
     buffer[i] = a[i] ^ b[i]
   return buffer
 }
+
+// GBrain (#6543 A4): what one statement does to the connection's statement_timeout, in order: `set` (`local`, `ms`;
+// 0 disables it, undefined is DEFAULT), `reset` (RESET statement_timeout / RESET ALL / DISCARD ALL), `end` (a
+// transaction began or ended, which drops a SET LOCAL), and `unknown` for a change whose value cannot be read here.
+// Dollar-quoted bodies are skipped, so a function body's BEGIN/END is not a transaction boundary.
+const budgetSyntax = /(?:^|;)\s*(begin|start\s+transaction|commit|end|abort|rollback(?!\s+(?:to|prepared)\b))\b|\bset\s+(local\s+|session\s+)?statement_timeout\s*(?:=|\bto\b)\s*('(?:[^']|'')*'|[^\s;)]+)|\breset\s+(?:statement_timeout|all)\b|\bdiscard\s+all\b|\bset_config\s*\(\s*'statement_timeout'\s*,\s*('(?:[^']|'')*'|\$\d+)\s*,\s*([^)\s]+)\s*\)/gi
+
+function statementTimeoutChanges(text, parameters) {
+  const changes = []
+  const plain = String(text || '').replace(/\$([A-Za-z_][A-Za-z0-9_]*)?\$[\s\S]*?\$\1\$/g, ' ')
+  budgetSyntax.lastIndex = 0
+  let m
+  while ((m = budgetSyntax.exec(plain))) {
+    if (m[1]) {
+      changes.push({ kind: 'end' })
+    } else if (m[3] !== undefined) {
+      const ms = timeoutMs(m[3], parameters)
+      changes.push(Number.isNaN(ms) ? { kind: 'unknown' } : { kind: 'set', local: /^local/i.test(m[2] || ''), ms })
+    } else if (m[4] !== undefined) {
+      const ms = timeoutMs(m[4], parameters)
+      const local = parameterValue(m[5], parameters)
+      changes.push(Number.isNaN(ms) || local === undefined ? { kind: 'unknown' } : { kind: 'set', local: /^(t|true|on|1)$/i.test(local), ms })
+    } else {
+      changes.push({ kind: 'reset' })
+    }
+  }
+  return changes
+}
+
+function parameterValue(raw, parameters) {
+  const p = /^\$(\d+)$/.exec(raw.trim())
+  if (p) {
+    const v = parameters && parameters[p[1] - 1]
+    return v === null || v === undefined ? undefined : String(v)
+  }
+  const v = raw.trim()
+  return /^'.*'$/s.test(v) ? v.slice(1, -1).replace(/''/g, "'") : v
+}
+
+function timeoutMs(raw, parameters) {
+  const v = parameterValue(raw, parameters)
+  if (v === undefined)
+    return NaN
+  if (/^default$/i.test(v.trim()))
+    return undefined
+  const m = /^\s*(\d+(?:\.\d+)?)\s*(us|ms|s|min|h|d)?\s*$/i.exec(v)
+  if (!m)
+    return NaN
+  const unit = (m[2] || 'ms').toLowerCase()
+  return Math.round(+m[1] * { us: 0.001, ms: 1, s: 1000, min: 60000, h: 3600000, d: 86400000 }[unit])
+}
+
+Connection.statementTimeoutChanges = statementTimeoutChanges
 
 function timer(fn, seconds) {
   seconds = typeof seconds === 'function' ? seconds() : seconds

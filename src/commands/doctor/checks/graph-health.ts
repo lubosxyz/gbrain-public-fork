@@ -13,8 +13,9 @@ import { quarantineFilterFragment } from '../../../core/quarantine.ts';
 import { entityTypePredicateSql, resolveEntityTypes } from '../../../core/schema-pack/entity-types.ts';
 import { MIN_ENTITY_PAGES_FOR_COVERAGE } from '../../../core/types.ts';
 import type { Check } from '../../doctor.ts';
-import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
-import { brainScorePlanFix, checkError } from '../check-fix.ts';
+import { connectedEngine, type DoctorContext, type DoctorEntry, doctorHealth } from '../context.ts';
+import { agentFix, brainScorePlanFix, checkError } from '../check-fix.ts';
+import { ORPHAN_FULL_SCAN_KEY, countLivePages, estimateOrphanRatio, orphanFullScanMaxPages, type OrphanEstimate } from './orphan-estimate.ts';
 
 async function runGraphCoverage(ctx: DoctorContext): Promise<Check[]> {
   const { progress } = ctx;
@@ -30,7 +31,7 @@ async function runGraphCoverage(ctx: DoctorContext): Promise<Check[]> {
   // condition is a false positive. Closes #530.
   progress.heartbeat('graph_coverage');
   try {
-    const health = await engine.getHealth();
+    const health = await doctorHealth(ctx);
     // #4772: the entity types come from the active schema pack(s), per source,
     // through the same policy getHealth binds. A pack that does not load is a
     // warn below, never a legacy-list reading.
@@ -194,6 +195,13 @@ async function runOrphanRatio(ctx: DoctorContext): Promise<Check[]> {
         message: `Vacuous: ${entityCount} entity pages (<100). Orphan ratio not meaningful at this scale.`,
       });
     } else {
+      // #6696 B1: above the cutoff the full anti-join belongs to --tier deep; the standard tier estimates from a sample.
+      const livePages = ctx.tier === 'deep' ? 0 : await countLivePages(engine, srcId);
+      const cutoff = ctx.tier === 'deep' ? Infinity : await orphanFullScanMaxPages(engine);
+      if (livePages > cutoff) {
+        checks.push(estimatedOrphanRatioCheck(await estimateOrphanRatio(engine, livePages, srcId), cutoff, srcId));
+        return checks;
+      }
       // F7 (Codex): under EXPLICIT --source, an operator deliberately asked
       // about one source — answer it even below 100 entities, with a
       // low-scale caveat, instead of swallowing a real per-source failure
@@ -238,6 +246,25 @@ async function runOrphanRatio(ctx: DoctorContext): Promise<Check[]> {
     checks.push(checkError('orphan_ratio', 'check orphan ratio'));
   }
   return checks;
+}
+
+/** The standard tier's sampled orphan ratio: same thresholds, labelled an estimate, with the deep-tier command for the exact figure. */
+function estimatedOrphanRatioCheck(est: OrphanEstimate, cutoff: number, srcId: string | undefined): Check {
+  const pct = (est.ratio * 100).toFixed(0);
+  const deep = ['gbrain', 'doctor', '--tier', 'deep', '--only', 'orphan_ratio', ...(srcId ? ['--source', srcId] : []), '--json'];
+  const details = { exact: false, estimated: true, ...est, full_scan_max_pages: cutoff, config_key: ORPHAN_FULL_SCAN_KEY, exact_command: deep.join(' ') };
+  // #7145: a sample with no linkable page estimated nothing; 0/0 is not 0%.
+  if (est.sample_linkable === 0) {
+    return { name: 'orphan_ratio', status: 'warn', details: { ...details, health: 'unknown', reason: 'empty_sample' },
+      message: `Orphan ratio unknown${srcId ? ` in source '${srcId}'` : ''}: the ${est.sample_pages}-page sample of ${est.live_pages} live pages held no linkable page. Exact figure: ${deep.join(' ')}.`,
+      fix: agentFix(deep, 'Read-only: the exact orphan ratio from the full scan.', 'orphan_ratio') };
+  }
+  const message = `Orphan ratio about ${pct}%${srcId ? ` in source '${srcId}'` : ''} (estimated: ${est.sample_orphans}/${est.sample_linkable} linkable pages in a `
+    + `${est.sample_pages}-page sample of ${est.live_pages} live pages; the full scan runs above ${cutoff} pages only with --tier deep: ${deep.join(' ')}).`;
+  if (est.ratio <= 0.5) return { name: 'orphan_ratio', status: 'ok', message, details };
+  return { name: 'orphan_ratio', status: est.ratio > 0.8 ? 'fail' : 'warn', details,
+    message: `${message} Run: gbrain extract links --by-mention --source db${srcId ? ` --source-id ${srcId}` : ''}   (auto-links entity mentions in body text).`,
+    fix: agentFix(deep, 'Read-only: the exact orphan ratio from the full scan, before acting on an estimate.', 'orphan_ratio') };
 }
 
 export const orphanRatioEntry: DoctorEntry = {
@@ -287,8 +314,7 @@ async function runTimelineHistory(ctx: DoctorContext): Promise<Check[]> {
   progress.heartbeat('timeline_history');
   {
     const { timelineHistoryCheck } = await import('./timeline-history.ts');
-    const { derivedVisibilityCheck } = await import('./derived-visibility.ts');
-    checks.push(await timelineHistoryCheck(engine, orphanRatioSourceId), await derivedVisibilityCheck(engine, orphanRatioSourceId));
+    checks.push(await timelineHistoryCheck(engine, orphanRatioSourceId));
     // Wave checks registered in doctor/wave-checks.ts rather than inline here.
     const { runWaveChecks } = await import('../wave-checks.ts');
     for (const finding of await runWaveChecks(engine, { only: 'wave', sourceIds: orphanRatioSourceId ? [orphanRatioSourceId] : undefined })) checks.push(finding.check);
@@ -296,11 +322,25 @@ async function runTimelineHistory(ctx: DoctorContext): Promise<Check[]> {
   return checks;
 }
 
+/** #7276: the privacy check is its own entry, run before the full scans, so its answer never waits on the wave checks' budget. */
+async function runDerivedVisibility(ctx: DoctorContext): Promise<Check[]> {
+  ctx.progress.heartbeat('derived_visibility');
+  const { derivedVisibilityCheck } = await import('./derived-visibility.ts');
+  const checks: Check[] = [];
+  checks.push(await derivedVisibilityCheck(connectedEngine(ctx), ctx.orphanRatioSourceId));
+  return checks;
+}
+
+export const derivedVisibilityEntry: DoctorEntry = {
+  name: 'derived_visibility',
+  emits: ['derived_visibility'],
+  run: runDerivedVisibility,
+};
+
 export const timelineHistoryEntry: DoctorEntry = {
   name: 'timeline_history',
   emits: [
     'timeline_history',
-    'derived_visibility',
     'safe_index_pending',
     'credential_projection_pending',
     'connector_checkpoints',
@@ -314,19 +354,31 @@ export const timelineHistoryEntry: DoctorEntry = {
     'frontmatter_hook',
     'orphan_persistence_bindings',
     'foreign_ownership_marker',
+    'coordination_lock_location',
     'unbound_source',
     'writer_version',
+    'segmented_storage',
     'self_capture',
     'vector_plan',
+    'keyword_plan',
     'stale_embedding_effects',
     'google_file_modes',
+    'google_calendar_readable',
+    'google_api_access',
+    'atom_retirements_restorable',
+    'generation_retirements',
+    'generation_held',
+    'generation_pending',
     'extractor_facts_expired',
     'conversation_label_facts',
     'conversation_outcomes_stale',
     'captured_facts_active',
+    'facts_redaction_marker',
+    'fact_bulk_dates',
     'loop_facts_drift',
     'ontology_facts_fenced',
     'stale_frontmatter_keys',
+    'maintenance_write_drift',
   ],
   run: runTimelineHistory,
 };

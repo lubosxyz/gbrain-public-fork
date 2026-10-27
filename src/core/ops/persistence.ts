@@ -2,7 +2,7 @@
 import { OperationError, opError, type Operation, type OperationContext } from './contract.ts';
 import { invalidParam, readFix } from './op-fix.ts';
 import { isValidSourceId } from '../source-id.ts';
-import { enforceBoundClientOpAllowList, enforceClientSlugFence, enforceSubagentSlugFence, normalizeSlugPrefix, parseSourceIdParam } from './context.ts';
+import { enforceBoundClientOpAllowList, enforceClientSlugFence, enforceSubagentSlugFence, normalizeSlugPrefix, parseSourceIdParam, readPolicyOpts, resolveRequestedScope } from './context.ts';
 import { hasScope } from '../scope.ts';
 import { normalizeTokenScopes } from '../legacy-token-scope.ts';
 import { parseWriteRequestId } from '../persistence/preconditions.ts';
@@ -113,11 +113,27 @@ async function publicReceipt(ctx: OperationContext, row: WriteRequest, facts?: W
   // #5929: a trusted local reader learns when the owner that ran the attempt is on another build.
   const mismatch = ctx.remote === false ? (await import('../persistence/publication-failure.ts')).ownerBuildMismatch(row.error_detail, (await import('../../version.ts')).VERSION) : null;
   const withdrawn = (await import('../facts/withdrawal.ts')).withdrawnFromDetail(row.error_detail);
+  const diagnostic = isWriteErrorCode(row.error_code) ? writeFailureDiagnostic(row.error_code, row.error_message) : null;
+  // #6650: the classification the receipt's own columns support, with the structured next step (verify is read-only).
+  const terminal = isTerminalOrRecovering(row) ? (await import('../persistence/terminal-classify.ts')).classifyTerminal({ request_id: row.request_id, source_id: row.source_id,
+    slug: row.slug, operation: row.operation, state: row.state, error_code: row.error_code, error_detail: row.error_detail ?? null, recovery: row.recovery,
+    blocked_reason: row.blocked_reason, compacted: row.compacted, publication_started: row.publication_started, error_message: row.error_message,
+    intent_kind: typeof row.intent?.kind === 'string' ? row.intent.kind : null, build: (row as { admitter_version?: string | null }).admitter_version ?? null,
+    schema_behind: await (await import('../persistence/schema-admission.ts')).readSchemaBehind(ctx.engine) }) : null;
+  const { cliRenderContext, renderAction } = await import('../agent-output.ts');
+  const render = ctx.remote === false ? cliRenderContext() : { transport: 'stdio' as const, isCallable: () => false, preapproved: () => false };
+  const { liveSearchable } = await import('../persistence/searchable.ts');
   return {
     ...publicWriteReceipt(receiptFor(row, facts)),
     operation: row.operation, source_id: row.source_id, slug: row.slug,
+    ...await liveSearchable(ctx, { request_id: row.request_id, state: row.state, source_id: row.source_id, slug: row.slug, searchable: row.outcome?.searchable }),
     ...(mismatch ? { owner_build: mismatch } : {}),
-    ...(isWriteErrorCode(row.error_code) ? { write_error: row.error_code, write_error_message: writeFailureDiagnostic(row.error_code, row.error_message).message } : {}),
+    // #7112: the owner-side detail (an owner exception's class, errno, frame, redacted database error text and statement) for a trusted local reader only.
+    ...(ctx.remote === false && row.error_detail ? { error_detail: row.error_detail } : {}),
+    ...(diagnostic ? { write_error: row.error_code, write_error_message: diagnostic.message, write_error_reason: diagnostic.reason, suggestion: diagnostic.suggestion } : {}),
+    ...(terminal ? { diagnosis: { category: terminal.category, public_category: terminal.public_category, code: terminal.code, class: terminal.class, safe_actions: terminal.safe_actions, needs_human: terminal.needs_human,
+      ...(terminal.human_reason ? { human_reason: terminal.human_reason } : {}), escalate: terminal.escalate, historical: terminal.historical,
+      fix: renderAction(terminal.action, render) } } : {}),
     ...(withdrawn ? { withdrawn } : {}),
     ...(checkpoint ? { detail: checkpoint.detail, suggestion: checkpoint.suggestion, docs: checkpoint.docs } : {}),
     effects: (await publicEffectsForRequest(ctx.engine, row.id)).map(effect => {
@@ -125,6 +141,11 @@ async function publicReceipt(ctx: OperationContext, row: WriteRequest, facts?: W
       return hint ? { ...effect, suggestion: hint.suggestion, docs: hint.docs } : effect;
     }),
   };
+}
+
+/** A receipt the terminal classifier reads: ended without committing, or holding a publication recovery record outside an in-flight claim (committed or parked `recovering`). */
+function isTerminalOrRecovering(row: WriteRequest): boolean {
+  return ['failed', 'conflict', 'cancelled'].includes(row.state) || ((row.state === 'committed' || row.state === 'recovering') && row.recovery != null);
 }
 
 function requiredRequestId(value: unknown): string {
@@ -140,8 +161,9 @@ export const persistenceOperations: Operation[] = [
     name: 'get_write_request',
     idempotent: true,
     outputRedaction: 'no_stored_text',
-    description: 'Read your write\'s receipt by request_id (after write_pending or a lost reply). Poll at retry_after_ms until final.',
-    params: { request_id: requestParam },
+    description: 'Your write\'s receipt by request_id (after write_pending or a lost reply). Poll at retry_after_ms until final.',
+    params: { request_id: requestParam,
+      applied: { type: 'boolean', fullSurfaceOnly: true, description: 'Also return applied: searchable yet, the gap, the write watermark.' } },
     scope: 'write', mutating: false, area: 'pages',
     cliHints: { name: 'write-request', positional: ['request_id'] },
     handler: async (ctx, params) => {
@@ -150,18 +172,21 @@ export const persistenceOperations: Operation[] = [
       const { getWriteRequest, writeHealthFacts } = await import('../persistence/journal.ts');
       const row = await getWriteRequest(ctx.engine, principal, id);
       if (!row || !await visible(ctx, row)) throw missing(callerSource(ctx));
-      return publicReceipt(ctx, row, (await writeHealthFacts(ctx.engine, [row])).get(row.id));
+      const receipt = await publicReceipt(ctx, row, (await writeHealthFacts(ctx.engine, [row])).get(row.id));
+      if (params.applied !== true) return receipt;
+      const applied = await (await import('../persistence/write-applied.ts')).readWriteApplied(ctx.engine, row).catch(() => null);
+      return applied ? { ...receipt, applied } : receipt;
     },
   },
   {
     name: 'list_write_requests',
     idempotent: true,
     outputRedaction: 'no_stored_text',
-    description: 'List your write receipts in one source, newest first, for a lost request_id.',
+    description: 'Your write receipts in one source, newest first (for a lost request_id).',
     params: {
       source_id: { type: 'string', description: 'Default: yours.' },
-      limit: { type: 'number', default: 25, description: '1-100 (default 25).' },
-      before: { type: 'string', description: 'next cursor from the previous page.' },
+      limit: { type: 'number', default: 25, description: '1-100 (default 25).', fullSurfaceOnly: true },
+      before: { type: 'string', description: "Previous page's next cursor." },
     },
     scope: 'write', mutating: false, area: 'pages',
     cliHints: { name: 'write-requests' },
@@ -187,10 +212,44 @@ export const persistenceOperations: Operation[] = [
     },
   },
   {
+    // #6643 (B0): the conflict pile grouped by slug. Database-derived fields only for remote callers, filtered by source grant, slug fence
+    // and page visibility in the aggregating SQL; the live file check runs only for the trusted local CLI on the canonical owner host.
+    name: 'list_write_conflicts',
+    idempotent: true,
+    outputRedaction: 'no_stored_text',
+    description: 'Pages whose writes keep ending in a source_changed conflict, grouped by slug.',
+    params: {
+      source_id: { type: 'string', description: 'Default: yours.' },
+      limit: { type: 'number', default: 25, description: '1-100 slugs (default 25).' },
+      cursor: { type: 'string', description: "Previous page's next." },
+    },
+    scope: 'read', mutating: false, area: 'pages',
+    cliHints: { name: 'write-conflicts' },
+    handler: async (ctx, params) => {
+      const sourceId = parseSourceIdParam(params.source_id ?? ctx.sourceId, 'list_write_conflicts') ?? 'default';
+      // A remote caller naming a source outside its grant is refused like every source-scoped read (permission_denied, whether or not it exists).
+      if (params.source_id !== undefined) resolveRequestedScope(ctx, sourceId);
+      const limit = params.limit ?? 25;
+      if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 100) throw invalidParam(ctx, 'list_write_conflicts', 'limit', 'limit must be an integer from 1 to 100.', { example: 25 });
+      if (params.cursor !== undefined && typeof params.cursor !== 'string') throw opError('invalid_params', 'Invalid conflict cursor.', "Pass `cursor` exactly as the previous response's `next` value.");
+      const policy = await readPolicyOpts(ctx);
+      const trusted = ctx.remote === false;
+      const sourceIds = policy.sourceIds ?? (!trusted && policy.sourceId ? [policy.sourceId] : undefined);
+      const subagent = ctx.viaSubagent !== true ? undefined : ctx.allowedSlugPrefixes?.length ? ctx.allowedSlugPrefixes
+        : typeof ctx.subagentId === 'number' ? [`wiki/agents/${ctx.subagentId}/`] : [];
+      const bound = ctx.auth?.boundSlugPrefixes?.map(normalizeSlugPrefix);
+      // Both fences apply: a slug must sit under each confinement this caller carries.
+      const slugPrefixes = bound && subagent ? intersectPrefixes(bound, subagent) : bound ?? subagent?.map(normalizeSlugPrefix);
+      const { auditDriftConflicts } = await import('../persistence/drift-conflicts.ts');
+      return auditDriftConflicts(ctx.engine, sourceId, { trusted, sourceIds, slugPrefixes, excludePrivate: policy.excludePrivate === true },
+        { limit, cursor: params.cursor as string | undefined });
+    },
+  },
+  {
     name: 'cancel_write_request',
     idempotent: true,
     outputRedaction: 'no_stored_text',
-    description: 'Cancel your accepted write before it publishes. Returns the actual receipt.',
+    description: 'Cancel your accepted write before it publishes; returns the receipt.',
     params: { request_id: requestParam },
     scope: 'write', mutating: true, area: 'pages',
     cliHints: { name: 'cancel-write-request', positional: ['request_id'] },

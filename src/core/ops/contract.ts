@@ -79,6 +79,8 @@ export class OperationError extends Error {
   public protocolVersion?: number;
   public writeRequest?: WriteReceipt;
   public writeError?: WriteErrorCode;
+  /** #6989: the request ID of a write that may have committed although its reply was not delivered (`response_too_large`); never invented for a read. */
+  public requestId?: string;
   /** Agent contract v1 (A1): which cause, when one code covers several. */
   public reason?: string;
   /** Agent contract v1: why it happened, for the agent to explain and weigh. */
@@ -94,6 +96,8 @@ export class OperationError extends Error {
   public fenceIssues?: Array<Record<string, unknown>>;
   /** A `fact_withdrawn` refusal's withdrawal: when and for which subject the exact claim was forgotten. Absence carries no meaning. */
   public withdrawn?: WithdrawnDetail;
+  /** #6643: a managed-sync refusal's owner-side classification (knock-on root, cursor fence snapshot); stored as the receipt's error_detail, never in the envelope. */
+  public syncRefusal?: Record<string, unknown>;
   /** Set to 1 by opError(); toJSON() emits `contract_version` only when set. */
   public contractVersion?: 1;
   /**
@@ -149,6 +153,7 @@ export class OperationError extends Error {
       detail: this.detail,
       protocol_version: this.protocolVersion,
       ...(this.writeRequest ? { write_request: publicWriteReceipt(this.writeRequest) } : {}),
+      ...(this.requestId ? { request_id: this.requestId } : {}),
       ...(this.writeError ? { write_error: this.writeError } : {}),
       ...(this.reason !== undefined ? { reason: this.reason } : {}),
       ...(this.why !== undefined ? { why: this.why } : {}),
@@ -183,6 +188,14 @@ export interface OpErrorOpts {
  * positional and required. Use `OperationError.bare()` only when no next step
  * can be named at the throw site.
  */
+const notAdmittedWrites = new WeakSet<OperationError>();
+/**
+ * A write refusal raised after its admission transaction rolled back, so nothing was admitted: the agent contract's
+ * safe-recovery rule (only idempotent mutations read retryable) gives way for it. Only write admission marks errors.
+ */
+export function markNotAdmitted(error: OperationError): OperationError { notAdmittedWrites.add(error); return error; }
+export function provesNotAdmitted(error: unknown): boolean { return error instanceof OperationError && notAdmittedWrites.has(error); }
+
 export function opError(code: RegistryCode, message: string, suggestion: string, opts: OpErrorOpts = {}): OperationError {
   const e = new OperationError(opts.legacy_error ?? code, message, suggestion, opts.docs);
   if (opts.legacy_error !== undefined) e.canonical = code;
@@ -251,6 +264,10 @@ export interface ParamDef {
   properties?: Record<string, ParamDef>;
   /** Advertised on the full MCP surface only (keeps the starter tool list inside its size budget). */
   fullSurfaceOnly?: boolean;
+  /** An object param the CLI takes as repeated `--flag key=value` (`key=a,b` is a list); MCP passes the object. */
+  cliKeyValue?: boolean;
+  /** An object window the CLI also takes as `N-M` (inclusive) or `N`: the [start, length] member names. */
+  cliRange?: readonly [string, string];
 }
 
 export interface Logger {
@@ -478,6 +495,11 @@ export interface OperationContext {
    */
   remote: boolean;
   /**
+   * #6696 (A5): who this caller's writes are for, set only by trusted host-side entry points (the CLI, the MCP
+   * transports). Unset is `background`; it is never derived from `remote` (persistence/admission-origin.ts).
+   */
+  admissionOrigin?: import('../persistence/admission-origin.ts').AdmissionOrigin;
+  /**
    * Transport marker for auth-less remote surfaces (#1061). The stdio MCP
    * dispatch sets 'stdio' — it is deliberately `remote: true` (agent-facing,
    * untrusted) but has no per-token auth (local pipe), so identity ops like
@@ -489,6 +511,12 @@ export interface OperationContext {
    * (network transports), independent of the remote trust flag.
    */
   transport?: 'stdio' | 'http';
+  /**
+   * Largest request frame this connection reads, in bytes, set by the transport that built the context (legacy HTTP:
+   * GBRAIN_HTTP_MAX_BODY_BYTES; OAuth /mcp: the SDK's 4 MiB; stdio: its message buffer). Sizes upload parts
+   * (persistence/page-upload.ts partMaxFrameBytes); never a trust input.
+   */
+  inboundFrameBytes?: number;
   /**
    * WP2/D3: response-meta side channel. Handlers that compute out-of-band
    * result metadata (retrieval degradation, strict-mode warnings) publish it
@@ -589,6 +617,22 @@ export interface OperationContext {
    * Shape only, never authority: nothing security-relevant reads it.
    */
   resultRows?: 'lean' | 'full';
+  /**
+   * Large pages (Wave A): the caller identified itself as gbrain's thin client
+   * (X-Gbrain-Client header). A thin client that names no `body` mode on
+   * get_page renders compiled_truth as the whole page, so the read is full
+   * or refused, never a window. Shape only, never authority.
+   */
+  thinClient?: boolean;
+  /**
+   * Whether this caller can call `opName` on its surface right now: the MCP
+   * dispatch predicate (the stdio session's surface after any `request_tools`
+   * widening, the HTTP client's effective surface and scopes under the
+   * server ceiling). Set by MCP dispatch only; publish-gated ops read as not
+   * callable. Unset on local and in-process callers. Shape only, never
+   * authority: dispatch enforces callability itself.
+   */
+  isCallable?: (opName: string) => boolean;
   /**
    * Resolved global CLI options (--quiet / --progress-json / --progress-interval).
    * CLI callers populate this from `getCliOptions()`. MCP / library callers

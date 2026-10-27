@@ -70,13 +70,27 @@ export async function withTopologyLocks<T>(engine: BrainEngine, sourceId: string
         `The worktree holding source ${item.source_id || sourceId} is owned by host ${item.owner_host_id}, not this host (${localHostId()}), or has no coordination path here, so nothing changed. Run the lifecycle command on the owning host; moving ownership is a separate, deliberate writer transfer.`,
         {fix:ownerStatusFix(sourceId)});
       await take(item.coordination_path);
-      if(!item.local_path||!existsSync(item.local_path)) continue;
-      const identity={worktreeId:item.worktree_id,coordinationPath:item.coordination_path};
-      if(opts.relocation&&item.source_id===sourceId&&additionalRoot&&item.local_path!==additionalRoot&&realpathSync(item.local_path)===additionalRoot) inspectRelocatedPhysicalRoot(item.local_path,additionalRoot,identity);
-      else assertPhysicalRoot(item.local_path,identity);
+      assertBindingPhysicalRoot(item,sourceId,additionalRoot,opts);
     }
     return await run(bindings);
   } finally { for (const handle of handles.reverse()) await handle.release(); }
+}
+
+function assertBindingPhysicalRoot(item: TopologyBinding, sourceId: string, additionalRoot: string|undefined, opts: { relocation?: boolean }): void {
+  if(!item.local_path||!existsSync(item.local_path)) return;
+  const identity={worktreeId:item.worktree_id,coordinationPath:item.coordination_path};
+  if(opts.relocation&&item.source_id===sourceId&&additionalRoot&&item.local_path!==additionalRoot&&realpathSync(item.local_path)===additionalRoot) inspectRelocatedPhysicalRoot(item.local_path,additionalRoot,identity);
+  else assertPhysicalRoot(item.local_path,identity);
+}
+
+/**
+ * #6849: a lifecycle dry run predicts the physical-root refusal the real run hits in withTopologyLocks for the
+ * source's own binding on this host. Read-only: it takes no lock and writes no stamp, reservation or row.
+ */
+export async function inspectTopologyPhysicalRoot(engine: BrainEngine, sourceId: string, additionalRoot?: string, opts: { relocation?: boolean } = {}): Promise<void> {
+  const binding = await getWorktreeBinding(engine, sourceId);
+  if (!binding || binding.owner_host_id !== localHostId() || !binding.coordination_path) return;
+  assertBindingPhysicalRoot(binding, sourceId, additionalRoot, opts);
 }
 
 /**
@@ -146,11 +160,11 @@ export async function settleTopologyRequests(tx: BrainEngine, sources: string[],
   }
   const [blocked] = await tx.executeRaw<{ id: string; source_id: string | null }>(`SELECT id,source_id FROM persistence_effects WHERE
     (source_id=ANY($1::text[]) OR worktree_id=ANY($2::uuid[])) AND
-    (recovery IS NOT NULL OR state='running' OR (kind='withdrawal-mirror' AND state<>'committed')) LIMIT 1`, [sources,worktrees]);
+    (recovery IS NOT NULL OR state='running' OR (kind='withdrawal-mirror' AND state='queued')) LIMIT 1`, [sources,worktrees]);
   if (blocked) {
     const source = blocked.source_id ?? sources[0];
     throw opError('recovery_required', 'Finish the pending withdrawal mirror and publication effects before changing source topology.',
-      `Effect ${blocked.id} on source ${source} (a withdrawal mirror or publication effect) has not finished, so the lifecycle change rolled back and nothing changed. The owner's effect worker settles it; check it with the command in fix, which lists it with its page and request; gbrain sources writer retry-effects re-authorizes a failed or parked one. Then run the same lifecycle command again with the same request_id.`,
+      `Effect ${blocked.id} on source ${source} (a queued withdrawal mirror, a running effect or one holding a recovery record) has not finished, so the lifecycle change rolled back and nothing changed. The owner's effect worker settles it; check it with the command in fix, which lists it with its page and request. Then run the same lifecycle command again with the same request_id.`,
       {fix:ownerStatusFix(source)});
   }
   const pending = requests.filter(row => row.state === 'queued');

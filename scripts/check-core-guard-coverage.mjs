@@ -16,14 +16,16 @@
  */
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Fixture root for scripts/guard-self-test.sh: argv[2] or GBRAIN_GUARD_ROOT.
-const ROOT = process.argv[2] ?? process.env.GBRAIN_GUARD_ROOT ?? new URL('..', import.meta.url).pathname;
+const ROOT = process.argv[2] ?? process.env.GBRAIN_GUARD_ROOT ?? fileURLToPath(new URL('..', import.meta.url));
 
 /** Reviewed: preparers that publish without the core guard, and why that is safe. */
 const EXEMPT = {
   'src/core/persistence/sync-prepare.ts': 'owner git edits (managed sync) pass by design; doctor core_memory reports any overage',
   'src/core/persistence/group-publish.ts': 'bulk managed sync of owner git edits; groupable() excludes core-locked members',
+  'src/core/persistence/sync-pass-fold.ts': 'adds the pass checkpoint rows to the managed sync import sync-prepare.ts prepared (owner git edits); writes no page text of its own (test/sync-pass-fold-6712.test.ts, core guard)',
   'src/core/persistence/reconcile-prepare.ts': 'reconciles the owner checkout into the database (owner edit)',
   'src/core/persistence/file-repair.ts': 'publishes bytes the owner approved with gbrain repair frontmatter --apply',
   'src/core/persistence/grandfather.ts': 'adopts pages that already exist at activation; no content change',
@@ -33,19 +35,28 @@ const EXEMPT = {
   'src/core/persistence/connector-google-receipts.ts': 'connector receipt rows, not page text',
   'src/core/persistence/projection-reindex.ts': 'rebuilds derived projections; page text is unchanged',
   'src/core/persistence/noop-kernel.ts': 'decides that nothing would change; publishes nothing',
+  'src/core/generations/repair.ts': 'the managed restore of a database-only generation (chronicle event pages, never core pages) revives and retires derived items through the adapter inside the coordinated request',
+  'src/core/generations/managed.ts': 'the generation activation flips the derived ledger; it writes no page text (its member page writes go through preparePageMutation)',
   'src/core/persistence/consumer.ts': 'dispatches to preparers; no page content of its own',
   'src/core/persistence/coordinator.ts': 'takes the ordered source lock from exclusiveSources; prepares nothing itself',
   'src/core/persistence/effect-journal.ts': 'post-publication effects; no page text',
+  'src/core/repair/file-drift.ts': 'removes a held file whose page is deleted: no live page records the path (re-read under the publication guard), the page row is untouched, and core counts only live pages; --prefer file publishes through file-repair.ts',
   'src/core/repair/captured-facts.ts': 'owner-run repair that expires fact rows (shrinks only)',
   'src/core/repair/extractor-facts.ts': 'owner-run repair restoring expired fact rows',
+  'src/core/repair/redacted-facts.ts': 'owner-run, preview-bound repair rewriting the text of database-only fact rows to words a source page proves; page text is unchanged (fenced rows publish through put_page, preparePageMutation)',
+  'src/core/repair/visibility.ts': 'owner-run, preview-first repair that only tightens database-only fact rows from world to private; page text is unchanged (fenced rows and page labels publish through put_page, preparePageMutation)',
   'src/core/repair/conversation-labels.ts': 'owner-run repair expiring fact rows and writing an outcome row (shrinks only; page text unchanged)',
   'src/core/shared-skills/publication.ts': 'skill bundles, not pages',
   'src/core/persistence/prepared-import.ts': 'type definitions shared by import preparers; prepares nothing itself',
   'src/commands/extract-timeline-db.ts': 'writes timeline rows; timeline never enters core',
   'src/core/extract-timeline-from-meetings.ts': 'writes meeting timeline rows on entity pages; page text is unchanged',
   'src/core/facts/conversation-publication.ts': 'writes database-only conversation fact rows; page text is unchanged',
+  'src/core/facts/conversation-relink.ts': 'sets entity_slug on database-only conversation fact rows; page text is unchanged',
   'src/core/cycle/extract-facts.ts': 'fence reconcile and deleted-page expiry write fact rows only; page text is unchanged',
   'src/core/cycle/extract-takes.ts': 'takes reextract writes take rows only; page text is unchanged',
+  'src/core/persistence/upload-streamed.ts': 'an upload over the single-string ceiling refuses when the page is or would become always-loaded core (the guard renders it whole); smaller uploads go through preparePageMutation',
+  'src/core/persistence/page-edit.ts': 'segmented edit_page splices through page-append.ts prepareSegmentedSpliceMutation, which declines an always-loaded core page to preparePageMutation; the splice never changes frontmatter',
+  'src/core/trust/release-publish.ts': 'append mode publishes the page write prepareFenceFactAppend builds with preparePageMutation (core guard and exclusiveSources spread into the result); index-existing indexes a fence row the file already holds and changes no page text',
   'src/core/repair/take-supersession.ts': 'reprojection writes takes.superseded_by only; fence edits go through put_page (preparePageMutation)',
 };
 

@@ -51,11 +51,13 @@ import type {
 } from './types.ts';
 import { resolveRecipe, assertTouchpoint, parseModelId, embeddingDimsForModel } from './model-resolver.ts';
 import { recordChatUsage } from './chat-usage.ts';
+import { buildExpansionPrompt } from './expansion-prompt.ts';
 import {
   OPENROUTER_CACHE_HEADER,
   openrouterRequiresExplicitPromptCache,
 } from './recipes/openrouter.ts';
 import { resolveModelDetailed, resolveEffectiveChatModel, resolveEffectiveExpansionModel } from '../model-config.ts';
+import { readLegacyModelPin } from './legacy-model-pin.ts';
 import { snapshotConfigReader } from '../config-snapshot.ts';
 import { clearGatewayModelSources, gatewayModelSource, setGatewayModelSource } from './gateway-model-sources.ts';
 import { parseLlmJson } from '../llm-json.ts';
@@ -80,6 +82,7 @@ import { cachedQueryEmbedding, clearQueryEmbedCache, queryEmbedCacheKey, queryEm
 import { createGuardedGeneration, chatInvocation } from './guarded-generation.ts';
 installAiSdkWarningWriter();
 const guardedGeneration = createGuardedGeneration(() => DEFAULT_MAX_OUTPUT_TOKENS);
+const guardedExpansion = createGuardedGeneration(() => DEFAULT_MAX_OUTPUT_TOKENS, 'gateway.expand');
 
 // ---- Gateway-wide AI-HTTP timeout (v0.42.20.0, #1762/#1775) ----
 //
@@ -99,8 +102,8 @@ function resolveAiTimeoutMs(envVar: string, fallback: number): number {
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
-/** chat / expansion / OCR — generous; only catches true hangs (non-streaming generateText). */
-const AI_CHAT_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_CHAT_TIMEOUT_MS', 300_000);
+/** chat / expansion / OCR — generous; only catches true hangs (non-streaming generateText). Also sizes the auto-drain job deadline. */
+export const AI_CHAT_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_CHAT_TIMEOUT_MS', 300_000);
 /** embed sub-batch (per SDK call, NOT per whole import). */
 const AI_EMBED_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_EMBED_TIMEOUT_MS', 60_000);
 /** multimodal per request. */
@@ -132,7 +135,7 @@ const DEFAULT_CHAT_MODEL = 'anthropic:claude-sonnet-4-6';
 // v0.35.0.0+: reranker runtime fallback. Used only when search.reranker.enabled
 // is set AND no explicit reranker_model is configured. #3657 seam: the value is
 // `DEFAULT_RERANKER_MODEL` imported from ./defaults.ts (ONE constant, shared with
-// the mode bundles) — `voyage:rerank-2.5` since v0.48.2.
+// the mode bundles) — `voyage:rerank-3-lite` (was `voyage:rerank-2.5` from v0.48.2).
 
 let _config: AIGatewayConfig | null = null;
 /** #5137: provider auth errors echo keys; scrub every key in effect before the text leaves the gateway. */
@@ -535,33 +538,45 @@ export function refreshGatewayEnvFromFilePlane(): void {
  * config for callers who want to inspect what landed.
  */
 export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise<AIGatewayConfig> {
-  const cfg = requireConfig();
-  // Refresh the OpenAI latest-model discovery cache BEFORE resolution so the
-  // key-aware tier defaults below see it. TTL-throttled (one fetch/24h),
-  // 3s-bounded, fail-open, disabled in test lanes via GBRAIN_MODEL_DISCOVERY
-  // — a connect never blocks on or breaks from discovery.
-  const { refreshLatestOpenAIModels } = await import('./openai-latest.ts');
-  // Discovery hits the same endpoint real native-openai calls use:
-  // OPENAI_BASE_URL via resolveNativeBaseUrl — the ENV PLANE, deliberately
-  // NOT cfg.base_urls.openai. Two reasons: (1) defaulting to api.openai.com
-  // when a custom endpoint is configured would send that endpoint's key to
-  // the official host; (2) base_urls can be DB-plane-merged from a mounted
-  // brain, and discovery fires automatically on connect — a hostile shared
-  // brain must never be able to point this process's bearer key at an
-  // attacker URL (native chat calls ignore base_urls for the same reason).
-  await refreshLatestOpenAIModels({
-    env: cfg.env ?? process.env,
-    baseUrl: resolveNativeBaseUrl('openai', cfg),
-  });
+  _discoveryEngine = engine;
+  _discovery = null;
+  return resolveGatewayModels(engine);
+}
 
-  // The two resolutions below each walk a 5-tier precedence chain that reads
-  // up to 4 config keys, plus alias expansion. Against the engine that is
-  // many sequential round trips before the CLI does any work — seconds of
-  // `gbrain stats`'s wall clock on a hosted brain, for reads the server
-  // answered in microseconds. Take one snapshot of the config table (AFTER
-  // the discovery refresh above, so tier defaults see fresh discovery) and
-  // resolve every model against it. Same keys, same precedence, one round
-  // trip.
+let _discoveryEngine: BrainEngine | null = null;
+let _discovery: Promise<void> | null = null;
+
+/**
+ * #6607: OpenAI model discovery runs once per reconfigure, just before an
+ * OpenAI-routed call, never on connect (a brain that never calls OpenAI sends
+ * nothing). TTL, backoff, decline and kill switch live in openai-latest.ts.
+ * Changed tiers re-resolve the models first. Endpoint: OPENAI_BASE_URL (env
+ * plane), never DB-mergeable base_urls, so a shared brain cannot redirect the
+ * key. Fail-open.
+ */
+async function discoverBeforeOpenAICall(modelStr: string | undefined): Promise<void> {
+  if (!modelStr) return;
+  try { if (resolveRecipe(modelStr).recipe.id !== 'openai') return; } catch { return; }
+  _discovery ??= (async () => {
+    try {
+      const cfg = requireConfig();
+      const { refreshLatestOpenAIModels, latestOpenAITiers } = await import('./openai-latest.ts');
+      const before = JSON.stringify(latestOpenAITiers());
+      await refreshLatestOpenAIModels({ env: cfg.env ?? process.env, baseUrl: resolveNativeBaseUrl('openai', cfg) });
+      if (_discoveryEngine && JSON.stringify(latestOpenAITiers()) !== before) await resolveGatewayModels(_discoveryEngine);
+    } catch {
+      // Fail-open: the call proceeds on the models already resolved.
+    }
+  })();
+  await _discovery;
+}
+
+async function resolveGatewayModels(engine: BrainEngine): Promise<AIGatewayConfig> {
+  const cfg = requireConfig();
+
+  // Resolve every model (each walks a 5-tier chain plus alias expansion, and
+  // the legacy DB pins below) against ONE config snapshot: per-key reads add
+  // seconds of sequential round trips on a hosted brain.
   const reader = await snapshotConfigReader(engine);
 
   // Resolve expansion (utility tier) and chat (reasoning tier). Embedding is
@@ -587,6 +602,7 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
   // present), warns once and falls to the key-aware tier default otherwise —
   // an init-era `chat_model: openai:*` pin survives reconnect when the
   // OpenAI key is live, and stops freezing provider choice when it isn't.
+  // Only with no pin does a DB-plane chat_model/expansion_model (#6795) apply.
   const needsFileCfg = (s: string) => s === 'tier_default' || s === 'fallback';
   let fileCfg: GBrainConfig | null = null;
   if (needsFileCfg(chatDetailed.source) || needsFileCfg(expansionDetailed.source)) {
@@ -599,8 +615,10 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
   const env = cfg.env ?? process.env;
   const chatEffective = needsFileCfg(chatDetailed.source) ? resolveEffectiveChatModel(fileCfg, env) : null;
   const expansionEffective = needsFileCfg(expansionDetailed.source) ? resolveEffectiveExpansionModel(fileCfg, env) : null;
-  const newChat = chatEffective?.model ?? chatDetailed.model;
-  const newExpansion = expansionEffective?.model ?? expansionDetailed.model;
+  const dbChat = await readLegacyModelPin(reader, 'chat_model', chatEffective, fileCfg, env);
+  const dbExpansion = await readLegacyModelPin(reader, 'expansion_model', expansionEffective, fileCfg, env);
+  const newChat = dbChat ?? chatEffective?.model ?? chatDetailed.model;
+  const newExpansion = dbExpansion ?? expansionEffective?.model ?? expansionDetailed.model;
 
   // Resolved values are bare model ids (e.g. `claude-sonnet-4-6`) — prepend
   // the existing provider prefix from cfg so the gateway keeps routing to
@@ -610,8 +628,8 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
   const chatFull = newChat.includes(':') ? newChat : prefixWithProviderFrom(cfg.chat_model ?? DEFAULT_CHAT_MODEL, newChat);
 
   _config = { ...cfg, expansion_model: expansionFull, chat_model: chatFull };
-  setGatewayModelSource('expansion', expansionFull, gatewayModelSource('expansion', expansionDetailed, expansionEffective));
-  setGatewayModelSource('chat', chatFull, gatewayModelSource('chat', chatDetailed, chatEffective));
+  setGatewayModelSource('expansion', expansionFull, dbExpansion ? { source: 'config_key', origin: 'expansion_model' } : gatewayModelSource('expansion', expansionDetailed, expansionEffective));
+  setGatewayModelSource('chat', chatFull, dbChat ? { source: 'config_key', origin: 'chat_model' } : gatewayModelSource('chat', chatDetailed, chatEffective));
   _modelCache.clear();
   clearQueryEmbedCache();
   _shrinkState.clear();
@@ -693,6 +711,8 @@ export function __setGatewayResetBaselineForTests(
 /** Clear every piece of module state. Shared by both reset flavors. */
 function clearGatewayState(): void {
   _config = null;
+  _discoveryEngine = null;
+  _discovery = null;
   clearGatewayModelSources();
   stashGatewayAnthropicKeyFromEnv(undefined); // gateway-owned snapshot dies with the config
   _modelCache.clear();
@@ -1406,6 +1426,7 @@ function noKeyOnce(modelStr: string, keyName: string, query: string, docCount: n
 }
 
 async function resolveEmbeddingProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
+  await discoverBeforeOpenAICall(modelStr);
   const { parsed, recipe } = resolveRecipe(modelStr);
   assertTouchpoint(recipe, 'embedding', parsed.modelId);
   const cfg = requireConfig();
@@ -1745,8 +1766,9 @@ async function embedSubBatch(
   opts?: EmbedOpts,
 ): Promise<{ embeddings: Float32Array[]; reportedTokens: number | null }> {
   try {
+    const maxRetries = hasAIInvocationGuard() ? 0 : opts?.maxRetries ?? __budgetStore.getStore()?.providerRetries; // PR 4 (Wave B incremental derivation, transcripts): an embed in a metered page step makes only the attempts it reserved for
     const callTransport = () => invokeAI({ operation: 'gateway.embed', kind: 'embedding', model: `${recipe.id}:${modelId}`,
-      maxInputTokens: embedRequestMaxInputTokens(texts, recipe, modelId), maxOutputTokens: 0 }, () => _embedTransport({
+      maxInputTokens: embedRequestMaxInputTokens(texts, recipe, modelId), maxOutputTokens: 0, estimatedInputTokens: Math.ceil(texts.reduce((n, text) => n + text.length, 0) / (recipe.touchpoints.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN)) }, () => _embedTransport({
       model,
       values: texts,
       providerOptions: providerOpts,
@@ -1755,7 +1777,7 @@ async function embedSubBatch(
       // per-SDK-call scope). Composes with a caller signal (Fix 3's 6s query
       // deadline) — shorter wins.
       abortSignal: withDefaultTimeout(opts?.abortSignal, AI_EMBED_TIMEOUT_MS),
-      ...(hasAIInvocationGuard() ? { maxRetries: 0 } : opts?.maxRetries !== undefined ? { maxRetries: opts.maxRetries } : {}),
+      ...(maxRetries !== undefined ? { maxRetries } : {}),
     }), sdkInvocationUsage, err => isTokenLimitError(err) || isUnbilledEmbeddingRejection(recipe.id, err) ? { inputTokens: 0, outputTokens: 0 } : null);
     // Carry the threaded input_type across the SDK boundary via
     // __embedInputTypeStore (the adapter strips it from providerOptions —
@@ -2346,6 +2368,7 @@ export async function embedMultimodalSafe(
 // ---- Expansion ----
 
 async function resolveExpansionProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
+  await discoverBeforeOpenAICall(modelStr);
   const { parsed, recipe } = resolveRecipe(modelStr);
   assertTouchpoint(recipe, 'expansion', parsed.modelId);
   const cfg = requireConfig();
@@ -2477,13 +2500,7 @@ export async function expand(query: string): Promise<string[]> {
     metadata: { query_chars: query.length },
   });
 
-  const expansionPrompt = [
-    'Rewrite the search query below into 3-4 different, related queries that would help find relevant documents. Respond with a JSON object in exactly this shape: {"queries": ["rewrite1", "rewrite2", "rewrite3"]}. The JSON key MUST be exactly "queries" (not "rewrites" or any other variation).',
-    'Return ONLY the JSON object. Do NOT include the original query in the result.',
-    'Each rewrite should emphasize different aspects, synonyms, or framings.',
-    '',
-    `Query: ${query}`,
-  ].join('\n');
+  const expansionPrompt = buildExpansionPrompt(query);
 
   // #4121: expand() calls generateObject/generateText directly and never
   // goes through chat()'s _recordBudget closure, so every expansion LLM
@@ -2503,11 +2520,16 @@ export async function expand(query: string): Promise<string[]> {
   });
 
   try {
+    await discoverBeforeOpenAICall(_config?.expansion_model);
     const requestedModelId = getExpansionModel();
     const { model, recipe, modelId } = await resolveExpansionProvider(requestedModelId);
     const modelLabel = `${recipe.id}:${modelId}`;
-    const recordExpansionUsage = (usage: unknown, countsAsCall: boolean): void =>
-      recordOnTracker(tracker, { modelId: modelLabel, requestedModelId, label: 'gateway.expand', countsAsCall, ...normalizeSdkUsage(usage) });
+    // #7176: a successful expansion is also a chat_usage_log row, phase 'expansion'.
+    const recordExpansionUsage = (usage: unknown, countsAsCall: boolean): void => {
+      const { inputTokens, outputTokens } = normalizeSdkUsage(usage);
+      recordOnTracker(tracker, { modelId: modelLabel, requestedModelId, label: 'gateway.expand', countsAsCall, inputTokens, outputTokens });
+      recordChatUsage({ model: modelLabel, provider: recipe.id, phase: 'expansion', usage: { input_tokens: inputTokens, output_tokens: outputTokens } });
+    };
     const recordExpansionFailure = (err: unknown, countsAsCall: boolean): void =>
       recordOnTracker(tracker, {
         modelId: modelLabel,
@@ -2526,7 +2548,7 @@ export async function expand(query: string): Promise<string[]> {
     const viaText = async (countsAsCall = true): Promise<string[]> => {
       let textResult: Awaited<ReturnType<GenerateTextFn>>;
       try {
-        textResult = await guardedGeneration(modelLabel, _generateTextTransport, {
+        textResult = await guardedExpansion(modelLabel, _generateTextTransport, {
           model,
           abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
           prompt: expansionPrompt,
@@ -2567,7 +2589,7 @@ export async function expand(query: string): Promise<string[]> {
       // generic, so `object` would be `{}`.)
       let result: { object?: unknown; usage?: unknown };
       try {
-        result = await guardedGeneration(modelLabel, _generateObjectTransport, {
+        result = await guardedExpansion(modelLabel, _generateObjectTransport, {
           model,
           schema: ExpansionSchema,
           // Name the schema. On the native-anthropic path the SDK turns the schema
@@ -2601,7 +2623,7 @@ export async function expand(query: string): Promise<string[]> {
       // schema (strict validation), and fall back to the text path if it is
       // rejected at call time so a mis-declared capability never drops expansion.
       try {
-        const result = await guardedGeneration(modelLabel, _generateObjectTransport, {
+        const result = await guardedExpansion(modelLabel, _generateObjectTransport, {
           model,
           schema: ExpansionSchema,
           // Same schema name+description as the native branch above: an
@@ -3087,6 +3109,8 @@ export interface ChatResult {
   providerMetadata?: Record<string, any>;
   /** Set when a `chat_fallback_chain` entry answered: the call's own model, which failed or refused (`model` names the one that ran). */
   fallbackFrom?: string;
+  /** With `fallbackFrom`: why that model did not answer ("failed (<first error line>)" / "refused (...)"). */
+  fallbackReason?: string;
 }
 
 export interface ChatOpts {
@@ -3268,6 +3292,7 @@ function chatSupportsPromptCache(recipe: Recipe, modelId: string): boolean {
 }
 
 async function resolveChatProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
+  await discoverBeforeOpenAICall(modelStr);
   const { parsed, recipe } = resolveRecipe(modelStr);
   assertTouchpoint(recipe, 'chat', parsed.modelId);
   const cfg = requireConfig();
@@ -3517,6 +3542,7 @@ export function toAISDKTools(tools: ChatToolDef[] | undefined): Record<string, a
 }
 
 export async function chat(opts: ChatOpts): Promise<ChatResult> {
+  await discoverBeforeOpenAICall(opts.model ?? _config?.chat_model);
   const fallbackChain = opts.allowFallback === false ? undefined : _config?.chat_fallback_chain;
   if (fallbackChain?.length) return chatWithFallback(opts, opts.model ?? getChatModel(), fallbackChain, chat, { onRefusal: _config?.chat_fallback_on_refusal !== false });
   const tracker = __budgetStore.getStore() ?? null;
@@ -3738,6 +3764,8 @@ async function chatAdmitted(opts: ChatOpts, admitted: {
     abortSignal: withDefaultTimeout(opts.abortSignal, opts.timeoutMs ?? AI_CHAT_TIMEOUT_MS),
     providerOptions: Object.keys(providerOptions).length > 0 ? providerOptions : undefined,
     ...(requestHeaders ? { headers: requestHeaders } : {}),
+    // PR 4 (Wave B incremental derivation, transcripts): a metered page step sees every attempt it pays for.
+    ...(tracker?.providerRetries !== undefined ? { maxRetries: tracker.providerRetries } : {}),
   });
 
   try {
@@ -4425,7 +4453,7 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
   try {
     const transport: RerankTransport = _rerankTransport ?? ((u, init) => fetch(u, init));
     const maxInputTokens = rerankRequestMaxInputTokens(input.query, input.documents);
-    const resp = await invokeAI({ operation: 'gateway.rerank', kind: 'rerank', model: modelStr, maxInputTokens }, () => transport(url, {
+    const resp = await invokeAI({ operation: 'gateway.rerank', kind: 'rerank', model: modelStr, maxInputTokens, estimatedInputTokens: Math.ceil(rerankChars / (recipe.touchpoints.embedding?.chars_per_token ?? 4)) }, () => transport(url, {
       method: 'POST',
       headers,
       body,

@@ -39,9 +39,11 @@ import { existsSync } from 'fs';
 import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
 import { SOURCE_FRESHNESS_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
+import { GLOBAL_FLOOR_MIN, resolveGlobalFloorMin } from '../core/minions/handlers/autopilot-global-maintenance.ts';
 import { CONNECTOR_SOURCE_PHASES } from '../core/cycle/phase-scope.ts';
 import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
-import { attemptedConnectorSourceIds } from '../core/persistence/connector-state.ts';
+import { attemptedConnectorSourceIds, type ConnectorAccountMismatch } from '../core/persistence/connector-state.ts';
+import { connectorAccountMismatches, connectorAccountMismatchSkipWarning } from '../core/persistence/connector-account-mismatch.ts';
 import { parseSourceConfig, sourceLocalPathSkipWarning } from '../core/sources-load.ts';
 import { automaticSyncPull } from '../core/persistence/automatic-sync-policy.ts';
 import { automaticSyncSkip, loadActivationPendingSourceIds, reportAutomaticSyncSkip } from '../core/sync-policy.ts';
@@ -291,6 +293,10 @@ export async function resolveFailureCooldownOpts(engine: BrainEngine): Promise<C
  * the exact failures that drive the storm. Engine-parity-safe via executeRaw
  * (one query, both engines); cutoff is precomputed in JS to avoid INTERVAL
  * portability concerns. codex #6: rows with a null source_id are excluded.
+ * #7188: a cycle that ran but had a failed phase ends `failed` with
+ * `job_outcome: 'phase_failed'` and does not count: only a whole-cycle failure
+ * (a thrown handler, a timeout or stall, `blocked_by_failures`) backs a source off,
+ * so one failing phase never stops the source's sync.
  */
 export async function readRecentSourceFailures(
   engine: BrainEngine,
@@ -308,6 +314,7 @@ export async function readRecentSourceFailures(
          FROM minion_jobs
         WHERE name = 'autopilot-cycle'
           AND status IN ('dead','failed')
+          AND (result->>'job_outcome' IS NULL OR result->>'job_outcome' <> 'phase_failed')
           AND data->>'source_id' IS NOT NULL
           AND finished_at IS NOT NULL
           AND finished_at > $1`;
@@ -368,6 +375,7 @@ export function selectSourcesForDispatch(
   cooldownOpts: CooldownOpts = { baseMin: FAILURE_COOLDOWN_BASE_MIN, capMin: FAILURE_COOLDOWN_CAP_MIN },
   pathExists: (path: string) => boolean = () => true,
   connectorIds: ReadonlySet<string> = new Set(),
+  accountMismatches: ReadonlyMap<string, ConnectorAccountMismatch> = new Map(),
 ): {
   dispatch: SourceRow[];
   skippedFresh: SourceRow[];
@@ -382,7 +390,9 @@ export function selectSourcesForDispatch(
   const cooldown: SourceRow[] = [];
   const unavailablePath: Array<SourceRow & { skip_warning: string }> = [];
   for (const s of sources) {
-    const skipWarning = s.local_path && !connectorIds.has(s.id) ? sourceLocalPathSkipWarning(s.id, s.local_path, pathExists, s.config) : null;
+    const mismatch = connectorIds.has(s.id) ? accountMismatches.get(s.id) : undefined;
+    const skipWarning = mismatch ? connectorAccountMismatchSkipWarning(s.id, mismatch)
+      : s.local_path && !connectorIds.has(s.id) ? sourceLocalPathSkipWarning(s.id, s.local_path, pathExists, s.config) : null;
     if (skipWarning) {
       unavailablePath.push({ ...s, skip_warning: skipWarning });
       continue;
@@ -542,6 +552,8 @@ export async function dispatchPerSource(
   }
 
   const pathExists = opts.pathExists ?? existsSync;
+  // #6803: a connector whose credential resolves to another account is unavailable until the operator repins it.
+  const accountMismatches = connectorIds.size ? await connectorAccountMismatches(engine).catch(() => new Map<string, ConnectorAccountMismatch>()) : new Map<string, ConnectorAccountMismatch>();
   const { dispatch, skippedFresh, skippedCap, skippedCooldown, skippedUnavailablePath } =
     selectSourcesForDispatch(
       sources,
@@ -552,6 +564,7 @@ export async function dispatchPerSource(
       cooldownOpts,
       pathExists,
       connectorIds,
+      accountMismatches,
     );
 
   for (const src of skippedUnavailablePath) {
@@ -681,8 +694,6 @@ export async function dispatchPerSource(
   };
 }
 
-const GLOBAL_FLOOR_MIN = 60;
-
 /** Is the brain-wide maintenance overdue? Null/unparseable → overdue. */
 export function isGlobalMaintenanceStale(lastGlobalAtIso: string | null, now = Date.now(), floorMin = GLOBAL_FLOOR_MIN): boolean {
   if (!lastGlobalAtIso) return true;
@@ -725,12 +736,7 @@ export async function dispatchGlobalMaintenance(
   const emit = opts.emit ?? ((line) => process.stderr.write(line + '\n'));
   const log = opts.log ?? ((line) => console.log(line));
 
-  let floorMin = GLOBAL_FLOOR_MIN;
-  const floorCfg = await engine.getConfig('autopilot.global_floor_min');
-  if (floorCfg) {
-    const n = parseInt(floorCfg, 10);
-    if (Number.isFinite(n) && n >= 1) floorMin = n;
-  }
+  const floorMin = await resolveGlobalFloorMin(engine);
   const lastGlobalAt = await engine.getConfig(LAST_GLOBAL_AT_KEY);
   if (!isGlobalMaintenanceStale(lastGlobalAt, Date.now(), floorMin)) {
     return { dispatched: false, reason: 'fresh' };

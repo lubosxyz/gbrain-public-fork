@@ -3,7 +3,8 @@ import { importFenceTally, type FencesNormalized } from '../core/fence-repair/re
 import { opError } from '../core/ops/contract.ts';
 import { hasSourceFilesystemLock, withSourceFilesystemLock, currentSourceFilesystemSignal } from '../core/minions/source-filesystem.ts';
 import { readdirSync, lstatSync, existsSync, mkdirSync } from 'fs';
-import { execFileSync } from 'child_process';
+import { recordFunnelEvent } from '../core/funnel.ts';
+import { execFileSync } from '../core/spawn.ts';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
@@ -25,8 +26,10 @@ import {
   pruneDir,
   isPathPruned,
   isSyncMetafile,
+  DEFAULT_METAFILE_PAGES_MODE, readMetafilePagesMode, type MetafilePagesMode,
   type SyncStrategy,
 } from '../core/sync.ts';
+import { diskMetafileHeads, metafilePagePredicate } from '../core/sync-metafile-pages.ts';
 import { sortNewestFirst } from '../core/sort-newest-first.ts';
 import {
   loadCheckpoint,
@@ -45,6 +48,7 @@ import { estimateCostFromChars, lookupEmbeddingPrice } from '../core/embedding-p
 import { getEmbeddingModel } from '../core/ai/gateway.ts';
 import { managedRootMarkerFor } from '../core/persistence/root-registry.ts';
 import { readManagedMode } from '../core/persistence/ownership.ts';
+import { readPageBodyPolicy } from '../core/page-body/limits.ts';
 
 /** Return a refusal when an import target lies outside every admitted root. */
 export function configuredRootImportError(dir: string, configuredRoots: string[]): string | null {
@@ -245,6 +249,17 @@ async function keylessImportRefusal(engine: BrainEngine, args: string[], e: unkn
     });
 }
 
+type ImportFileResultCallback = (path: string, filePath: string, result: Pick<ImportResult, 'status' | 'error' | 'refusal' | 'frontmatter_recovery' | 'fences_normalized' | 'fence_issues'>) => Promise<'held' | undefined>;
+
+/** GBRA-130 A-66: a throwing caller callback is that file's outcome, never a rejection of the whole import. */
+async function reportFileResult(onFileResult: ImportFileResultCallback | undefined, ...args: Parameters<ImportFileResultCallback>): Promise<'held' | undefined> {
+  try { return await onFileResult?.(...args); }
+  catch (e) {
+    console.error(`  Warning: could not record the outcome of ${sanitizePathForDisplay(args[0])} (${e instanceof Error ? e.message : String(e)}); it is not held, the import continues.`);
+    return undefined;
+  }
+}
+
 export async function runImport(
   engine: BrainEngine,
   args: string[],
@@ -257,7 +272,7 @@ export async function runImport(
     /** #5988: paths the caller already held this run; they are skipped without importing (not failures). */
     heldPaths?: ReadonlySet<string>;
     /** #5988: each file's outcome (a throw arrives as `{ status: 'error', error }`); `'held'` = the caller held it, not a failure. */
-    onFileResult?: (path: string, filePath: string, result: Pick<ImportResult, 'status' | 'error' | 'refusal' | 'frontmatter_recovery' | 'fences_normalized' | 'fence_issues'>) => Promise<'held' | undefined>;
+    onFileResult?: ImportFileResultCallback;
     /**
      * #753/#774: glob patterns to exclude from the import (same semantics as
      * `isSyncable`'s `exclude` — matched against the dir-relative path).
@@ -460,6 +475,7 @@ export async function runImport(
   } catch {
     importActivePack = undefined;
   }
+  const bodyPolicy = await readPageBodyPolicy(engine);
 
   const workersIdx = args.indexOf('--workers');
   const workersArg = workersIdx !== -1 ? args[workersIdx + 1] : null;
@@ -564,7 +580,7 @@ export async function runImport(
   let allFiles = company ? company.plan.manifest.filter(entry => entry.disposition === 'included').map(entry => join(dir, entry.path))
     : singleFile ? [dir] : collectSyncableFiles(dir, {
     strategy, includeGitignored,
-    includeHidden: opts.includeHidden,
+    includeHidden: opts.includeHidden, metafilePages: await readMetafilePagesMode(engine),
     onExcluded: (rel) => { malformedExcluded.push(rel); },
   });
   console.error(
@@ -725,7 +741,7 @@ export async function runImport(
         ? await importManagedFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, signal, slugRoot: opts.slugRoot })
         : isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
         ? await importImageFile(eng, filePath, importRelPath, { noEmbed, sourceId })
-        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, firstCommitAt: firstCommits?.get(filePath) });
+        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, bodyPolicy, firstCommitAt: firstCommits?.get(filePath) });
       // An import that landed while cancellation arrived is still complete.
       // Account for it before stopping, so resume never loses a successful path.
       noteTypeWarning((result as { type_warning?: Parameters<typeof noteTypeWarning>[0] }).type_warning); fenceTally.note(importRelPath, result);
@@ -733,7 +749,7 @@ export async function runImport(
       if (!settled && _fileMs > 5000) {
         console.error(`[gbrain phase] import.process_file slow ${_fileMs}ms ${relativePath}`);
       }
-      if (await opts.onFileResult?.(importRelPath, filePath, result) === 'held') {
+      if (await reportFileResult(opts.onFileResult, importRelPath, filePath, result) === 'held') {
         skipped++;
         completed.add(relativePath);
       } else if (result.status === 'imported') {
@@ -778,7 +794,7 @@ export async function runImport(
       }
       // #5600: an accepted managed import still publishing is not a failure; the next run resumes its request.
       if (acceptedPendingReceipt(e)) { skipped++; console.error(`  Pending: ${relativePath} was accepted and is still publishing; rerun to confirm it.`); }
-      else if (await opts.onFileResult?.(importRelPath, filePath, { status: 'error', error: e instanceof Error ? e.message : String(e) }) === 'held') { skipped++; completed.add(relativePath); } else {
+      else if (await reportFileResult(opts.onFileResult, importRelPath, filePath, { status: 'error', error: e instanceof Error ? e.message : String(e) }) === 'held') { skipped++; completed.add(relativePath); } else {
         const msg = e instanceof Error ? e.message : String(e);
         const { count, sample } = recordImportFailure(errorCounts, errorSamples, msg);
         if (count <= 5) {
@@ -1207,6 +1223,7 @@ export async function runImport(
   }
 
   if (imported > 0 && !opts.managedBookmark) await refreshProjectionStatistics(engine, imported);
+  if (imported > 0) recordFunnelEvent('import');
   return {
     imported, skipped, errors, chunksCreated, failures,
     ...(resealSummary ? { resealed: resealSummary } : {}), ...fenceTally.fields(),
@@ -1245,6 +1262,7 @@ interface CollectOpts {
   onExcluded?: (relPath: string) => void;
   /** See `RunImportOpts.includeHidden` — same repeatable-glob semantics. */
   includeHidden?: string[];
+  metafilePages?: MetafilePagesMode; // GBRA-150: `sync.metafile_pages`, whether a typed nested metafile under `dir` is collected
 }
 
 /**
@@ -1270,6 +1288,7 @@ function isCollectibleForWalker(
   strategy: SyncStrategy,
   multimodalOn: boolean,
   includeHidden?: string[],
+  metafilePage?: (relPath: string) => boolean, relPath = path,
 ): boolean {
   // #2607: apply the SAME segment-level prune gate as incremental sync's
   // `classifySync` (core/sync.ts) — via the shared `isPathPruned`, so this
@@ -1293,8 +1312,8 @@ function isCollectibleForWalker(
   // Metafiles are directory scaffolding (READMEs / index / log / schema /
   // resolver, and the root AGENTS.md / CLAUDE.md harden writes), not typed
   // brain pages — same exclusion `sync`'s `isSyncable` applies. Guards both
-  // the FS-walk and the git-fast-path collection routes.
-  if (isSyncMetafile(path)) return false;
+  // the FS-walk and the git-fast-path collection routes. GBRA-150: a nested typed one is a page (dir-relative depth).
+  if (isSyncMetafile(path) && !metafilePage?.(relPath)) return false;
 
   switch (strategy) {
     case 'code':
@@ -1339,6 +1358,7 @@ function gitListSyncableFiles(
   multimodalOn: boolean,
   onExcluded?: (relPath: string) => void,
   includeHidden?: string[],
+  metafilePage?: (relPath: string) => boolean,
 ): string[] | null {
   const stdout = gitLsFiles(dir, ['--cached', '--others', '--exclude-standard', '-z']);
   if (stdout === null) return null; // not a git work tree, or git not on PATH → FS-walk fallback
@@ -1352,7 +1372,7 @@ function gitListSyncableFiles(
     // exclusion is reportable — other filters (strategy, prune, metafile)
     // are silent by design; this one hides renameable content.
     if (hasMalformedPathSegment(rel)) { onExcluded?.(rel); continue; }
-    if (!isCollectibleForWalker(rel, strategy, multimodalOn, includeHidden)) continue;
+    if (!isCollectibleForWalker(rel, strategy, multimodalOn, includeHidden, metafilePage)) continue;
     const full = join(dir, rel);
     let st;
     try {
@@ -1386,6 +1406,7 @@ function gitListSyncableFiles(
 export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): string[] {
   const strategy: SyncStrategy = opts.strategy ?? 'markdown';
   const multimodalOn = process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
+  const metafilePage = metafilePagePredicate(opts.metafilePages ?? DEFAULT_METAFILE_PAGES_MODE, diskMetafileHeads(dir));
 
   // v0.42.x (#1159 --respect-gitignore / #1483 .gbrainignore): when `dir` is a
   // git work tree, enumerate via `git ls-files` so the walk honors
@@ -1397,7 +1418,7 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
   // PLUS untracked-not-ignored, so uncommitted source is still indexed. Non-git
   // dirs (or git unavailable) fall through to the FS walk below.
   if (!opts.includeGitignored) {
-    const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn, opts.onExcluded, opts.includeHidden);
+    const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn, opts.onExcluded, opts.includeHidden, metafilePage);
     if (gitFiles) return gitFiles;
   }
 
@@ -1459,7 +1480,7 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
         // bracket directory segment above a clean-named markdown file).
         const rel = relative(dir, full);
         if (hasMalformedPathSegment(rel)) { opts.onExcluded?.(rel); continue; }
-        if (!isCollectibleForWalker(entry, strategy, multimodalOn)) continue;
+        if (!isCollectibleForWalker(entry, strategy, multimodalOn, undefined, metafilePage, rel.split(sep).join('/'))) continue;
         files.push(full);
       }
     }

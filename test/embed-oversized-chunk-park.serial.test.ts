@@ -39,7 +39,7 @@ mock.module('../src/core/embedding.ts', () => ({
 // Import AFTER mocking.
 // 0.51.6.0 merge: the embed path now reads a guarded projection snapshot and
 // installs vectors through `installPageEmbeddings` inside `engine.transaction`
-// (upstream #5149). This suite pins the PARKING contract, not the guard, so
+// (upstream #5149), under the per-page embedding lease. This suite pins the PARKING contract, not the guard, so
 // the projection layer is stubbed onto the same tracked mock engine: the
 // snapshot is whatever `getChunks` returns and installation is the old
 // `upsertChunks` call the assertions below already inspect.
@@ -62,7 +62,8 @@ mock.module('../src/core/page-state/projections.ts', () => ({
     const { slug, source_id: sourceId } = prepared.snapshot.page;
     await engine.upsertChunks(slug, chunks, { sourceId });
     if (signature) await engine.setPageEmbeddingSignature(slug, { sourceId, signature });
-    return true;
+    // PageEmbeddingInstall: every offered vector commits in this mock.
+    return { installed: chunks.filter((c: any) => c.embedding).length, complete: true };
   },
   installPageProjection: async () => {},
   sealPageTextProjection: async () => {},
@@ -88,6 +89,11 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
       if (prop === '_calls') return calls;
       if (prop === 'executeRaw') return async (sql: string, ...args: unknown[]) => {
         if (sql.includes('count(*)') && sql.includes('s.archived')) return [{ n: 0 }];
+        // The per-page embedding lease (src/core/page-embedding-lease.ts) is always free, and its
+        // install-time renewal always holds, in this single-process mock.
+        if (sql.startsWith('INSERT INTO gbrain_cycle_locks') || sql.startsWith('UPDATE gbrain_cycle_locks')) {
+          return [{ id: (args[0] as unknown[] | undefined)?.[0] }];
+        }
         return overrides.executeRaw ? overrides.executeRaw(sql, ...args) : [];
       };
       if (overrides[prop]) return overrides[prop];
@@ -434,7 +440,7 @@ describe('round-2 P2 — batch-boundary parking', () => {
       upsertChunks: async (slug: string, rows: any[]) => { upserts.push({ slug, chunks: rows }); },
       // #4825 provenance stamp probes DB state; report incomplete (chunk 1 is
       // parked, its provenance stays NULL) so no stamp fires.
-      executeRaw: async () => [{ complete: false }],
+      executeRaw: async (sql: string) => (sql.includes('AS complete') ? [{ complete: false }] : []),
     });
 
     const result = await runEmbedCore(engine, { stale: true, batchSize: 2 });
@@ -483,7 +489,7 @@ describe('round-3 P2 — parking verdicts and unresolved failures', () => {
       upsertChunks: async (_slug: string, rows: any[]) => {
         for (const r of rows) if (r.embedding) embeddedIdx.add(r.chunk_index);
       },
-      executeRaw: async () => [{ complete: false }],
+      executeRaw: async (sql: string) => (sql.includes('AS complete') ? [{ complete: false }] : []),
     });
 
     const result = await runEmbedCore(engine, { stale: true, batchSize: 2 });
@@ -515,7 +521,7 @@ describe('round-3 P2 — parking verdicts and unresolved failures', () => {
       }; })(),
       getChunks: async () => chunkRows(chunks),
       upsertChunks: async () => {},
-      executeRaw: async () => [{ complete: false }],
+      executeRaw: async (sql: string) => (sql.includes('AS complete') ? [{ complete: false }] : []),
     });
 
     const result = await runEmbedCore(engine, { stale: true });
@@ -544,7 +550,7 @@ describe('round-3 P2 — parking verdicts and unresolved failures', () => {
       }; })(),
       getChunks: async () => [...chunkRows(chunks), restoreShaped],
       upsertChunks: async () => {},
-      executeRaw: async () => [{ complete: false }],
+      executeRaw: async (sql: string) => (sql.includes('AS complete') ? [{ complete: false }] : []),
     });
 
     const result = await runEmbedCore(engine, { stale: true });

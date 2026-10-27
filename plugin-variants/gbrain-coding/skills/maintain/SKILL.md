@@ -29,6 +29,7 @@ triggers:
   - "consolidate yesterday's conversations"
 tools:
   - get_health
+  - get_brain_health
   - get_page
   - put_page
   - list_pages
@@ -110,7 +111,7 @@ Use the per-dimension walk below (Phase 2 onward) when:
 
 ### Manual path
 
-1. **Run health check.** Check gbrain health to get the dashboard.
+1. **Run health check.** Check gbrain health (`get_health`) to get the dashboard. `get_health` needs admin scope; without it, call `get_brain_health` (read scope), which returns bands only (write capacity, write failures, ghost pages, unsearchable chunks), and skip the dimensions it cannot answer: stale pages, orphan pages, dead links, embed coverage, link and timeline counts and the brain score. Name the skipped dimensions in the report and ask for an admin token, or for `gbrain doctor --json` on the brain host, to cover them.
 2. **Check each dimension:**
 
 ### Stale pages
@@ -258,10 +259,14 @@ so re-running on the same content is a no-op. `dream.synthesize.exclude_patterns
 Each entry is auto-wrapped as a word-boundary regex (e.g. `medical` matches
 "medical advice" but NOT "comedical"). Power users may pass full regex.
 
-**Cooldown:** the cycle's spend cap. `dream.synthesize.cooldown_hours` (default
-12) means at most ~2 synthesize runs per day under autopilot. The completion
-timestamp is stored in `dream.synthesize.last_completion_ts` and is written
-ONLY on successful runs (not on skipped/failed). Explicit `--input` /
+**Cooldown:** `dream.synthesize.cooldown_hours` (default 12) skips synthesize
+for that long after a fully drained pass. The completion timestamp is stored
+in `dream.synthesize.last_completion_ts` and is written only when every child
+completed and nothing was deferred (synthesis budget, triage time budget or
+publish pending), never on skipped or failed runs. So under a standing
+backlog the cooldown never applies and synthesize runs every cycle until the
+backlog drains (#6753); it is not a cap of ~2 runs a day. To cap spend, use
+`dream.synthesize.max_submissions_per_source_per_day`. Explicit `--input` /
 `--date` / `--from` / `--to` invocations bypass cooldown.
 
 **`--dry-run` semantics:** runs the scored triage pass (judges + caches
@@ -417,6 +422,13 @@ For a long run (>1000 chunks), route the approved command through the
 durable ladder in `skills/minion-orchestrator/SKILL.md` instead of a bare
 background shell, which hides that exit 3 in a log file.
 
+To see what search cannot reach on one source, run
+`gbrain pages unsearchable --source <id> --json` (read-only). Read
+`semantic_unsearchable`, not only `unsearchable`: it adds `keyword_only`
+pages, which keyword search finds but vector search misses. `awaiting_sync`
+counts files sync still holds, which no embedding state includes; follow
+`gbrain sync status --source <id> --json` for those. Each row carries its `fix`.
+
 ### Security (RLS verification)
 Run `gbrain doctor --json` and check the RLS status.
 All tables should show RLS enabled. If not, run `gbrain init` again.
@@ -526,6 +538,7 @@ Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) 
 - `gbrain doctor --remediate` steps marked "requires user agreement" (PROTECTED repairs, paid steps): show the plan and cost, and run with `--yes --include-repairs --expect <plan_hash> --max-usd <n>` (the hash from `--remediation-plan --json`) only after the user agrees; `preview_changed` means the plan moved, so preview and ask again. A step that would exceed the cap is not started.
 - A finding classified `operator_required`: follow its instruction or relay it to the brain host's operator. `consent_required`: ask the user.
 - A writer-coordination refusal (`writer_coordinator_required`, `writer_not_quiesced`, `recovery_required`): inspect `gbrain sources writer status` and hand the blocked recovery to the operator; never claim a checkout or delete a lock.
+- Doctor warns `persistence_terminal_failures`: run its `fix.command` (an active blocker: a recovery record or a sync checkpoint blocker; or an unresolved gbrain-defect class to report with the receipt ids). For the rest of the pile, `gbrain sources writer failures <source> --group-by category` (read-only) groups receipts with a fix and drill-down per group; historical rows need nothing. Never cancel or edit receipts to clear the count. Runbook: [terminal write failures](https://github.com/lubosxyz/gbrain-public-fork/blob/master/docs/guides/troubleshooting.md#terminal-write-failures).
 - `gbrain dream` stops on a budget (exit 11): run the printed `resume_command` within the agreed budget.
 
 ## Anti-Patterns
@@ -574,7 +587,8 @@ The maintenance report follows this structure:
 
 ## Tools Used
 
-- Check gbrain health (get_health)
+- Check gbrain health (get_health; admin scope)
+- Check banded brain health without admin scope (get_brain_health)
 - List pages in gbrain with filters (list_pages)
 - Read a page from gbrain (get_page)
 - Check backlinks in gbrain (get_backlinks)

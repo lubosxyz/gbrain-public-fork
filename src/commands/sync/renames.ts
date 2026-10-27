@@ -13,6 +13,7 @@ import { maintenanceTransaction } from '../../core/persistence/attribution.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { movePageIdReferences, moveSlugBindings, recordRenameAlias } from '../../core/page-state/rename-alias.ts';
 import { renamePageOntoSlug } from './rename-collision.ts';
+import { workingTreeIdentityHead } from '../../core/sync-rename-identity.ts';
 import {
   resolveSlugsForRemovedPaths,
   refusedRemovedPathMessage,
@@ -30,9 +31,13 @@ import {
 import type { SyncResult } from '../sync.ts';
 import { trackedSlugIndex, activeSlugsBySourcePath } from './rename-reconcile.ts';
 import type { TrackedSlugIndex } from './rename-reconcile.ts';
-import { clearLegacyHold, holdRefusedImport, holdRenameDestination, noteScreenedImport } from './holds.ts';
+import { clearLegacyHold, holdRefusedImport, holdRenameDestination, noteScreenedImport, recordLegacyHold, type LegacyHolds } from './holds.ts';
+import { classifyItemFailure } from '../../core/item-failure.ts';
 import { partial, noteTypeWarning, markCompleted } from './sync-run.ts';
 import type { SyncPlan, SyncRun, SyncProgress } from './sync-run.ts';
+import { noteCommittedProgress } from '../../core/forward-progress.ts';
+import { recordFallbackRename } from '../../core/belief/identity.ts';
+import { markBeliefCommits } from '../../core/belief/append.ts';
 
 type RenamePlan = Pick<SyncPlan, 'opts' | 'filtered' | 'manifest' | 'lastCommit' | 'pin' | 'gitContextRoot' | 'modePath' | 'syncImportRoot' | 'syncActivePack' | 'holds'>;
 
@@ -187,8 +192,8 @@ export async function runRenamesPhase(
 
 
     const ctx: RenameContext = { renameOpts, slugLiveness, renameOldSlugs, fromSlugByPath, renameSentinelAlreadyOpen, noEmbed };
-    for (const { from, to } of renamesToDo) {
-      const aborted = await applyRename(run, plan, ctx, progress, from, to);
+    for (const { from, to, identityHead } of renamesToDo) {
+      const aborted = await applyRename(run, plan, ctx, progress, from, to, identityHead);
       if (aborted) return aborted;
     }
     progress.finish();
@@ -204,6 +209,7 @@ async function applyRename(
   progress: SyncProgress,
   from: string,
   to: string,
+  identityHead?: string,
 ): Promise<SyncResult | undefined> {
   const { engine, failedFiles, succeededPaths, pagesAffected, deletedSlugs } = run;
   const { opts, gitContextRoot, syncImportRoot, syncActivePack, holds } = plan;
@@ -234,6 +240,14 @@ async function applyRename(
   const newSlug = resolveSlugForPath(to);
   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- `to` is a git-diff rename path; the joined path is read only after the same isPathSafe(filePath, gitContextRoot) realpath containment check the import below applies
   const filePath = join(syncImportRoot, to);
+  // #6729: a dirty-tree rename keeps its page only for the bytes its verdict read; a file edited since then is left
+  // for the next sync to re-check, and nothing moves.
+  if (identityHead !== undefined && workingTreeIdentityHead(syncImportRoot, to) !== identityHead) {
+    failedFiles.push({ path: to, error: `${to} changed after sync confirmed it keeps the page of ${from}; nothing moved. Run gbrain sync again to re-check it.` });
+    serr(`  [sync] rename ${sanitizePathForDisplay(from)} -> ${sanitizePathForDisplay(to)}: the file changed after its identity was confirmed; nothing moved, the next sync re-checks it.`);
+    progress.tick(1, newSlug);
+    return undefined;
+  }
   // #5988 (E13): a destination the import would refuse is screened before the
   // old page's slug or origin moves; it is held and the old page stays whole.
   if (isPathSafe(filePath, gitContextRoot) && await holdRenameDestination(engine, holds, { from, to, filePath, oldSlug, activePack: syncActivePack })) {
@@ -340,7 +354,7 @@ async function applyRename(
   // banking `to` would make the resume filter skip this rename on the
   // retry run — a permanent duplicate (reconcile) or a permanently
   // unimported target (import error) — the exact bug class being fixed.
-  if (!reconcileFailed && !importErrored) await markCompleted(run, to);
+  if (!reconcileFailed && !importErrored) { await markCompleted(run, to); noteCommittedProgress(); }
   progress.tick(1, newSlug);
   return undefined;
 }
@@ -352,16 +366,44 @@ async function applyRename(
  * aliases) move, and page-id-keyed rows (edges, timeline, versions) move with
  * duplicates on their unique keys dropped from the stale side.
  */
-async function carryRenameIdentity(engine: BrainEngine, sourceId: string, staleSlug: string, newSlug: string): Promise<void> {
+export async function carryRenameIdentity(engine: BrainEngine, sourceId: string, staleSlug: string, newSlug: string): Promise<void> {
   const rows = await engine.executeRaw<{ slug: string; id: number | string }>(
     'SELECT slug, id FROM pages WHERE source_id = $1 AND slug = ANY($2::text[])', [sourceId, [staleSlug, newSlug]]);
   const from = rows.find(r => r.slug === staleSlug), to = rows.find(r => r.slug === newSlug);
   if (!from || !to || from.id === to.id) return;
-  await maintenanceTransaction(engine, async tx => {
-    await recordRenameAlias(tx, sourceId, staleSlug, newSlug);
-    await moveSlugBindings(tx, sourceId, staleSlug, newSlug);
-    await movePageIdReferences(tx, Number(from.id), Number(to.id));
+  const publication = await maintenanceTransaction(engine, async tx => {
+    await tx.lockPageKeys([{ sourceId, slug: staleSlug }, { sourceId, slug: newSlug }]);
+    return recordFallbackRename(tx, { sourceId, staleSlug, newSlug, fromPageId: Number(from.id), toPageId: Number(to.id) }, async () => {
+      await recordRenameAlias(tx, sourceId, staleSlug, newSlug);
+      await moveSlugBindings(tx, sourceId, staleSlug, newSlug);
+      await movePageIdReferences(tx, Number(from.id), Number(to.id));
+    });
   });
+  if (publication) await markBeliefCommits(engine, [publication]).catch(() => undefined);
+}
+
+/** The reconcile's own "cannot prove the old row stale" verdict: the one throw that keeps the `<rename:…>` sentinel by design. */
+class RenameStalenessUnprovable extends Error {}
+
+/**
+ * GBRA-133 S-67: holds `to` as `rename_reconcile_failed` when finding the stale rows threw something other than the
+ * unprovable verdict or a transient database error (a connection, a timeout, a lock), which a later run retries. The hold records
+ * the cause's class and code only, never its message (it can quote content). False when it does not apply.
+ */
+async function holdUnexpectedReconcileFailure(engine: BrainEngine, holds: LegacyHolds | null, input: { from: string; to: string; error: unknown }): Promise<boolean> {
+  if (!holds?.active || input.error instanceof RenameStalenessUnprovable) return false;
+  const classified = classifyItemFailure(input.error);
+  if (classified.scope === 'run' || classified.code === 'statement_timeout' || classified.code === 'lock_timeout') return false;
+  const name = input.error instanceof Error ? input.error.name : typeof input.error;
+  const code = (input.error as { code?: unknown } | null)?.code;
+  const cause = `${name}${typeof code === 'string' && /^[\w.-]{1,40}$/.test(code) ? ` ${code}` : ''}`;
+  try {
+    await recordLegacyHold(engine, holds, { path: input.to, upstreamVersion: null, refusal: { code: 'rename_reconcile_failed',
+      message: `${input.to} was renamed from ${input.from} and imported, but removing the old page failed unexpectedly (${cause}), so the old page was kept and may be a duplicate.` } });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -372,7 +414,7 @@ async function carryRenameIdentity(engine: BrainEngine, sourceId: string, staleS
  */
 async function reconcileRenameFallback(
   run: SyncRun,
-  plan: Pick<SyncPlan, 'opts'>,
+  plan: Pick<SyncPlan, 'opts' | 'holds'>,
   ctx: Pick<RenameContext, 'slugLiveness' | 'renameOldSlugs' | 'renameSentinelAlreadyOpen'>,
   from: string,
   to: string,
@@ -429,6 +471,7 @@ async function reconcileRenameFallback(
       // review) — so `staleSlug` below (and the sentinel/remedy text it
       // feeds) can only ever name a genuinely-stale row.
       let staleSlug: string | undefined;
+      let deleting = false;
       try {
         const active = await activeSlugsBySourcePath(
           engine, [from], opts.sourceId ?? DEFAULT_SOURCE_ID,
@@ -488,6 +531,7 @@ async function reconcileRenameFallback(
           }
         }
         if (staleSlugs.length > 0) {
+          deleting = true;
           // Delete every genuinely-stale active row still carrying the
           // old path — with a non-unique source_path there can be more
           // than one, and the rename is checkpointed after this loop, so
@@ -545,7 +589,7 @@ async function reconcileRenameFallback(
           // actionable slug an earlier failure had recorded. `undefined`
           // renders as `?`, which is the truth: not known.
           staleSlug = undefined;
-          throw new Error(
+          throw new RenameStalenessUnprovable(
             `staleness unprovable for ${unprovable.length} row(s) ` +
             `(${unprovable.join(', ')}): the tracked-file slug index is ` +
             `incomplete, so no index miss proves a row stale, and this ` +
@@ -554,6 +598,10 @@ async function reconcileRenameFallback(
           );
         }
       } catch (e: unknown) {
+        // GBRA-133 S-67: a failed delete keeps the sentinel (#3056/#3479: it converges, or `gbrain delete` is its exit), as do
+        // the unprovable verdict and a transient database error; any other throw while finding the stale rows is
+        // deterministic, so this rename is held and the rest of the source syncs.
+        if (!deleting && await holdUnexpectedReconcileFailure(engine, plan.holds, { from, to, error: e })) return false;
         reconcileFailed = true;
         failedFiles.push({
           path: renameSentinelPath(to),

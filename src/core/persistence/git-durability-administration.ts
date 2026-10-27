@@ -21,8 +21,9 @@ import { execFileBounded } from '../bounded-child-exec.ts';
 import { classifyGitCheckout } from '../git-checkout.ts';
 import { durableSsrfFlags, GIT_ENV, GIT_ENV_AUTH, GIT_SSRF_SUBCOMMAND_FLAGS } from '../git-remote.ts';
 import { gitChildEnv } from '../git-env.ts';
+import { NON_FAST_FORWARD } from './effect-git.ts';
 import { ensureGbrainHome, resolveGbrainHome } from '../gbrain-home.ts';
-import { opError } from '../ops/contract.ts';
+import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 import type { BrainEngine } from '../engine.ts';
@@ -30,7 +31,8 @@ import { existingLocalHostId } from './identity.ts';
 import { getWorktreeBinding, type GitDurabilitySetting, type WorktreeBinding } from './ownership.ts';
 import { requireWriterAdminIntent, assertWriterAdminState, writerAdminState } from './admin-intent.ts';
 import { gitDurabilityPolicy, planGitDurabilityCatchUp, requeueGitDurabilityCatchUp } from './git-durability-policy.ts';
-import { retryParkedEffects } from './effect-retry.ts';
+import { refusalEnvelope, retryParkedEffects } from './effect-retry.ts';
+import { GIT_PUSH_CODES } from './git-push-holds.ts';
 import { patchManagedDurabilityBlock } from '../brain-repo-durability.ts';
 
 export const GIT_DURABILITY_PARAMS = ['source_id', 'enable', 'disable', 'pat_file', 'dry_run', 'admin_intent', 'expected_state'] as const;
@@ -99,14 +101,22 @@ export async function inspectDurabilityCheckout(root: string): Promise<{ branch:
   return { branch, remote: tracked ? remote.stdout.trim() : null, merge: tracked ? merge.stdout.trim() : null };
 }
 
-export type PushProbe = { ok: true; skipped?: 'no_tracking_remote' } | { ok: false; reason: 'auth' | 'protected' | 'unreachable' | 'other'; detail: string };
+export type PushProbe = { ok: true; skipped?: 'no_tracking_remote'; remote_moved?: true; detail?: string }
+  | { ok: false; reason: 'auth' | 'protected' | 'unreachable' | 'other'; detail: string };
 
-/** `git push --dry-run` to the branch's tracking remote: proves push authority without a commit; the same refspec the Git effect pushes. */
+/**
+ * `git push --dry-run` to the branch's tracking remote: proves push authority without a commit; the same refspec the Git effect pushes.
+ * GBRA-133: a rejection only because the remote moved (`fetch first`, `non-fast-forward`) comes after the remote accepted
+ * the push connection, and the Git effect publishes that case itself (it merges the remote commits in memory and pushes,
+ * #7010, `pushGitRoot`), so the probe passes it with `remote_moved`. Auth, protected-branch and unreachable refusals still fail.
+ */
 export async function probeDurabilityPush(root: string, checkout: { remote: string | null; merge: string | null }, redact: (s: string) => string): Promise<PushProbe> {
   if (!checkout.remote || !checkout.merge) return { ok: true, skipped: 'no_tracking_remote' };
   const push = await git(root, ['push', ...GIT_SSRF_SUBCOMMAND_FLAGS, '--dry-run', '--', checkout.remote, `HEAD:${checkout.merge}`], true);
   if (push.code === 0) return { ok: true };
   const detail = redact(`${push.stderr}\n${push.stdout}`).replace(/\s+/g, ' ').trim().slice(0, 200);
+  if (NON_FAST_FORWARD.test(push.stderr)) return { ok: true, remote_moved: true,
+    detail: 'the remote branch has commits this checkout lacks; the Git effect merges them in memory and pushes the merge (#7010) without pulling into the checkout, and holds a same-file conflict as integrate_conflict for the user to choose' };
   const low = detail.toLowerCase();
   const reason = low.includes('authentication') || low.includes('403') || low.includes('permission') || low.includes('could not read') ? 'auth'
     : low.includes('protected') || low.includes('pre-receive') || low.includes('hook declined') ? 'protected'
@@ -162,25 +172,68 @@ export async function wireDurabilityCredential(root: string, remote: string | nu
   return { status: 'fixed', detail: `wired a repo-scoped credential for ${host} (store 0600; replaces an earlier token for that host)` };
 }
 
+export type ParkedPushRefusal = { source_id: string; request_id: string; code: string; message: string; suggestion?: string; fix?: Action };
+export type ParkedPushRetry = { status: 'ok' | 'partial'; requests: number; queued: number; unchanged: number; refused: ParkedPushRefusal[] };
+const REQUEST_REFUSALS = new Set(['permission_denied', 'source_changed', 'write_claim_lost']);
+
 /**
  * #5808(a): after a credential change, one more attempt for every effect of this
- * worktree that parked on `git_push_unavailable`. Other worktrees are untouched;
- * each request goes through `retryParkedEffects`, so the original write's
+ * worktree that parked on a push code (`git_push_unavailable`; #7010 adds
+ * `push_unconfirmed` and `integrate_conflict`, see `retrySourceParkedPushes`). Other worktrees are untouched;
+ * each journal row goes through `retryParkedEffects`, so the original write's
  * authority is re-checked and a claimed or settled effect is left alone.
+ * #6678: effects reference the internal journal id, so the public receipt id is
+ * joined for the report and the row is selected by its internal id. A request
+ * refused on its own (revoked writer, replaced source, live claim) is listed in
+ * `refused` with the same envelope in preview and apply, and the run is `partial`;
+ * a host or binding problem (`owner_unavailable`) still stops the whole run.
  */
-export async function retryParkedPushes(engine: BrainEngine, worktreeId: string, dryRun: boolean): Promise<{ requests: number; queued: number; unchanged: number }> {
-  const rows = await engine.executeRaw<{ source_id: string; request_id: string }>(`
-    SELECT DISTINCT e.source_id,e.request_id::text AS request_id FROM persistence_effects e
+export async function retryParkedPushes(engine: BrainEngine, worktreeId: string, dryRun: boolean, codes: readonly string[] = GIT_PUSH_CODES): Promise<ParkedPushRetry> {
+  const rows = await engine.executeRaw<{ source_id: string; id: string; request_id: string }>(`
+    SELECT DISTINCT e.source_id,r.id::text AS id,r.request_id::text AS request_id FROM persistence_effects e
+      JOIN persistence_requests r ON r.id=e.request_id
      WHERE e.worktree_id=$1::uuid AND e.kind='git' AND e.state='failed' AND e.error_code='targets_parked' AND e.recovery IS NULL
-       AND EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(e.data->'parked','[]'::jsonb)) p WHERE p->>'error_code'='git_push_unavailable')
-     ORDER BY e.source_id,request_id`, [worktreeId]);
+       AND EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(e.data->'parked','[]'::jsonb)) p WHERE p->>'error_code'=ANY($2::text[]))
+     ORDER BY e.source_id,request_id,id`, [worktreeId, [...codes]]);
   let queued = 0, unchanged = 0;
+  const refused: ParkedPushRefusal[] = [];
   for (const row of rows) {
-    const result = await retryParkedEffects(engine, row.source_id, row.request_id, dryRun);
+    const target = { source_id: row.source_id, request_id: row.request_id };
+    let result: Record<string, unknown> | null;
+    try {
+      result = await retryParkedEffects(engine, row.source_id, row.request_id, dryRun, { internalId: row.id, parkedOnly: true });
+    } catch (error) {
+      if (!(error instanceof OperationError) || !REQUEST_REFUSALS.has(error.code)) throw error;
+      refused.push({ ...target, ...refusalEnvelope(error) });
+      continue;
+    }
+    if (result?.action === 'owner_revoked') { refused.push({ ...target, ...(result.refusal as ReturnType<typeof refusalEnvelope>) }); continue; }
     const effects = (result?.effects ?? []) as Array<{ action: string }>;
     if (effects.some(effect => effect.action === 'retry_queued' || effect.action === 'would_retry')) queued++; else unchanged++;
   }
-  return { requests: rows.length, queued, unchanged };
+  return { status: refused.length ? 'partial' : 'ok', requests: rows.length, queued, unchanged, refused };
+}
+
+/**
+ * #7010: `retry-effects <source> --parked-pushes`: one more attempt for every Git effect of the source's worktree
+ * parked on a push code, without a credential change. A push the remote rejected because it moved now publishes over
+ * the remote without moving the checkout, so the effects a moved remote parked before this release go through.
+ */
+export async function retrySourceParkedPushes(engine: BrainEngine, sourceId: string, dryRun: boolean): Promise<Record<string, unknown>> {
+  const binding = await ownedBinding(engine, sourceId);
+  return { action: 'writer_retry_parked_pushes', source_id: sourceId, worktree_id: binding.worktree_id, dry_run: dryRun,
+    ...await retryParkedPushes(engine, binding.worktree_id, dryRun) };
+}
+
+/**
+ * GBRA-133: `retry-effects <source> --parked-code <code>`: one more attempt for every Git effect of the source's worktree
+ * with a target parked on `code` (for example `git_target_ignored` after its .gitignore rule changed), each through
+ * `retryParkedEffects` as `--parked-pushes` does.
+ */
+export async function retrySourceParkedCode(engine: BrainEngine, sourceId: string, code: string, dryRun: boolean): Promise<Record<string, unknown>> {
+  const binding = await ownedBinding(engine, sourceId);
+  return { action: 'writer_retry_parked_code', source_id: sourceId, worktree_id: binding.worktree_id, code, dry_run: dryRun,
+    ...await retryParkedPushes(engine, binding.worktree_id, dryRun, [code]) };
 }
 
 async function ownedBinding(engine: BrainEngine, sourceId: string): Promise<WorktreeBinding & { local_path: string }> {
@@ -223,7 +276,9 @@ export async function runGitDurabilityAdministration(engine: BrainEngine, params
   if (token && checkout) {
     report.credential = await wireDurabilityCredential(root, checkout.remote, token, input.dryRun);
     // Only after the credential write succeeded: one more attempt per parked push of this worktree.
-    report.parked_pushes = await retryParkedPushes(engine, binding.worktree_id, input.dryRun);
+    const parked = await retryParkedPushes(engine, binding.worktree_id, input.dryRun);
+    report.parked_pushes = parked;
+    report.status = parked.status;
   }
   if (target === 'enabled' && checkout) {
     const probe = await probeDurabilityPush(root, checkout, redact);
@@ -264,5 +319,6 @@ export async function runGitDurabilityAdministration(engine: BrainEngine, params
   return { ...report, applied: true, queued_catch_up: queued.length, fix: statusFix(input.sourceId),
     why: target === 'enabled' ? `Page writes to ${input.sourceId} now commit (and push to ${checkout?.remote ?? 'no tracking remote: commits stay local'}) through the persistence owner's Git effect; ${queued.length} earlier skipped effect(s) were re-queued.`
       : target === 'disabled' ? `Git effects for ${input.sourceId} now complete as skipped (durability_not_enabled) even where a legacy hook exists; database writes are unaffected. Re-enable with --enable; the skipped effects are caught up then.`
-        : `The push credential was re-wired; ${report.parked_pushes ? (report.parked_pushes as { queued: number }).queued : 0} parked push(es) got one more attempt.` };
+        : `The push credential was re-wired; ${report.parked_pushes ? (report.parked_pushes as ParkedPushRetry).queued : 0} parked push(es) got one more attempt${
+          report.status === 'partial' ? `; ${(report.parked_pushes as ParkedPushRetry).refused.length} request(s) were refused on their own and are listed in parked_pushes.refused with their fix (exit 1)` : ''}.` };
 }

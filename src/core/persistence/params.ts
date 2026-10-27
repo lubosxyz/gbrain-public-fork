@@ -2,11 +2,11 @@ import type { ParamDef } from '../ops/contract.ts';
 
 /** Capture input sugar stays data; the owner materializes generated fields once. */
 export const CAPTURE_EVENT_PARAMS: Record<string, ParamDef> = {
-  who: { type: 'string', description: 'Event: comma-separated entity slugs.' },
-  what: { type: 'string', description: 'Event.' },
-  where: { type: 'string', description: 'Event place.' },
-  kind: { type: 'string', description: 'Event kind.' },
-  depth: { type: 'string', description: 'Event depth page to link.' },
+  who: { type: 'string', description: 'Event: comma-separated entity slugs.', fullSurfaceOnly: true },
+  what: { type: 'string', description: 'Event.', fullSurfaceOnly: true },
+  where: { type: 'string', description: 'Event place.', fullSurfaceOnly: true },
+  kind: { type: 'string', description: 'Event kind.', fullSurfaceOnly: true },
+  depth: { type: 'string', description: 'Event depth page to link.', fullSurfaceOnly: true },
 };
 /**
  * #6524: the provenance the trusted local CLI stamps on its own captures
@@ -36,7 +36,7 @@ import { WRITE_REQUEST_STATES, WRITE_HEALTH_REASONS, WRITE_HEALTH_ASSESSMENTS, W
  */
 export const WRITE_REQUEST_PARAM: ParamDef = {
   type: 'string',
-  description: 'Optional; reuse only to retry.',
+  description: 'Reuse only to retry.',
 };
 
 /** #6007: transport-only long-poll; never stored with the write or compared on replay. */
@@ -108,6 +108,7 @@ export const WRITE_RECEIPT_SCHEMA = {
         mode: { type: 'string', enum: ['filesystem', 'database'] },
         file_written: { type: 'boolean' },
         git_state: { type: 'string' },
+        git_commit: { type: 'string' },
       },
     },
     created_at: { type: 'string' },

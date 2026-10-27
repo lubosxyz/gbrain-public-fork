@@ -42,6 +42,7 @@ const OOS = {
   dream: 'out-of-scope:dream-verdicts',
   raw: 'out-of-scope:raw-data',
   stub: 'out-of-scope:no-sql-stub',
+  pageBody: 'out-of-scope:page-body (Wave B segmented storage, born in engine-sql/page-body.ts; pinned by test/engine-sql-page-body.test.ts)',
 } as const;
 
 export const DOMAIN_OF: Record<string, string> = {
@@ -53,7 +54,9 @@ export const DOMAIN_OF: Record<string, string> = {
   'rlsScopeBindingEnabled': OOS.helper,
   'withScopedReadTransaction': OOS.helper,
   'jitOffRead': OOS.helper,
+  'readTransaction': OOS.helper,
   'connect': OOS.lifecycle,
+  'connectedDatabaseUrl': OOS.lifecycle,
   'disconnect': OOS.lifecycle,
   'disconnectInternal': OOS.helper,
   'initSchema': OOS.lifecycle,
@@ -68,6 +71,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'runUnsafe': OOS.helper,
   'executeRaw': OOS.lifecycle,
   'executeRawDirect': OOS.lifecycle,
+  'keywordBoundedRead': OOS.lifecycle,
   'runMigration': OOS.lifecycle,
   'getBulkRetryOpts': OOS.helper,
   'batchRetry': OOS.helper,
@@ -78,6 +82,7 @@ export const DOMAIN_OF: Record<string, string> = {
   '_searchKeywordCJK': OOS.helper,
   'runVectorAttempt': OOS.helper,
   'vectorIterativeScanSupported': OOS.helper,
+  'keywordStatementTimeoutSetting': OOS.helper,
 
   // pages
   'getPage': 'pages', 'readPageSnapshot': 'pages', 'readPageSnapshotsBatch': 'pages', 'lockPageKeys': 'pages', 'findDuplicatePage': 'pages', 'findDuplicatePages': 'pages',
@@ -107,10 +112,13 @@ export const DOMAIN_OF: Record<string, string> = {
   // files
   'upsertFile': 'files', 'getFile': 'files', 'listFilesForPage': 'files',
   // chunks
-  'upsertChunks': 'chunks', 'getChunks': 'chunks', 'getChunkWindows': 'chunks', 'countStaleChunks': 'chunks', 'sumStaleChunkChars': 'chunks',
+  'upsertChunks': 'chunks', 'getChunks': 'chunks', 'getChunkPage': 'chunks', 'getChunkWindows': 'chunks', 'countStaleChunks': 'chunks', 'sumStaleChunkChars': 'chunks',
   'setPageEmbeddingSignature': 'chunks', 'markEmbedSkip': 'chunks', 'invalidateStaleSignatureEmbeddings': 'chunks',
   'invalidateContentDriftEmbeddings': 'chunks', 'listStaleChunks': 'chunks',
   'countChunklessPagesWithContent': 'chunks', 'listChunklessPagesWithContent': 'chunks', 'deleteChunks': 'chunks',
+  'readEmbeddingStateCounts': 'chunks', 'listEmbeddingStateRows': 'chunks',
+  'allocateBodyOccurrenceIds': OOS.pageBody, 'stageSegmentTexts': OOS.pageBody, 'readSegmentTexts': OOS.pageBody, 'stageManifestRows': OOS.pageBody, 'readManifest': OOS.pageBody, 'stageSegmentChunks': OOS.pageBody, 'createSegmentedPageShell': OOS.pageBody, 'flipBodyGeneration': OOS.pageBody, 'openBodyStaging': OOS.pageBody, 'setBodyStagingState': OOS.pageBody, 'sweepSegments': OOS.pageBody,
+  'readSegmentDerivations': OOS.pageBody, 'upsertSegmentDerivations': OOS.pageBody, 'retireSegmentDerivations': OOS.pageBody,
   'getEmbeddingsByChunkIds': 'chunks', 'getChunksWithEmbeddings': 'chunks',
   // facts (incl. the ontology rows of the facts table)
   'insertFact': 'facts', 'expireFact': 'facts', 'insertFacts': 'facts', 'deleteFactsForPage': 'facts',
@@ -175,6 +183,8 @@ const DEFAULT_RULES: Rule[] = [
   [/AS snapshot_withdrawals/, [{ ...PAGE_ROW, source_incarnation: INCARNATION, snapshot_tags: [], snapshot_withdrawals: [], fingerprint_body: '', fingerprint_timeline: '' }]],
   [/current_setting\('app\.scopes', true\) AS scopes/, [{ scopes: '*' }]],
   [/^SHOW enable_seqscan$/, [{ enable_seqscan: 'on' }]],
+  // The chunk-read manifest probe (safe-chunks.ts chunkManifestReads) as the owning role answers it.
+  [/chunk-visibility-ok: whether any chunk row of a segmented body exists/, [{ readable: true, segmented: false }]],
   [/^SHOW statement_timeout$/, [{ statement_timeout: '0' }]],
 ];
 
@@ -369,8 +379,8 @@ export const SQL_CASES: SqlCase[] = [
     ['sourceId', (e) => e.revertToVersion(SLUG, 3, { sourceId: SRC })],
   ]),
   ...variants('updateSlug', [
-    ['moved', (e) => e.updateSlug(SLUG, 'people/alice-example-2', { sourceId: SRC }), [[/^UPDATE pages SET slug = \$1/, [{ id: 1 }]]]],
-    ['noop', (e) => e.updateSlug(SLUG, 'people/alice-example-2')],
+    ['moved', (e) => e.updateSlug(SLUG, 'people/alice-example-2', { sourceId: SRC }), [[/^UPDATE pages SET slug = \$1/, [{ id: 1 }]], [/page_versions/, [{ id: 1, page_id: 1, compiled_truth: 'x', frontmatter: {}, snapshot_at: EPOCH }]]]],
+    ['noop', (e) => e.updateSlug(SLUG, 'people/alice-example-2'), [[/page_versions/, [{ id: 1, page_id: 1, compiled_truth: 'x', frontmatter: {}, snapshot_at: EPOCH }]]]],
   ]),
   ...variants('resolveSlugWithAlias', [['default', (e) => e.resolveSlugWithAlias('alice', SRC)]]),
   ...variants('resolveSlugWithAliasDetailed', [
@@ -530,6 +540,10 @@ export const SQL_CASES: SqlCase[] = [
     ['includeUnsealed', (e) => e.getChunks(SLUG, { includeUnsealed: true })],
     ['requireSafeChunks', (e) => e.getChunks(SLUG, { requireSafeChunks: true })],
   ]),
+  ...variants('getChunkPage', [
+    ['default', (e) => e.getChunkPage(SLUG, { fromIndex: 50, limit: 50 })],
+    ['sourceIds+excludePrivate', (e) => e.getChunkPage(SLUG, { sourceIds: SRCS, excludePrivate: true, fromIndex: 0, limit: 10 })],
+  ]),
   ...variants('countStaleChunks', [
     ['default', (e) => e.countStaleChunks()],
     ['signature+sourceId', (e) => e.countStaleChunks({ signature: 'model:3', sourceId: SRC })],
@@ -564,6 +578,15 @@ export const SQL_CASES: SqlCase[] = [
   ...variants('listChunklessPagesWithContent', [
     ['default', (e) => e.listChunklessPagesWithContent()],
     ['afterPageId+sourceId', (e) => e.listChunklessPagesWithContent({ afterPageId: 3, sourceId: SRC, batchSize: 5 })],
+  ]),
+  ...variants('readEmbeddingStateCounts', [
+    ['full', (e) => e.readEmbeddingStateCounts({ mode: 'full', purgeWindowHours: 72 })],
+    ['full+sourceIds', (e) => e.readEmbeddingStateCounts({ mode: 'full', sourceIds: [SRC], purgeWindowHours: 72 })],
+    ['ops', (e) => e.readEmbeddingStateCounts({ mode: 'ops', purgeWindowHours: 72 })],
+  ]),
+  ...variants('listEmbeddingStateRows', [
+    ['default', (e) => e.listEmbeddingStateRows({ states: ['pending', 'empty'], limit: 51, purgeWindowHours: 72 })],
+    ['sourceIds', (e) => e.listEmbeddingStateRows({ sourceIds: [SRC], states: ['keyword_only'], limit: 11, purgeWindowHours: 72 })],
   ]),
   ...variants('deleteChunks', [['default', (e) => e.deleteChunks(SLUG)]]),
   ...variants('getEmbeddingsByChunkIds', [

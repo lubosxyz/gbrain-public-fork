@@ -46,8 +46,8 @@
  */
 
 import type { BrainEngine } from './engine.ts';
-import { isUndefinedTableError } from './utils.ts';
-import { registerBackgroundWorkDrainer } from './background-work.ts';
+import { isMissingSchemaObject } from './utils.ts';
+import { deferUntilResponse, registerBackgroundWorkDrainer } from './background-work.ts';
 
 let _trackRetrievalCache: { ts: number; enabled: boolean } | null = null;
 const TRACK_RETRIEVAL_CACHE_TTL_MS = 30_000;
@@ -197,6 +197,10 @@ export const BUMP_LAST_RETRIEVED_SQL = `INSERT INTO page_retrievals (page_id, la
  */
 export function bumpLastRetrievedAt(engine: BrainEngine, pageIds: number[]): void {
   if (pageIds.length === 0) return;
+  deferUntilResponse(() => startBump(engine, pageIds));
+}
+
+function startBump(engine: BrainEngine, pageIds: number[]): void {
   // Fire-and-forget on purpose for callers (MCP, internal). The CLI
   // path awaits the drain helper below before disconnecting, which
   // is how #1247/#1269/#1290 are fixed without exposing the IIFE
@@ -212,7 +216,7 @@ export function bumpLastRetrievedAt(engine: BrainEngine, pageIds: number[]): voi
     } catch (err) {
       // Pre-v224 brain (table missing) falls through silently — the search
       // op already returned, the LSD signal just stays NULL until upgrade.
-      if (isUndefinedTableError(err)) return;
+      if (isMissingSchemaObject(err, 'table', 'page_retrievals')) return;
       // Other errors: stderr-warn but don't break the op response.
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[last-retrieved] write-back failed (best-effort): ${msg}`);

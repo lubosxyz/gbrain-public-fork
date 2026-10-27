@@ -16,7 +16,7 @@ import { isInsideGitRepo, hasTrackedContent } from '../git-remote.ts';
 import { containsPath, getWorktreeBinding, humanManifestProgress, type WorktreeBinding, type WorktreeManifest, worktreeManifest } from './ownership.ts';
 import { manifestDifferences, storedManifestScope, type WorktreeManifestScope } from './worktree-manifest.ts';
 import { localHostId } from './identity.ts';
-import { advanceTopology, lockTopologyPrincipal, lockTopologyRows, settleTopologyRequests, topologyCanonicalStamp, topologyPrincipal, withTopologyLocks } from './topology-locks.ts';
+import { advanceTopology, inspectTopologyPhysicalRoot, lockTopologyPrincipal, lockTopologyRows, settleTopologyRequests, topologyCanonicalStamp, topologyPrincipal, withTopologyLocks } from './topology-locks.ts';
 import { priorTopologyChange, recordTopologyChange, topologyReceipt } from './topology-receipts.ts';
 import { isWriteRequestId } from './types.ts';
 import { withCoordinatedWrite } from './context.ts';
@@ -28,6 +28,8 @@ import { claimPhysicalRoot } from './physical-root.ts';
 import { inspectRelocatedPhysicalRoot, relocatePhysicalRoot } from './physical-root-record.ts';
 import { assertWriterAdminState, WRITER_INSPECTION_HINT } from './admin-intent.ts';
 import { assertWriterAdminUnlocked } from './admin-lock.ts';
+import { rebindContentReceipts } from '../shared-skills/receipt-root.ts';
+import { assertLinkedWorktreeIntact } from './worktree-link.ts';
 
 export interface SourceLifecycleInput {
   operation:'add'|'claim'|'archive'|'restore'|'remove'|'purge'|'rebind'|'reclone';
@@ -58,6 +60,7 @@ function localRoot(path:string,create=false):{source:string;worktree:string}{
     'The path names a file. Pass the directory that holds the source content, then rerun the command; nothing was changed.');
   let worktree=source;
   let ancestor=source;while(!existsSync(ancestor))ancestor=dirname(ancestor);
+  assertLinkedWorktreeIntact(ancestor);
   try{worktree=realpathSync(discoverGitRoot(ancestor));}catch{/* directory source */}
   return {source,worktree};
 }
@@ -155,6 +158,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
   const retire=['archive','remove','purge'].includes(input.operation);
   const manifestRequired=!retire||(await engine.executeRaw<{digest:string|null}>(
     `SELECT w.manifest->>'digest' AS digest FROM persistence_source_bindings b JOIN persistence_worktrees w ON w.id=b.worktree_id WHERE b.source_id=$1`,[input.sourceId])).some(row=>!row.digest);
+  if(input.dryRun) await inspectTopologyPhysicalRoot(engine,input.sourceId,root?.worktree,{relocation:input.operation==='rebind'});
   if(input.dryRun) return {dry_run:true,operation:input.operation,source_id:input.sourceId,source_incarnation:before?.incarnation??null,path:root?.source??before?.local_path??null,manifest_required:manifestRequired};
   return withTopologyLocks(engine,input.sourceId,async bindings=>{
     // Hash canonical bytes while holding native exclusion, without a database
@@ -278,6 +282,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
         await tx.executeRaw('DELETE FROM sources WHERE id=$1 AND incarnation=$2::uuid',[input.sourceId,incarnation]);
         await tx.executeRaw('DELETE FROM persistence_source_bindings WHERE source_id=$1 AND source_incarnation=$2::uuid',[input.sourceId,incarnation]);
       }
+      const contentReceipts=input.operation==='rebind'?await rebindContentReceipts(tx,worktrees,localHostId(),relocated?undefined:[input.sourceId]):[];
       await advanceTopology(tx,worktrees);
       for(const id of worktrees){
         const [host]=await tx.executeRaw<{local_path:string}>('SELECT local_path FROM persistence_host_bindings WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[id,localHostId()]);
@@ -288,7 +293,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       // stale installations cannot write after a source moved or disappeared.
       await refreshManagedFilesystemRoots(tx,managedFilesystemDatastorePath(engine));
       return {operation:input.operation,source_id:input.sourceId,source_incarnation:incarnation,invalidated_requests:invalidated,
-        ...(missingCheckout?{retired_without_checkout:missingCheckout}:{}),
+        ...(missingCheckout?{retired_without_checkout:missingCheckout}:{}),...(contentReceipts.length?{content_receipts:contentReceipts}:{}),
         ...(root?{local_path:root.source}:{}),...(['remove','purge'].includes(input.operation)?{storage_retained:true,local_path:ownedSourcePath??null,pages_deleted:pagesDeleted}:{}),
         ...(input.operation==='add'?{name:input.name??source?.name??input.sourceId,config:redactSourceConfig({...source?.config,...input.config}),id:input.sourceId}: {})};
     },principalAttribution({kind:'local_cli',id:principal}));
