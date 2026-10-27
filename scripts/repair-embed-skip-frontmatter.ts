@@ -14,8 +14,9 @@
  *   - there is at least one further element, and every further element is a
  *     JSON string whose text parses to exactly what markEmbedSkip writes:
  *     `{"embed_skip": {reason, bytes, assessed_at}}` with reason one of the known
- *     values, bytes a non-negative integer and assessed_at an ISO timestamp string
- *     (no other keys at either level)
+ *     values, bytes a non-negative integer and assessed_at a canonical ISO timestamp string
+ *     (no other keys at either level); assessed_at must be the canonical
+ *     `toISOString()` form the builders write
  * The repaired value is `element0 || <last marker object>` (the newest marker
  * wins, matching what a correct merge would have left). Any other array-shaped
  * frontmatter is reported and left untouched.
@@ -112,6 +113,13 @@ export function isDamagedShape(elements: unknown): boolean {
   return true;
 }
 
+/** Only the form the builders write (`now.toISOString()`): parseable-but-different spellings are not markers. */
+function isCanonicalIso(v: unknown): boolean {
+  if (typeof v !== 'string') return false;
+  const t = Date.parse(v);
+  return !Number.isNaN(t) && new Date(t).toISOString() === v;
+}
+
 /** Exactly `{embed_skip: {reason, bytes, assessed_at}}` as markEmbedSkip writes it. */
 function isMarkerPatch(v: unknown): boolean {
   if (!isPlainObject(v)) return false;
@@ -123,7 +131,7 @@ function isMarkerPatch(v: unknown): boolean {
   return (
     typeof marker.reason === 'string' && MARKER_REASONS.has(marker.reason) &&
     typeof marker.bytes === 'number' && Number.isInteger(marker.bytes) && marker.bytes >= 0 &&
-    typeof marker.assessed_at === 'string' && !Number.isNaN(Date.parse(marker.assessed_at))
+    isCanonicalIso(marker.assessed_at)
   );
 }
 
