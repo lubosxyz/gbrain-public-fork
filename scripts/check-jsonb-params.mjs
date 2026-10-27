@@ -28,6 +28,14 @@
  * then verifies JSON.stringify feeds THAT param when the params argument is an
  * array literal (falls back to whole-span correlation otherwise).
  *
+ * It ALSO flags the template-interpolation form `${JSON.stringify(<balanced
+ * argument, object literals included>)}::jsonb` anywhere in a scanned file
+ * (scanTemplateStringify); the grep in check-jsonb-pattern.sh cannot cross the
+ * `}` of an object literal. Limitation: the scan is textual, so a plain '...' or
+ * "..." string literal (or a template inside a generated-code string) that merely
+ * CONTAINS that text is flagged too; mark such a line `jsonb-guard-ok`. A false
+ * negative would hide a real bug, so quote tracking is deliberately not attempted.
+ *
  * Allowed forms (NOT flagged):
  *   - `$N::text::jsonb` + JSON.stringify  (the fix: binds as text, cast parses it)
  *   - `$N::text[]`                        (the unnest path — arrays bind fine)
@@ -177,8 +185,36 @@ function nthParamText(span, n) {
 
 const violations = [];
 
+// Template-interpolation form: `${JSON.stringify(<anything>)}::jsonb`. The
+// legacy grep in check-jsonb-pattern.sh stops at the first `}`, so an object
+// literal argument (`${JSON.stringify({ k: v })}::jsonb`, the engine-sql
+// markEmbedSkip regression) slipped past it. Here the argument span is found
+// by balancing parens, so nested braces/parens/strings are no obstacle.
+// `}::text::jsonb` is the sanctioned spelling and is not matched.
+const TPL_STRINGIFY_RE = /\$\{\s*JSON\s*\.\s*stringify\s*\(/g;
+
+function scanTemplateStringify(file, src) {
+  TPL_STRINGIFY_RE.lastIndex = 0;
+  let m;
+  while ((m = TPL_STRINGIFY_RE.exec(src))) {
+    const lineStart = src.lastIndexOf('\n', m.index) + 1;
+    const lineEnd = src.indexOf('\n', m.index);
+    const lineText = src.slice(lineStart, lineEnd === -1 ? src.length : lineEnd);
+    if (/^\s*(\/\/|\*|\/\*)/.test(lineText)) continue; // documentation example
+    if (/jsonb-guard-ok/.test(lineText)) continue;
+    const [, argEnd] = findSpan(src, m.index + m[0].length - 1);
+    const tail = src.slice(argEnd + 1, argEnd + 40);
+    if (!/^\s*\}\s*::\s*jsonb\b/.test(tail)) continue;
+    const line = src.slice(0, m.index).split('\n').length;
+    violations.push(
+      `${file}:${line}  \${JSON.stringify(...)}::jsonb interpolation double-encodes on postgres.js — bind jsonbParam(x) (engine-sql), sql.json(x), or \${JSON.stringify(x)}::text::jsonb`,
+    );
+  }
+}
+
 function scanFile(file) {
   const src = readFileSync(file, 'utf8');
+  scanTemplateStringify(file, src);
   CALL_RE.lastIndex = 0;
   let m;
   while ((m = CALL_RE.exec(src))) {
