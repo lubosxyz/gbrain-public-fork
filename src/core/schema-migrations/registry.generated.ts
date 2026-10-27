@@ -282,6 +282,7 @@ import { v278 } from './v278-fork-replay-upstream-v166-v169.ts';
 import { v279 } from './v279-fork-replay-upstream-v150-canonical-page-revisions.ts';
 import { v280 } from './v280-fork-replay-upstream-v160-projection-statistics.ts';
 import { v281 } from './v281-fork-replay-upstream-v161-pending-projection-index.ts';
+import { v282 } from './v282-fork-repair-embed-skip-frontmatter.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -562,4 +563,5 @@ export const MIGRATIONS: Migration[] = [
   v279,
   v280,
   v281,
+  v282,
 ];

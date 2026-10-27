@@ -1,6 +1,6 @@
 {
   "golden": {
-    "count": 276,
+    "count": 277,
     "gaps": [
       17,
       18,
@@ -76,6 +76,7 @@
       "quietMigrationNotices": "4045c32034a8f46204dd5d89e185ff5c35e8073f560f14caa8b127f8a695957c",
       "readExistingEmbeddingShape": "16d92d7cd52d8ebd7e89982f02e1bbdd8e8d08a6712a4ce57fbcf0952b7a6ca5",
       "relationsWithoutRls": "1350afca7865e0a915bfd4c6c2614361705090fca4905f25ac3b38312065c99c",
+      "repairEmbedSkipFrontmatter": "e2a44f2a27ffa57315af8bd726080a15480e9ea645870991e788d12298194357",
       "repairLegacyClientGrants": "c1dc6b1d0c4933c041583aa1c4eacaefc0ff0ae2a67f56cfad7534f87a5ab309",
       "repairLegacyTimelineSourceRows": "405d4ae158482c020b029b93aff1ae4ac6854e6948cafaf82dbef473e6e5552e",
       "resolveSchemaLockTimeoutMs": "944eadd479e8de6c6da7dfb5208eb3b140e84b318db97a644d08ae0054d69138",
@@ -88,7 +89,7 @@
       "verifyProjectionStatistics": "0d231b04ecfbc5a4109d6fca9567bf4e8c9e9db6c3fbbb35212e026579ed6f67",
       "withSchemaLockTimeout": "95605bd3004955e11e936c7a4aa6889319b401098abf9db18ef3e48da2c3fc59"
     },
-    "latest": 281,
+    "latest": 282,
     "records": [
       {
         "handler": {
@@ -4553,6 +4554,27 @@
         "transaction": "absent",
         "verify": "absent",
         "version": 281
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "migrationNotice",
+            "quietMigrationNotices",
+            "repairEmbedSkipFrontmatter"
+          ],
+          "sha256": "47efbda4e9ef6d86a0d3f0d0f499c17581403753861cb6274de5ebfdacf7a93c"
+        },
+        "idempotent": true,
+        "name": "fork_repair_embed_skip_frontmatter",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 282
       }
     ],
     "versions": [
@@ -4831,7 +4853,8 @@
       278,
       279,
       280,
-      281
+      281,
+      282
     ]
   },
   "normalizer": "migrations-record-v1"
