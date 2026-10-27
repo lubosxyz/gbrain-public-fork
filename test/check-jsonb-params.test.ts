@@ -40,11 +40,34 @@ beforeAll(() => {
     join(badDir, 'bad_generic.ts'),
     "await engine.executeRaw<{ id: string }>(`UPDATE t SET a = $2::jsonb WHERE id = $1`, [id, JSON.stringify(x)]);\n",
   );
+  // BAD: template interpolation with an object-literal argument (the
+  // markEmbedSkip regression the grep in check-jsonb-pattern.sh could not see).
+  writeFileSync(
+    join(badDir, 'bad_tpl_object.ts'),
+    "await exec.run(sqlFragment`UPDATE pages SET frontmatter = frontmatter || ${JSON.stringify({ [KEY]: marker })}::jsonb WHERE slug = ${slug}`);\n",
+  );
+  // BAD: template interpolation with a nested call argument.
+  writeFileSync(
+    join(badDir, 'bad_tpl_nested.ts'),
+    "await exec.run(sqlFragment`UPDATE t SET a = ${JSON.stringify(build(x, { y: (1) }))}::jsonb`);\n",
+  );
 
   // GOOD: the fix — $1::text::jsonb.
   writeFileSync(
     join(goodDir, 'good_text.ts'),
     "await engine.executeRaw(`INSERT INTO t (a) VALUES ($1::text::jsonb)`, [JSON.stringify(x)]);\n",
+  );
+  // GOOD: template interpolation through ::text::jsonb, a documentation
+  // comment, and the explicit opt-out.
+  writeFileSync(
+    join(goodDir, 'good_tpl.ts'),
+    [
+      "await exec.run(sqlFragment`UPDATE t SET a = ${JSON.stringify({ k: v })}::text::jsonb`);",
+      "// bad example: ${JSON.stringify({ k: v })}::jsonb",
+      "await exec.run(sqlFragment`UPDATE t SET a = ${JSON.stringify(x)}::jsonb`); // jsonb-guard-ok",
+      "await exec.run(sqlFragment`UPDATE t SET a = ${jsonbParam({ k: v })}::jsonb`);",
+      '',
+    ].join('\n'),
   );
   // GOOD: text[] array path (the appendCompleted unnest shape).
   writeFileSync(
@@ -73,9 +96,11 @@ describe('check-jsonb-params guard', () => {
     expect(code).toBe(1);
     expect(err).toContain('bad.ts');
     expect(err).toContain('bad_generic.ts');
+    expect(err).toContain('bad_tpl_object.ts');
+    expect(err).toContain('bad_tpl_nested.ts');
   });
 
-  test('passes the sanctioned forms (::text::jsonb, ::text[], executeRawJsonb, opt-out)', () => {
+  test('passes the sanctioned forms (::text::jsonb, ::text[], executeRawJsonb, jsonbParam, opt-out)', () => {
     const { code, err } = runGuard(goodDir);
     expect(code).toBe(0);
     expect(err).toContain('clean');

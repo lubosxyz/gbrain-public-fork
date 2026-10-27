@@ -41,7 +41,7 @@ import { QUARANTINE_FILTER_FRAGMENT } from '../quarantine.ts';
 import { pageBudgetLimitedFilter } from '../page-size-policy.ts';
 import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
 import { mapChunkWindowRows, type ChunkWindowOpts, type ChunkWindowPage, type ChunkWindowRequest } from '../search/chunk-windows.ts';
-import type { SqlExecutor } from './executor.ts';
+import { jsonbParam, type SqlExecutor } from './executor.ts';
 import type { LegacyUnscopedRead, ScopedRead } from './brands.ts';
 import { joinFragments, renderFragment, sqlFragment, trustedSql, type SqlFragment } from './fragment.ts';
 import { pipelined } from '../page-state/transactions.ts';
@@ -1183,12 +1183,12 @@ export async function getChunksWithEmbeddings(exec: LegacyUnscopedRead, slug: st
 
 /**
  * Merge a permanent input rejection without replacing unrelated frontmatter.
- * The patch binds as text and the cast parses it: a string bound straight to
- * `::jsonb` arrives on Postgres as a jsonb string, and `object || string` is
- * an array (repaired by schema migration v282).
+ * The patch binds as a JSONB object: a JSON string bound straight to `::jsonb`
+ * arrives on Postgres as a jsonb string, and `object || string` is an array
+ * (repaired by schema migration v282).
  */
 export async function markEmbedSkip(exec: SqlExecutor, slug: string, opts: { sourceId?: string; marker: EmbedSkipMarker }): Promise<void> {
   await exec.run(sqlFragment`UPDATE pages
-    SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || ${JSON.stringify({ [EMBED_SKIP_KEY]: opts.marker })}::text::jsonb
+    SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || ${jsonbParam({ [EMBED_SKIP_KEY]: opts.marker })}::jsonb
     WHERE slug = ${slug} AND source_id = ${opts.sourceId ?? 'default'}`);
 }
