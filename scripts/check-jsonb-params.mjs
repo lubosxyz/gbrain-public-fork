@@ -31,7 +31,10 @@
  * It ALSO flags the template-interpolation form `${JSON.stringify(<balanced
  * argument, object literals included>)}::jsonb` anywhere in a scanned file
  * (scanTemplateStringify); the grep in check-jsonb-pattern.sh cannot cross the
- * `}` of an object literal.
+ * `}` of an object literal. Limitation: the scan is textual, so a plain '...' or
+ * "..." string literal (or a template inside a generated-code string) that merely
+ * CONTAINS that text is flagged too; mark such a line `jsonb-guard-ok`. A false
+ * negative would hide a real bug, so quote tracking is deliberately not attempted.
  *
  * Allowed forms (NOT flagged):
  *   - `$N::text::jsonb` + JSON.stringify  (the fix: binds as text, cast parses it)

@@ -80,6 +80,20 @@ export function defineRepairCases(h: RepairCaseHooks): void {
         'foreign/extra-key': [{ a: 1 }, JSON.stringify({ embed_skip: { bytes: 1 }, more: 2 })],
         'foreign/non-object-head': ['x', JSON.stringify({ embed_skip: { bytes: 1 } })],
         'foreign/nested-array-tail': [{ a: 1 }, [JSON.stringify({ embed_skip: { bytes: 1 } })]],
+        // Payloads that carry the key but are not what markEmbedSkip writes.
+        'foreign/marker-null': [{ keep: 'original' }, JSON.stringify({ embed_skip: null })],
+        'foreign/marker-number': [{ a: 1 }, JSON.stringify({ embed_skip: 7 })],
+        'foreign/marker-string': [{ a: 1 }, JSON.stringify({ embed_skip: 'x' })],
+        'foreign/marker-array': [{ a: 1 }, JSON.stringify({ embed_skip: [1, 2] })],
+        'foreign/marker-unrelated-keys': [{ a: 1 }, JSON.stringify({ embed_skip: { unrelated: 1 } })],
+        'foreign/marker-extra-inner-key': [{ a: 1 }, JSON.stringify({ embed_skip: { ...buildChunkTokenLimitMarker(3), extra: true } })],
+        'foreign/marker-bytes-string': [{ a: 1 }, JSON.stringify({ embed_skip: { ...buildChunkTokenLimitMarker(3), bytes: '3' } })],
+        'foreign/marker-negative-bytes': [{ a: 1 }, JSON.stringify({ embed_skip: { ...buildChunkTokenLimitMarker(3), bytes: -3 } })],
+        'foreign/marker-unknown-reason': [{ a: 1 }, JSON.stringify({ embed_skip: { ...buildChunkTokenLimitMarker(3), reason: 'other' } })],
+        'foreign/marker-bad-timestamp': [{ a: 1 }, JSON.stringify({ embed_skip: { ...buildChunkTokenLimitMarker(3), assessed_at: 'not a date' } })],
+        'foreign/second-element-valid-third-not': [{ a: 1 }, JSON.stringify({ embed_skip: buildChunkTokenLimitMarker(3) }), JSON.stringify({ embed_skip: null })],
+        'foreign/top-level-array-payload': [{ a: 1 }, JSON.stringify([{ embed_skip: buildChunkTokenLimitMarker(3) }])],
+        'foreign/top-level-null-payload': [{ a: 1 }, 'null'],
       };
       for (const [slug, value] of Object.entries(foreign)) await h.seedRaw(slug, value);
       await h.seedDamaged('damaged/among-foreign', { keep: 'me' }, [7]);

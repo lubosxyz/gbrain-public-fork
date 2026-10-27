@@ -14,6 +14,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { hasDatabase, setupDB, teardownDB, getEngine, getConn } from './helpers.ts';
 import { EMBED_SKIP_KEY, buildChunkTokenLimitMarker, isEmbedSkipped } from '../../src/core/embed-skip.ts';
 import { defineRepairCases } from '../helpers/embed-skip-repair-cases.ts';
+import { repairEmbedSkipFrontmatter, stillDamaged } from '../../scripts/repair-embed-skip-frontmatter.ts';
 
 const skip = !hasDatabase();
 const describeE2E = skip ? describe.skip : describe;
@@ -106,6 +107,35 @@ describeE2E('embed-skip jsonb on Postgres', () => {
         if (shape.t !== 'array') throw new Error(`legacy write did not reproduce the array shape (got ${shape.t})`);
       },
       seedRaw: async (slug, value) => { await insertPage(slug, JSON.stringify(value)); },
+    });
+
+    // Real Postgres semantics: after the guard refuses one row the transaction must
+    // stay usable (ROLLBACK TO SAVEPOINT), the next row is still processed, and the
+    // run reports every refused row instead of aborting.
+    test('rows the writer guard refuses are skipped per row, reported, and left damaged', async () => {
+      await getConn().unsafe('DELETE FROM pages');
+      await getConn().unsafe(`DELETE FROM sources WHERE id IN ('guarded-a', 'guarded-b')`);
+      await getConn().unsafe(`INSERT INTO sources (id, name) VALUES ('guarded-a', 'guarded-a'), ('guarded-b', 'guarded-b')`);
+      for (const [source, slug] of [['guarded-a', 'g/one'], ['guarded-b', 'g/two']]) {
+        await getConn().unsafe(
+          `INSERT INTO pages (source_id, slug, type, title, compiled_truth, timeline, frontmatter)
+           VALUES ($1, $2, 'note', $2, 'body', '', $3::text::jsonb)`,
+          [source, slug, JSON.stringify([{ keep: 'me' }, JSON.stringify({ [EMBED_SKIP_KEY]: buildChunkTokenLimitMarker(5) })])],
+        );
+      }
+      await getConn().unsafe('UPDATE persistence_brain SET enabled = true WHERE singleton = 1');
+      try {
+        const report = await repairEmbedSkipFrontmatter(getEngine(), { apply: true });
+        expect(report.repaired).toBe(0);
+        expect(report.skipped.map(r => `${r.source_id}/${r.slug}`)).toEqual(['guarded-a/g/one', 'guarded-b/g/two']);
+        expect(stillDamaged(report)).toBe(2);
+      } finally {
+        await getConn().unsafe('UPDATE persistence_brain SET enabled = false WHERE singleton = 1');
+      }
+      const rows = await getConn().unsafe(`SELECT jsonb_typeof(frontmatter) AS t FROM pages WHERE slug IN ('g/one', 'g/two')`);
+      expect(rows.map((r: any) => r.t)).toEqual(['array', 'array']);
+      await getConn().unsafe('DELETE FROM pages');
+      await getConn().unsafe(`DELETE FROM sources WHERE id IN ('guarded-a', 'guarded-b')`);
     });
   });
 });
