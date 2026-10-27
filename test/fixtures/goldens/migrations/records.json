@@ -4477,7 +4477,20 @@
         "version": 276
       },
       {
-        "handler": "absent",
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "EXEMPT_RE",
+            "enableRlsSql",
+            "isLockTimeoutError",
+            "migrationStatementTimeoutMs",
+            "protectTables",
+            "relationsWithoutRls",
+            "resolveSchemaLockTimeoutMs",
+            "schemaLockBlockedError"
+          ],
+          "sha256": "b7d88149a6932c6364ea20677d7a143082fcde5575400943e55ae65f359ca6a5"
+        },
         "idempotent": true,
         "name": "fork_upstream_v150_reconciliation",
         "sql": {

@@ -1,4 +1,5 @@
 import type { Migration } from './types.ts';
+import { protectTables } from './v275-rls-backfill-unguarded-tables.ts';
 
 export const v277: Migration = {
     version: 277,
@@ -95,4 +96,7 @@ export const v277: Migration = {
       );
       CREATE INDEX IF NOT EXISTS idx_auth_audit_created ON auth_audit (created_at DESC);
     `,
+    // The fork's tables are not in v275's frozen list, and on a brain without
+    // the auto-RLS event trigger only the schema blob would enable their RLS.
+    handler: async engine => { await protectTables(engine, ['auth_audit', 'mcp_request_log_purged'], 'v277'); },
   };
