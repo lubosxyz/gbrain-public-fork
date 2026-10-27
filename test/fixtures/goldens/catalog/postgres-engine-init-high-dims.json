@@ -5,7 +5,11 @@
       "access_tokens.access_tokens_pkey": "p PRIMARY KEY (id)",
       "access_tokens.access_tokens_source_grant_check": "c CHECK ((source_grant = ANY (ARRAY['default'::text, 'scalar'::text, 'federated'::text, 'none'::text])))",
       "access_tokens.access_tokens_token_hash_key": "u UNIQUE (token_hash)",
+      "access_tokens.chk_access_tokens_company_slug_format": "c CHECK (((company_slug IS NULL) OR (company_slug ~ '^[a-z0-9][a-z0-9-]{0,62}$'::text)))",
+      "access_tokens.chk_access_tokens_tenant_expiry": "c CHECK ((((company_slug IS NULL) AND (expires_at IS NULL) AND (minted_by IS NULL)) OR ((company_slug IS NOT NULL) AND (expires_at IS NOT NULL) AND (minted_by IS NOT NULL))))",
+      "access_tokens.chk_access_tokens_tenant_read_only": "c CHECK (((company_slug IS NULL) OR ((scopes IS NOT NULL) AND (scopes = ARRAY['read'::text]))))",
       "access_tokens.trust_generation_update": "t TRIGGER DEFERRABLE INITIALLY DEFERRED",
+      "auth_audit.auth_audit_pkey": "p PRIMARY KEY (id)",
       "belief_commit_marks.belief_commit_marks_pkey": "p PRIMARY KEY (publication_id)",
       "belief_events.belief_events_event_key_key": "u UNIQUE (event_key)",
       "belief_events.belief_events_origin_check": "c CHECK ((origin = ANY (ARRAY['live'::text, 'unmanaged'::text, 'baseline'::text, 'backfill'::text, 'reconcile'::text])))",
@@ -166,6 +170,7 @@
       "loop_suppressions.loop_suppressions_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "loop_suppressions.loop_suppressions_uniq": "u UNIQUE (source_id, kind, value)",
       "mcp_request_log.mcp_request_log_pkey": "p PRIMARY KEY (id)",
+      "mcp_request_log_purged.mcp_request_log_purged_pkey": "p PRIMARY KEY (token_name)",
       "mcp_spend_log.mcp_spend_log_one_budget_owner": "c CHECK (((client_id IS NULL) OR (budget_key IS NULL)))",
       "mcp_spend_log.mcp_spend_log_pkey": "p PRIMARY KEY (id)",
       "mcp_spend_reservations.mcp_spend_reservations_job_id_fkey": "f FOREIGN KEY (job_id) REFERENCES minion_jobs(id) ON DELETE SET NULL",
@@ -583,6 +588,9 @@
       "access_tokens": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "auth_audit": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "belief_commit_marks": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
@@ -761,6 +769,9 @@
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "mcp_request_log": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "mcp_request_log_purged": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "mcp_spend_log": [
@@ -1070,6 +1081,7 @@
     "indexes": {
       "access_tokens_pkey": "CREATE UNIQUE INDEX access_tokens_pkey ON public.access_tokens USING btree (id)",
       "access_tokens_token_hash_key": "CREATE UNIQUE INDEX access_tokens_token_hash_key ON public.access_tokens USING btree (token_hash)",
+      "auth_audit_pkey": "CREATE UNIQUE INDEX auth_audit_pkey ON public.auth_audit USING btree (id)",
       "belief_commit_marks_pkey": "CREATE UNIQUE INDEX belief_commit_marks_pkey ON public.belief_commit_marks USING btree (publication_id)",
       "belief_events_claim_fp": "CREATE INDEX belief_events_claim_fp ON public.belief_events USING btree (source_id, claim_fp) WHERE (claim_fp IS NOT NULL)",
       "belief_events_event_key_key": "CREATE UNIQUE INDEX belief_events_event_key_key ON public.belief_events USING btree (event_key)",
@@ -1185,6 +1197,7 @@
       "gbrain_cycle_locks_pkey": "CREATE UNIQUE INDEX gbrain_cycle_locks_pkey ON public.gbrain_cycle_locks USING btree (id)",
       "git_canonical_brain_pkey": "CREATE UNIQUE INDEX git_canonical_brain_pkey ON public.git_canonical_brain USING btree (singleton)",
       "idx_access_tokens_hash": "CREATE INDEX idx_access_tokens_hash ON public.access_tokens USING btree (token_hash) WHERE (revoked_at IS NULL)",
+      "idx_auth_audit_created": "CREATE INDEX idx_auth_audit_created ON public.auth_audit USING btree (created_at DESC)",
       "idx_budget_reservations_expires": "CREATE INDEX idx_budget_reservations_expires ON public.budget_reservations USING btree (expires_at) WHERE (status = 'held'::text)",
       "idx_chat_usage_log_created": "CREATE INDEX idx_chat_usage_log_created ON public.chat_usage_log USING btree (created_at)",
       "idx_chat_usage_log_model": "CREATE INDEX idx_chat_usage_log_model ON public.chat_usage_log USING btree (model, created_at)",
@@ -1322,6 +1335,7 @@
       "loop_suppressions_pkey": "CREATE UNIQUE INDEX loop_suppressions_pkey ON public.loop_suppressions USING btree (id)",
       "loop_suppressions_uniq": "CREATE UNIQUE INDEX loop_suppressions_uniq ON public.loop_suppressions USING btree (source_id, kind, value)",
       "mcp_request_log_pkey": "CREATE UNIQUE INDEX mcp_request_log_pkey ON public.mcp_request_log USING btree (id)",
+      "mcp_request_log_purged_pkey": "CREATE UNIQUE INDEX mcp_request_log_purged_pkey ON public.mcp_request_log_purged USING btree (token_name)",
       "mcp_spend_log_pkey": "CREATE UNIQUE INDEX mcp_spend_log_pkey ON public.mcp_spend_log USING btree (id)",
       "mcp_spend_reservations_pkey": "CREATE UNIQUE INDEX mcp_spend_reservations_pkey ON public.mcp_spend_reservations USING btree (reservation_id)",
       "mention_gazetteer_entries_pkey": "CREATE UNIQUE INDEX mention_gazetteer_entries_pkey ON public.mention_gazetteer_entries USING btree (source_id, name_norm, target_slug, case_sensitive)",
@@ -1625,14 +1639,32 @@
           "5 created_at timestamp with time zone/timestamptz NULL DEFAULT now()",
           "6 last_used_at timestamp with time zone/timestamptz NULL",
           "7 revoked_at timestamp with time zone/timestamptz NULL",
-          "8 permissions jsonb/jsonb NOT NULL DEFAULT '{\"takes_holders\": [\"world\"]}'::jsonb",
-          "9 source_grant text/text NULL",
-          "10 source_id text/text NULL",
-          "11 federated_read ARRAY/_text NULL",
-          "12 allowed_operations ARRAY/_text NULL",
-          "13 takes_holders ARRAY/_text NULL",
-          "14 grant_revision integer/int4 NOT NULL DEFAULT 0",
-          "15 min_trust text/text NULL"
+          "8 company_slug text/text NULL",
+          "9 expires_at timestamp with time zone/timestamptz NULL",
+          "10 minted_by text/text NULL",
+          "11 permissions jsonb/jsonb NOT NULL DEFAULT '{\"takes_holders\": [\"world\"]}'::jsonb",
+          "12 source_grant text/text NULL",
+          "13 source_id text/text NULL",
+          "14 federated_read ARRAY/_text NULL",
+          "15 allowed_operations ARRAY/_text NULL",
+          "16 takes_holders ARRAY/_text NULL",
+          "17 grant_revision integer/int4 NOT NULL DEFAULT 0",
+          "18 min_trust text/text NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "auth_audit": {
+        "columns": [
+          "1 id uuid/uuid NOT NULL DEFAULT gen_random_uuid()",
+          "2 correlation_id text/text NOT NULL",
+          "3 decision text/text NOT NULL",
+          "4 method text/text NULL",
+          "5 reason text/text NULL",
+          "6 token_id text/text NULL",
+          "7 token_name text/text NULL",
+          "8 company_slug text/text NULL",
+          "9 actor text/text NULL",
+          "10 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
         ],
         "flags": "relkind=r rls=true force_rls=false"
       },
@@ -2625,6 +2657,14 @@
           "7 params jsonb/jsonb NULL",
           "8 error_message text/text NULL",
           "9 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "mcp_request_log_purged": {
+        "columns": [
+          "1 token_name text/text NOT NULL",
+          "2 purged_requests bigint/int8 NOT NULL DEFAULT 0",
+          "3 purged_last_used_at timestamp with time zone/timestamptz NULL"
         ],
         "flags": "relkind=r rls=true force_rls=false"
       },
